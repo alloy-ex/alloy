@@ -68,14 +68,26 @@ defmodule Anvil.Tool.Core.BashTest do
       assert result =~ "truncated"
     end
 
-    test "enforces timeout", %{tmp_dir: tmp_dir} do
+    test "enforces timeout with a descriptive message", %{tmp_dir: tmp_dir} do
       assert {:error, msg} =
                Bash.execute(
                  %{"command" => "sleep 10", "timeout" => 100},
                  %{working_directory: tmp_dir}
                )
 
-      assert msg =~ "timed out" or msg =~ "timeout"
+      assert msg =~ "timed out"
+      assert msg =~ ~r/server|loop|input/i
+    end
+
+    test "executes in bash not sh", %{tmp_dir: tmp_dir} do
+      # $0 reports the name of the invoking shell: "bash" when called as bash, "sh" when called as sh
+      assert {:ok, result} =
+               Bash.execute(
+                 %{"command" => "echo $0"},
+                 %{working_directory: tmp_dir}
+               )
+
+      assert result =~ "bash"
     end
 
     test "uses default working directory when not in context" do

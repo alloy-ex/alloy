@@ -40,7 +40,7 @@ defmodule Anvil.Tool.Core.Bash do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-c", command], opts)
+        System.cmd("bash", ["-c", command], opts)
       end)
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
@@ -49,7 +49,8 @@ defmodule Anvil.Tool.Core.Bash do
         {:ok, "#{output}\nexit code: #{exit_code}"}
 
       nil ->
-        {:error, "Command timed out after #{timeout}ms"}
+        {:error,
+         "Command timed out after #{timeout}ms. The process may have started a server, entered an infinite loop, or is waiting for input. Try a non-blocking approach."}
     end
   end
 

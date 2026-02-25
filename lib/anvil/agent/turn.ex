@@ -36,7 +36,17 @@ defmodule Anvil.Agent.Turn do
     provider = state.config.provider
     provider_config = build_provider_config(state)
 
-    case provider.complete(state.messages, state.tool_defs, provider_config) do
+    streaming? = state.config.streaming && function_exported?(provider, :stream, 4)
+    on_chunk = Map.get(state.config.context, :on_chunk) || fn _chunk -> :ok end
+
+    result =
+      if streaming? do
+        provider.stream(state.messages, state.tool_defs, provider_config, on_chunk)
+      else
+        provider.complete(state.messages, state.tool_defs, provider_config)
+      end
+
+    case result do
       {:ok, %{stop_reason: :tool_use, messages: new_msgs, usage: usage}} ->
         state =
           state

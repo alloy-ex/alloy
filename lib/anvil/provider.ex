@@ -40,4 +40,19 @@ defmodule Anvil.Provider do
               tool_defs :: [tool_def()],
               config :: map()
             ) :: {:ok, completion_response()} | {:error, term()}
+
+  @doc """
+  Stream a completion, calling `on_chunk` for each text delta.
+
+  Returns the same `{:ok, completion_response()}` as `complete/3` once
+  the stream finishes -- the full accumulated response.
+  """
+  @callback stream(
+              messages :: [Anvil.Message.t()],
+              tool_defs :: [tool_def()],
+              config :: map(),
+              on_chunk :: (String.t() -> :ok)
+            ) :: {:ok, completion_response()} | {:error, term()}
+
+  @optional_callbacks [stream: 4]
 end

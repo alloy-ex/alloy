@@ -55,4 +55,6 @@ defmodule Anvil.Middleware.Telemetry do
 
     state
   end
+
+  def call(_hook, %State{} = state), do: state
 end

@@ -229,6 +229,48 @@ defmodule Anvil.Provider.AnthropicTest do
     end
   end
 
+  describe "complete/3 retry behavior" do
+    test "retries on 429 rate limit and eventually succeeds" do
+      calls = :counters.new(1, [:atomics])
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        n = :counters.get(calls, 1)
+        :counters.add(calls, 1, 1)
+
+        if n == 0 do
+          Plug.Conn.send_resp(conn, 429, "Too Many Requests")
+        else
+          Plug.Conn.send_resp(
+            conn,
+            200,
+            Jason.encode!(%{
+              "id" => "msg_retry",
+              "type" => "message",
+              "role" => "assistant",
+              "content" => [%{"type" => "text", "text" => "Hello after retry!"}],
+              "stop_reason" => "end_turn",
+              "usage" => %{"input_tokens" => 5, "output_tokens" => 5}
+            })
+          )
+        end
+      end)
+
+      config = %{
+        api_key: "sk-ant-test-key",
+        model: "claude-sonnet-4-5-20250514",
+        max_tokens: 4096,
+        req_options: [
+          plug: {Req.Test, __MODULE__},
+          retry_delay: 1
+        ]
+      }
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Hi")], [], config)
+      assert result.stop_reason == :end_turn
+      assert :counters.get(calls, 1) == 2
+    end
+  end
+
   # --- Test Helpers ---
 
   defp config_with_response(response) do

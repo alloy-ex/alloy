@@ -19,13 +19,15 @@ defmodule Anvil.Agent.State do
           status: status(),
           error: term() | nil,
           tool_defs: [map()],
-          tool_fns: %{String.t() => {module(), map()}}
+          tool_fns: %{String.t() => {module(), map()}},
+          scratchpad: pid() | nil
         }
 
   @enforce_keys [:config]
   defstruct [
     :config,
     :error,
+    :scratchpad,
     messages: [],
     turn: 0,
     usage: %Usage{},
@@ -45,7 +47,8 @@ defmodule Anvil.Agent.State do
       config: config,
       messages: messages,
       tool_defs: tool_defs,
-      tool_fns: tool_fns
+      tool_fns: tool_fns,
+      scratchpad: maybe_start_scratchpad(config.tools)
     }
   end
 
@@ -75,5 +78,12 @@ defmodule Anvil.Agent.State do
   @spec merge_usage(t(), map()) :: t()
   def merge_usage(%__MODULE__{} = state, response_usage) do
     %{state | usage: Usage.merge(state.usage, response_usage)}
+  end
+
+  defp maybe_start_scratchpad(tools) do
+    if Anvil.Tool.Core.Scratchpad in tools do
+      {:ok, pid} = Agent.start_link(fn -> %{} end)
+      pid
+    end
   end
 end

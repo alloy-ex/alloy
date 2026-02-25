@@ -40,7 +40,9 @@ defmodule Anvil.Provider.Anthropic do
           {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
           {"content-type", "application/json"}
         ],
-        body: Jason.encode!(body)
+        body: Jason.encode!(body),
+        retry: :transient,
+        max_retries: 3
       ] ++ Map.get(config, :req_options, [])
 
     case Req.request(req_opts) do
@@ -53,6 +55,216 @@ defmodule Anvil.Provider.Anthropic do
       {:error, reason} ->
         {:error, "HTTP request failed: #{inspect(reason)}"}
     end
+  end
+
+  @doc """
+  Stream a completion using Anthropic's SSE streaming API.
+
+  Calls `on_chunk` for each text delta as it arrives. Accumulates all
+  content blocks and returns the same `{:ok, completion_response()}` shape
+  as `complete/3` once the stream finishes.
+  """
+  @impl true
+  def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
+    body =
+      build_request_body(messages, tool_defs, config)
+      |> Map.put("stream", true)
+
+    # Mutable accumulator for SSE state, held in a process dictionary-free
+    # approach using the Req `into:` callback accumulator pattern.
+    initial_acc = %{
+      buffer: "",
+      content_blocks: %{},
+      input_json_buffers: %{},
+      stop_reason: nil,
+      usage: %{},
+      on_chunk: on_chunk
+    }
+
+    stream_handler = fn {:data, chunk}, {req, resp} ->
+      # Store our SSE accumulator in the response private map
+      sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
+      sse_acc = process_sse_chunk(sse_acc, chunk)
+      resp = put_in(resp.private[:sse_acc], sse_acc)
+      {:cont, {req, resp}}
+    end
+
+    req_opts =
+      [
+        url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
+        method: :post,
+        headers: [
+          {"x-api-key", config.api_key},
+          {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
+          {"content-type", "application/json"}
+        ],
+        body: Jason.encode!(body),
+        into: stream_handler,
+        retry: :transient,
+        max_retries: 3
+      ] ++ Map.get(config, :req_options, [])
+
+    case Req.request(req_opts) do
+      {:ok, %{status: 200} = resp} ->
+        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
+        build_stream_response(sse_acc)
+
+      {:ok, %{status: status, body: resp_body}} ->
+        {:error, parse_error(status, resp_body)}
+
+      {:error, reason} ->
+        {:error, "HTTP request failed: #{inspect(reason)}"}
+    end
+  end
+
+  # Process a raw SSE chunk. Chunks may contain partial events, so we buffer
+  # and split on double-newline boundaries.
+  defp process_sse_chunk(acc, chunk) do
+    buffer = acc.buffer <> chunk
+
+    # Split on double-newline (SSE event boundary)
+    {events, remaining} = split_sse_events(buffer)
+
+    acc = %{acc | buffer: remaining}
+
+    Enum.reduce(events, acc, fn event, acc ->
+      process_sse_event(acc, event)
+    end)
+  end
+
+  defp split_sse_events(buffer) do
+    # SSE events are separated by \n\n
+    parts = String.split(buffer, "\n\n")
+
+    case parts do
+      # Only one part means no complete event yet
+      [only] -> {[], only}
+      # Last part is the incomplete remainder
+      _ ->
+        {complete, [remainder]} = Enum.split(parts, length(parts) - 1)
+        {complete, remainder}
+    end
+  end
+
+  defp process_sse_event(acc, event_str) do
+    lines = String.split(event_str, "\n")
+
+    event_type =
+      Enum.find_value(lines, fn
+        "event: " <> type -> String.trim(type)
+        _ -> nil
+      end)
+
+    data =
+      Enum.find_value(lines, fn
+        "data: " <> json -> json
+        _ -> nil
+      end)
+
+    if event_type && data do
+      case Jason.decode(data) do
+        {:ok, parsed} -> handle_sse_event(acc, event_type, parsed)
+        {:error, _} -> acc
+      end
+    else
+      acc
+    end
+  end
+
+  defp handle_sse_event(acc, "message_start", %{"message" => msg}) do
+    usage = Map.get(msg, "usage", %{})
+    %{acc | usage: merge_sse_usage(acc.usage, usage)}
+  end
+
+  defp handle_sse_event(acc, "content_block_start", %{
+         "index" => index,
+         "content_block" => block
+       }) do
+    put_in(acc.content_blocks[index], block)
+  end
+
+  defp handle_sse_event(acc, "content_block_delta", %{
+         "index" => index,
+         "delta" => %{"type" => "text_delta", "text" => text}
+       }) do
+    # Call on_chunk for text deltas
+    acc.on_chunk.(text)
+
+    # Accumulate text into the content block
+    current = Map.get(acc.content_blocks, index, %{"type" => "text", "text" => ""})
+    updated = Map.update!(current, "text", &(&1 <> text))
+    put_in(acc.content_blocks[index], updated)
+  end
+
+  defp handle_sse_event(acc, "content_block_delta", %{
+         "index" => index,
+         "delta" => %{"type" => "input_json_delta", "partial_json" => json}
+       }) do
+    # Accumulate partial JSON for tool_use input
+    current_buffer = Map.get(acc.input_json_buffers, index, "")
+    %{acc | input_json_buffers: Map.put(acc.input_json_buffers, index, current_buffer <> json)}
+  end
+
+  defp handle_sse_event(acc, "content_block_stop", %{"index" => index}) do
+    # If there's a JSON buffer for this index, parse it and merge into the block
+    case Map.get(acc.input_json_buffers, index) do
+      nil ->
+        acc
+
+      json_str ->
+        case Jason.decode(json_str) do
+          {:ok, input} ->
+            current = Map.get(acc.content_blocks, index, %{})
+            updated = Map.put(current, "input", input)
+            acc = put_in(acc.content_blocks[index], updated)
+            %{acc | input_json_buffers: Map.delete(acc.input_json_buffers, index)}
+
+          {:error, _} ->
+            acc
+        end
+    end
+  end
+
+  defp handle_sse_event(acc, "message_delta", %{"delta" => delta, "usage" => usage}) do
+    stop_reason = Map.get(delta, "stop_reason")
+    %{acc | stop_reason: stop_reason, usage: merge_sse_usage(acc.usage, usage)}
+  end
+
+  defp handle_sse_event(acc, "message_delta", %{"delta" => delta}) do
+    stop_reason = Map.get(delta, "stop_reason")
+    %{acc | stop_reason: stop_reason}
+  end
+
+  defp handle_sse_event(acc, _event_type, _data), do: acc
+
+  defp merge_sse_usage(existing, new) do
+    Map.merge(existing, new, fn _k, v1, v2 ->
+      if is_number(v1) and is_number(v2), do: v1 + v2, else: v2
+    end)
+  end
+
+  defp build_stream_response(acc) do
+    # Sort content blocks by index and convert to normalized format
+    content_blocks =
+      acc.content_blocks
+      |> Enum.sort_by(fn {index, _} -> index end)
+      |> Enum.map(fn {_index, block} -> block end)
+      |> parse_content_blocks()
+
+    stop_reason = parse_stop_reason(acc.stop_reason)
+    usage = parse_usage(acc.usage)
+
+    message = %Message{
+      role: :assistant,
+      content: content_blocks
+    }
+
+    {:ok,
+     %{
+       stop_reason: stop_reason,
+       messages: [message],
+       usage: usage
+     }}
   end
 
   # --- Request Building ---

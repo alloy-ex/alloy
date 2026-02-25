@@ -15,7 +15,9 @@ defmodule Anvil.Agent.Config do
           max_tokens: pos_integer(),
           middleware: [module()],
           working_directory: String.t(),
-          context: map()
+          context: map(),
+          context_discovery: boolean(),
+          streaming: boolean()
         }
 
   @enforce_keys [:provider, :provider_config]
@@ -28,7 +30,9 @@ defmodule Anvil.Agent.Config do
     max_tokens: 200_000,
     middleware: [],
     working_directory: ".",
-    context: %{}
+    context: %{},
+    context_discovery: false,
+    streaming: false
   ]
 
   @doc """
@@ -37,17 +41,36 @@ defmodule Anvil.Agent.Config do
   @spec from_opts(keyword()) :: t()
   def from_opts(opts) do
     {provider_mod, provider_config} = parse_provider(opts[:provider])
+    context_discovery = Keyword.get(opts, :context_discovery, false)
+    context = Keyword.get(opts, :context, %{})
+    working_directory = Keyword.get(opts, :working_directory, ".")
+    base_prompt = Keyword.get(opts, :system_prompt)
+
+    system_prompt =
+      if context_discovery do
+        discovery_opts = [
+          home: Map.get(context, :home, System.user_home!()),
+          working_directory: working_directory
+        ]
+
+        sections = Anvil.Context.Discovery.discover(discovery_opts)
+        Anvil.Context.SystemPrompt.build(base_prompt || "", sections)
+      else
+        base_prompt
+      end
 
     %__MODULE__{
       provider: provider_mod,
       provider_config: Map.new(provider_config),
       tools: Keyword.get(opts, :tools, []),
-      system_prompt: Keyword.get(opts, :system_prompt),
+      system_prompt: system_prompt,
       max_turns: Keyword.get(opts, :max_turns, 25),
       max_tokens: Keyword.get(opts, :max_tokens, 200_000),
       middleware: Keyword.get(opts, :middleware, []),
-      working_directory: Keyword.get(opts, :working_directory, "."),
-      context: Keyword.get(opts, :context, %{})
+      working_directory: working_directory,
+      context: context,
+      context_discovery: context_discovery,
+      streaming: Keyword.get(opts, :streaming, false)
     }
   end
 

@@ -37,7 +37,9 @@ defmodule Anvil.Provider.OpenAI do
           {"authorization", "Bearer #{config.api_key}"},
           {"content-type", "application/json"}
         ],
-        body: Jason.encode!(body)
+        body: Jason.encode!(body),
+        retry: :transient,
+        max_retries: 3
       ] ++ Map.get(config, :req_options, [])
 
     case Req.request(req_opts) do

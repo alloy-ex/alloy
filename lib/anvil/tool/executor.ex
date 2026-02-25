@@ -9,19 +9,36 @@ defmodule Anvil.Tool.Executor do
 
   alias Anvil.Message
   alias Anvil.Agent.State
+  alias Anvil.Middleware
 
   @doc """
   Execute all tool calls and return a list of tool_result content blocks
   wrapped in a single user message.
+
+  Runs `:before_tool_call` middleware before each tool. If middleware
+  returns `{:block, reason}`, that tool's result is an error block and
+  the tool is not executed.
   """
   @spec execute_all([map()], %{String.t() => module()}, State.t()) :: Message.t()
   def execute_all(tool_calls, tool_fns, %State{} = state) do
     context = build_context(state)
 
+    # Check middleware before execution — tag each call
+    tagged =
+      Enum.map(tool_calls, fn call ->
+        case Middleware.run_before_tool_call(state, call) do
+          :ok -> {:execute, call}
+          {:block, reason} -> {:blocked, call, reason}
+        end
+      end)
+
     results =
-      tool_calls
+      tagged
       |> Task.async_stream(
-        fn call -> execute_one(call, tool_fns, context) end,
+        fn
+          {:execute, call} -> execute_one(call, tool_fns, context)
+          {:blocked, call, reason} -> error_result(call[:id], "Blocked: #{reason}")
+        end,
         timeout: 120_000,
         ordered: true
       )
@@ -69,7 +86,8 @@ defmodule Anvil.Tool.Executor do
   defp build_context(%State{} = state) do
     Map.merge(state.config.context, %{
       working_directory: state.config.working_directory,
-      config: state.config
+      config: state.config,
+      scratchpad_pid: state.scratchpad
     })
   end
 end

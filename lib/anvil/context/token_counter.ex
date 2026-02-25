@@ -9,13 +9,20 @@ defmodule Anvil.Context.TokenCounter do
   alias Anvil.Message
 
   @model_limits %{
-    "claude-sonnet-4-5" => 200_000,
-    "claude-opus-4-5" => 200_000,
-    "claude-haiku-4-5" => 200_000,
+    # Anthropic (200k context)
+    "claude-opus-4-6" => 200_000,
+    "claude-sonnet-4-6" => 200_000,
+    "claude-sonnet-4-5-20250514" => 200_000,
+    "claude-haiku-4-5-20251001" => 200_000,
+    # OpenAI
+    "gpt-4.1" => 1_047_576,
+    "gpt-4.1-mini" => 1_047_576,
     "gpt-4o" => 128_000,
     "gpt-4o-mini" => 128_000,
-    "gemini-2.0-flash" => 1_000_000,
-    "gemini-2.5-pro" => 1_000_000
+    # Google Gemini
+    "gemini-2.5-flash" => 1_000_000,
+    "gemini-2.5-pro" => 1_000_000,
+    "gemini-2.0-flash" => 1_000_000
   }
 
   @default_limit 200_000

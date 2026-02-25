@@ -39,7 +39,9 @@ defmodule Anvil.Provider.Google do
           {"content-type", "application/json"},
           {"x-goog-api-key", config.api_key}
         ],
-        body: Jason.encode!(body)
+        body: Jason.encode!(body),
+        retry: :transient,
+        max_retries: 3
       ] ++ Map.get(config, :req_options, [])
 
     case Req.request(req_opts) do

@@ -45,6 +45,35 @@ defmodule Anvil.Provider.Test do
   """
   @impl Anvil.Provider
   def complete(_messages, _tool_defs, %{agent_pid: pid}) do
+    pop_response(pid)
+  end
+
+  @doc """
+  Streams the next scripted response, calling `on_chunk` for each character
+  of text content. For tool_use responses, returns the response without
+  streaming. Consumes from the same script queue as `complete/3`.
+  """
+  @impl Anvil.Provider
+  def stream(_messages, _tool_defs, %{agent_pid: pid}, on_chunk) when is_function(on_chunk, 1) do
+    case pop_response(pid) do
+      {:ok, %{stop_reason: :end_turn, messages: messages} = response} ->
+        # Stream each character of text content
+        for msg <- messages,
+            text = Anvil.Message.text(msg),
+            text != nil,
+            char <- String.graphemes(text) do
+          on_chunk.(char)
+        end
+
+        {:ok, response}
+
+      other ->
+        # Tool use or error -- return as-is without streaming
+        other
+    end
+  end
+
+  defp pop_response(pid) do
     Agent.get_and_update(pid, fn
       [] -> {{:error, :no_more_responses}, []}
       [response | rest] -> {response, rest}

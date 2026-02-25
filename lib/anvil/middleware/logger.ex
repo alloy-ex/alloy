@@ -29,4 +29,6 @@ defmodule Anvil.Middleware.Logger do
     Logger.error("Anvil turn #{state.turn}: error - #{inspect(state.error)}")
     state
   end
+
+  def call(_hook, %State{} = state), do: state
 end
