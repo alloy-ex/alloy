@@ -23,7 +23,7 @@ defmodule Anvil.Tool.Core.Write do
 
   @impl true
   def execute(input, context) do
-    path = resolve_path(input["file_path"], context)
+    path = Anvil.Tool.resolve_path(input["file_path"], context)
 
     path |> Path.dirname() |> File.mkdir_p!()
 
@@ -33,17 +33,6 @@ defmodule Anvil.Tool.Core.Write do
 
       {:error, reason} ->
         {:error, "Failed to write to #{path}: #{reason}"}
-    end
-  end
-
-  defp resolve_path(file_path, context) do
-    if Path.type(file_path) == :absolute do
-      file_path
-    else
-      case Map.get(context, :working_directory) do
-        nil -> Path.expand(file_path)
-        wd -> Path.join(wd, file_path)
-      end
     end
   end
 end

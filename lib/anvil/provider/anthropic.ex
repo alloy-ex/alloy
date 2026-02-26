@@ -138,7 +138,9 @@ defmodule Anvil.Provider.Anthropic do
 
     case parts do
       # Only one part means no complete event yet
-      [only] -> {[], only}
+      [only] ->
+        {[], only}
+
       # Last part is the incomplete remainder
       _ ->
         {complete, [remainder]} = Enum.split(parts, length(parts) - 1)
@@ -206,22 +208,16 @@ defmodule Anvil.Provider.Anthropic do
   end
 
   defp handle_sse_event(acc, "content_block_stop", %{"index" => index}) do
-    # If there's a JSON buffer for this index, parse it and merge into the block
-    case Map.get(acc.input_json_buffers, index) do
-      nil ->
-        acc
+    with json_str when is_binary(json_str) <- Map.get(acc.input_json_buffers, index),
+         {:ok, input} <- Jason.decode(json_str) do
+      current = Map.get(acc.content_blocks, index, %{})
+      updated = Map.put(current, "input", input)
 
-      json_str ->
-        case Jason.decode(json_str) do
-          {:ok, input} ->
-            current = Map.get(acc.content_blocks, index, %{})
-            updated = Map.put(current, "input", input)
-            acc = put_in(acc.content_blocks[index], updated)
-            %{acc | input_json_buffers: Map.delete(acc.input_json_buffers, index)}
-
-          {:error, _} ->
-            acc
-        end
+      acc
+      |> put_in([Access.key(:content_blocks), index], updated)
+      |> Map.put(:input_json_buffers, Map.delete(acc.input_json_buffers, index))
+    else
+      _ -> acc
     end
   end
 
@@ -318,15 +314,19 @@ defmodule Anvil.Provider.Anthropic do
   end
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do
-    %{"name" => name, "description" => desc, "input_schema" => stringify_keys(schema)}
+    %{
+      "name" => name,
+      "description" => desc,
+      "input_schema" => Anvil.Provider.stringify_keys(schema)
+    }
   end
 
   # --- Response Parsing ---
 
   defp parse_response(body) when is_binary(body) do
-    case Jason.decode(body) do
+    case Anvil.Provider.decode_body(body) do
       {:ok, decoded} -> parse_response(decoded)
-      {:error, _} -> {:error, "Failed to decode response JSON"}
+      {:error, _} = err -> err
     end
   end
 
@@ -409,16 +409,4 @@ defmodule Anvil.Provider.Anthropic do
         "HTTP #{status}: #{inspect(body)}"
     end
   end
-
-  # --- Helpers ---
-
-  defp stringify_keys(map) when is_map(map) do
-    Map.new(map, fn
-      {k, v} when is_atom(k) -> {Atom.to_string(k), stringify_keys(v)}
-      {k, v} -> {k, stringify_keys(v)}
-    end)
-  end
-
-  defp stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
-  defp stringify_keys(value), do: value
 end

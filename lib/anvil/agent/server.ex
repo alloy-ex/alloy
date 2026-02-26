@@ -120,7 +120,8 @@ defmodule Anvil.Agent.Server do
   """
   @spec stream_chat(GenServer.server(), String.t(), (String.t() -> :ok)) ::
           {:ok, result()} | {:error, result()}
-  def stream_chat(server, message, on_chunk) when is_binary(message) and is_function(on_chunk, 1) do
+  def stream_chat(server, message, on_chunk)
+      when is_binary(message) and is_function(on_chunk, 1) do
     GenServer.call(server, {:stream_chat, message, on_chunk}, :infinity)
   end
 
@@ -212,7 +213,7 @@ defmodule Anvil.Agent.Server do
 
   @impl GenServer
   def handle_call(:reset, _from, state) do
-    new_state = %{state | messages: [], turn: 0, status: :running, error: nil}
+    new_state = %{state | messages: []} |> reset_for_new_run()
     {:reply, :ok, new_state}
   end
 
@@ -236,21 +237,12 @@ defmodule Anvil.Agent.Server do
 
   defp build_result(%State{} = state) do
     %{
-      text: extract_text(state),
+      text: State.last_assistant_text(state),
       messages: state.messages,
       usage: state.usage,
       status: state.status,
       turns: state.turn,
       error: state.error
     }
-  end
-
-  defp extract_text(%State{messages: messages}) do
-    messages
-    |> Enum.reverse()
-    |> Enum.find_value(fn
-      %Message{role: :assistant} = msg -> Message.text(msg)
-      _ -> nil
-    end)
   end
 end

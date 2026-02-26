@@ -15,7 +15,7 @@ defmodule Anvil.Context.SystemPrompt do
       iex> Anvil.Context.SystemPrompt.build("You are helpful.", rules: "Be concise")
       "You are helpful.\\n\\nBe concise"
   """
-  @spec build(String.t(), keyword(String.t())) :: String.t()
+  @spec build(String.t(), [{term(), String.t()}]) :: String.t()
   def build(base, sections \\ [])
 
   def build(base, []), do: base

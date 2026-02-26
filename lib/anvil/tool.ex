@@ -54,4 +54,22 @@ defmodule Anvil.Tool do
   """
   @callback execute(input :: map(), context :: map()) ::
               {:ok, String.t()} | {:error, String.t()}
+
+  @doc """
+  Resolve a file path against the working directory from context.
+
+  Absolute paths are returned as-is. Relative paths are joined with
+  the `:working_directory` from context, or expanded from cwd if not set.
+  """
+  @spec resolve_path(String.t(), map()) :: String.t()
+  def resolve_path(file_path, context) do
+    if Path.type(file_path) == :absolute do
+      file_path
+    else
+      case Map.get(context, :working_directory) do
+        nil -> Path.expand(file_path)
+        wd -> Path.join(wd, file_path)
+      end
+    end
+  end
 end

@@ -5,26 +5,7 @@ defmodule Anvil.Agent.TurnTest do
   alias Anvil.Message
   alias Anvil.Provider.Test, as: TestProvider
 
-  # A simple tool for testing
-  defmodule EchoTool do
-    @behaviour Anvil.Tool
-
-    @impl true
-    def name, do: "echo"
-
-    @impl true
-    def description, do: "Echoes input back"
-
-    @impl true
-    def input_schema do
-      %{type: "object", properties: %{text: %{type: "string"}}, required: ["text"]}
-    end
-
-    @impl true
-    def execute(%{"text" => text}, _context) do
-      {:ok, "Echo: #{text}"}
-    end
-  end
+  alias Anvil.Test.EchoTool
 
   describe "run_loop/1 with simple text response" do
     test "completes in one turn" do

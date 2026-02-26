@@ -142,7 +142,7 @@ defmodule Mix.Tasks.Anvil do
     skills = Anvil.Skill.discover()
 
     if skills != [] do
-      skill_names = Enum.map_join(skills, ", ", &("/#{&1.name}"))
+      skill_names = Enum.map_join(skills, ", ", &"/#{&1.name}")
       Mix.shell().info("Skills: #{skill_names}")
     end
 
@@ -218,7 +218,7 @@ defmodule Mix.Tasks.Anvil do
         Mix.shell().error("Unknown skill: /#{skill_name}")
 
         if skills != [] do
-          names = Enum.map_join(skills, ", ", &("/#{&1.name}"))
+          names = Enum.map_join(skills, ", ", &"/#{&1.name}")
           Mix.shell().info("Available skills: #{names}")
         end
 
@@ -244,7 +244,7 @@ defmodule Mix.Tasks.Anvil do
     """)
 
     if skills != [] do
-      names = Enum.map_join(skills, ", ", &("/#{&1.name}"))
+      names = Enum.map_join(skills, ", ", &"/#{&1.name}")
       Mix.shell().info("Skills: #{names}\n")
     end
   end

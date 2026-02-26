@@ -153,7 +153,7 @@ defmodule Anvil.Provider.OpenAI do
       "function" => %{
         "name" => name,
         "description" => desc,
-        "parameters" => stringify_keys(schema)
+        "parameters" => Anvil.Provider.stringify_keys(schema)
       }
     }
   end
@@ -161,9 +161,9 @@ defmodule Anvil.Provider.OpenAI do
   # --- Response Parsing ---
 
   defp parse_response(body) when is_binary(body) do
-    case Jason.decode(body) do
+    case Anvil.Provider.decode_body(body) do
       {:ok, decoded} -> parse_response(decoded)
-      {:error, _} -> {:error, "Failed to decode response JSON"}
+      {:error, _} = err -> err
     end
   end
 
@@ -237,14 +237,4 @@ defmodule Anvil.Provider.OpenAI do
       _ -> "HTTP #{status}: #{inspect(body)}"
     end
   end
-
-  defp stringify_keys(map) when is_map(map) do
-    Map.new(map, fn
-      {k, v} when is_atom(k) -> {Atom.to_string(k), stringify_keys(v)}
-      {k, v} -> {k, stringify_keys(v)}
-    end)
-  end
-
-  defp stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
-  defp stringify_keys(value), do: value
 end

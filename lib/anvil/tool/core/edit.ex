@@ -29,7 +29,7 @@ defmodule Anvil.Tool.Core.Edit do
 
   @impl true
   def execute(input, context) do
-    path = resolve_path(input["file_path"], context)
+    path = Anvil.Tool.resolve_path(input["file_path"], context)
     old_string = input["old_string"]
     new_string = input["new_string"]
     replace_all = input["replace_all"] || false
@@ -74,16 +74,5 @@ defmodule Anvil.Tool.Core.Edit do
     |> String.split(substring)
     |> length()
     |> Kernel.-(1)
-  end
-
-  defp resolve_path(file_path, context) do
-    if Path.type(file_path) == :absolute do
-      file_path
-    else
-      case Map.get(context, :working_directory) do
-        nil -> Path.expand(file_path)
-        wd -> Path.join(wd, file_path)
-      end
-    end
   end
 end

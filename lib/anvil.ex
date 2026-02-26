@@ -71,7 +71,7 @@ defmodule Anvil do
     final_state = Turn.run_loop(state)
 
     result = %{
-      text: extract_final_text(final_state),
+      text: State.last_assistant_text(final_state),
       messages: final_state.messages,
       usage: final_state.usage,
       status: final_state.status,
@@ -93,14 +93,5 @@ defmodule Anvil do
   defp build_messages(text, opts) when is_binary(text) do
     existing = Keyword.get(opts, :messages, [])
     existing ++ [Message.user(text)]
-  end
-
-  defp extract_final_text(%State{messages: messages}) do
-    messages
-    |> Enum.reverse()
-    |> Enum.find_value(fn
-      %Message{role: :assistant} = msg -> Message.text(msg)
-      _ -> nil
-    end)
   end
 end

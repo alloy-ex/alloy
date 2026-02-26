@@ -74,8 +74,12 @@ defmodule Anvil.Tool.Core.Scratchpad do
     value = input["value"]
 
     cond do
-      is_nil(key) -> {:error, "'write' requires a 'key'"}
-      is_nil(value) -> {:error, "'write' requires a 'value'"}
+      is_nil(key) ->
+        {:error, "'write' requires a 'key'"}
+
+      is_nil(value) ->
+        {:error, "'write' requires a 'value'"}
+
       true ->
         Agent.update(pid, &Map.put(&1, key, value))
         {:ok, "Saved: #{key}"}

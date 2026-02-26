@@ -80,6 +80,19 @@ defmodule Anvil.Agent.State do
     %{state | usage: Usage.merge(state.usage, response_usage)}
   end
 
+  @doc """
+  Extract the text from the last assistant message.
+  """
+  @spec last_assistant_text(t()) :: String.t() | nil
+  def last_assistant_text(%__MODULE__{messages: messages}) do
+    messages
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %Message{role: :assistant} = msg -> Message.text(msg)
+      _ -> nil
+    end)
+  end
+
   defp maybe_start_scratchpad(tools) do
     if Anvil.Tool.Core.Scratchpad in tools do
       {:ok, pid} = Agent.start_link(fn -> %{} end)

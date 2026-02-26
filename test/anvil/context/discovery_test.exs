@@ -34,7 +34,7 @@ defmodule Anvil.Context.DiscoveryTest do
 
       result = Discovery.discover(home: home, working_directory: cwd)
       assert length(result) == 1
-      assert {:rules, "Be concise"} in result
+      assert {"rules", "Be concise"} in result
     end
 
     test "discovers project context files from git root", %{
@@ -46,7 +46,7 @@ defmodule Anvil.Context.DiscoveryTest do
 
       result = Discovery.discover(home: home, working_directory: cwd)
       assert length(result) == 1
-      assert {:project, "Project context"} in result
+      assert {"project", "Project context"} in result
     end
 
     test "merges global and project files in order (global first)", %{
@@ -60,8 +60,8 @@ defmodule Anvil.Context.DiscoveryTest do
       result = Discovery.discover(home: home, working_directory: cwd)
       assert length(result) == 2
       # Global comes first
-      assert Enum.at(result, 0) == {:alpha, "Global alpha"}
-      assert Enum.at(result, 1) == {:beta, "Project beta"}
+      assert Enum.at(result, 0) == {"alpha", "Global alpha"}
+      assert Enum.at(result, 1) == {"beta", "Project beta"}
     end
 
     test "sorts files alphabetically within each tier", %{home: home, cwd: cwd} do
@@ -69,7 +69,7 @@ defmodule Anvil.Context.DiscoveryTest do
       File.write!(Path.join(home, ".anvil/context/alpha.md"), "A content")
 
       result = Discovery.discover(home: home, working_directory: cwd)
-      assert [{:alpha, "A content"}, {:zebra, "Z content"}] = result
+      assert [{"alpha", "A content"}, {"zebra", "Z content"}] = result
     end
 
     test "ignores non-.md files", %{home: home, cwd: cwd} do
@@ -79,7 +79,7 @@ defmodule Anvil.Context.DiscoveryTest do
 
       result = Discovery.discover(home: home, working_directory: cwd)
       assert length(result) == 1
-      assert {:notes, "Keep me"} in result
+      assert {"notes", "Keep me"} in result
     end
 
     test "discovers cwd-level context files (third tier)", %{
@@ -94,12 +94,14 @@ defmodule Anvil.Context.DiscoveryTest do
       result = Discovery.discover(home: home, working_directory: cwd)
       assert length(result) == 2
       # Project (git root) comes before cwd
-      assert Enum.at(result, 0) == {:project, "Project context"}
-      assert Enum.at(result, 1) == {:local, "CWD context"}
+      assert Enum.at(result, 0) == {"project", "Project context"}
+      assert Enum.at(result, 1) == {"local", "CWD context"}
     end
 
     test "handles missing .anvil/context directories gracefully" do
-      nowhere = Path.join(System.tmp_dir!(), "anvil_nowhere_#{System.unique_integer([:positive])}")
+      nowhere =
+        Path.join(System.tmp_dir!(), "anvil_nowhere_#{System.unique_integer([:positive])}")
+
       assert Discovery.discover(home: nowhere, working_directory: nowhere) == []
     end
 
@@ -112,7 +114,7 @@ defmodule Anvil.Context.DiscoveryTest do
       File.write!(Path.join(project, ".anvil/context/found.md"), "Found via git root")
 
       result = Discovery.discover(home: home, working_directory: cwd)
-      assert {:found, "Found via git root"} in result
+      assert {"found", "Found via git root"} in result
     end
 
     test "does not duplicate when cwd IS the git root", %{home: home, project: project} do
@@ -120,7 +122,7 @@ defmodule Anvil.Context.DiscoveryTest do
 
       result = Discovery.discover(home: home, working_directory: project)
       assert length(result) == 1
-      assert {:only_once, "Once"} in result
+      assert {"only_once", "Once"} in result
     end
   end
 

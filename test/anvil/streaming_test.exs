@@ -5,26 +5,7 @@ defmodule Anvil.StreamingTest do
   alias Anvil.Message
   alias Anvil.Provider.Test, as: TestProvider
 
-  # A simple tool for testing streaming + tool loops
-  defmodule EchoTool do
-    @behaviour Anvil.Tool
-
-    @impl true
-    def name, do: "echo"
-
-    @impl true
-    def description, do: "Echoes input back"
-
-    @impl true
-    def input_schema do
-      %{type: "object", properties: %{text: %{type: "string"}}, required: ["text"]}
-    end
-
-    @impl true
-    def execute(%{"text" => text}, _context) do
-      {:ok, "Echo: #{text}"}
-    end
-  end
+  alias Anvil.Test.EchoTool
 
   # ── TestProvider.stream/4 ──────────────────────────────────────────────
 
@@ -33,9 +14,10 @@ defmodule Anvil.StreamingTest do
       {:ok, pid} = TestProvider.start_link([TestProvider.text_response("Hi!")])
       config = %{agent_pid: pid}
 
-      chunks = collect_chunks(fn on_chunk ->
-        TestProvider.stream([Message.user("Hello")], [], config, on_chunk)
-      end)
+      chunks =
+        collect_chunks(fn on_chunk ->
+          TestProvider.stream([Message.user("Hello")], [], config, on_chunk)
+        end)
 
       # "Hi!" should yield 3 chunks: "H", "i", "!"
       assert chunks == ["H", "i", "!"]
@@ -46,7 +28,9 @@ defmodule Anvil.StreamingTest do
       {:ok, pid2} = TestProvider.start_link([TestProvider.text_response("Same")])
 
       {:ok, from_complete} = TestProvider.complete([Message.user("Hi")], [], %{agent_pid: pid1})
-      {:ok, from_stream} = TestProvider.stream([Message.user("Hi")], [], %{agent_pid: pid2}, fn _ -> :ok end)
+
+      {:ok, from_stream} =
+        TestProvider.stream([Message.user("Hi")], [], %{agent_pid: pid2}, fn _ -> :ok end)
 
       assert from_complete.stop_reason == from_stream.stop_reason
       assert from_complete.messages == from_stream.messages
@@ -61,9 +45,10 @@ defmodule Anvil.StreamingTest do
       {:ok, pid} = TestProvider.start_link([TestProvider.tool_use_response(tool_calls)])
       config = %{agent_pid: pid}
 
-      chunks = collect_chunks(fn on_chunk ->
-        TestProvider.stream([Message.user("Use tool")], [], config, on_chunk)
-      end)
+      chunks =
+        collect_chunks(fn on_chunk ->
+          TestProvider.stream([Message.user("Use tool")], [], config, on_chunk)
+        end)
 
       # No chunks for tool_use responses
       assert chunks == []
@@ -196,9 +181,7 @@ defmodule Anvil.StreamingTest do
       {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Hi!")])
 
       {:ok, agent} =
-        Server.start_link(
-          provider: {TestProvider, agent_pid: provider}
-        )
+        Server.start_link(provider: {TestProvider, agent_pid: provider})
 
       test_pid = self()
       on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
@@ -220,9 +203,7 @@ defmodule Anvil.StreamingTest do
         ])
 
       {:ok, agent} =
-        Server.start_link(
-          provider: {TestProvider, agent_pid: provider}
-        )
+        Server.start_link(provider: {TestProvider, agent_pid: provider})
 
       {:ok, _} = Server.stream_chat(agent, "Hello", fn _ -> :ok end)
       {:ok, _} = Server.stream_chat(agent, "Again", fn _ -> :ok end)
@@ -240,9 +221,7 @@ defmodule Anvil.StreamingTest do
         ])
 
       {:ok, agent} =
-        Server.start_link(
-          provider: {TestProvider, agent_pid: provider}
-        )
+        Server.start_link(provider: {TestProvider, agent_pid: provider})
 
       # First: stream_chat
       {:ok, _} = Server.stream_chat(agent, "Hello", fn _ -> :ok end)

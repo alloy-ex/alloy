@@ -192,7 +192,9 @@ defmodule Anvil.SkillTest do
     end
 
     test "returns empty list when no skill directories exist" do
-      nowhere = Path.join(System.tmp_dir!(), "anvil_nowhere_#{System.unique_integer([:positive])}")
+      nowhere =
+        Path.join(System.tmp_dir!(), "anvil_nowhere_#{System.unique_integer([:positive])}")
+
       assert Skill.discover(home: nowhere, project: nowhere) == []
     end
 

@@ -15,13 +15,13 @@ defmodule Anvil.Context.Discovery do
   @context_subdir ".anvil/context"
 
   @doc """
-  Discovers context files and returns `[{filename_atom, content}]`.
+  Discovers context files and returns `[{filename, content}]`.
 
   ## Options
     - `:home` — override the home directory (default: `System.user_home!/0`)
     - `:working_directory` — the current working directory (default: `"."`)
   """
-  @spec discover(keyword()) :: keyword(String.t())
+  @spec discover(keyword()) :: [{String.t(), String.t()}]
   def discover(opts \\ []) do
     home = Keyword.get(opts, :home, System.user_home!())
     cwd = Keyword.get(opts, :working_directory, ".") |> Path.expand()
@@ -50,7 +50,7 @@ defmodule Anvil.Context.Discovery do
         |> Enum.filter(&String.ends_with?(&1, ".md"))
         |> Enum.sort()
         |> Enum.map(fn filename ->
-          key = filename |> Path.rootname() |> String.to_atom()
+          key = Path.rootname(filename)
           content = File.read!(Path.join(dir, filename))
           {key, content}
         end)
@@ -60,16 +60,13 @@ defmodule Anvil.Context.Discovery do
     end
   end
 
+  defp find_git_root("/"), do: nil
+
   defp find_git_root(dir) do
-    cond do
-      File.dir?(Path.join(dir, ".git")) ->
-        dir
-
-      dir == "/" ->
-        nil
-
-      true ->
-        find_git_root(Path.dirname(dir))
+    if File.dir?(Path.join(dir, ".git")) do
+      dir
+    else
+      find_git_root(Path.dirname(dir))
     end
   end
 end

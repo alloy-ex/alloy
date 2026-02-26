@@ -55,4 +55,37 @@ defmodule Anvil.Provider do
             ) :: {:ok, completion_response()} | {:error, term()}
 
   @optional_callbacks [stream: 4]
+
+  # ── Shared Helpers (used by provider implementations) ──────────────
+
+  @doc """
+  Recursively convert atom keys to strings in maps.
+
+  Used by providers to prepare JSON-compatible request bodies.
+  """
+  @spec stringify_keys(term()) :: term()
+  def stringify_keys(map) when is_map(map) do
+    Map.new(map, fn
+      {k, v} when is_atom(k) -> {Atom.to_string(k), stringify_keys(v)}
+      {k, v} -> {k, stringify_keys(v)}
+    end)
+  end
+
+  def stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
+  def stringify_keys(value), do: value
+
+  @doc """
+  Decode a JSON binary response body, passing through maps unchanged.
+
+  Returns `{:ok, decoded_map}` or `{:error, reason}`.
+  """
+  @spec decode_body(binary() | map()) :: {:ok, map()} | {:error, String.t()}
+  def decode_body(body) when is_map(body), do: {:ok, body}
+
+  def decode_body(body) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, decoded} -> {:ok, decoded}
+      {:error, _} -> {:error, "Failed to decode response JSON"}
+    end
+  end
 end

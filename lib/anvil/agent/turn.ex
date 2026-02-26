@@ -80,12 +80,10 @@ defmodule Anvil.Agent.Turn do
   end
 
   defp build_provider_config(%State{config: config}) do
-    config.provider_config
-    |> Map.put(:system_prompt, config.system_prompt)
+    Map.put(config.provider_config, :system_prompt, config.system_prompt)
   end
 
   defp extract_tool_calls(messages) do
-    messages
-    |> Enum.flat_map(&Message.tool_calls/1)
+    Enum.flat_map(messages, &Message.tool_calls/1)
   end
 end
