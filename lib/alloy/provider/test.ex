@@ -1,0 +1,124 @@
+defmodule Alloy.Provider.Test do
+  @moduledoc """
+  A scripted test provider that returns pre-configured responses in order.
+
+  Used for testing agent behavior without making HTTP calls. Start an Agent
+  process with a list of responses, then pass its pid in the config.
+
+  ## Usage
+
+      {:ok, pid} = Alloy.Provider.Test.start_link([
+        Alloy.Provider.Test.text_response("Hello!"),
+        Alloy.Provider.Test.text_response("Goodbye!")
+      ])
+
+      config = %{agent_pid: pid}
+
+      {:ok, resp1} = Alloy.Provider.Test.complete([msg], [], config)
+      # resp1 contains "Hello!"
+
+      {:ok, resp2} = Alloy.Provider.Test.complete([msg], [], config)
+      # resp2 contains "Goodbye!"
+  """
+
+  @behaviour Alloy.Provider
+
+  @doc """
+  Starts an Agent process holding the list of scripted responses.
+
+  Returns `{:ok, pid}` where the pid should be placed in the config
+  as `:agent_pid`.
+  """
+  @spec start_link([{:ok, Alloy.Provider.completion_response()} | {:error, term()}]) ::
+          {:ok, pid()}
+  def start_link(responses) when is_list(responses) do
+    Agent.start_link(fn -> responses end)
+  end
+
+  @doc """
+  Pops the next scripted response from the agent.
+
+  Ignores `messages` and `tool_defs` -- they exist only to satisfy the
+  behaviour callback. Config must contain `:agent_pid`.
+
+  Returns `{:error, :no_more_responses}` when all responses have been consumed.
+  """
+  @impl Alloy.Provider
+  def complete(_messages, _tool_defs, %{agent_pid: pid}) do
+    pop_response(pid)
+  end
+
+  @doc """
+  Streams the next scripted response, calling `on_chunk` for each character
+  of text content. For tool_use responses, returns the response without
+  streaming. Consumes from the same script queue as `complete/3`.
+  """
+  @impl Alloy.Provider
+  def stream(_messages, _tool_defs, %{agent_pid: pid}, on_chunk) when is_function(on_chunk, 1) do
+    case pop_response(pid) do
+      {:ok, %{stop_reason: :end_turn, messages: messages} = response} ->
+        # Stream each character of text content
+        for msg <- messages,
+            text = Alloy.Message.text(msg),
+            text != nil,
+            char <- String.graphemes(text) do
+          on_chunk.(char)
+        end
+
+        {:ok, response}
+
+      other ->
+        # Tool use or error -- return as-is without streaming
+        other
+    end
+  end
+
+  defp pop_response(pid) do
+    Agent.get_and_update(pid, fn
+      [] -> {{:error, :no_more_responses}, []}
+      [response | rest] -> {response, rest}
+    end)
+  end
+
+  # --- Helper functions for building scripted responses ---
+
+  @doc """
+  Builds a scripted `{:ok, completion_response}` with a simple text reply.
+  """
+  @spec text_response(String.t()) :: {:ok, Alloy.Provider.completion_response()}
+  def text_response(text) when is_binary(text) do
+    {:ok,
+     %{
+       stop_reason: :end_turn,
+       messages: [Alloy.Message.assistant(text)],
+       usage: %{input_tokens: 10, output_tokens: 5}
+     }}
+  end
+
+  @doc """
+  Builds a scripted `{:ok, completion_response}` with tool_use blocks.
+  """
+  @spec tool_use_response([Alloy.Message.content_block()]) ::
+          {:ok, Alloy.Provider.completion_response()}
+  def tool_use_response(tool_calls) when is_list(tool_calls) do
+    blocks =
+      Enum.map(tool_calls, fn call ->
+        Map.put_new(call, :type, "tool_use")
+      end)
+
+    {:ok,
+     %{
+       stop_reason: :tool_use,
+       messages: [Alloy.Message.assistant_blocks(blocks)],
+       usage: %{input_tokens: 10, output_tokens: 5}
+     }}
+  end
+
+  @doc """
+  Builds a scripted `{:error, reason}` response.
+  """
+  @spec error_response(term()) :: {:error, term()}
+  def error_response(reason) do
+    {:error, reason}
+  end
+end

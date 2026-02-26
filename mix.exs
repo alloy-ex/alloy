@@ -1,12 +1,12 @@
-defmodule Anvil.MixProject do
+defmodule Alloy.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/chrisohalloran/anvil"
+  @source_url "https://github.com/chrisohalloran/alloy"
 
   def project do
     [
-      app: :anvil,
+      app: :alloy,
       version: @version,
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
@@ -46,7 +46,7 @@ defmodule Anvil.MixProject do
 
   defp docs do
     [
-      main: "Anvil",
+      main: "Alloy",
       source_url: @source_url,
       source_ref: "v#{@version}"
     ]

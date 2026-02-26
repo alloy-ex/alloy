@@ -1,4 +1,4 @@
-# Anvil Roadmap
+# Alloy Roadmap
 
 Last updated: 2026-02-26
 
@@ -12,7 +12,7 @@ Last updated: 2026-02-26
 
 ### Completed (v0.1)
 
-- [x] Context file auto-discovery (`.anvil/context/*.md`, 3-tier: global/git-root/cwd)
+- [x] Context file auto-discovery (`.alloy/context/*.md`, 3-tier: global/git-root/cwd)
 - [x] Richer extension events (`:before_tool_call` with blocking, `:session_start`, `:session_end`)
 - [x] Skills system (frontmatter parsing, discovery, placeholder expansion, REPL integration)
 - [x] Cron/heartbeat scheduler (GenServer + Task.Supervisor, overlap protection, dynamic jobs)
@@ -22,7 +22,7 @@ Last updated: 2026-02-26
 - [x] Streaming responses (optional `stream/4` callback, Anthropic SSE, Turn loop auto-detect)
 - [x] Mid-session model switching (`Server.set_model/2`, `/model` REPL command)
 - [x] REPL quality of life (`/help`, `/usage`, `/history`, `/reset`)
-- [x] Multi-agent teams (`Anvil.Team` — delegate, broadcast, handoff, shared context, fault isolation)
+- [x] Multi-agent teams (`Alloy.Team` — delegate, broadcast, handoff, shared context, fault isolation)
 
 ---
 
@@ -67,17 +67,17 @@ Switch provider/model without resetting conversation history.
 Supervisor trees of collaborating agents. The killer feature Pi can't replicate.
 
 ```elixir
-Anvil.Team.start_link(
+Alloy.Team.start_link(
   agents: [
     researcher: [provider: gemini_flash, tools: [WebSearch], system_prompt: "..."],
     coder: [provider: claude, tools: [Read, Write, Edit, Bash]]
   ],
   strategy: :one_for_one
 )
-Anvil.Team.delegate(team, :researcher, "Find the latest Elixir release notes")
+Alloy.Team.delegate(team, :researcher, "Find the latest Elixir release notes")
 ```
 
-- `Anvil.Team` — Supervisor wrapper with named agent children
+- `Alloy.Team` — Supervisor wrapper with named agent children
 - Inter-agent messaging via Server.chat
 - Shared session context (optional)
 - Fault isolation: one agent crashes, others keep running
@@ -90,7 +90,7 @@ Rate-limited pool of agents for batch workloads.
 - NimblePool or Poolboy-based
 - Queue requests when all agents busy
 - Per-pool rate limiting (e.g., max 10 API calls/min)
-- Package: `anvil_pool`
+- Package: `alloy_pool`
 
 ---
 
@@ -112,14 +112,14 @@ Rate-limited pool of agents for batch workloads.
 
 ### Provider Architecture Note
 Each provider is ~200 LOC implementing the `Provider` behaviour. Adding providers is
-mechanical work — translate wire format to/from `Anvil.Message`. The behaviour already
+mechanical work — translate wire format to/from `Alloy.Message`. The behaviour already
 handles the abstraction cleanly.
 
 ---
 
 ## Phase 4: Ecosystem (Separate Packages)
 
-### Agent Pooling — `anvil_pool`
+### Agent Pooling — `alloy_pool`
 **Status: Planned | Deps: NimblePool or Poolboy | Priority: HIGH for production use**
 
 Rate-limited pool of agents for batch/API workloads.
@@ -131,23 +131,23 @@ Rate-limited pool of agents for batch/API workloads.
 - Dead agent replacement — pool auto-restarts crashed agents
 
 **Why separate:** Introduces opinion about pool sizing strategy and adds a NimblePool
-dependency. Not every Anvil user needs pooling — it's a production scaling concern.
+dependency. Not every Alloy user needs pooling — it's a production scaling concern.
 
 **API sketch:**
 ```elixir
-{:ok, pool} = Anvil.Pool.start_link(
+{:ok, pool} = Alloy.Pool.start_link(
   size: 5,
   agent_opts: [provider: {Anthropic, api_key: "..."}, tools: [Read, Bash]]
 )
-{:ok, result} = Anvil.Pool.run(pool, "Analyze this file")  # queues if all busy
-Anvil.Pool.stats(pool)  # %{busy: 3, idle: 2, queued: 0}
+{:ok, result} = Alloy.Pool.run(pool, "Analyze this file")  # queues if all busy
+Alloy.Pool.stats(pool)  # %{busy: 3, idle: 2, queued: 0}
 ```
 
 **Estimated effort:** ~200 LOC wrapping NimblePool. 1-2 days.
 
 ---
 
-### Distributed Agents — `anvil_distributed`
+### Distributed Agents — `alloy_distributed`
 **Status: Future | Deps: libcluster (optional) | Priority: LOW**
 
 Agents running across Erlang cluster nodes, coordinated via pg (process groups)
@@ -171,7 +171,7 @@ model (releases, node naming). Most users run single-node.
 
 ---
 
-### Broadway/GenStage Pipelines — `anvil_pipeline`
+### Broadway/GenStage Pipelines — `alloy_pipeline`
 **Status: Future | Deps: Broadway or GenStage | Priority: MEDIUM**
 
 Event-driven processing of work items through agent chains with backpressure.
@@ -193,7 +193,7 @@ Only needed for high-volume batch processing scenarios.
 
 **API sketch:**
 ```elixir
-Anvil.Pipeline.start_link(
+Alloy.Pipeline.start_link(
   stages: [
     classifier: [provider: gemini_flash, system_prompt: "Classify..."],
     analyzer: [provider: claude, system_prompt: "Analyze...", tools: [Read]],
@@ -201,39 +201,39 @@ Anvil.Pipeline.start_link(
   ],
   concurrency: [classifier: 10, analyzer: 5, reporter: 3]
 )
-Anvil.Pipeline.push(pipeline, "Review PR #1234")
+Alloy.Pipeline.push(pipeline, "Review PR #1234")
 ```
 
 **Estimated effort:** 400-600 LOC wrapping Broadway. 1 week.
 
 ---
 
-### Phoenix LiveView Integration — `anvil_live`
+### Phoenix LiveView Integration — `alloy_live`
 **Status: Future | Deps: Phoenix, Phoenix.LiveView | Priority: MEDIUM**
 
 Real-time agent UI in Phoenix. Streaming tokens push to browser via LiveView.
 
 **What it does:**
-- `AnvilLive.ChatComponent` — drop-in LiveView component for agent chat
+- `AlloyLive.ChatComponent` — drop-in LiveView component for agent chat
 - Streaming tokens push via LiveView socket (no WebSocket boilerplate)
 - Tool execution progress indicators
 - Conversation history with collapsible tool results
 - Multi-agent dashboard showing all running agents
 
-**Why separate:** Phoenix is a framework dependency. Most Anvil users won't
+**Why separate:** Phoenix is a framework dependency. Most Alloy users won't
 use Phoenix. Those who do get first-class integration.
 
 **API sketch:**
 ```elixir
 # In your LiveView
 def mount(_params, _session, socket) do
-  {:ok, agent} = Anvil.Agent.Server.start_link(agent_opts)
+  {:ok, agent} = Alloy.Agent.Server.start_link(agent_opts)
   {:ok, assign(socket, agent: agent, messages: [])}
 end
 
 def handle_event("send", %{"message" => msg}, socket) do
-  # AnvilLive handles streaming tokens to the browser
-  AnvilLive.stream_chat(socket, socket.assigns.agent, msg)
+  # AlloyLive handles streaming tokens to the browser
+  AlloyLive.stream_chat(socket, socket.assigns.agent, msg)
 end
 ```
 
@@ -241,7 +241,7 @@ end
 
 ---
 
-### Rich TUI — `anvil_tui`
+### Rich TUI — `alloy_tui`
 **Status: Future | Deps: Owl or Ratatouille | Priority: LOW**
 
 Full terminal UI with panels, scrollback, syntax highlighting, split panes.
@@ -260,7 +260,7 @@ concerns. The basic IO.gets REPL in core is sufficient for most use cases.
 
 ---
 
-### Tree-Structured Sessions — `anvil_sessions`
+### Tree-Structured Sessions — `alloy_sessions`
 **Status: Future | Deps: none | Priority: MEDIUM**
 
 Rewind, branch, and explore alternative conversation paths.
@@ -282,8 +282,8 @@ and UI concerns.
 
 ## Why Elixir / OTP?
 
-Anvil's moat is the **production runtime**. Most agent frameworks target the single-developer
-CLI experience. Anvil targets what happens after — when you need agents running in production
+Alloy's moat is the **production runtime**. Most agent frameworks target the single-developer
+CLI experience. Alloy targets what happens after — when you need agents running in production
 with supervision, fault isolation, concurrency, and multi-agent orchestration.
 
 ### What OTP gives us for free

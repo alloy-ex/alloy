@@ -1,6 +1,6 @@
-defmodule Anvil.Test.EchoTool do
+defmodule Alloy.Test.EchoTool do
   @moduledoc false
-  @behaviour Anvil.Tool
+  @behaviour Alloy.Tool
 
   @impl true
   def name, do: "echo"
