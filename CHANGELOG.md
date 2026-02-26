@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-02-26
+
+### Added
+
+- Test coverage for `Session`, `Tool.resolve_path/2`, and `Tool.Executor` (26 new tests)
+- Automated hex.pm publish pipeline via GitHub Actions (tag-triggered)
+
+### Changed
+
+- Updated all provider model references to current models (Feb 2026)
+- Total test suite: 298 tests
+
 ## [0.1.0] - 2026-02-26
 
 ### Added
@@ -25,4 +37,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.2.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.2.0
 [0.1.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.1.0
