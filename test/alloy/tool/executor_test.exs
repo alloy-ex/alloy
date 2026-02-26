@@ -164,7 +164,12 @@ defmodule Alloy.Tool.ExecutorTest do
 
   describe "execute_all/3 — context building" do
     test "passes working_directory and custom context to tools" do
-      state = build_state([ContextTool], context: %{custom_key: "hello"}, working_directory: "/test/dir")
+      state =
+        build_state([ContextTool],
+          context: %{custom_key: "hello"},
+          working_directory: "/test/dir"
+        )
+
       tool_call = %{id: "c_ctx", name: "context_checker", type: "tool_use", input: %{}}
 
       result = Executor.execute_all([tool_call], state.tool_fns, state)
