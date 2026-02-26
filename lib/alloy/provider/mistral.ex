@@ -17,6 +17,15 @@ defmodule Alloy.Provider.Mistral do
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.mistral.ai")
   - `:req_options` - Additional options passed to Req
+
+  ## Example
+
+      Alloy.run("Write a Python quicksort.",
+        provider: {Alloy.Provider.Mistral,
+          api_key: System.get_env("MISTRAL_API_KEY"),
+          model: "devstral-2512"
+        }
+      )
   """
 
   @behaviour Alloy.Provider

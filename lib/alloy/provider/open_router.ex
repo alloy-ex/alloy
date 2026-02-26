@@ -21,6 +21,16 @@ defmodule Alloy.Provider.OpenRouter do
   - `:app_name` - Your app name for OpenRouter attribution (default: "Alloy")
   - `:app_url` - Your app URL for OpenRouter attribution (default: "https://github.com/alloy-ex")
   - `:req_options` - Additional options passed to Req
+
+  ## Example
+
+      # Access 100+ models through a single API key
+      Alloy.run("Compare Elixir and Go.",
+        provider: {Alloy.Provider.OpenRouter,
+          api_key: System.get_env("OPENROUTER_API_KEY"),
+          model: "anthropic/claude-sonnet-4-6"
+        }
+      )
   """
 
   @behaviour Alloy.Provider

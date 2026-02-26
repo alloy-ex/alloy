@@ -1,5 +1,19 @@
 defmodule Alloy.Tool.Core.Read do
-  @moduledoc "Reads a file and returns contents with line numbers."
+  @moduledoc """
+  Built-in tool: read files with line numbers.
+
+  Returns file contents formatted as `line_number\\tcontent` (matching
+  `cat -n` output). Supports pagination via `:offset` and `:limit`
+  parameters, defaulting to the first 2,000 lines.
+
+  ## Usage
+
+      config = %{tools: [Alloy.Tool.Core.Read], ...}
+
+  The agent can then call:
+
+      %{file_path: "lib/app.ex", offset: 10, limit: 50}
+  """
 
   @behaviour Alloy.Tool
 

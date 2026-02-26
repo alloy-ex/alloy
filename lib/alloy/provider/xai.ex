@@ -17,6 +17,15 @@ defmodule Alloy.Provider.XAI do
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.x.ai")
   - `:req_options` - Additional options passed to Req
+
+  ## Example
+
+      Alloy.run("What happened today?",
+        provider: {Alloy.Provider.XAI,
+          api_key: System.get_env("XAI_API_KEY"),
+          model: "grok-3"
+        }
+      )
   """
 
   @behaviour Alloy.Provider

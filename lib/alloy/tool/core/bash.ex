@@ -1,5 +1,19 @@
 defmodule Alloy.Tool.Core.Bash do
-  @moduledoc "Executes shell commands and returns stdout/stderr with exit code."
+  @moduledoc """
+  Built-in tool: execute shell commands via `bash -c`.
+
+  Returns stdout/stderr merged with the exit code appended. Output is
+  truncated at 30,000 characters to prevent context overflow.
+  Commands that exceed the timeout are killed and return an error.
+
+  ## Usage
+
+      config = %{tools: [Alloy.Tool.Core.Bash], ...}
+
+  The agent can then call:
+
+      %{command: "ls -la", timeout: 5000}
+  """
 
   @behaviour Alloy.Tool
 

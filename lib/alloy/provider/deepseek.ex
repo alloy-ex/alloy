@@ -16,6 +16,15 @@ defmodule Alloy.Provider.DeepSeek do
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.deepseek.com")
   - `:req_options` - Additional options passed to Req
+
+  ## Example
+
+      Alloy.run("Solve this step by step: what is 23 * 47?",
+        provider: {Alloy.Provider.DeepSeek,
+          api_key: System.get_env("DEEPSEEK_API_KEY"),
+          model: "deepseek-reasoner"
+        }
+      )
   """
 
   @behaviour Alloy.Provider

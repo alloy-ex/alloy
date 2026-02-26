@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.2.0"
+  @version "0.3.0"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -14,6 +14,7 @@ defmodule Alloy.MixProject do
       description: "Model-agnostic agent harness for Elixir",
       package: package(),
       docs: docs(),
+      dialyzer: [plt_add_apps: [:mix]],
       elixirc_paths: elixirc_paths(Mix.env())
     ]
   end
@@ -50,7 +51,60 @@ defmodule Alloy.MixProject do
     [
       main: "Alloy",
       source_url: @source_url,
-      source_ref: "v#{@version}"
+      source_ref: "v#{@version}",
+      groups_for_modules: [
+        Core: [
+          Alloy,
+          Alloy.Agent.Config,
+          Alloy.Agent.Server,
+          Alloy.Agent.State,
+          Alloy.Agent.Turn,
+          Alloy.Message,
+          Alloy.Session,
+          Alloy.Usage
+        ],
+        Providers: [
+          Alloy.Provider,
+          Alloy.Provider.Anthropic,
+          Alloy.Provider.OpenAI,
+          Alloy.Provider.Google,
+          Alloy.Provider.Ollama,
+          Alloy.Provider.OpenRouter,
+          Alloy.Provider.XAI,
+          Alloy.Provider.DeepSeek,
+          Alloy.Provider.Mistral,
+          Alloy.Provider.Test
+        ],
+        Tools: [
+          Alloy.Tool,
+          Alloy.Tool.Core.Bash,
+          Alloy.Tool.Core.Read,
+          Alloy.Tool.Core.Write,
+          Alloy.Tool.Core.Edit,
+          Alloy.Tool.Core.Scratchpad,
+          Alloy.Tool.Executor,
+          Alloy.Tool.Registry
+        ],
+        Context: [
+          Alloy.Context.Compactor,
+          Alloy.Context.Discovery,
+          Alloy.Context.SystemPrompt,
+          Alloy.Context.TokenCounter
+        ],
+        Middleware: [
+          Alloy.Middleware,
+          Alloy.Middleware.Logger,
+          Alloy.Middleware.Telemetry
+        ],
+        Advanced: [
+          Alloy.Team,
+          Alloy.Scheduler,
+          Alloy.Skill
+        ],
+        Testing: [
+          Alloy.Testing
+        ]
+      ]
     ]
   end
 end

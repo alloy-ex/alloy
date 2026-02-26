@@ -17,6 +17,15 @@ defmodule Alloy.Provider.Google do
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://generativelanguage.googleapis.com")
   - `:req_options` - Additional options passed to Req
+
+  ## Example
+
+      Alloy.run("Explain OTP supervisors.",
+        provider: {Alloy.Provider.Google,
+          api_key: System.get_env("GEMINI_API_KEY"),
+          model: "gemini-2.5-flash"
+        }
+      )
   """
 
   @behaviour Alloy.Provider

@@ -18,6 +18,15 @@ defmodule Alloy.Provider.Anthropic do
   - `:api_url` - Base URL (default: "https://api.anthropic.com")
   - `:api_version` - API version header (default: "2023-06-01")
   - `:req_options` - Additional options passed to Req (useful for testing)
+
+  ## Example
+
+      Alloy.run("What is Elixir?",
+        provider: {Alloy.Provider.Anthropic,
+          api_key: System.get_env("ANTHROPIC_API_KEY"),
+          model: "claude-sonnet-4-6"
+        }
+      )
   """
 
   @behaviour Alloy.Provider

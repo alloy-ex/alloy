@@ -1,5 +1,19 @@
 defmodule Alloy.Tool.Core.Write do
-  @moduledoc "Writes content to a file, creating parent directories as needed."
+  @moduledoc """
+  Built-in tool: write files, creating parent directories as needed.
+
+  Overwrites the target file completely. Parent directories are created
+  automatically via `File.mkdir_p!/1`. Paths are resolved against the
+  agent's `:working_directory` context.
+
+  ## Usage
+
+      config = %{tools: [Alloy.Tool.Core.Write], ...}
+
+  The agent can then call:
+
+      %{file_path: "lib/new_file.ex", content: "defmodule NewFile do\\nend"}
+  """
 
   @behaviour Alloy.Tool
 

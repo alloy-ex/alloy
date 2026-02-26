@@ -18,6 +18,13 @@ defmodule Alloy.Provider.Ollama do
   - `:max_tokens` - Max output tokens (default: 4096)
   - `:system_prompt` - System prompt string
   - `:req_options` - Additional options passed to Req
+
+  ## Example
+
+      # No API key needed — runs locally
+      Alloy.run("Write a haiku about Elixir.",
+        provider: {Alloy.Provider.Ollama, model: "llama4"}
+      )
   """
 
   @behaviour Alloy.Provider

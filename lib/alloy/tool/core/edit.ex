@@ -1,5 +1,20 @@
 defmodule Alloy.Tool.Core.Edit do
-  @moduledoc "Performs search-and-replace edits on files."
+  @moduledoc """
+  Built-in tool: search-and-replace edits on files.
+
+  Finds `old_string` in the file and replaces it with `new_string`.
+  By default, the match must be unique (appears exactly once). Set
+  `replace_all: true` to replace all occurrences. Returns an error
+  if no match is found or if the match is ambiguous.
+
+  ## Usage
+
+      config = %{tools: [Alloy.Tool.Core.Edit], ...}
+
+  The agent can then call:
+
+      %{file_path: "lib/app.ex", old_string: "v1", new_string: "v2"}
+  """
 
   @behaviour Alloy.Tool
 

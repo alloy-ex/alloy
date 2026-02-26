@@ -16,6 +16,15 @@ defmodule Alloy.Provider.OpenAI do
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.openai.com")
   - `:req_options` - Additional options passed to Req
+
+  ## Example
+
+      Alloy.run("Summarize this code.",
+        provider: {Alloy.Provider.OpenAI,
+          api_key: System.get_env("OPENAI_API_KEY"),
+          model: "gpt-5.2"
+        }
+      )
   """
 
   @behaviour Alloy.Provider
