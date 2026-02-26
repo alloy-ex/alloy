@@ -442,7 +442,7 @@ defmodule Mix.Tasks.Alloy do
   # ── Formatting ────────────────────────────────────────────────────────────
 
   defp tool_label([]), do: ""
-  defp tool_label(tools), do: " +[#{tools |> Enum.map(& &1.name()) |> Enum.join(",")}]"
+  defp tool_label(tools), do: " +[#{Enum.map_join(tools, ",", & &1.name())}]"
 
   defp footer(result) do
     tokens = result.usage.input_tokens + result.usage.output_tokens

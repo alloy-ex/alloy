@@ -33,6 +33,8 @@ defmodule Alloy.MixProject do
       {:jason, "~> 1.2"},
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:plug, "~> 1.16", only: :test}
     ]
   end

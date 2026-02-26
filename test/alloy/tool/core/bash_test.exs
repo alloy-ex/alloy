@@ -64,7 +64,7 @@ defmodule Alloy.Tool.Core.BashTest do
       assert {:ok, result} =
                Bash.execute(%{"command" => cmd}, %{working_directory: tmp_dir})
 
-      assert String.length(result) <= 31000
+      assert String.length(result) <= 31_000
       assert result =~ "truncated"
     end
 

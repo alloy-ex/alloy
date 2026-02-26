@@ -117,8 +117,7 @@ defmodule Alloy.Provider.OpenRouter do
     text_parts =
       blocks
       |> Enum.filter(&(&1[:type] == "text"))
-      |> Enum.map(& &1.text)
-      |> Enum.join("\n")
+      |> Enum.map_join("\n", & &1.text)
 
     msg = %{"role" => "assistant"}
 
