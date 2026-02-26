@@ -74,9 +74,9 @@ defmodule Alloy.Context.TokenCounterTest do
 
   describe "model_limit/1" do
     test "returns known model limits" do
-      assert TokenCounter.model_limit("claude-sonnet-4-5") == 200_000
-      assert TokenCounter.model_limit("gpt-4o") == 128_000
-      assert TokenCounter.model_limit("gemini-2.0-flash") == 1_000_000
+      assert TokenCounter.model_limit("claude-sonnet-4-6") == 200_000
+      assert TokenCounter.model_limit("gpt-5.2") == 1_047_576
+      assert TokenCounter.model_limit("gemini-2.5-flash") == 1_000_000
     end
 
     test "returns default for unknown model" do

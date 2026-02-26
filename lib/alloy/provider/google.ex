@@ -9,7 +9,8 @@ defmodule Alloy.Provider.Google do
 
   Required:
   - `:api_key` - Google AI API key
-  - `:model` - Model name (e.g., "gemini-2.0-flash", "gemini-2.5-pro")
+  - `:model` - Model name (e.g., "gemini-2.5-flash", "gemini-2.5-pro",
+    "gemini-3-flash-preview")
 
   Optional:
   - `:max_tokens` - Max output tokens (default: 4096)

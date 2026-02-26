@@ -202,7 +202,7 @@ defmodule Alloy.Provider.XAITest do
   defp config_with_response(response) do
     %{
       api_key: "xai-test-key",
-      model: "grok-2",
+      model: "grok-3",
       req_options: [
         plug: {Req.Test, __MODULE__},
         retry: false
@@ -220,7 +220,7 @@ defmodule Alloy.Provider.XAITest do
 
     %{
       api_key: "xai-test-key",
-      model: "grok-2",
+      model: "grok-3",
       req_options: [
         plug: {Req.Test, __MODULE__},
         retry: false

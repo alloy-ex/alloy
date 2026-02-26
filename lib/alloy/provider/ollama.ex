@@ -9,7 +9,8 @@ defmodule Alloy.Provider.Ollama do
   ## Config
 
   Required:
-  - `:model` - Model name (e.g., "llama3.2", "qwen2.5", "deepseek-r1", "mistral")
+  - `:model` - Model name (e.g., "llama4", "qwen3", "deepseek-r1", "gemma3",
+    "mistral", "phi4")
 
   Optional:
   - `:api_key` - API key (only if Ollama is behind an auth proxy)

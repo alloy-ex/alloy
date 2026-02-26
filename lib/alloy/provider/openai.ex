@@ -9,7 +9,7 @@ defmodule Alloy.Provider.OpenAI do
 
   Required:
   - `:api_key` - OpenAI API key
-  - `:model` - Model name (e.g., "gpt-4o", "gpt-4o-mini")
+  - `:model` - Model name (e.g., "gpt-5.2", "gpt-5.1", "o3-pro")
 
   Optional:
   - `:max_tokens` - Max output tokens (default: 4096)

@@ -19,7 +19,7 @@ defmodule Mix.Tasks.Alloy do
 
       mix alloy -p "What is the capital of France?"
       mix alloy -p "Read mix.exs and tell me the version" --tools read
-      mix alloy -p "Write a haiku" --provider openai --model gpt-4o
+      mix alloy -p "Write a haiku" --provider openai --model gpt-5.2
 
   ## Options
 
@@ -43,9 +43,9 @@ defmodule Mix.Tasks.Alloy do
 
   @providers %{
     "anthropic" => {Alloy.Provider.Anthropic, "ANTHROPIC_API_KEY", "claude-opus-4-6"},
-    "gemini" => {Alloy.Provider.Google, "GEMINI_API_KEY", "gemini-2.0-flash"},
-    "google" => {Alloy.Provider.Google, "GEMINI_API_KEY", "gemini-2.0-flash"},
-    "openai" => {Alloy.Provider.OpenAI, "OPENAI_API_KEY", "gpt-4o"}
+    "gemini" => {Alloy.Provider.Google, "GEMINI_API_KEY", "gemini-2.5-flash"},
+    "google" => {Alloy.Provider.Google, "GEMINI_API_KEY", "gemini-2.5-flash"},
+    "openai" => {Alloy.Provider.OpenAI, "OPENAI_API_KEY", "gpt-5.2"}
   }
 
   @tool_map %{

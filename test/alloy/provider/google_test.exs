@@ -239,7 +239,7 @@ defmodule Alloy.Provider.GoogleTest do
   defp config_with_response(response) do
     %{
       api_key: "test-api-key",
-      model: "gemini-2.0-flash",
+      model: "gemini-2.5-flash",
       max_tokens: 4096,
       req_options: [
         plug: {Req.Test, __MODULE__},
@@ -258,7 +258,7 @@ defmodule Alloy.Provider.GoogleTest do
 
     %{
       api_key: "test-api-key",
-      model: "gemini-2.0-flash",
+      model: "gemini-2.5-flash",
       max_tokens: 4096,
       req_options: [
         plug: {Req.Test, __MODULE__},

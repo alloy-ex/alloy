@@ -10,9 +10,9 @@ defmodule Alloy.Provider.OpenRouter do
 
   Required:
   - `:api_key` - OpenRouter API key
-  - `:model` - Model in provider/model format (e.g., "anthropic/claude-haiku-4-5-20251001",
-    "meta-llama/llama-3.1-70b-instruct", "x-ai/grok-2", "qwen/qwen-2.5-72b-instruct",
-    "minimax/minimax-01")
+  - `:model` - Model in provider/model format (e.g., "anthropic/claude-sonnet-4-6",
+    "openai/gpt-5.2", "google/gemini-2.5-flash", "x-ai/grok-3",
+    "qwen/qwen3-72b", "meta-llama/llama-4-70b")
 
   Optional:
   - `:max_tokens` - Max output tokens (default: 4096)

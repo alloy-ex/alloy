@@ -3,14 +3,14 @@ defmodule Alloy.Provider.Mistral do
   Provider for the Mistral AI API.
 
   Mistral uses an OpenAI-compatible chat completions format. Supports
-  Mistral Large, Mistral Small, Codestral, and other Mistral models.
+  Mistral Large, Mistral Small, Devstral, Magistral, and other Mistral models.
 
   ## Config
 
   Required:
   - `:api_key` - Mistral API key
   - `:model` - Model name (e.g., "mistral-large-latest", "mistral-small-latest",
-    "codestral-latest", "open-mistral-nemo")
+    "devstral-2512", "magistral-medium-2509")
 
   Optional:
   - `:max_tokens` - Max output tokens (default: 4096)

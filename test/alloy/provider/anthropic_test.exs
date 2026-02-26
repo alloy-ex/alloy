@@ -257,7 +257,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
       config = %{
         api_key: "sk-ant-test-key",
-        model: "claude-sonnet-4-5-20250514",
+        model: "claude-sonnet-4-6-20250514",
         max_tokens: 4096,
         req_options: [
           plug: {Req.Test, __MODULE__},
@@ -276,7 +276,7 @@ defmodule Alloy.Provider.AnthropicTest do
   defp config_with_response(response) do
     %{
       api_key: "sk-ant-test-key",
-      model: "claude-sonnet-4-5-20250514",
+      model: "claude-sonnet-4-6-20250514",
       max_tokens: 4096,
       req_options: [
         plug: {Req.Test, __MODULE__},
@@ -295,7 +295,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
     %{
       api_key: "sk-ant-test-key",
-      model: "claude-sonnet-4-5-20250514",
+      model: "claude-sonnet-4-6-20250514",
       max_tokens: 4096,
       req_options: [
         plug: {Req.Test, __MODULE__},

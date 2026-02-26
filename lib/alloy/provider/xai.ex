@@ -9,7 +9,8 @@ defmodule Alloy.Provider.XAI do
 
   Required:
   - `:api_key` - xAI API key
-  - `:model` - Model name (e.g., "grok-2", "grok-2-mini", "grok-3")
+  - `:model` - Model name (e.g., "grok-4-1-fast-reasoning", "grok-3",
+    "grok-3-mini")
 
   Optional:
   - `:max_tokens` - Max output tokens (default: 4096)

@@ -9,7 +9,8 @@ defmodule Alloy.Provider.Anthropic do
 
   Required:
   - `:api_key` - Anthropic API key
-  - `:model` - Model name (e.g., "claude-sonnet-4-5-20250514")
+  - `:model` - Model name (e.g., "claude-opus-4-6", "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001")
 
   Optional:
   - `:max_tokens` - Max output tokens (default: 4096)
