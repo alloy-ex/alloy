@@ -4,9 +4,9 @@ Last updated: 2026-02-26
 
 ## Current State
 
-- **LOC**: ~4,000 (lib/) + ~2,500 (test/)
-- **Tests**: 226, 0 failures
-- **Providers**: Anthropic, Google (Gemini), OpenAI
+- **LOC**: ~5,400 (lib/) + ~5,500 (test/)
+- **Tests**: 272, 0 failures
+- **Providers**: Anthropic, Google (Gemini), OpenAI, Ollama (local), OpenRouter (100+ models), xAI (Grok), DeepSeek, Mistral
 - **Tools**: read, write, edit, bash, scratchpad
 - **Core**: Turn loop, GenServer wrapper, middleware pipeline, telemetry, context compaction, streaming, multi-agent teams
 
@@ -99,13 +99,16 @@ Rate-limited pool of agents for batch workloads.
 ### Priority Providers to Add
 **Effort: ~100 LOC each | Status: As needed**
 
-| Provider | Why | Priority |
-|----------|-----|----------|
-| Ollama | Local models, no API key needed, great for dev | HIGH |
-| OpenRouter | One API key → 100+ models | HIGH |
-| AWS Bedrock | Enterprise customers | MEDIUM |
-| Azure OpenAI | Enterprise customers | MEDIUM |
-| Groq | Fast inference, good for tools-heavy flows | LOW |
+| Provider | Why | Priority | Status |
+|----------|-----|----------|--------|
+| Ollama | Local models, no API key needed, great for dev | HIGH | **DONE** |
+| OpenRouter | One API key → 100+ models (Qwen, MiniMax, etc.) | HIGH | **DONE** |
+| xAI (Grok) | Real-time knowledge, strong reasoning | HIGH | **DONE** |
+| DeepSeek | Cost-effective, strong coding (R1 reasoning) | HIGH | **DONE** |
+| Mistral | European AI, strong multilingual, Codestral | HIGH | **DONE** |
+| AWS Bedrock | Enterprise customers | MEDIUM | Planned |
+| Azure OpenAI | Enterprise customers | MEDIUM | Planned |
+| Groq | Fast inference, good for tools-heavy flows | LOW | Planned |
 
 ### Provider Architecture Note
 Each provider is ~200 LOC implementing the `Provider` behaviour. Adding providers is
