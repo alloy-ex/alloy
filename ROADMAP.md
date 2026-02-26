@@ -1,28 +1,35 @@
 # Anvil Roadmap
 
-Last updated: 2026-02-25
+Last updated: 2026-02-26
 
 ## Current State
 
-- **LOC**: ~3,300 (lib/) + ~2,000 (test/)
-- **Tests**: 184, 0 failures
+- **LOC**: ~4,000 (lib/) + ~2,500 (test/)
+- **Tests**: 226, 0 failures
 - **Providers**: Anthropic, Google (Gemini), OpenAI
 - **Tools**: read, write, edit, bash, scratchpad
-- **Core**: Turn loop, GenServer wrapper, middleware pipeline, telemetry, context compaction, session persistence
+- **Core**: Turn loop, GenServer wrapper, middleware pipeline, telemetry, context compaction, streaming, multi-agent teams
 
-### Completed (v0.1 — Pi-Agent Parity)
+### Completed (v0.1)
 
 - [x] Context file auto-discovery (`.anvil/context/*.md`, 3-tier: global/git-root/cwd)
 - [x] Richer extension events (`:before_tool_call` with blocking, `:session_start`, `:session_end`)
 - [x] Skills system (frontmatter parsing, discovery, placeholder expansion, REPL integration)
 - [x] Cron/heartbeat scheduler (GenServer + Task.Supervisor, overlap protection, dynamic jobs)
 
+### Completed (v0.1.1 — Core UX + OTP Differentiator)
+
+- [x] Streaming responses (optional `stream/4` callback, Anthropic SSE, Turn loop auto-detect)
+- [x] Mid-session model switching (`Server.set_model/2`, `/model` REPL command)
+- [x] REPL quality of life (`/help`, `/usage`, `/history`, `/reset`)
+- [x] Multi-agent teams (`Anvil.Team` — delegate, broadcast, handoff, shared context, fault isolation)
+
 ---
 
 ## Phase 1: Core UX (Next)
 
 ### Streaming Responses
-**Priority: HIGH | Effort: Medium | Status: Next up**
+**Priority: HIGH | Effort: Medium | Status: DONE**
 
 Token-by-token streaming from providers to REPL/callers.
 
@@ -33,7 +40,7 @@ Token-by-token streaming from providers to REPL/callers.
 - Middleware hooks: `:on_stream_chunk` (optional)
 
 ### Mid-Session Model Switching
-**Priority: HIGH | Effort: Small | Status: Planned**
+**Priority: HIGH | Effort: Small | Status: DONE**
 
 Switch provider/model without resetting conversation history.
 
@@ -42,7 +49,7 @@ Switch provider/model without resetting conversation history.
 - Validate new config before swapping
 
 ### REPL Quality of Life
-**Priority: MEDIUM | Effort: Small | Status: Planned**
+**Priority: MEDIUM | Effort: Small | Status: DONE**
 
 - `/history` — show conversation summary
 - `/usage` — show token usage and estimated cost
@@ -55,7 +62,7 @@ Switch provider/model without resetting conversation history.
 ## Phase 2: OTP Differentiators
 
 ### Multi-Agent Teams
-**Priority: HIGH | Effort: Medium | Status: Planned — Core**
+**Priority: HIGH | Effort: Medium | Status: DONE**
 
 Supervisor trees of collaborating agents. The killer feature Pi can't replicate.
 
@@ -270,42 +277,22 @@ and UI concerns.
 
 ---
 
-## Competitive Position vs Pi-Agent
+## Why Elixir / OTP?
 
-### Where Anvil matches Pi
-- Core tools (4+1)
-- Context discovery
-- Skills
-- Extension hooks (blocking)
-- Scheduling
-- Interactive + programmatic modes
-- Session persistence
+Anvil's moat is the **production runtime**. Most agent frameworks target the single-developer
+CLI experience. Anvil targets what happens after — when you need agents running in production
+with supervision, fault isolation, concurrency, and multi-agent orchestration.
 
-### Where Pi is ahead
-- Provider breadth (15+ vs 3)
-- Streaming responses (token-by-token)
-- Mid-session model switching
-- Tree-structured sessions (rewind/branch)
-- Rich TUI (pi-tui)
-- Web UI (web components)
-- RPC mode
-- Pi packages (npm/git extension bundles)
-
-### Where Anvil is ahead (OTP)
+### What OTP gives us for free
+- Multi-agent teams (delegate, broadcast, handoff, fault isolation, shared context)
 - Supervision trees (auto-restart crashed agents)
-- Real parallel tool execution (BEAM processes, not event loop)
-- GenServer agent wrapping (stateful, supervisable)
-- OTP scheduler (zero-dependency cron via Process.send_after)
+- Real parallel tool execution (BEAM processes, not threads or event loops)
+- GenServer agent wrapping (stateful, supervisable, message-passing)
+- Zero-dependency cron scheduling (Process.send_after)
 - Hot code reloading (update agents without stopping conversations)
-- Deterministic test provider (scripted responses for testing)
-- Telemetry integration (built-in observability)
-- Path to multi-agent teams, pooling, distributed — architecturally impossible in Node.js without heavy infra
-
-### Strategic Moat
-Pi optimizes for the single-developer CLI experience. Anvil's moat is the **production runtime** —
-supervision, fault isolation, concurrency, and multi-agent orchestration. These are properties of
-the BEAM, not features you bolt on. Any Node.js agent framework hitting scale will need to
-reinvent what OTP gives us for free.
+- Deterministic test provider (scripted responses for full TDD)
+- Built-in telemetry and observability
+- Path to pooling and distributed agents — architecturally native to the BEAM
 
 ---
 
@@ -315,7 +302,10 @@ reinvent what OTP gives us for free.
 |------|----------|-----------|
 | 2026-02-25 | Skills parser stays in core | 100 LOC, no dependencies, skill files are external |
 | 2026-02-25 | Scheduler stays in core | OTP-native, zero dependencies, ~250 LOC |
-| 2026-02-25 | Streaming is next priority | Biggest single UX gap vs Pi |
+| 2026-02-25 | Streaming is next priority | Biggest single UX gap for interactive use |
 | 2026-02-25 | Agent pooling → separate package | Opinionated about pool sizing, adds NimblePool dep |
 | 2026-02-25 | Distributed agents → separate package | Advanced use case, different deployment model |
 | 2026-02-25 | Phoenix integration → separate package | Framework dependency |
+| 2026-02-26 | Team uses GenServer + DynamicSupervisor | Needs mutable state (agent registry), `:temporary` children so Team handles restarts |
+| 2026-02-26 | Async GenServer.reply for delegate/broadcast/handoff | Keeps Team responsive during long-running agent chats |
+| 2026-02-26 | Crashed agents are removed, not restarted | Simplest correct behaviour; users can add back or use supervision |
