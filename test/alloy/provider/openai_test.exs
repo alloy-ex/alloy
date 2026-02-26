@@ -223,6 +223,123 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
+  describe "complete/3 multimodal formatting" do
+    test "image block in user message formats to image_url data URL" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            %{type: "text", text: "What is in this image?"},
+            Message.image("image/jpeg", "base64img==")
+          ]
+        }
+      ]
+
+      OpenAI.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
+      assert is_list(user_msg["content"])
+
+      img_block = Enum.find(user_msg["content"], &(&1["type"] == "image_url"))
+      assert img_block != nil
+      assert img_block["image_url"]["url"] == "data:image/jpeg;base64,base64img=="
+    end
+
+    test "audio block in user message formats to input_audio" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [Message.audio("audio/mp3", "base64audio==")]
+        }
+      ]
+
+      OpenAI.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
+      assert is_list(user_msg["content"])
+
+      [audio_block] = user_msg["content"]
+      assert audio_block["type"] == "input_audio"
+      assert audio_block["input_audio"]["data"] == "base64audio=="
+      assert audio_block["input_audio"]["format"] == "mp3"
+    end
+
+    test "wav audio mime maps to wav format string" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [Message.audio("audio/wav", "wavdata==")]
+        }
+      ]
+
+      OpenAI.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
+      [audio_block] = user_msg["content"]
+      assert audio_block["input_audio"]["format"] == "wav"
+    end
+
+    test "video block in user message formats to text notice instead of being dropped" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [Message.video("video/mp4", "base64video==")]
+        }
+      ]
+
+      OpenAI.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
+      # Must NOT be nil/empty — the block should appear as a text notice
+      assert is_list(user_msg["content"])
+      [block] = user_msg["content"]
+      assert block["type"] == "text"
+      assert String.contains?(block["text"], "Unsupported")
+    end
+
+    test "document block in user message formats to text notice instead of being dropped" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [Message.document("application/pdf", "gs://bucket/file.pdf")]
+        }
+      ]
+
+      OpenAI.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
+      assert is_list(user_msg["content"])
+      [block] = user_msg["content"]
+      assert block["type"] == "text"
+      assert String.contains?(block["text"], "Unsupported")
+    end
+  end
+
   describe "complete/3 error handling" do
     test "returns error on HTTP failure" do
       config = config_with_response(%{status: 500, body: "Internal Server Error"})

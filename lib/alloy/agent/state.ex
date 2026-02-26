@@ -9,7 +9,7 @@ defmodule Alloy.Agent.State do
   alias Alloy.{Message, Usage}
   alias Alloy.Agent.Config
 
-  @type status :: :running | :completed | :error | :max_turns
+  @type status :: :running | :completed | :error | :max_turns | :halted
 
   @type t :: %__MODULE__{
           config: Config.t(),
@@ -20,7 +20,9 @@ defmodule Alloy.Agent.State do
           error: term() | nil,
           tool_defs: [map()],
           tool_fns: %{String.t() => {module(), map()}},
-          scratchpad: pid() | nil
+          scratchpad: pid() | nil,
+          started_at: integer() | nil,
+          agent_id: String.t()
         }
 
   @enforce_keys [:config]
@@ -33,7 +35,9 @@ defmodule Alloy.Agent.State do
     usage: %Usage{},
     status: :running,
     tool_defs: [],
-    tool_fns: %{}
+    tool_fns: %{},
+    started_at: nil,
+    agent_id: ""
   ]
 
   @doc """
@@ -43,12 +47,17 @@ defmodule Alloy.Agent.State do
   def init(%Config{} = config, messages \\ []) do
     {tool_defs, tool_fns} = Alloy.Tool.Registry.build(config.tools)
 
+    agent_id =
+      Map.get(config.context, :session_id) || generate_agent_id()
+
     %__MODULE__{
       config: config,
       messages: messages,
       tool_defs: tool_defs,
       tool_fns: tool_fns,
-      scratchpad: maybe_start_scratchpad(config.tools)
+      scratchpad: maybe_start_scratchpad(config.tools),
+      started_at: System.monotonic_time(:millisecond),
+      agent_id: agent_id
     }
   end
 
@@ -98,5 +107,9 @@ defmodule Alloy.Agent.State do
       {:ok, pid} = Agent.start_link(fn -> %{} end)
       pid
     end
+  end
+
+  defp generate_agent_id do
+    :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
   end
 end

@@ -23,21 +23,38 @@ defmodule Alloy.Middleware do
           | :session_start
           | :session_end
 
-  @type call_result :: State.t() | {:block, String.t()}
+  @type call_result :: State.t() | {:block, String.t()} | {:halt, String.t()}
 
   @doc """
   Called at the specified hook point. Returns modified state,
-  or `{:block, reason}` for `:before_tool_call` to prevent execution.
+  `{:block, reason}` for `:before_tool_call` to prevent execution,
+  or `{:halt, reason}` to stop the entire agent loop immediately.
   """
   @callback call(hook(), State.t()) :: call_result()
 
   @doc """
   Runs all middleware for a given hook point.
+
+  Middleware can return `{:halt, reason}` to stop processing immediately
+  and mark the agent as halted. Returns either the final state or
+  `{:halted, reason}` tuple.
   """
-  @spec run(hook(), State.t()) :: State.t()
+  @spec run(hook(), State.t()) :: State.t() | {:halted, String.t()}
   def run(hook, %State{} = state) do
-    Enum.reduce(state.config.middleware, state, fn middleware, acc ->
-      middleware.call(hook, acc)
+    Enum.reduce_while(state.config.middleware, state, fn middleware, acc ->
+      case middleware.call(hook, acc) do
+        {:halt, reason} ->
+          {:halt, {:halted, reason}}
+
+        %State{} = new_state ->
+          {:cont, new_state}
+
+        {:block, reason} ->
+          raise ArgumentError,
+                "#{inspect(middleware)} returned {:block, #{inspect(reason)}} " <>
+                  "from hook #{inspect(hook)}, but {:block, reason} is only valid for " <>
+                  "the :before_tool_call hook. Use {:halt, reason} to stop the agent loop."
+      end
     end)
   end
 
@@ -47,7 +64,8 @@ defmodule Alloy.Middleware do
   Injects the tool call into `state.config.context[:current_tool_call]`
   before running middleware. Returns `:ok` or `{:block, reason}`.
   """
-  @spec run_before_tool_call(State.t(), map()) :: :ok | {:block, String.t()}
+  @spec run_before_tool_call(State.t(), map()) ::
+          :ok | {:block, String.t()} | {:halted, String.t()}
   def run_before_tool_call(%State{} = state, tool_call) do
     # Inject the tool call into context so middleware can inspect it
     updated_context = Map.put(state.config.context, :current_tool_call, tool_call)
@@ -57,6 +75,7 @@ defmodule Alloy.Middleware do
     Enum.reduce_while(updated_state.config.middleware, :ok, fn middleware, _acc ->
       case middleware.call(:before_tool_call, updated_state) do
         {:block, reason} -> {:halt, {:block, reason}}
+        {:halt, reason} -> {:halt, {:halted, reason}}
         %State{} -> {:cont, :ok}
       end
     end)

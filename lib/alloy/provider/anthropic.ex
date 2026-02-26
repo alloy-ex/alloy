@@ -318,6 +318,33 @@ defmodule Alloy.Provider.Anthropic do
     if Map.get(block, :is_error), do: Map.put(result, "is_error", true), else: result
   end
 
+  defp format_content_block(%{type: "image", mime_type: mime_type, data: data}) do
+    %{
+      "type" => "image",
+      "source" => %{
+        "type" => "base64",
+        "media_type" => mime_type,
+        "data" => data
+      }
+    }
+  end
+
+  # Anthropic does not support audio or video inline. Convert to a text notice
+  # so the conversation can continue without crashing the turn loop.
+  defp format_content_block(%{type: type}) when type in ["audio", "video"] do
+    %{"type" => "text", "text" => "[Unsupported media type for Anthropic provider: #{type}]"}
+  end
+
+  # Document blocks require Anthropic's Files API (separate upload step). Convert
+  # to a text notice in the same spirit as the audio/video fallback above.
+  defp format_content_block(%{type: "document", mime_type: mime_type}) do
+    %{
+      "type" => "text",
+      "text" =>
+        "[Unsupported inline document (#{mime_type}) for Anthropic provider: use the Files API]"
+    }
+  end
+
   defp format_content_block(block) when is_map(block) do
     # Pass through any other block types as-is, converting atom keys to strings
     Map.new(block, fn {k, v} -> {to_string(k), v} end)

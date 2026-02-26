@@ -78,10 +78,10 @@ defmodule Alloy.StreamingTest do
     end
   end
 
-  # ── Turn.run_loop with streaming ───────────────────────────────────────
+  # ── Turn.run_loop with streaming via opts ──────────────────────────────
 
-  describe "Turn.run_loop with streaming" do
-    test "calls on_chunk when streaming=true" do
+  describe "Turn.run_loop with streaming via opts" do
+    test "calls on_chunk when streaming: true passed as opt" do
       {:ok, pid} = TestProvider.start_link([TestProvider.text_response("Hello")])
 
       test_pid = self()
@@ -89,13 +89,11 @@ defmodule Alloy.StreamingTest do
 
       config = %Config{
         provider: TestProvider,
-        provider_config: %{agent_pid: pid},
-        streaming: true,
-        context: %{on_chunk: on_chunk}
+        provider_config: %{agent_pid: pid}
       }
 
       state = State.init(config, [Message.user("Hi")])
-      result = Turn.run_loop(state)
+      result = Turn.run_loop(state, streaming: true, on_chunk: on_chunk)
 
       assert result.status == :completed
 
@@ -111,7 +109,7 @@ defmodule Alloy.StreamingTest do
       {:ok, pid1} = TestProvider.start_link([TestProvider.text_response("Same result")])
       {:ok, pid2} = TestProvider.start_link([TestProvider.text_response("Same result")])
 
-      # Non-streaming
+      # Non-streaming (no opts)
       config1 = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid1}
@@ -120,16 +118,14 @@ defmodule Alloy.StreamingTest do
       state1 = State.init(config1, [Message.user("Hi")])
       result1 = Turn.run_loop(state1)
 
-      # Streaming
+      # Streaming (via opts)
       config2 = %Config{
         provider: TestProvider,
-        provider_config: %{agent_pid: pid2},
-        streaming: true,
-        context: %{on_chunk: fn _ -> :ok end}
+        provider_config: %{agent_pid: pid2}
       }
 
       state2 = State.init(config2, [Message.user("Hi")])
-      result2 = Turn.run_loop(state2)
+      result2 = Turn.run_loop(state2, streaming: true, on_chunk: fn _ -> :ok end)
 
       assert result1.status == result2.status
       assert result1.turn == result2.turn
@@ -154,13 +150,11 @@ defmodule Alloy.StreamingTest do
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
-        tools: [EchoTool],
-        streaming: true,
-        context: %{on_chunk: on_chunk}
+        tools: [EchoTool]
       }
 
       state = State.init(config, [Message.user("Echo hi")])
-      result = Turn.run_loop(state)
+      result = Turn.run_loop(state, streaming: true, on_chunk: on_chunk)
 
       assert result.status == :completed
       assert result.turn == 2
@@ -171,6 +165,36 @@ defmodule Alloy.StreamingTest do
       assert_received {:chunk, "n"}
       assert_received {:chunk, "e"}
       assert_received {:chunk, "!"}
+    end
+
+    test "no opts defaults to non-streaming" do
+      {:ok, pid} = TestProvider.start_link([TestProvider.text_response("No stream")])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid}
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      # Call without opts — should not raise and should complete normally
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert State.last_assistant_text(result) == "No stream"
+    end
+  end
+
+  # ── Config does not have :streaming field ──────────────────────────────
+
+  describe "Config struct" do
+    test "does not have a :streaming field" do
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{}
+      }
+
+      # Accessing a non-existent key on a struct raises KeyError
+      assert_raise KeyError, fn -> Map.fetch!(config, :streaming) end
     end
   end
 
@@ -231,6 +255,21 @@ defmodule Alloy.StreamingTest do
       {:ok, result} = Server.chat(agent, "Hello again")
       assert result.text == "Not streamed"
       assert result.status == :completed
+    end
+
+    test "server state config does not have :streaming field after stream_chat" do
+      {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Done")])
+
+      {:ok, agent} =
+        Server.start_link(provider: {TestProvider, agent_pid: provider})
+
+      {:ok, _} = Server.stream_chat(agent, "Hello", fn _ -> :ok end)
+
+      # Inspect internal GenServer state and verify config has no :streaming key
+      state = :sys.get_state(agent)
+
+      # Config struct should not have :streaming — accessing it raises KeyError
+      assert_raise KeyError, fn -> Map.fetch!(state.config, :streaming) end
     end
   end
 

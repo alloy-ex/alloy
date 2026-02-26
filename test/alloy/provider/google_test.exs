@@ -181,6 +181,29 @@ defmodule Alloy.Provider.GoogleTest do
       assert decl["description"] == "Read a file"
     end
 
+    test "unknown block type in user message formats to text notice instead of crashing" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [%{type: "unknown_future_type", some_data: "value"}]
+        }
+      ]
+
+      # Should not raise FunctionClauseError
+      result = Google.complete(messages, [], config)
+      assert match?({:ok, _}, result)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      [user_content] = decoded["contents"]
+      [part] = user_content["parts"]
+      assert is_binary(part["text"])
+      assert String.contains?(part["text"], "Unhandled block type")
+    end
+
     test "formats tool results as functionResponse parts" do
       config = config_that_captures_request()
 
@@ -205,6 +228,98 @@ defmodule Alloy.Provider.GoogleTest do
       [part] = tool_msg["parts"]
       assert part["functionResponse"]["name"] == "read"
       assert part["functionResponse"]["response"]["content"] == "file contents here"
+    end
+  end
+
+  describe "complete/3 multimodal formatting" do
+    test "image block in user message formats to inlineData" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            %{type: "text", text: "Describe this image."},
+            Message.image("image/jpeg", "base64img==")
+          ]
+        }
+      ]
+
+      Google.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      user_content = hd(decoded["contents"])
+      assert user_content["role"] == "user"
+
+      img_part = Enum.find(user_content["parts"], &Map.has_key?(&1, "inlineData"))
+      assert img_part != nil
+      assert img_part["inlineData"]["mimeType"] == "image/jpeg"
+      assert img_part["inlineData"]["data"] == "base64img=="
+    end
+
+    test "audio block in user message formats to inlineData" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [Message.audio("audio/mp3", "base64audio==")]
+        }
+      ]
+
+      Google.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      [user_content] = decoded["contents"]
+      [part] = user_content["parts"]
+      assert part["inlineData"]["mimeType"] == "audio/mp3"
+      assert part["inlineData"]["data"] == "base64audio=="
+    end
+
+    test "document block in user message formats to fileData" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [Message.document("application/pdf", "gs://bucket/report.pdf")]
+        }
+      ]
+
+      Google.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      [user_content] = decoded["contents"]
+      [part] = user_content["parts"]
+      assert part["fileData"]["mimeType"] == "application/pdf"
+      assert part["fileData"]["fileUri"] == "gs://bucket/report.pdf"
+    end
+
+    test "video block in user message formats to inlineData" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [Message.video("video/mp4", "base64video==")]
+        }
+      ]
+
+      Google.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      [user_content] = decoded["contents"]
+      [part] = user_content["parts"]
+      assert part["inlineData"]["mimeType"] == "video/mp4"
+      assert part["inlineData"]["data"] == "base64video=="
     end
   end
 

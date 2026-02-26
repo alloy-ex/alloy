@@ -229,6 +229,60 @@ defmodule Alloy.Provider.AnthropicTest do
     end
   end
 
+  describe "complete/3 multimodal formatting" do
+    test "image block formats to Anthropic base64 source format" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            %{type: "text", text: "What is in this image?"},
+            Message.image("image/jpeg", "base64data==")
+          ]
+        }
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      user_msg = hd(decoded["messages"])
+      assert user_msg["role"] == "user"
+
+      image_block = Enum.find(user_msg["content"], &(&1["type"] == "image"))
+      assert image_block != nil
+      assert image_block["source"]["type"] == "base64"
+      assert image_block["source"]["media_type"] == "image/jpeg"
+      assert image_block["source"]["data"] == "base64data=="
+    end
+
+    test "audio block formats gracefully (text fallback) since Anthropic does not support it" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [Message.audio("audio/mp3", "audiodata")]
+        }
+      ]
+
+      # Should not raise — graceful handling
+      result = Anthropic.complete(messages, [], config)
+      assert match?({:ok, _}, result)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+      user_msg = hd(decoded["messages"])
+
+      # The audio block should have been converted to some sendable form
+      assert is_list(user_msg["content"])
+      [block] = user_msg["content"]
+      assert is_map(block)
+    end
+  end
+
   describe "complete/3 retry behavior" do
     test "retries on 429 rate limit and eventually succeeds" do
       calls = :counters.new(1, [:atomics])

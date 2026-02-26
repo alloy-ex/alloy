@@ -17,6 +17,16 @@ defmodule Alloy.Tool.Core.Bash do
 
   @behaviour Alloy.Tool
 
+  @typedoc """
+  A custom command executor. Receives the shell command string and the working
+  directory path, and must return `{output, exit_code}`.
+
+  The default executor calls `System.cmd/3`. Supply a custom executor via
+  the `:bash_executor` key in the agent's `:context` map to sandbox or
+  proxy shell execution.
+  """
+  @type executor :: (command :: String.t(), dir :: String.t() -> {String.t(), non_neg_integer()})
+
   @default_timeout 120_000
   @max_output 30_000
 
@@ -47,7 +57,16 @@ defmodule Alloy.Tool.Core.Bash do
     command = input["command"]
     timeout = input["timeout"] || @default_timeout
     working_dir = Map.get(context, :working_directory)
+    executor = Map.get(context, :bash_executor)
 
+    if executor do
+      run_custom_executor(executor, command, working_dir, timeout)
+    else
+      run_host(command, working_dir, timeout)
+    end
+  end
+
+  defp run_host(command, working_dir, timeout) do
     opts =
       [stderr_to_stdout: true]
       |> maybe_add_cd(working_dir)
@@ -59,12 +78,29 @@ defmodule Alloy.Tool.Core.Bash do
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
       {:ok, {output, exit_code}} ->
-        output = truncate(output)
-        {:ok, "#{output}\nexit code: #{exit_code}"}
+        {:ok, "#{truncate(output)}\nexit code: #{exit_code}"}
+
+      {:exit, reason} ->
+        {:error, "Executor crashed: #{inspect(reason)}"}
 
       nil ->
         {:error,
          "Command timed out after #{timeout}ms. The process may have started a server, entered an infinite loop, or is waiting for input. Try a non-blocking approach."}
+    end
+  end
+
+  defp run_custom_executor(executor, command, working_dir, timeout) do
+    task = Task.async(fn -> executor.(command, working_dir) end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, exit_code}} ->
+        {:ok, "#{truncate(output)}\nexit code: #{exit_code}"}
+
+      {:exit, reason} ->
+        {:error, "Executor crashed: #{inspect(reason)}"}
+
+      nil ->
+        {:error, "Command timed out after #{timeout}ms."}
     end
   end
 

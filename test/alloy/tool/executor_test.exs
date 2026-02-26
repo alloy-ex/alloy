@@ -59,6 +59,13 @@ defmodule Alloy.Tool.ExecutorTest do
     def call(_hook, state), do: state
   end
 
+  defmodule HaltingMiddleware do
+    @behaviour Alloy.Middleware
+
+    def call(:before_tool_call, _state), do: {:halt, "spend cap exceeded"}
+    def call(_hook, state), do: state
+  end
+
   # --- Tests ---
 
   describe "execute_all/3 — happy path" do
@@ -159,6 +166,57 @@ defmodule Alloy.Tool.ExecutorTest do
       assert blocked.content =~ "Blocked"
       # error_tool was NOT blocked — it ran and returned its error
       assert executed.content == "something went wrong"
+    end
+  end
+
+  describe "execute_all/3 — middleware halt" do
+    test "returns {:halted, reason} when middleware returns {:halt, reason} for before_tool_call" do
+      state = build_state([SuccessTool], middleware: [HaltingMiddleware])
+      tool_call = %{id: "call_halt", name: "success", type: "tool_use", input: %{}}
+
+      result = Executor.execute_all([tool_call], state.tool_fns, state)
+
+      assert result == {:halted, "spend cap exceeded"}
+    end
+
+    test "halts immediately without executing any tools when middleware halts" do
+      # Use an agent to verify SuccessTool is never invoked
+      test_pid = self()
+
+      defmodule SpyTool do
+        @behaviour Alloy.Tool
+        def name, do: "spy"
+        def description, do: "Reports invocation"
+        def input_schema, do: %{type: "object", properties: %{}}
+
+        def execute(_input, ctx) do
+          send(ctx[:test_pid], :spy_tool_executed)
+          {:ok, "spied"}
+        end
+      end
+
+      state =
+        build_state([SpyTool], middleware: [HaltingMiddleware], context: %{test_pid: test_pid})
+
+      tool_call = %{id: "call_spy", name: "spy", type: "tool_use", input: %{}}
+
+      result = Executor.execute_all([tool_call], state.tool_fns, state)
+
+      assert result == {:halted, "spend cap exceeded"}
+      refute_received :spy_tool_executed
+    end
+
+    test "halts on first halted call when multiple tool calls are present" do
+      state = build_state([SuccessTool, ErrorTool], middleware: [HaltingMiddleware])
+
+      calls = [
+        %{id: "c1", name: "success", type: "tool_use", input: %{}},
+        %{id: "c2", name: "error_tool", type: "tool_use", input: %{}}
+      ]
+
+      result = Executor.execute_all(calls, state.tool_fns, state)
+
+      assert result == {:halted, "spend cap exceeded"}
     end
   end
 

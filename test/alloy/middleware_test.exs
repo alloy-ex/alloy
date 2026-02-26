@@ -127,6 +127,93 @@ defmodule Alloy.MiddlewareTest do
     end
   end
 
+  describe "run/2 with halt" do
+    test "middleware returning {:halt, reason} stops the chain" do
+      # Second middleware should NOT be called
+      defmodule HaltFirstMiddleware do
+        @behaviour Alloy.Middleware
+        def call(_hook, _state), do: {:halt, "spend cap"}
+      end
+
+      defmodule SecondMiddleware do
+        @behaviour Alloy.Middleware
+        def call(_hook, _state) do
+          send(self(), :second_middleware_called)
+          {:halt, "should not reach here"}
+        end
+      end
+
+      state = build_state(middleware: [HaltFirstMiddleware, SecondMiddleware])
+
+      result = Middleware.run(:before_completion, state)
+
+      assert result == {:halted, "spend cap"}
+      refute_received :second_middleware_called
+    end
+
+    test "middleware returning %State{} continues the chain" do
+      defmodule PassThroughMiddleware do
+        @behaviour Alloy.Middleware
+        def call(_hook, %State{} = state), do: state
+      end
+
+      state = build_state(middleware: [PassThroughMiddleware])
+
+      result = Middleware.run(:before_completion, state)
+
+      assert %State{} = result
+    end
+
+    test "{:halt, reason} from second middleware stops after first" do
+      defmodule FirstPassMiddleware do
+        @behaviour Alloy.Middleware
+        def call(_hook, %State{} = state), do: state
+      end
+
+      defmodule HaltSecondMiddleware do
+        @behaviour Alloy.Middleware
+        def call(_hook, _state), do: {:halt, "limit"}
+      end
+
+      state = build_state(middleware: [FirstPassMiddleware, HaltSecondMiddleware])
+
+      result = Middleware.run(:before_completion, state)
+
+      assert result == {:halted, "limit"}
+    end
+  end
+
+  describe "run/2 with {:block, reason} at non-tool-call hook" do
+    test "raises ArgumentError instead of CaseClauseError when middleware returns {:block, reason} from a general hook" do
+      defmodule BlockAtWrongHookMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_completion, _state), do: {:block, "wrong hook usage"}
+        def call(_hook, %State{} = state), do: state
+      end
+
+      state = build_state(middleware: [BlockAtWrongHookMiddleware])
+
+      assert_raise ArgumentError, ~r/\{:block.*:before_tool_call/s, fn ->
+        Middleware.run(:before_completion, state)
+      end
+    end
+  end
+
+  describe "run_before_tool_call/2 with halt" do
+    test "middleware returning {:halt, reason} on :before_tool_call returns {:halted, reason}" do
+      defmodule HaltOnToolCallMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, _state), do: {:halt, "blocked"}
+        def call(_hook, %State{} = state), do: state
+      end
+
+      state = build_state(middleware: [HaltOnToolCallMiddleware])
+      tool_call = %{id: "tc_1", name: "bash", input: %{"command" => "rm -rf /"}}
+
+      assert {:halted, "blocked"} = Middleware.run_before_tool_call(state, tool_call)
+    end
+  end
+
   describe "Executor integration with blocking" do
     test "blocked tool calls produce error result blocks" do
       {:ok, provider_pid} =

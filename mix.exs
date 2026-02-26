@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.3.0"
+  @version "0.4.0"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -36,7 +36,8 @@ defmodule Alloy.MixProject do
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:plug, "~> 1.16", only: :test}
+      {:plug, "~> 1.16", only: :test},
+      {:phoenix_pubsub, "~> 2.1", optional: true}
     ]
   end
 
@@ -99,7 +100,8 @@ defmodule Alloy.MixProject do
         Advanced: [
           Alloy.Team,
           Alloy.Scheduler,
-          Alloy.Skill
+          Alloy.Skill,
+          Alloy.PubSub
         ],
         Testing: [
           Alloy.Testing
