@@ -22,3 +22,9 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 alloy-*.tar
 
+# Generated source dumps.
+*_flat.txt
+
+# Local tooling state.
+.claude/specs/
+
