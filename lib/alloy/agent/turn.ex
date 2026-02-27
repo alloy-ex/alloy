@@ -46,7 +46,9 @@ defmodule Alloy.Agent.Turn do
         provider_config = build_provider_config(state)
 
         streaming? =
-          Keyword.get(opts, :streaming, false) && function_exported?(provider, :stream, 4)
+          Keyword.get(opts, :streaming, false) &&
+            (Code.ensure_loaded(provider) == {:module, provider} &&
+               function_exported?(provider, :stream, 4))
 
         on_chunk = Keyword.get(opts, :on_chunk, fn _chunk -> :ok end)
 
