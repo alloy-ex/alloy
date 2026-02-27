@@ -38,7 +38,7 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.1.0"}
+    {:alloy, "~> 0.3.0"}
   ]
 end
 ```
