@@ -95,4 +95,64 @@ defmodule Alloy.Tool.Core.BashTest do
       assert result =~ "works"
     end
   end
+
+  describe "custom bash_executor" do
+    test "uses custom executor function when provided in context" do
+      executor = fn _command, _working_dir -> {"custom output", 0} end
+
+      assert {:ok, result} =
+               Bash.execute(
+                 %{"command" => "echo hello"},
+                 %{bash_executor: executor}
+               )
+
+      assert result =~ "custom output"
+      assert result =~ "exit code: 0"
+    end
+
+    test "custom executor receives command and working_dir arguments", %{tmp_dir: tmp_dir} do
+      test_pid = self()
+
+      executor = fn command, working_dir ->
+        send(test_pid, {:called_with, command, working_dir})
+        {"ok", 0}
+      end
+
+      Bash.execute(
+        %{"command" => "echo test"},
+        %{bash_executor: executor, working_directory: tmp_dir}
+      )
+
+      assert_receive {:called_with, "echo test", ^tmp_dir}
+    end
+
+    test "custom executor timeout returns error when executor exceeds timeout" do
+      executor = fn _command, _working_dir ->
+        Process.sleep(5_000)
+        {"never returned", 0}
+      end
+
+      assert {:error, msg} =
+               Bash.execute(
+                 %{"command" => "anything", "timeout" => 100},
+                 %{bash_executor: executor}
+               )
+
+      assert msg =~ "timed out"
+    end
+
+    test "custom executor output is truncated when over 30000 chars" do
+      big_output = String.duplicate("x", 40_000)
+      executor = fn _command, _working_dir -> {big_output, 0} end
+
+      assert {:ok, result} =
+               Bash.execute(
+                 %{"command" => "anything"},
+                 %{bash_executor: executor}
+               )
+
+      assert String.length(result) <= 31_000
+      assert result =~ "truncated"
+    end
+  end
 end

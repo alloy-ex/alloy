@@ -84,6 +84,74 @@ defmodule Alloy.Context.TokenCounterTest do
     end
   end
 
+  describe "estimate_block_tokens/1 with media blocks" do
+    test "image block returns a non-zero token estimate" do
+      msg = %Message{
+        role: :user,
+        content: [Message.image("image/jpeg", "base64data")]
+      }
+
+      assert TokenCounter.estimate_message_tokens(msg) > 0
+    end
+
+    test "audio block returns a non-zero token estimate" do
+      msg = %Message{
+        role: :user,
+        content: [Message.audio("audio/mp3", "base64audio")]
+      }
+
+      assert TokenCounter.estimate_message_tokens(msg) > 0
+    end
+
+    test "video block returns a non-zero token estimate" do
+      msg = %Message{
+        role: :user,
+        content: [Message.video("video/mp4", "base64video")]
+      }
+
+      assert TokenCounter.estimate_message_tokens(msg) > 0
+    end
+
+    test "document block returns a non-zero token estimate" do
+      msg = %Message{
+        role: :user,
+        content: [Message.document("application/pdf", "gs://bucket/file.pdf")]
+      }
+
+      assert TokenCounter.estimate_message_tokens(msg) > 0
+    end
+
+    test "video estimate is larger than audio estimate (heuristic ordering)" do
+      audio_msg = %Message{
+        role: :user,
+        content: [Message.audio("audio/mp3", "data")]
+      }
+
+      video_msg = %Message{
+        role: :user,
+        content: [Message.video("video/mp4", "data")]
+      }
+
+      assert TokenCounter.estimate_message_tokens(video_msg) >=
+               TokenCounter.estimate_message_tokens(audio_msg)
+    end
+
+    test "media blocks do not crash within_budget? check" do
+      messages = [
+        %Message{
+          role: :user,
+          content: [
+            %{type: "text", text: "What do you see?"},
+            Message.image("image/jpeg", "base64data")
+          ]
+        }
+      ]
+
+      # Should not raise; just return a boolean
+      assert is_boolean(TokenCounter.within_budget?(messages, 200_000))
+    end
+  end
+
   describe "within_budget?/2" do
     test "returns true when well within budget" do
       messages = [Message.user("hello")]

@@ -68,21 +68,42 @@ defmodule Alloy.Team do
 
   The Team GenServer remains responsive while the agent works — concurrent
   delegates to different agents run in parallel.
+
+  ## Options
+
+    - `:timeout` - Milliseconds to wait before raising a timeout exit. Defaults
+      to `120_000` (2 minutes). Use `:infinity` to wait forever. The agent
+      receives this timeout directly. The outer `GenServer.call` adds a 1-second
+      coordination buffer so the agent-level timeout resolves before the caller
+      times out.
   """
-  @spec delegate(GenServer.server(), atom(), String.t()) ::
+  @spec delegate(GenServer.server(), atom(), String.t(), keyword()) ::
           {:ok, Server.result()} | {:error, term()}
-  def delegate(team, agent_name, message) when is_atom(agent_name) and is_binary(message) do
-    GenServer.call(team, {:delegate, agent_name, message}, :infinity)
+  def delegate(team, agent_name, message, opts \\ [])
+      when is_atom(agent_name) and is_binary(message) do
+    timeout = Keyword.get(opts, :timeout, 120_000)
+    outer_timeout = coordination_timeout(timeout)
+    GenServer.call(team, {:delegate, agent_name, message, timeout}, outer_timeout)
   end
 
   @doc """
   Send a message to all agents in parallel and collect results.
 
   Returns a map of `%{agent_name => {:ok, result} | {:error, reason}}`.
+
+  ## Options
+
+    - `:timeout` - Milliseconds to wait before raising a timeout exit. Defaults
+      to `120_000` (2 minutes). Use `:infinity` to wait forever. Each individual
+      agent receives this timeout. The outer `GenServer.call` adds a 1-second
+      coordination buffer so that agent-level timeouts resolve before the caller
+      times out.
   """
-  @spec broadcast(GenServer.server(), String.t()) :: %{atom() => term()}
-  def broadcast(team, message) when is_binary(message) do
-    GenServer.call(team, {:broadcast, message}, :infinity)
+  @spec broadcast(GenServer.server(), String.t(), keyword()) :: %{atom() => term()}
+  def broadcast(team, message, opts \\ []) when is_binary(message) do
+    timeout = Keyword.get(opts, :timeout, 120_000)
+    outer_timeout = coordination_timeout(timeout)
+    GenServer.call(team, {:broadcast, message, timeout}, outer_timeout)
   end
 
   @doc """
@@ -91,12 +112,27 @@ defmodule Alloy.Team do
 
   Returns `{:ok, result}` from the last agent in the chain, or the first
   error encountered.
+
+  ## Options
+
+    - `:timeout` - Milliseconds to wait before raising a timeout exit. Defaults
+      to `120_000` (2 minutes). Use `:infinity` to wait forever. This timeout
+      applies both to the outer GenServer call and to each individual agent call
+      within the chain.
   """
-  @spec handoff(GenServer.server(), [atom()], String.t()) ::
-          {:ok, Server.result()} | {:error, term()}
-  def handoff(team, agent_names, message)
+  # Returns {:ok, nil} when agent_names is empty — no handoff occurred.
+  @spec handoff(GenServer.server(), [atom()], String.t(), keyword()) ::
+          {:ok, Server.result() | nil} | {:error, term()}
+  def handoff(team, agent_names, message, opts \\ [])
       when is_list(agent_names) and is_binary(message) do
-    GenServer.call(team, {:handoff, agent_names, message}, :infinity)
+    timeout = Keyword.get(opts, :timeout, 120_000)
+
+    outer_timeout =
+      if timeout == :infinity,
+        do: :infinity,
+        else: coordination_timeout(max(timeout * length(agent_names), timeout))
+
+    GenServer.call(team, {:handoff, agent_names, message, timeout}, outer_timeout)
   end
 
   @doc """
@@ -175,15 +211,18 @@ defmodule Alloy.Team do
       shared_context: shared_context
     }
 
-    state =
-      Enum.reduce(agents_config, initial_state, fn {name, agent_opts}, acc ->
+    result =
+      Enum.reduce_while(agents_config, {:ok, initial_state}, fn {name, agent_opts}, {:ok, acc} ->
         case start_agent(acc.supervisor, agent_opts) do
-          {:ok, pid} -> track_agent(acc, name, pid)
-          {:error, reason} -> raise "Failed to start agent #{name}: #{inspect(reason)}"
+          {:ok, pid} -> {:cont, {:ok, track_agent(acc, name, pid)}}
+          {:error, reason} -> {:halt, {:error, name, reason}}
         end
       end)
 
-    {:ok, state}
+    case result do
+      {:ok, state} -> {:ok, state}
+      {:error, name, reason} -> {:stop, {:failed_to_start_agent, name, reason}}
+    end
   end
 
   @impl GenServer
@@ -200,20 +239,23 @@ defmodule Alloy.Team do
   # ── Delegate (async reply) ──────────────────────────────────────────
 
   @impl GenServer
-  def handle_call({:delegate, name, message}, from, state) do
+  def handle_call({:delegate, name, message, timeout}, from, state) do
     case Map.get(state.agents, name) do
       nil ->
         {:reply, {:error, {:unknown_agent, name}}, state}
 
       pid ->
-        state = start_reply_task(state, from, fn -> Server.chat(pid, message) end)
+        state =
+          start_reply_task(state, from, fn -> Server.chat(pid, message, timeout: timeout) end)
+
         {:noreply, state}
     end
   end
 
   # ── Broadcast (async reply) ─────────────────────────────────────────
 
-  def handle_call({:broadcast, message}, from, state) do
+  @impl GenServer
+  def handle_call({:broadcast, message, timeout}, from, state) do
     agents_snapshot = state.agents
 
     if map_size(agents_snapshot) == 0 do
@@ -221,13 +263,33 @@ defmodule Alloy.Team do
     else
       state =
         start_reply_task(state, from, fn ->
-          agents_snapshot
+          agents_list = Map.to_list(agents_snapshot)
+
+          agents_list
           |> Task.async_stream(
-            fn {name, pid} -> {name, Server.chat(pid, message)} end,
-            ordered: false,
+            fn {name, pid} ->
+              result =
+                try do
+                  Server.chat(pid, message, timeout: timeout)
+                catch
+                  :exit, reason -> {:error, {:exit, reason}}
+                end
+
+              {name, result}
+            end,
+            ordered: true,
             timeout: :infinity
           )
-          |> Enum.into(%{}, fn {:ok, {name, result}} -> {name, result} end)
+          |> Enum.zip(agents_list)
+          |> Enum.reduce(%{}, fn
+            {{:ok, {name, result}}, _agent}, acc ->
+              Map.put(acc, name, result)
+
+            {{:exit, reason}, {name, _pid}}, acc ->
+              # Task was killed externally (:kill bypasses try/catch).
+              # By zipping with the original list, we recover the name and report it.
+              Map.put(acc, name, {:error, {:task_crashed, reason}})
+          end)
         end)
 
       {:noreply, state}
@@ -236,12 +298,13 @@ defmodule Alloy.Team do
 
   # ── Handoff (async reply) ───────────────────────────────────────────
 
-  def handle_call({:handoff, names, initial_message}, from, state) do
+  @impl GenServer
+  def handle_call({:handoff, names, initial_message, timeout}, from, state) do
     agents_snapshot = state.agents
 
     state =
       start_reply_task(state, from, fn ->
-        run_handoff(names, initial_message, agents_snapshot)
+        run_handoff(names, initial_message, agents_snapshot, timeout)
       end)
 
     {:noreply, state}
@@ -249,6 +312,7 @@ defmodule Alloy.Team do
 
   # ── Agent Management ────────────────────────────────────────────────
 
+  @impl GenServer
   def handle_call({:add_agent, name, opts}, _from, state) do
     if Map.has_key?(state.agents, name) do
       {:reply, {:error, :agent_already_exists}, state}
@@ -263,6 +327,7 @@ defmodule Alloy.Team do
     end
   end
 
+  @impl GenServer
   def handle_call({:remove_agent, name}, _from, state) do
     case Map.get(state.agents, name) do
       nil ->
@@ -287,21 +352,25 @@ defmodule Alloy.Team do
 
   # ── Introspection ──────────────────────────────────────────────────
 
+  @impl GenServer
   def handle_call(:agents, _from, state) do
     {:reply, Map.to_list(state.agents), state}
   end
 
+  @impl GenServer
   def handle_call({:get_agent, name}, _from, state) do
     {:reply, Map.get(state.agents, name), state}
   end
 
   # ── Shared Context ─────────────────────────────────────────────────
 
+  @impl GenServer
   def handle_call({:put_context, key, value}, _from, state) do
     new_context = Map.put(state.shared_context, key, value)
     {:reply, :ok, %{state | shared_context: new_context}}
   end
 
+  @impl GenServer
   def handle_call({:get_context, key, default}, _from, state) do
     {:reply, Map.get(state.shared_context, key, default), state}
   end
@@ -325,6 +394,7 @@ defmodule Alloy.Team do
 
   # ── Monitor Handling ───────────────────────────────────────────────
 
+  @impl GenServer
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     # Check if it's a pending reply task that crashed
     case Map.pop(state.pending_replies, ref) do
@@ -351,6 +421,7 @@ defmodule Alloy.Team do
     end
   end
 
+  @impl GenServer
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -380,7 +451,14 @@ defmodule Alloy.Team do
     }
   end
 
-  defp run_handoff(names, initial_message, agents) do
+  # Adds a 1-second coordination buffer to the outer GenServer.call timeout so
+  # that agent-level timeouts resolve before the caller's call times out. Returns
+  # the timeout unchanged for :infinity and 0 (explicit "fail immediately").
+  defp coordination_timeout(:infinity), do: :infinity
+  defp coordination_timeout(0), do: 0
+  defp coordination_timeout(timeout) when is_integer(timeout), do: timeout + 1_000
+
+  defp run_handoff(names, initial_message, agents, timeout) do
     initial = %{message: initial_message, result: nil}
 
     names
@@ -390,7 +468,7 @@ defmodule Alloy.Team do
           {:halt, {:error, {:unknown_agent, name}}}
 
         pid ->
-          case Server.chat(pid, acc.message) do
+          case Server.chat(pid, acc.message, timeout: timeout) do
             {:ok, result} ->
               next_message = result.text || "(no response)"
               {:cont, {:ok, %{message: next_message, result: result}}}

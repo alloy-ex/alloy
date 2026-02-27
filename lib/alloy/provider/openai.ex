@@ -139,21 +139,66 @@ defmodule Alloy.Provider.OpenAI do
     [msg]
   end
 
-  # User message with tool_result blocks -> separate role:"tool" messages
+  # User message with blocks. Two distinct cases:
+  #   1. Tool results (from the agent loop) -> separate role:"tool" wire messages
+  #   2. Media / text blocks (multimodal user turn) -> single user message with
+  #      an array content field (OpenAI's vision / audio format)
   defp format_message(%Message{role: :user, content: blocks}) when is_list(blocks) do
-    Enum.map(blocks, fn
-      %{type: "tool_result", tool_use_id: tool_call_id, content: content} ->
-        %{
-          "role" => "tool",
-          "tool_call_id" => tool_call_id,
-          "content" => content
-        }
+    if Enum.any?(blocks, &(&1[:type] == "tool_result")) do
+      blocks
+      |> Enum.map(fn
+        %{type: "tool_result", tool_use_id: tool_call_id, content: content} ->
+          %{"role" => "tool", "tool_call_id" => tool_call_id, "content" => content}
 
-      _other ->
-        nil
-    end)
-    |> Enum.reject(&is_nil/1)
+        _other ->
+          nil
+      end)
+      |> Enum.reject(&is_nil/1)
+    else
+      parts = blocks |> Enum.map(&format_user_content_block/1) |> Enum.reject(&is_nil/1)
+      [%{"role" => "user", "content" => parts}]
+    end
   end
+
+  defp format_user_content_block(%{type: "text", text: text}) do
+    %{"type" => "text", "text" => text}
+  end
+
+  defp format_user_content_block(%{type: "image", mime_type: mime_type, data: data}) do
+    %{"type" => "image_url", "image_url" => %{"url" => "data:#{mime_type};base64,#{data}"}}
+  end
+
+  defp format_user_content_block(%{type: "audio", mime_type: mime_type, data: data}) do
+    %{
+      "type" => "input_audio",
+      "input_audio" => %{"data" => data, "format" => mime_to_audio_format(mime_type)}
+    }
+  end
+
+  defp format_user_content_block(%{type: "video", mime_type: mime_type}) do
+    %{
+      "type" => "text",
+      "text" => "[Unsupported media type for OpenAI provider: video/#{mime_type}]"
+    }
+  end
+
+  defp format_user_content_block(%{type: "document", mime_type: mime_type}) do
+    %{
+      "type" => "text",
+      "text" => "[Unsupported media type for OpenAI provider: document/#{mime_type}]"
+    }
+  end
+
+  defp format_user_content_block(_block), do: nil
+
+  defp mime_to_audio_format("audio/mp3"), do: "mp3"
+  defp mime_to_audio_format("audio/mpeg"), do: "mp3"
+  defp mime_to_audio_format("audio/wav"), do: "wav"
+  defp mime_to_audio_format("audio/ogg"), do: "ogg"
+  defp mime_to_audio_format("audio/flac"), do: "flac"
+  defp mime_to_audio_format("audio/webm"), do: "webm"
+  # Generic fallback: take the subtype (e.g. "audio/x-m4a" -> "x-m4a")
+  defp mime_to_audio_format(mime), do: mime |> String.split("/") |> List.last()
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do
     %{

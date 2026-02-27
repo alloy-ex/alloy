@@ -95,14 +95,13 @@ defmodule Mix.Tasks.Alloy do
       system_prompt: system_prompt,
       max_turns: max_turns,
       working_directory: working_dir,
-      context_discovery: context_discovery,
-      streaming: streaming?
+      context_discovery: context_discovery
     ]
 
     if programmatic? do
       run_programmatic(opening_message, agent_opts, provider_name, model, tools)
     else
-      run_interactive(opening_message, agent_opts, provider_name, model, tools)
+      run_interactive(opening_message, agent_opts, provider_name, model, tools, streaming?)
     end
   end
 
@@ -136,7 +135,7 @@ defmodule Mix.Tasks.Alloy do
 
   # ── Interactive (REPL) ────────────────────────────────────────────────────
 
-  defp run_interactive(opening_message, agent_opts, provider_name, model, tools) do
+  defp run_interactive(opening_message, agent_opts, provider_name, model, tools, streaming?) do
     Mix.shell().info("[alloy] #{provider_name}/#{model}" <> tool_label(tools) <> " · interactive")
 
     skills = Alloy.Skill.discover()
@@ -151,13 +150,13 @@ defmodule Mix.Tasks.Alloy do
     {:ok, pid} = Alloy.Agent.Server.start_link(agent_opts)
 
     if opening_message != "" do
-      chat_and_print(pid, opening_message)
+      chat_and_print(pid, opening_message, streaming?)
     end
 
-    repl_loop(pid, skills)
+    repl_loop(pid, skills, streaming?)
   end
 
-  defp repl_loop(pid, skills) do
+  defp repl_loop(pid, skills, streaming?) do
     case IO.gets("You: ") do
       :eof ->
         Mix.shell().info("\nGoodbye!")
@@ -173,42 +172,42 @@ defmodule Mix.Tasks.Alloy do
             Mix.shell().info("Goodbye!")
 
           message == "" ->
-            repl_loop(pid, skills)
+            repl_loop(pid, skills, streaming?)
 
           # ── Built-in REPL commands (before skill handler) ──────────
           message == "/help" ->
             handle_help(skills)
-            repl_loop(pid, skills)
+            repl_loop(pid, skills, streaming?)
 
           message == "/usage" ->
             handle_usage(pid)
-            repl_loop(pid, skills)
+            repl_loop(pid, skills, streaming?)
 
           message == "/history" ->
             handle_history(pid)
-            repl_loop(pid, skills)
+            repl_loop(pid, skills, streaming?)
 
           message == "/reset" ->
             handle_reset(pid)
-            repl_loop(pid, skills)
+            repl_loop(pid, skills, streaming?)
 
           String.starts_with?(message, "/model") ->
             handle_model_command(pid, message)
-            repl_loop(pid, skills)
+            repl_loop(pid, skills, streaming?)
 
           # ── Skill commands ─────────────────────────────────────────
           String.starts_with?(message, "/") ->
-            handle_skill_command(pid, message, skills)
-            repl_loop(pid, skills)
+            handle_skill_command(pid, message, skills, streaming?)
+            repl_loop(pid, skills, streaming?)
 
           true ->
-            chat_and_print(pid, message)
-            repl_loop(pid, skills)
+            chat_and_print(pid, message, streaming?)
+            repl_loop(pid, skills, streaming?)
         end
     end
   end
 
-  defp handle_skill_command(pid, message, skills) do
+  defp handle_skill_command(pid, message, skills, streaming?) do
     [command | rest] = String.split(message, " ", parts: 2)
     skill_name = String.trim_leading(command, "/")
     input = List.first(rest, "")
@@ -224,7 +223,7 @@ defmodule Mix.Tasks.Alloy do
 
       skill ->
         expanded = Alloy.Skill.apply(skill, input)
-        chat_and_print(pid, expanded)
+        chat_and_print(pid, expanded, streaming?)
     end
   end
 
@@ -366,11 +365,7 @@ defmodule Mix.Tasks.Alloy do
     end
   end
 
-  defp chat_and_print(pid, message) do
-    # Check if the agent's config has streaming enabled
-    state = :sys.get_state(pid)
-    streaming? = state.config.streaming
-
+  defp chat_and_print(pid, message, streaming?) do
     if streaming? do
       IO.write("\nAlloy: ")
 

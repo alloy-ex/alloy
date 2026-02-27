@@ -133,6 +133,61 @@ defmodule Alloy.TeamTest do
       {:ok, team} = Team.start_link(agents: [])
       assert Team.broadcast(team, "Anyone?") == %{}
     end
+
+    test "includes error entry for crashed agent, does not drop it from result map" do
+      {:ok, team} =
+        Team.start_link(
+          agents: [
+            stable: agent_opts([TestProvider.text_response("Stable")]),
+            fragile: agent_opts([TestProvider.text_response("About to crash")])
+          ]
+        )
+
+      # Kill the fragile agent immediately before broadcast so it is still
+      # present in the agents snapshot (the :DOWN monitor message has not yet
+      # been processed by the Team GenServer) but the Server.chat call will fail.
+      fragile_pid = Team.get_agent(team, :fragile)
+      Process.exit(fragile_pid, :kill)
+
+      results = Team.broadcast(team, "Hello", timeout: 500)
+
+      # The stable agent should succeed
+      assert {:ok, stable_result} = results[:stable]
+      assert stable_result.text == "Stable"
+
+      # The fragile agent should appear in the result map with an error, not disappear
+      assert Map.has_key?(results, :fragile),
+             "broadcast should include an error entry for crashed agents, not drop them"
+
+      assert {:error, _reason} = results[:fragile]
+    end
+
+    test "broadcast preserves agent name in result map even when task is killed externally" do
+      {:ok, team} =
+        Team.start_link(
+          agents: [
+            stable: agent_opts([TestProvider.text_response("Stable")]),
+            fragile: agent_opts([TestProvider.text_response("About to crash")])
+          ]
+        )
+
+      # Kill fragile agent immediately — before broadcast — so it is still in
+      # the agents snapshot (the :DOWN monitor has not yet been processed), but
+      # the Server.chat call inside the stream task will exit with :killed.
+      # This exercises the {:exit, reason} arm of the zip-reduce, where the
+      # name must be recovered from the original agents_list via Enum.zip/2.
+      fragile_pid = Team.get_agent(team, :fragile)
+      Process.exit(fragile_pid, :kill)
+
+      results = Team.broadcast(team, "Hello", timeout: 500)
+
+      assert {:ok, _} = results[:stable]
+
+      assert Map.has_key?(results, :fragile),
+             "broadcast must include :fragile in result map even after crash"
+
+      assert {:error, _reason} = results[:fragile]
+    end
   end
 
   # ── handoff/3 ─────────────────────────────────────────────────────────
@@ -150,6 +205,12 @@ defmodule Alloy.TeamTest do
       assert {:ok, result} = Team.handoff(team, [:step1, :step2], "Start")
       # Result is from the last agent in the chain
       assert result.text == "Step 2 finalized"
+    end
+
+    test "empty agent_names list returns {:ok, nil} without timing out" do
+      {:ok, team} = Team.start_link(agents: [])
+
+      assert {:ok, nil} = Team.handoff(team, [], "hello")
     end
 
     test "stops chain on error and returns it" do
@@ -330,6 +391,77 @@ defmodule Alloy.TeamTest do
 
       assert Team.get_context(team, :project) == "alloy"
       assert Team.get_context(team, :version) == "0.2"
+    end
+  end
+
+  # ── delegate/4 with timeout option ───────────────────────────────────
+
+  describe "delegate/4 with timeout option" do
+    test "uses default timeout when not specified" do
+      {:ok, team} =
+        Team.start_link(agents: [greeter: agent_opts([TestProvider.text_response("Hello!")])])
+
+      assert {:ok, result} = Team.delegate(team, :greeter, "Hi")
+      assert result.text == "Hello!"
+    end
+
+    test "timeout: 0ms exits immediately" do
+      {:ok, team} =
+        Team.start_link(agents: [greeter: agent_opts([TestProvider.text_response("Hello!")])])
+
+      assert catch_exit(Team.delegate(team, :greeter, "Hi", timeout: 0)) != nil
+    end
+  end
+
+  # ── broadcast/3 with timeout option ──────────────────────────────────
+
+  describe "broadcast/3 with timeout option" do
+    test "uses default timeout when not specified" do
+      {:ok, team} =
+        Team.start_link(
+          agents: [
+            alice: agent_opts([TestProvider.text_response("Alice here")]),
+            bob: agent_opts([TestProvider.text_response("Bob here")])
+          ]
+        )
+
+      results = Team.broadcast(team, "Roll call!")
+      assert map_size(results) == 2
+    end
+
+    test "timeout: 0ms exits immediately" do
+      {:ok, team} =
+        Team.start_link(agents: [worker: agent_opts([TestProvider.text_response("Hi")])])
+
+      assert catch_exit(Team.broadcast(team, "Hello", timeout: 0)) != nil
+    end
+  end
+
+  # ── handoff/4 with timeout option ────────────────────────────────────
+
+  describe "handoff/4 with timeout option" do
+    test "uses default timeout when not specified" do
+      {:ok, team} =
+        Team.start_link(
+          agents: [
+            step1: agent_opts([TestProvider.text_response("Step 1 done")]),
+            step2: agent_opts([TestProvider.text_response("Step 2 done")])
+          ]
+        )
+
+      assert {:ok, result} = Team.handoff(team, [:step1, :step2], "Start")
+      assert result.text == "Step 2 done"
+    end
+
+    test "timeout: 0ms exits immediately" do
+      {:ok, team} =
+        Team.start_link(
+          agents: [
+            step1: agent_opts([TestProvider.text_response("Step 1 done")])
+          ]
+        )
+
+      assert catch_exit(Team.handoff(team, [:step1], "Start", timeout: 0)) != nil
     end
   end
 

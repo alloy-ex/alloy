@@ -52,6 +52,13 @@ defmodule Alloy.Context.TokenCounter do
     end)
   end
 
+  # Fixed heuristics for media types. These are intentionally conservative
+  # rough estimates — the compactor uses them as a budget signal, not for billing.
+  @image_tokens 1_000
+  @audio_tokens 500
+  @video_tokens 2_000
+  @document_tokens 3_000
+
   defp estimate_block_tokens(%{type: "text", text: text}) when is_binary(text) do
     estimate_tokens(text)
   end
@@ -65,6 +72,11 @@ defmodule Alloy.Context.TokenCounter do
   defp estimate_block_tokens(%{type: "tool_result", content: content}) when is_binary(content) do
     estimate_tokens(content)
   end
+
+  defp estimate_block_tokens(%{type: "image"}), do: @image_tokens
+  defp estimate_block_tokens(%{type: "audio"}), do: @audio_tokens
+  defp estimate_block_tokens(%{type: "video"}), do: @video_tokens
+  defp estimate_block_tokens(%{type: "document"}), do: @document_tokens
 
   defp estimate_block_tokens(_block), do: 0
 

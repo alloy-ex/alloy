@@ -8,9 +8,19 @@ defmodule Alloy.Message do
 
   ## Content Block Types
 
+  ### Text and tool blocks
   - `%{type: "text", text: "..."}` - Plain text
   - `%{type: "tool_use", id: "...", name: "...", input: %{}}` - Tool call from assistant
   - `%{type: "tool_result", tool_use_id: "...", content: "..."}` - Tool execution result
+
+  ### Media blocks (pass-through — providers map these to their wire format)
+  - `%{type: "image", mime_type: "image/jpeg", data: "base64..."}` - Inline image
+  - `%{type: "audio", mime_type: "audio/mp3", data: "base64..."}` - Inline audio
+  - `%{type: "video", mime_type: "video/mp4", data: "base64..."}` - Inline video
+  - `%{type: "document", mime_type: "application/pdf", uri: "..."}` - URI-referenced document
+
+  Alloy Core does not read, transcode, or base64-encode media. It expects callers
+  (e.g. Anvil connectors) to supply pre-encoded data or provider-specific URIs.
   """
 
   @type role :: :user | :assistant
@@ -91,4 +101,40 @@ defmodule Alloy.Message do
     result = %{type: "tool_result", tool_use_id: tool_use_id, content: content}
     if is_error, do: Map.put(result, :is_error, true), else: result
   end
+
+  @doc """
+  Creates an inline image content block.
+
+  `mime_type` should be one of `"image/jpeg"`, `"image/png"`, `"image/gif"`,
+  `"image/webp"`. `data` must be a base64-encoded string of the raw image bytes.
+  """
+  @spec image(String.t(), String.t()) :: content_block()
+  def image(mime_type, data), do: %{type: "image", mime_type: mime_type, data: data}
+
+  @doc """
+  Creates an inline audio content block.
+
+  `mime_type` is typically `"audio/mp3"`, `"audio/wav"`, `"audio/ogg"`, etc.
+  `data` must be a base64-encoded string of the raw audio bytes.
+  """
+  @spec audio(String.t(), String.t()) :: content_block()
+  def audio(mime_type, data), do: %{type: "audio", mime_type: mime_type, data: data}
+
+  @doc """
+  Creates an inline video content block.
+
+  `mime_type` is typically `"video/mp4"`, `"video/webm"`, etc.
+  `data` must be a base64-encoded string of the raw video bytes.
+  """
+  @spec video(String.t(), String.t()) :: content_block()
+  def video(mime_type, data), do: %{type: "video", mime_type: mime_type, data: data}
+
+  @doc """
+  Creates a URI-referenced document content block.
+
+  Used with provider APIs that require pre-uploaded files (e.g. Google File API).
+  `uri` is the provider-specific URI returned after uploading the file.
+  """
+  @spec document(String.t(), String.t()) :: content_block()
+  def document(mime_type, uri), do: %{type: "document", mime_type: mime_type, uri: uri}
 end

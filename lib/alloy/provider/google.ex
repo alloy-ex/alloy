@@ -130,37 +130,54 @@ defmodule Alloy.Provider.Google do
     [%{"role" => "model", "parts" => [%{"text" => content}]}]
   end
 
-  # Assistant message with content blocks (may contain tool_use)
-  defp format_message(%Message{role: :assistant, content: blocks}, _name_map)
+  # Assistant message with content blocks (may contain tool_use or media)
+  defp format_message(%Message{role: :assistant, content: blocks}, name_map)
        when is_list(blocks) do
-    parts =
-      Enum.map(blocks, fn
-        %{type: "text", text: text} ->
-          %{"text" => text}
-
-        %{type: "tool_use", name: name, input: input} ->
-          %{"functionCall" => %{"name" => name, "args" => input}}
-      end)
-
+    parts = Enum.map(blocks, &format_part(&1, name_map))
     [%{"role" => "model", "parts" => parts}]
   end
 
-  # User message with tool_result blocks -> functionResponse parts
+  # User message with blocks (tool_results, media, or mixed text+media)
   defp format_message(%Message{role: :user, content: blocks}, name_map) when is_list(blocks) do
-    parts =
-      Enum.map(blocks, fn
-        %{type: "tool_result", tool_use_id: tool_use_id, content: content} ->
-          name = Map.get(name_map, tool_use_id, tool_use_id)
-
-          %{
-            "functionResponse" => %{
-              "name" => name,
-              "response" => %{"content" => content}
-            }
-          }
-      end)
-
+    parts = Enum.map(blocks, &format_part(&1, name_map))
     [%{"role" => "user", "parts" => parts}]
+  end
+
+  # --- Content block -> Google part mapping ---
+
+  defp format_part(%{type: "text", text: text}, _name_map) do
+    %{"text" => text}
+  end
+
+  defp format_part(%{type: "tool_use", name: name, input: input}, _name_map) do
+    %{"functionCall" => %{"name" => name, "args" => input}}
+  end
+
+  defp format_part(%{type: "tool_result", tool_use_id: tool_use_id, content: content}, name_map) do
+    name = Map.get(name_map, tool_use_id, tool_use_id)
+
+    %{
+      "functionResponse" => %{
+        "name" => name,
+        "response" => %{"content" => content}
+      }
+    }
+  end
+
+  # Image, audio, and video all use inlineData (base64 payload)
+  defp format_part(%{type: type, mime_type: mime_type, data: data}, _name_map)
+       when type in ["image", "audio", "video"] do
+    %{"inlineData" => %{"mimeType" => mime_type, "data" => data}}
+  end
+
+  # Documents reference a pre-uploaded file by URI (Google File API)
+  defp format_part(%{type: "document", mime_type: mime_type, uri: uri}, _name_map) do
+    %{"fileData" => %{"mimeType" => mime_type, "fileUri" => uri}}
+  end
+
+  # Catch-all: unknown or malformed block types become a text notice instead of crashing
+  defp format_part(block, _name_map) do
+    %{"text" => "[Unhandled block type: #{inspect(block[:type])}]"}
   end
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do

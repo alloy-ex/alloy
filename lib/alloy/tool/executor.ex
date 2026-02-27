@@ -17,37 +17,57 @@ defmodule Alloy.Tool.Executor do
 
   Runs `:before_tool_call` middleware before each tool. If middleware
   returns `{:block, reason}`, that tool's result is an error block and
-  the tool is not executed.
+  the tool is not executed. If middleware returns `{:halt, reason}`,
+  the entire execute_all call returns `{:halted, reason}` immediately
+  without executing any tools.
   """
-  @spec execute_all([map()], %{String.t() => module()}, State.t()) :: Message.t()
+  @spec execute_all([map()], %{String.t() => module()}, State.t()) ::
+          Message.t() | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state) do
     context = build_context(state)
 
-    # Check middleware before execution — tag each call
-    tagged =
-      Enum.map(tool_calls, fn call ->
+    # Check middleware before execution — short-circuit on halt
+    case tag_tool_calls(state, tool_calls) do
+      {:halted, reason} ->
+        {:halted, reason}
+
+      {:ok, tagged} ->
+        results =
+          tagged
+          |> Task.async_stream(
+            fn
+              {:execute, call} -> execute_one(call, tool_fns, context)
+              {:blocked, call, reason} -> error_result(call[:id], "Blocked: #{reason}")
+            end,
+            timeout: 120_000,
+            ordered: true
+          )
+          |> Enum.map(fn
+            {:ok, result} ->
+              result
+
+            {:exit, reason} ->
+              error_result("unknown", "Tool execution crashed: #{inspect(reason)}")
+          end)
+
+        Message.tool_results(results)
+    end
+  end
+
+  defp tag_tool_calls(state, tool_calls) do
+    result =
+      Enum.reduce_while(tool_calls, {:ok, []}, fn call, {:ok, acc} ->
         case Middleware.run_before_tool_call(state, call) do
-          :ok -> {:execute, call}
-          {:block, reason} -> {:blocked, call, reason}
+          :ok -> {:cont, {:ok, [{:execute, call} | acc]}}
+          {:block, reason} -> {:cont, {:ok, [{:blocked, call, reason} | acc]}}
+          {:halted, reason} -> {:halt, {:halted, reason}}
         end
       end)
 
-    results =
-      tagged
-      |> Task.async_stream(
-        fn
-          {:execute, call} -> execute_one(call, tool_fns, context)
-          {:blocked, call, reason} -> error_result(call[:id], "Blocked: #{reason}")
-        end,
-        timeout: 120_000,
-        ordered: true
-      )
-      |> Enum.map(fn
-        {:ok, result} -> result
-        {:exit, reason} -> error_result("unknown", "Tool execution crashed: #{inspect(reason)}")
-      end)
-
-    Message.tool_results(results)
+    case result do
+      {:ok, tagged} -> {:ok, Enum.reverse(tagged)}
+      {:halted, _} = halted -> halted
+    end
   end
 
   defp execute_one(call, tool_fns, context) do

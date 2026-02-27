@@ -38,9 +38,10 @@ defmodule Alloy.Agent.Server do
   """
 
   use GenServer
+  require Logger
 
   alias Alloy.Agent.{Config, State, Turn}
-  alias Alloy.{Message, Middleware, Usage}
+  alias Alloy.{Message, Middleware, Session, Usage}
 
   @type result :: %{
           text: String.t() | nil,
@@ -67,10 +68,16 @@ defmodule Alloy.Agent.Server do
 
   Blocks until the model reaches `end_turn` (including all tool calls).
   Conversation history is preserved for subsequent calls.
+
+  ## Options
+
+    - `:timeout` - Milliseconds to wait before raising a timeout exit. Defaults
+      to `120_000` (2 minutes). Use `:infinity` to wait forever.
   """
-  @spec chat(GenServer.server(), String.t()) :: {:ok, result()} | {:error, result()}
-  def chat(server, message) when is_binary(message) do
-    GenServer.call(server, {:chat, message}, :infinity)
+  @spec chat(GenServer.server(), String.t(), keyword()) :: {:ok, result()} | {:error, result()}
+  def chat(server, message, opts \\ []) when is_binary(message) do
+    timeout = Keyword.get(opts, :timeout, 120_000)
+    GenServer.call(server, {:chat, message}, timeout)
   end
 
   @doc """
@@ -116,13 +123,19 @@ defmodule Alloy.Agent.Server do
 
   @doc """
   Send a message with streaming. Calls `on_chunk` for each text delta.
-  Returns the same result shape as `chat/2`.
+  Returns the same result shape as `chat/3`.
+
+  ## Options
+
+    - `:timeout` - Milliseconds to wait before raising a timeout exit. Defaults
+      to `120_000` (2 minutes). Use `:infinity` to wait forever.
   """
-  @spec stream_chat(GenServer.server(), String.t(), (String.t() -> :ok)) ::
+  @spec stream_chat(GenServer.server(), String.t(), (String.t() -> :ok), keyword()) ::
           {:ok, result()} | {:error, result()}
-  def stream_chat(server, message, on_chunk)
+  def stream_chat(server, message, on_chunk, opts \\ [])
       when is_binary(message) and is_function(on_chunk, 1) do
-    GenServer.call(server, {:stream_chat, message, on_chunk}, :infinity)
+    timeout = Keyword.get(opts, :timeout, 120_000)
+    GenServer.call(server, {:stream_chat, message, on_chunk}, timeout)
   end
 
   @doc """
@@ -133,19 +146,89 @@ defmodule Alloy.Agent.Server do
     GenServer.stop(server)
   end
 
+  @doc """
+  Export the current conversation as a serializable Session struct.
+  """
+  @spec export_session(GenServer.server()) :: Session.t()
+  def export_session(server) do
+    GenServer.call(server, :export_session)
+  end
+
+  @doc """
+  Returns a health summary map for the agent process.
+  """
+  @spec health(GenServer.server()) :: map()
+  def health(server) do
+    GenServer.call(server, :health, 5_000)
+  end
+
   # ── Server Callbacks ──────────────────────────────────────────────────────
 
   @impl GenServer
   def init(opts) do
+    Process.flag(:trap_exit, true)
     config = Config.from_opts(opts)
     state = State.init(config, Keyword.get(opts, :messages, []))
-    state = Middleware.run(:session_start, state)
-    {:ok, state}
+
+    case Middleware.run(:session_start, state) do
+      {:halted, reason} ->
+        {:stop, {:middleware_halted, reason}}
+
+      %State{} = state ->
+        # Subscribe to PubSub topics if configured.
+        # Use state.config (post-middleware) so session_start middleware can update
+        # pubsub/subscribe fields and have them reflected in actual subscriptions.
+        if state.config.pubsub do
+          unless Code.ensure_loaded?(Phoenix.PubSub) do
+            raise ArgumentError,
+                  "Alloy: pubsub: is configured but :phoenix_pubsub is not available. " <>
+                    "Add {:phoenix_pubsub, \">= 0.0.0\"} to your mix.exs dependencies."
+          end
+
+          for topic <- state.config.subscribe do
+            case Phoenix.PubSub.subscribe(state.config.pubsub, topic) do
+              :ok ->
+                :ok
+
+              {:error, reason} ->
+                Logger.warning(
+                  "Alloy: failed to subscribe to PubSub topic #{inspect(topic)}: #{inspect(reason)}"
+                )
+            end
+          end
+        end
+
+        {:ok, state}
+    end
   end
 
   @impl GenServer
   def terminate(_reason, state) do
-    Middleware.run(:session_end, state)
+    state =
+      case Middleware.run(:session_end, state) do
+        {:halted, reason} ->
+          Logger.warning(
+            "Alloy: :session_end middleware halted during shutdown (#{inspect(reason)})"
+          )
+
+          state
+
+        %State{} = new_state ->
+          new_state
+      end
+
+    if state.config.on_shutdown do
+      session = build_export_session(state)
+
+      try do
+        state.config.on_shutdown.(session)
+      rescue
+        _ -> :ok
+      catch
+        _, _ -> :ok
+      end
+    end
+
     :ok
   end
 
@@ -165,38 +248,26 @@ defmodule Alloy.Agent.Server do
     new_state = reset_for_new_run(final_state)
 
     case final_state.status do
-      :error -> {:reply, {:error, result}, new_state}
+      status when status in [:error, :halted] -> {:reply, {:error, result}, new_state}
       _ -> {:reply, {:ok, result}, new_state}
     end
   end
 
   @impl GenServer
   def handle_call({:stream_chat, message, on_chunk}, _from, state) do
-    # Temporarily enable streaming and inject on_chunk into context
-    original_config = state.config
-
-    streaming_config = %{
-      original_config
-      | streaming: true,
-        context: Map.put(original_config.context, :on_chunk, on_chunk)
-    }
-
     state =
-      %{state | config: streaming_config}
+      state
       |> State.append_messages([Message.user(message)])
       |> reset_for_new_run()
 
-    final_state = Turn.run_loop(state)
+    # Pass streaming as opts — no config mutation needed
+    final_state = Turn.run_loop(state, streaming: true, on_chunk: on_chunk)
 
     result = build_result(final_state)
-
-    # Restore original config so streaming doesn't persist
-    new_state =
-      %{final_state | config: original_config}
-      |> reset_for_new_run()
+    new_state = reset_for_new_run(final_state)
 
     case final_state.status do
-      :error -> {:reply, {:error, result}, new_state}
+      status when status in [:error, :halted] -> {:reply, {:error, result}, new_state}
       _ -> {:reply, {:ok, result}, new_state}
     end
   end
@@ -229,6 +300,69 @@ defmodule Alloy.Agent.Server do
     {:reply, :ok, %{state | config: updated_config}}
   end
 
+  @impl GenServer
+  def handle_call(:export_session, _from, state) do
+    {:reply, build_export_session(state), state}
+  end
+
+  @impl GenServer
+  def handle_call(:health, _from, state) do
+    {:reply,
+     %{
+       status: state.status,
+       turns: state.turn,
+       message_count: length(state.messages),
+       usage: state.usage,
+       uptime_ms: System.monotonic_time(:millisecond) - (state.started_at || 0)
+     }, state}
+  end
+
+  @impl GenServer
+  def handle_info({:agent_event, message}, state) when is_binary(message) do
+    state =
+      state
+      |> State.append_messages([Message.user(message)])
+      |> reset_for_new_run()
+
+    final_state = Turn.run_loop(state)
+
+    # Broadcast result if pubsub is configured.
+    # Use effective_session_id/1 so the topic matches what export_session/1
+    # returns as the session ID — a :session_start middleware that injects
+    # context[:session_id] would otherwise cause the broadcast topic to
+    # diverge from the exported session ID, dropping messages for subscribers
+    # that subscribe using the session ID.
+    if state.config.pubsub do
+      topic = "agent:#{effective_session_id(final_state)}:responses"
+
+      Phoenix.PubSub.broadcast(
+        state.config.pubsub,
+        topic,
+        {:agent_response, build_result(final_state)}
+      )
+    end
+
+    new_state = reset_for_new_run(final_state)
+    {:noreply, new_state}
+  end
+
+  @impl GenServer
+  def handle_info({:EXIT, _pid, :normal}, state) do
+    # Normal exits from linked helpers (e.g., the process that called start_link)
+    # are expected and should not stop the agent.
+    {:noreply, state}
+  end
+
+  @impl GenServer
+  def handle_info({:EXIT, _pid, reason}, state) do
+    {:stop, reason, state}
+  end
+
+  @impl GenServer
+  def handle_info(_msg, state) do
+    {:noreply, state}
+  end
+
   # ── Private ───────────────────────────────────────────────────────────────
 
   defp reset_for_new_run(state) do
@@ -244,5 +378,29 @@ defmodule Alloy.Agent.Server do
       turns: state.turn,
       error: state.error
     }
+  end
+
+  # Returns the canonical "effective session ID" used consistently for both
+  # PubSub broadcast topics and the exported Session.id.
+  #
+  # Precedence: context[:session_id] (set by middleware) > state.agent_id (stable UUID).
+  # Using this helper in both handle_info({:agent_event, ...}) and
+  # build_export_session/1 guarantees that subscribers using the exported
+  # session ID always receive events on the correct topic.
+  defp effective_session_id(%State{} = state) do
+    Map.get(state.config.context, :session_id) || state.agent_id
+  end
+
+  defp build_export_session(%State{} = state) do
+    Session.new(
+      id: effective_session_id(state),
+      messages: state.messages,
+      usage: state.usage,
+      metadata: %{
+        status: state.status,
+        turns: state.turn,
+        provider: state.config.provider
+      }
+    )
   end
 end

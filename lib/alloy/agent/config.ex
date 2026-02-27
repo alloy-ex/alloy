@@ -13,11 +13,15 @@ defmodule Alloy.Agent.Config do
           system_prompt: String.t() | nil,
           max_turns: pos_integer(),
           max_tokens: pos_integer(),
+          max_retries: non_neg_integer(),
+          retry_backoff_ms: pos_integer(),
           middleware: [module()],
           working_directory: String.t(),
           context: map(),
           context_discovery: boolean(),
-          streaming: boolean()
+          on_shutdown: (Alloy.Session.t() -> any()) | nil,
+          pubsub: module() | nil,
+          subscribe: [String.t()]
         }
 
   @enforce_keys [:provider, :provider_config]
@@ -28,11 +32,15 @@ defmodule Alloy.Agent.Config do
     system_prompt: nil,
     max_turns: 25,
     max_tokens: 200_000,
+    max_retries: 3,
+    retry_backoff_ms: 1_000,
     middleware: [],
     working_directory: ".",
     context: %{},
     context_discovery: false,
-    streaming: false
+    on_shutdown: nil,
+    pubsub: nil,
+    subscribe: []
   ]
 
   @doc """
@@ -66,11 +74,15 @@ defmodule Alloy.Agent.Config do
       system_prompt: system_prompt,
       max_turns: Keyword.get(opts, :max_turns, 25),
       max_tokens: Keyword.get(opts, :max_tokens, 200_000),
+      max_retries: Keyword.get(opts, :max_retries, 3),
+      retry_backoff_ms: Keyword.get(opts, :retry_backoff_ms, 1_000),
       middleware: Keyword.get(opts, :middleware, []),
       working_directory: working_directory,
       context: context,
       context_discovery: context_discovery,
-      streaming: Keyword.get(opts, :streaming, false)
+      on_shutdown: Keyword.get(opts, :on_shutdown, nil),
+      pubsub: Keyword.get(opts, :pubsub, nil),
+      subscribe: Keyword.get(opts, :subscribe, [])
     }
   end
 
