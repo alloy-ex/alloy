@@ -34,7 +34,9 @@ defmodule Alloy.Agent.Turn do
   def run_loop(%State{} = state, opts \\ []) do
     # Compute a hard deadline ONCE for the entire loop, leaving headroom
     # so the retry logic never overshoots the caller-side timeout.
-    deadline = System.monotonic_time(:millisecond) + state.config.timeout_ms - @deadline_headroom_ms
+    deadline =
+      System.monotonic_time(:millisecond) + state.config.timeout_ms - @deadline_headroom_ms
+
     do_turn(state, opts, deadline)
   end
 
@@ -62,7 +64,14 @@ defmodule Alloy.Agent.Turn do
         on_chunk = Keyword.get(opts, :on_chunk, fn _chunk -> :ok end)
 
         result =
-          call_provider_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline)
+          call_provider_with_retry(
+            state,
+            provider,
+            provider_config,
+            streaming?,
+            on_chunk,
+            deadline
+          )
 
         case result do
           {:ok, %{stop_reason: :tool_use, messages: new_msgs, usage: usage}} ->

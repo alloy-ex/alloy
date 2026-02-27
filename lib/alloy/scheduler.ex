@@ -207,7 +207,9 @@ defmodule Alloy.Scheduler do
           callback = (job && job[:on_result]) || (&default_on_result/1)
           callback.(result)
         else
-          Logger.warning("Alloy.Scheduler: discarding stale result for #{name} (gen #{gen} != #{current_gen})")
+          Logger.warning(
+            "Alloy.Scheduler: discarding stale result for #{name} (gen #{gen} != #{current_gen})"
+          )
         end
 
         state = %{state | running: MapSet.delete(state.running, name), task_refs: task_refs}
