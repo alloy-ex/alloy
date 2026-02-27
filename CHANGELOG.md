@@ -47,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Server.handle_call(:chat/:stream_chat)` treated `:halted` status as success — now returns `{:error, result}`
 - `Bash` tool missing `{:exit, reason}` clause in `Task.yield` result handling
 - `Usage.estimate_cost/3` used float arithmetic causing accumulation errors — converted to integer math
+- `Turn.run_loop/2` streaming fallback — `function_exported?/3` returned `false` for unloaded provider modules, silently falling back to non-streaming `complete/3`. Fixed with `Code.ensure_loaded/1` before the capability check.
 
 ## [0.3.0] - 2026-02-26
 
