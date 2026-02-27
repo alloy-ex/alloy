@@ -47,14 +47,13 @@ defmodule Alloy.Provider.Ollama do
       end
 
     req_opts =
-      [
-        url: "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions",
-        method: :post,
-        headers: headers,
-        body: Jason.encode!(body),
-        retry: :transient,
-        max_retries: 3
-      ] ++ Map.get(config, :req_options, [])
+      ([
+         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions",
+         method: :post,
+         headers: headers,
+         body: Jason.encode!(body)
+       ] ++ Map.get(config, :req_options, []))
+      |> Keyword.put(:retry, false)
 
     case Req.request(req_opts) do
       {:ok, %{status: 200, body: resp_body}} ->

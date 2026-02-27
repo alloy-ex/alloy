@@ -42,18 +42,17 @@ defmodule Alloy.Provider.Anthropic do
     body = build_request_body(messages, tool_defs, config)
 
     req_opts =
-      [
-        url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
-        method: :post,
-        headers: [
-          {"x-api-key", config.api_key},
-          {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
-          {"content-type", "application/json"}
-        ],
-        body: Jason.encode!(body),
-        retry: :transient,
-        max_retries: 3
-      ] ++ Map.get(config, :req_options, [])
+      ([
+         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
+         method: :post,
+         headers: [
+           {"x-api-key", config.api_key},
+           {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
+           {"content-type", "application/json"}
+         ],
+         body: Jason.encode!(body)
+       ] ++ Map.get(config, :req_options, []))
+      |> Keyword.put(:retry, false)
 
     case Req.request(req_opts) do
       {:ok, %{status: 200, body: resp_body}} ->
@@ -100,19 +99,18 @@ defmodule Alloy.Provider.Anthropic do
     end
 
     req_opts =
-      [
-        url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
-        method: :post,
-        headers: [
-          {"x-api-key", config.api_key},
-          {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
-          {"content-type", "application/json"}
-        ],
-        body: Jason.encode!(body),
-        into: stream_handler,
-        retry: :transient,
-        max_retries: 3
-      ] ++ Map.get(config, :req_options, [])
+      ([
+         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
+         method: :post,
+         headers: [
+           {"x-api-key", config.api_key},
+           {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
+           {"content-type", "application/json"}
+         ],
+         body: Jason.encode!(body),
+         into: stream_handler
+       ] ++ Map.get(config, :req_options, []))
+      |> Keyword.put(:retry, false)
 
     case Req.request(req_opts) do
       {:ok, %{status: 200} = resp} ->

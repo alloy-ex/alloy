@@ -156,8 +156,38 @@ defmodule Mix.Tasks.Alloy do
     repl_loop(pid, skills, streaming?)
   end
 
-  defp repl_loop(pid, skills, streaming?) do
+  # Reads one or more lines of input. When text is pasted, multiple lines
+  # arrive in the IO buffer at once. We drain any buffered lines within 50ms
+  # of the first line so that pasted multi-line text arrives as one message.
+  defp read_multiline_input do
     case IO.gets("You: ") do
+      :eof -> :eof
+      {:error, _} = err -> err
+      first_line -> first_line <> drain_buffered_lines(50)
+    end
+  end
+
+  defp drain_buffered_lines(timeout_ms) do
+    task = Task.async(fn -> IO.gets("") end)
+
+    case Task.yield(task, timeout_ms) do
+      {:ok, :eof} ->
+        ""
+
+      {:ok, {:error, _}} ->
+        ""
+
+      {:ok, line} when is_binary(line) ->
+        line <> drain_buffered_lines(timeout_ms)
+
+      nil ->
+        Task.shutdown(task, :brutal_kill)
+        ""
+    end
+  end
+
+  defp repl_loop(pid, skills, streaming?) do
+    case read_multiline_input() do
       :eof ->
         Mix.shell().info("\nGoodbye!")
 

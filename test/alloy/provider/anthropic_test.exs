@@ -284,29 +284,31 @@ defmodule Alloy.Provider.AnthropicTest do
   end
 
   describe "complete/3 retry behavior" do
-    test "retries on 429 rate limit and eventually succeeds" do
+    test "returns error on 429 (retry is handled by Turn, not the provider)" do
+      # Req retry is disabled — providers return errors immediately for Turn to retry.
+      Req.Test.stub(__MODULE__, fn conn ->
+        Plug.Conn.send_resp(conn, 429, "Too Many Requests")
+      end)
+
+      config = %{
+        api_key: "sk-ant-test-key",
+        model: "claude-sonnet-4-6-20250514",
+        max_tokens: 4096,
+        req_options: [plug: {Req.Test, __MODULE__}]
+      }
+
+      assert {:error, "HTTP 429: Too Many Requests"} =
+               Anthropic.complete([Message.user("Hi")], [], config)
+    end
+
+    test "req_options cannot re-enable Req retry (retry: false is enforced)" do
+      # A caller might pass retry: :transient in req_options. This must NOT
+      # re-enable Req's built-in retry, because Turn handles all retry logic.
       calls = :counters.new(1, [:atomics])
 
       Req.Test.stub(__MODULE__, fn conn ->
-        n = :counters.get(calls, 1)
         :counters.add(calls, 1, 1)
-
-        if n == 0 do
-          Plug.Conn.send_resp(conn, 429, "Too Many Requests")
-        else
-          Plug.Conn.send_resp(
-            conn,
-            200,
-            Jason.encode!(%{
-              "id" => "msg_retry",
-              "type" => "message",
-              "role" => "assistant",
-              "content" => [%{"type" => "text", "text" => "Hello after retry!"}],
-              "stop_reason" => "end_turn",
-              "usage" => %{"input_tokens" => 5, "output_tokens" => 5}
-            })
-          )
-        end
+        Plug.Conn.send_resp(conn, 429, "Too Many Requests")
       end)
 
       config = %{
@@ -315,13 +317,17 @@ defmodule Alloy.Provider.AnthropicTest do
         max_tokens: 4096,
         req_options: [
           plug: {Req.Test, __MODULE__},
+          retry: :transient,
           retry_delay: 1
         ]
       }
 
-      assert {:ok, result} = Anthropic.complete([Message.user("Hi")], [], config)
-      assert result.stop_reason == :end_turn
-      assert :counters.get(calls, 1) == 2
+      assert {:error, "HTTP 429: Too Many Requests"} =
+               Anthropic.complete([Message.user("Hi")], [], config)
+
+      # Must have been called exactly once — no Req retry
+      assert :counters.get(calls, 1) == 1,
+             "Expected 1 call but got #{:counters.get(calls, 1)} — Req retry was not disabled"
     end
   end
 

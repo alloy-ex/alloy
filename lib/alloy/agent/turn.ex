@@ -14,6 +14,11 @@ defmodule Alloy.Agent.Turn do
   alias Alloy.Context.Compactor
   alias Alloy.Tool.Executor
 
+  # Buffer subtracted from timeout_ms when computing the retry deadline.
+  # Ensures the retry loop finishes before the caller-side timeout fires.
+  # Note: timeout_ms values <= this constant effectively disable retries.
+  @deadline_headroom_ms 5_000
+
   @doc """
   Run the agent loop until completion, error, or max turns.
 
@@ -27,14 +32,18 @@ defmodule Alloy.Agent.Turn do
   """
   @spec run_loop(State.t(), keyword()) :: State.t()
   def run_loop(%State{} = state, opts \\ []) do
-    do_turn(state, opts)
+    # Compute a hard deadline ONCE for the entire loop, leaving headroom
+    # so the retry logic never overshoots the caller-side timeout.
+    deadline = System.monotonic_time(:millisecond) + state.config.timeout_ms - @deadline_headroom_ms
+    do_turn(state, opts, deadline)
   end
 
-  defp do_turn(%State{turn: turn, config: config} = state, _opts) when turn >= config.max_turns do
+  defp do_turn(%State{turn: turn, config: config} = state, _opts, _deadline)
+       when turn >= config.max_turns do
     %{state | status: :max_turns}
   end
 
-  defp do_turn(%State{} = state, opts) do
+  defp do_turn(%State{} = state, opts, deadline) do
     state = Compactor.maybe_compact(state)
 
     case Middleware.run(:before_completion, state) do
@@ -52,7 +61,8 @@ defmodule Alloy.Agent.Turn do
 
         on_chunk = Keyword.get(opts, :on_chunk, fn _chunk -> :ok end)
 
-        result = call_provider_with_retry(state, provider, provider_config, streaming?, on_chunk)
+        result =
+          call_provider_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline)
 
         case result do
           {:ok, %{stop_reason: :tool_use, messages: new_msgs, usage: usage}} ->
@@ -62,7 +72,7 @@ defmodule Alloy.Agent.Turn do
               |> State.increment_turn()
               |> State.merge_usage(usage)
 
-            handle_tool_use(state, new_msgs, opts)
+            handle_tool_use(state, new_msgs, opts, deadline)
 
           {:ok, %{stop_reason: :end_turn, messages: new_msgs, usage: usage}} ->
             state =
@@ -93,7 +103,7 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  defp handle_tool_use(%State{} = state, new_msgs, opts) do
+  defp handle_tool_use(%State{} = state, new_msgs, opts, deadline) do
     case Middleware.run(:after_completion, state) do
       {:halted, reason} ->
         %{state | status: :halted, error: "Halted by middleware: #{reason}"}
@@ -113,24 +123,37 @@ defmodule Alloy.Agent.Turn do
                 %{state | status: :halted, error: "Halted by middleware: #{reason}"}
 
               %State{} = state ->
-                do_turn(state, opts)
+                do_turn(state, opts, deadline)
             end
         end
     end
   end
 
-  defp call_provider_with_retry(state, provider, provider_config, streaming?, on_chunk) do
+  defp call_provider_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline) do
     do_provider_call(
       state,
       provider,
       provider_config,
       streaming?,
       on_chunk,
-      state.config.max_retries
+      state.config.max_retries,
+      deadline
     )
   end
 
-  defp do_provider_call(state, provider, provider_config, streaming?, on_chunk, retries_left) do
+  defp do_provider_call(
+         state,
+         provider,
+         provider_config,
+         streaming?,
+         on_chunk,
+         retries_left,
+         deadline
+       ) do
+    # Inject receive_timeout so hung HTTP requests can't overshoot the deadline.
+    # All providers read :req_options from config, so this flows through automatically.
+    provider_config = inject_receive_timeout(provider_config, deadline)
+
     {result, chunks_emitted?} =
       call_provider(provider, state, provider_config, streaming?, on_chunk)
 
@@ -141,22 +164,29 @@ defmodule Alloy.Agent.Turn do
       {:error, reason} when retries_left > 0 ->
         if retryable?(reason) and not chunks_emitted? do
           attempt = state.config.max_retries - retries_left + 1
-          backoff = round(state.config.retry_backoff_ms * :math.pow(2, attempt - 1))
+          base = round(state.config.retry_backoff_ms * :math.pow(2, attempt - 1))
+          # Full jitter: uniform random in [0, 2*base) — prevents thundering herd
+          # when multiple agents hit the same rate limit simultaneously.
+          backoff = :rand.uniform(base * 2)
+          remaining = deadline - System.monotonic_time(:millisecond)
 
-          # NOTE: Process.sleep/1 blocks this GenServer process. During backoff,
-          # health/1 and other calls will be unreachable. This is intentional —
-          # retry backoff is brief and bounded, and the alternative (timer-based)
-          # would add significant complexity for marginal benefit.
-          Process.sleep(backoff)
+          if remaining < backoff do
+            # Not enough time left — return the error rather than sleeping
+            # past the GenServer.call timeout.
+            {:error, reason}
+          else
+            Process.sleep(backoff)
 
-          do_provider_call(
-            state,
-            provider,
-            provider_config,
-            streaming?,
-            on_chunk,
-            retries_left - 1
-          )
+            do_provider_call(
+              state,
+              provider,
+              provider_config,
+              streaming?,
+              on_chunk,
+              retries_left - 1,
+              deadline
+            )
+          end
         else
           {:error, reason}
         end
@@ -188,7 +218,8 @@ defmodule Alloy.Agent.Turn do
 
   # HTTP status errors — providers return strings via parse_error/2.
   # The generic fallback format is "HTTP <status>: <body>".
-  # Retryable: 429 (rate limit) and 5xx server errors.
+  # Retryable: 408 (request timeout), 429 (rate limit), and 5xx server errors.
+  defp retryable?("HTTP 408:" <> _), do: true
   defp retryable?("HTTP 429:" <> _), do: true
   defp retryable?("HTTP 500:" <> _), do: true
   defp retryable?("HTTP 502:" <> _), do: true
@@ -218,12 +249,24 @@ defmodule Alloy.Agent.Turn do
   defp retryable?("HTTP request failed: " <> rest) do
     String.contains?(rest, ":econnrefused") or
       String.contains?(rest, ":closed") or
-      String.contains?(rest, ":timeout")
+      String.contains?(rest, ":timeout") or
+      String.contains?(rest, ":unprocessed")
   end
 
   # Atom :timeout kept for any caller that passes atoms directly.
   defp retryable?(:timeout), do: true
   defp retryable?(_), do: false
+
+  # Sets receive_timeout in the provider's req_options based on remaining deadline.
+  # This prevents a single hung HTTP request from overshooting the overall timeout.
+  # Uses Keyword.put to override any user-set value — the deadline takes precedence.
+  defp inject_receive_timeout(provider_config, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+    # Floor at 5s so we don't set absurdly short timeouts on the first call
+    timeout = max(remaining, 5_000)
+    existing = Map.get(provider_config, :req_options, [])
+    Map.put(provider_config, :req_options, Keyword.put(existing, :receive_timeout, timeout))
+  end
 
   defp build_provider_config(%State{config: config}) do
     Map.put(config.provider_config, :system_prompt, config.system_prompt)

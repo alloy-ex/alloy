@@ -41,18 +41,17 @@ defmodule Alloy.Provider.Google do
     model = config.model
 
     req_opts =
-      [
-        url:
-          "#{Map.get(config, :api_url, @default_api_url)}/v1beta/models/#{model}:generateContent",
-        method: :post,
-        headers: [
-          {"content-type", "application/json"},
-          {"x-goog-api-key", config.api_key}
-        ],
-        body: Jason.encode!(body),
-        retry: :transient,
-        max_retries: 3
-      ] ++ Map.get(config, :req_options, [])
+      ([
+         url:
+           "#{Map.get(config, :api_url, @default_api_url)}/v1beta/models/#{model}:generateContent",
+         method: :post,
+         headers: [
+           {"content-type", "application/json"},
+           {"x-goog-api-key", config.api_key}
+         ],
+         body: Jason.encode!(body)
+       ] ++ Map.get(config, :req_options, []))
+      |> Keyword.put(:retry, false)
 
     case Req.request(req_opts) do
       {:ok, %{status: 200, body: resp_body}} ->

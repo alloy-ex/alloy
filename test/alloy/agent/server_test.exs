@@ -609,6 +609,68 @@ defmodule Alloy.Agent.ServerTest do
     end
   end
 
+  describe "chat/2 timeout coupling with config.timeout_ms" do
+    test "chat does not crash with GenServer call timeout when config.timeout_ms is short" do
+      # The bug: chat/3 defaults GenServer.call timeout to 120_000 regardless of
+      # config.timeout_ms. If config.timeout_ms is very short (e.g. 100ms), the Turn
+      # returns quickly via deadline awareness, but the GenServer.call timeout is
+      # irrelevant here. The real issue surfaces when config.timeout_ms > 120_000.
+      #
+      # This test verifies the inverse: with a very short timeout_ms (100ms),
+      # the Turn aborts via deadline, and the GenServer.call does NOT wait 120s.
+      pid =
+        start_provider([
+          TestProvider.error_response("HTTP 429: Too Many Requests"),
+          TestProvider.text_response("Should not reach")
+        ])
+
+      {:ok, agent} =
+        Server.start_link(
+          opts(pid,
+            max_retries: 3,
+            retry_backoff_ms: 50_000,
+            timeout_ms: 100
+          )
+        )
+
+      start_time = System.monotonic_time(:millisecond)
+      result = Server.chat(agent, "Hi")
+      elapsed = System.monotonic_time(:millisecond) - start_time
+
+      # The Turn should abort via deadline in <500ms, and the GenServer.call
+      # should return promptly — NOT wait 120 seconds.
+      assert elapsed < 2_000,
+             "Expected quick return via deadline but took #{elapsed}ms — call timeout not coupled"
+
+      assert {:error, error_result} = result
+      assert error_result.status == :error
+    end
+
+    test "stream_chat does not crash with GenServer call timeout when config.timeout_ms is short" do
+      pid =
+        start_provider([
+          TestProvider.error_response("HTTP 429: Too Many Requests"),
+          TestProvider.text_response("Should not reach")
+        ])
+
+      {:ok, agent} =
+        Server.start_link(
+          opts(pid,
+            max_retries: 3,
+            retry_backoff_ms: 50_000,
+            timeout_ms: 100
+          )
+        )
+
+      start_time = System.monotonic_time(:millisecond)
+      result = Server.stream_chat(agent, "Hi", fn _chunk -> :ok end)
+      elapsed = System.monotonic_time(:millisecond) - start_time
+
+      assert elapsed < 2_000
+      assert {:error, _} = result
+    end
+  end
+
   describe "health/1" do
     test "returns expected shape" do
       pid = start_provider([])

@@ -71,12 +71,15 @@ defmodule Alloy.Agent.Server do
 
   ## Options
 
-    - `:timeout` - Milliseconds to wait before raising a timeout exit. Defaults
-      to `120_000` (2 minutes). Use `:infinity` to wait forever.
+    - `:timeout` - GenServer call timeout in milliseconds. Defaults to
+      `:infinity` because the Turn's deadline mechanism (driven by
+      `config.timeout_ms`) enforces the actual timeout internally,
+      guaranteeing a reply. Override only if you need a hard caller-side
+      safety net (e.g., `timeout: config.timeout_ms + 10_000`).
   """
   @spec chat(GenServer.server(), String.t(), keyword()) :: {:ok, result()} | {:error, result()}
   def chat(server, message, opts \\ []) when is_binary(message) do
-    timeout = Keyword.get(opts, :timeout, 120_000)
+    timeout = Keyword.get(opts, :timeout, :infinity)
     GenServer.call(server, {:chat, message}, timeout)
   end
 
@@ -127,14 +130,15 @@ defmodule Alloy.Agent.Server do
 
   ## Options
 
-    - `:timeout` - Milliseconds to wait before raising a timeout exit. Defaults
-      to `120_000` (2 minutes). Use `:infinity` to wait forever.
+    - `:timeout` - GenServer call timeout in milliseconds. Defaults to
+      `:infinity` because the Turn's deadline mechanism enforces the
+      actual timeout internally. See `chat/3` for details.
   """
   @spec stream_chat(GenServer.server(), String.t(), (String.t() -> :ok), keyword()) ::
           {:ok, result()} | {:error, result()}
   def stream_chat(server, message, on_chunk, opts \\ [])
       when is_binary(message) and is_function(on_chunk, 1) do
-    timeout = Keyword.get(opts, :timeout, 120_000)
+    timeout = Keyword.get(opts, :timeout, :infinity)
     GenServer.call(server, {:stream_chat, message, on_chunk}, timeout)
   end
 

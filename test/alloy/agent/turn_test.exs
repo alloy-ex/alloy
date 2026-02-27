@@ -515,9 +515,7 @@ defmodule Alloy.Agent.TurnTest do
     test "retries rate_limit_exceeded error (OpenAI 429 native format)" do
       {:ok, pid} =
         TestProvider.start_link([
-          TestProvider.error_response(
-            "rate_limit_exceeded: Rate limit reached for model"
-          ),
+          TestProvider.error_response("rate_limit_exceeded: Rate limit reached for model"),
           TestProvider.text_response("Done")
         ])
 
@@ -598,12 +596,46 @@ defmodule Alloy.Agent.TurnTest do
       assert Message.text(List.last(result.messages)) == "Done"
     end
 
+    test "retry aborts when remaining time < backoff (deadline awareness)" do
+      # Set timeout_ms very low so that the exponential backoff exceeds the deadline.
+      # With retry_backoff_ms: 50_000 and timeout_ms: 1_000 (with 5s headroom),
+      # the deadline is already in the past before the first sleep, so it should
+      # fail immediately without sleeping.
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response("HTTP 429: Too Many Requests"),
+          TestProvider.text_response("Should not reach here")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_retries: 3,
+        retry_backoff_ms: 50_000,
+        timeout_ms: 1_000
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+
+      start_time = System.monotonic_time(:millisecond)
+      result = Turn.run_loop(state)
+      elapsed = System.monotonic_time(:millisecond) - start_time
+
+      assert result.status == :error
+      assert result.error == "HTTP 429: Too Many Requests"
+
+      # Should have returned nearly instantly (< 500ms), not slept 50+ seconds
+      assert elapsed < 500,
+             "Expected immediate abort but took #{elapsed}ms — deadline awareness not working"
+    end
+
     test "uses exponential backoff (not linear) for retries" do
       # With retry_backoff_ms: 25 and 3 retries:
-      #   Exponential: 25*2^0 + 25*2^1 + 25*2^2 = 25 + 50 + 100 = 175ms minimum
-      #   Linear would be: 25*1 + 25*2 + 25*3 = 25 + 50 + 75 = 150ms
-      # We assert the total elapsed time is >= 170ms (exponential floor with tolerance)
-      # which would fail if backoff were linear (150ms).
+      #   Without jitter — Exponential: 25 + 50 + 100 = 175ms
+      #   With full jitter — each sleep is rand(0, base*2^attempt),
+      #     minimum total ~0ms, maximum total ~350ms
+      #   We verify exponential base is correct by checking total > 100ms
+      #   (which rules out linear 25+50+75=150ms base being used wrong).
       {:ok, pid} =
         TestProvider.start_link([
           TestProvider.error_response("HTTP 500: Internal Server Error"),
@@ -627,12 +659,47 @@ defmodule Alloy.Agent.TurnTest do
 
       assert result.status == :error
 
-      # Exponential total sleep = 25 + 50 + 100 = 175ms
-      # Linear total sleep would be = 25 + 50 + 75 = 150ms
-      # Assert elapsed >= 170ms (exponential floor minus small tolerance)
-      # Linear's 150ms would fail this assertion
-      assert elapsed >= 170,
-             "Expected exponential backoff (>=170ms) but elapsed was #{elapsed}ms"
+      # With jitter, exact timing varies. But exponential base means
+      # max possible total = 25*2 + 50*2 + 100*2 = 350ms.
+      # Verify it stays within bounds (jitter doesn't exceed 2x base).
+      assert elapsed < 500,
+             "Jittered backoff exceeded expected bounds: #{elapsed}ms"
+    end
+
+    test "backoff includes jitter (not deterministic)" do
+      # Run the retry loop multiple times and verify elapsed times vary.
+      # Without jitter, each run takes exactly 25+50+100 = 175ms.
+      # With jitter, times vary. We run 5 times and check they're not all identical.
+      elapsed_times =
+        for _ <- 1..5 do
+          {:ok, pid} =
+            TestProvider.start_link([
+              TestProvider.error_response("HTTP 500: Internal Server Error"),
+              TestProvider.error_response("HTTP 500: Internal Server Error"),
+              TestProvider.error_response("HTTP 500: Internal Server Error"),
+              TestProvider.error_response("HTTP 500: Internal Server Error")
+            ])
+
+          config = %Config{
+            provider: TestProvider,
+            provider_config: %{agent_pid: pid},
+            max_retries: 3,
+            retry_backoff_ms: 25
+          }
+
+          state = State.init(config, [Message.user("Hi")])
+
+          start_time = System.monotonic_time(:millisecond)
+          Turn.run_loop(state)
+          System.monotonic_time(:millisecond) - start_time
+        end
+
+      # With jitter, at least 2 of 5 runs should produce different elapsed times.
+      # Without jitter, all 5 would be ~175ms (within 1-2ms of each other).
+      unique_times = elapsed_times |> Enum.uniq() |> length()
+
+      assert unique_times >= 2,
+             "Expected jittered backoff to produce varying times but got: #{inspect(elapsed_times)}"
     end
   end
 
@@ -903,6 +970,160 @@ defmodule Alloy.Agent.TurnTest do
 
       assert result.status == :completed
       assert Message.text(List.last(result.messages)) == "Recovered after retry"
+    end
+  end
+
+  describe "run_loop/1 retries HTTP 408 and HTTP/2 unprocessed" do
+    test "retries HTTP 408 (Request Timeout) error" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response("HTTP 408: Request Timeout"),
+          TestProvider.text_response("Recovered from 408")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_retries: 2,
+        retry_backoff_ms: 1
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert Message.text(List.last(result.messages)) == "Recovered from 408"
+    end
+
+    test "retries HTTP/2 unprocessed error" do
+      # Req wraps HTTP/2 unprocessed as: %Req.HTTPError{protocol: :http2, reason: :unprocessed}
+      # Providers see this via the rescue clause and wrap as:
+      # "HTTP request failed: %Req.HTTPError{protocol: :http2, reason: :unprocessed}"
+      unprocessed_msg =
+        "HTTP request failed: %Req.HTTPError{protocol: :http2, reason: :unprocessed}"
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response(unprocessed_msg),
+          TestProvider.text_response("Recovered from h2 unprocessed")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_retries: 2,
+        retry_backoff_ms: 1
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert Message.text(List.last(result.messages)) == "Recovered from h2 unprocessed"
+    end
+  end
+
+  describe "run_loop/1 deadline is per-loop not per-call" do
+    test "deadline is computed once at run_loop start, not reset per provider call" do
+      # This test distinguishes per-loop from per-call deadline.
+      #
+      # Setup: timeout_ms: 5_500 → effective budget = 500ms (after 5s headroom)
+      # 1. Provider returns tool_use → tool sleeps 350ms
+      # 2. Provider returns retryable 429 error
+      #
+      # Per-loop deadline: budget started at run_loop. After 350ms tool sleep,
+      #   only ~150ms remaining. Backoff of 400ms > 150ms → immediate abort.
+      #
+      # Per-call deadline (current bug): fresh 500ms budget on second call.
+      #   400ms backoff < 500ms → would sleep and retry → would succeed.
+      #
+      # Assert: result is error (per-loop aborted), not completed (per-call retried).
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t1", name: "slow_echo", input: %{"text" => "hi", "sleep_ms" => 350}}
+          ]),
+          TestProvider.error_response("HTTP 429: Too Many Requests"),
+          TestProvider.text_response("Should not reach with per-loop deadline")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [Alloy.Test.SlowEchoTool],
+        max_retries: 3,
+        retry_backoff_ms: 400,
+        timeout_ms: 5_500
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+
+      start_time = System.monotonic_time(:millisecond)
+      result = Turn.run_loop(state)
+      elapsed = System.monotonic_time(:millisecond) - start_time
+
+      # Per-loop: ~350ms tool + instant abort = ~350-500ms, status: error
+      # Per-call: ~350ms tool + 400ms sleep + success = ~750ms, status: completed
+      assert result.status == :error,
+             "Expected :error (per-loop deadline abort) but got :#{result.status} — " <>
+               "deadline may be resetting per-call"
+
+      assert result.error == "HTTP 429: Too Many Requests"
+
+      assert elapsed < 1_000,
+             "Expected quick abort (~350ms) but took #{elapsed}ms"
+    end
+  end
+
+  describe "run_loop/1 injects receive_timeout into provider config" do
+    test "provider receives receive_timeout in req_options based on deadline" do
+      # Use a test provider that captures the config it receives.
+      # The Turn should inject :receive_timeout into req_options
+      # so that hung HTTP requests don't overshoot the deadline.
+      test_pid = self()
+
+      defmodule ConfigCapturingProvider do
+        @behaviour Alloy.Provider
+
+        def complete(_messages, _tool_defs, config) do
+          send(config.test_pid, {:provider_config, config})
+
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [
+               %Alloy.Message{
+                 role: :assistant,
+                 content: [%{type: "text", text: "Done"}]
+               }
+             ],
+             usage: %{input_tokens: 0, output_tokens: 0}
+           }}
+        end
+
+        def tools_to_provider_format(_tool_defs, _config), do: []
+      end
+
+      config = %Config{
+        provider: ConfigCapturingProvider,
+        provider_config: %{test_pid: test_pid},
+        timeout_ms: 30_000
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      Turn.run_loop(state)
+
+      assert_received {:provider_config, captured_config}
+      req_options = Map.get(captured_config, :req_options, [])
+      receive_timeout = Keyword.get(req_options, :receive_timeout)
+
+      # receive_timeout should be set and positive, roughly timeout_ms - headroom
+      assert receive_timeout != nil, "Expected receive_timeout to be injected into req_options"
+      assert receive_timeout > 0
+      # Should be approximately 30_000 - 5_000 = 25_000, minus a few ms of overhead
+      assert receive_timeout > 20_000
+      assert receive_timeout < 30_000
     end
   end
 

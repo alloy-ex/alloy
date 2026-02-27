@@ -40,17 +40,16 @@ defmodule Alloy.Provider.XAI do
     body = build_request_body(messages, tool_defs, config)
 
     req_opts =
-      [
-        url: "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions",
-        method: :post,
-        headers: [
-          {"authorization", "Bearer #{config.api_key}"},
-          {"content-type", "application/json"}
-        ],
-        body: Jason.encode!(body),
-        retry: :transient,
-        max_retries: 3
-      ] ++ Map.get(config, :req_options, [])
+      ([
+         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions",
+         method: :post,
+         headers: [
+           {"authorization", "Bearer #{config.api_key}"},
+           {"content-type", "application/json"}
+         ],
+         body: Jason.encode!(body)
+       ] ++ Map.get(config, :req_options, []))
+      |> Keyword.put(:retry, false)
 
     case Req.request(req_opts) do
       {:ok, %{status: 200, body: resp_body}} ->
