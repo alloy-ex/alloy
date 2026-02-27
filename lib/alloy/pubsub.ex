@@ -53,6 +53,7 @@ defmodule Alloy.PubSub do
 
   @doc "Returns the child spec for starting a PubSub supervisor."
   def child_spec(opts) do
+    ensure_pubsub!()
     name = Keyword.get(opts, :name, __MODULE__)
     Phoenix.PubSub.child_spec(name: name)
   end
@@ -60,6 +61,7 @@ defmodule Alloy.PubSub do
   @doc "Subscribe the current process to a PubSub topic."
   @spec subscribe(String.t(), keyword()) :: :ok | {:error, term()}
   def subscribe(topic, opts \\ []) do
+    ensure_pubsub!()
     pubsub = Keyword.get(opts, :pubsub, __MODULE__)
     Phoenix.PubSub.subscribe(pubsub, topic)
   end
@@ -67,7 +69,16 @@ defmodule Alloy.PubSub do
   @doc "Broadcast a message to all subscribers of a topic."
   @spec broadcast(String.t(), term(), keyword()) :: :ok | {:error, term()}
   def broadcast(topic, event, opts \\ []) do
+    ensure_pubsub!()
     pubsub = Keyword.get(opts, :pubsub, __MODULE__)
     Phoenix.PubSub.broadcast(pubsub, topic, event)
+  end
+
+  defp ensure_pubsub! do
+    unless Code.ensure_loaded?(Phoenix.PubSub) do
+      raise ArgumentError,
+            "Alloy.PubSub requires :phoenix_pubsub, but it is not available. " <>
+              "Add {:phoenix_pubsub, \"~> 2.1\"} to your mix.exs dependencies."
+    end
   end
 end

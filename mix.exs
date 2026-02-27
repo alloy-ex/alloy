@@ -43,6 +43,7 @@ defmodule Alloy.MixProject do
 
   defp package do
     [
+      files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE),
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url}
     ]

@@ -38,7 +38,7 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.3.0"}
+    {:alloy, "~> 0.4.0"}
   ]
 end
 ```
@@ -162,15 +162,17 @@ defmodule MyApp.Tools.WebSearch do
   @behaviour Alloy.Tool
 
   @impl true
-  def definition do
+  def name, do: "web_search"
+
+  @impl true
+  def description, do: "Search the web for information"
+
+  @impl true
+  def input_schema do
     %{
-      name: "web_search",
-      description: "Search the web for information",
-      input_schema: %{
-        type: "object",
-        properties: %{query: %{type: "string", description: "Search query"}},
-        required: ["query"]
-      }
+      type: "object",
+      properties: %{query: %{type: "string", description: "Search query"}},
+      required: ["query"]
     }
   end
 
@@ -190,7 +192,7 @@ Alloy.Agent.Server             GenServer wrapper (stateful, supervisable)
 Alloy.Team                     Multi-agent supervisor (delegate, broadcast, handoff)
 Alloy.Agent.Turn               Single turn: call provider → execute tools → return
 Alloy.Provider                 Behaviour: translate wire format ↔ Alloy.Message
-Alloy.Tool                     Behaviour: definition + execute
+Alloy.Tool                     Behaviour: name, description, input_schema, execute
 Alloy.Middleware               Pipeline: logger, telemetry, custom hooks
 Alloy.Context.Compactor        Automatic conversation summarization
 Alloy.Scheduler                Cron/heartbeat for recurring agent runs

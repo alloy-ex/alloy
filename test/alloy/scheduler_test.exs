@@ -1,8 +1,32 @@
+defmodule Alloy.SchedulerTest.BlockingProvider do
+  @moduledoc false
+  @behaviour Alloy.Provider
+
+  @impl true
+  def complete(_messages, _tool_defs, config) do
+    send(config[:notify_pid], {:provider_called, self()})
+
+    receive do
+      :unblock ->
+        {:ok,
+         %{
+           stop_reason: :end_turn,
+           messages: [Alloy.Message.assistant("done")],
+           usage: %{input_tokens: 10, output_tokens: 5}
+         }}
+    end
+  end
+
+  @impl true
+  def stream(_, _, _, _), do: {:error, :not_supported}
+end
+
 defmodule Alloy.SchedulerTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Scheduler
   alias Alloy.Provider.Test, as: TestProvider
+  alias Alloy.SchedulerTest.BlockingProvider
 
   defp make_agent_opts(responses) do
     {:ok, pid} = TestProvider.start_link(responses)
@@ -18,6 +42,42 @@ defmodule Alloy.SchedulerTest do
       assert {:ok, pid} = Scheduler.start_link(jobs: [])
       assert Process.alive?(pid)
       GenServer.stop(pid)
+    end
+
+    test "accepts an external task_supervisor" do
+      {:ok, sup} = Task.Supervisor.start_link()
+      test_pid = self()
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          task_supervisor: sup,
+          jobs: [
+            %{
+              name: :sup_job,
+              every: :timer.minutes(60),
+              prompt: "Block",
+              agent_opts: [
+                provider: {BlockingProvider, notify_pid: test_pid},
+                tools: []
+              ]
+            }
+          ]
+        )
+
+      # Trigger the job — blocks in provider
+      :ok = Scheduler.trigger(pid, :sup_job)
+      assert_receive {:provider_called, task_pid}, 1000
+
+      # The external supervisor should have children (proves it was used)
+      children = Task.Supervisor.children(sup)
+      assert length(children) > 0
+
+      # Clean up
+      send(task_pid, :unblock)
+      GenServer.stop(pid)
+
+      # External supervisor survives scheduler shutdown
+      assert Process.alive?(sup)
     end
 
     test "starts with initial jobs" do
@@ -92,14 +152,7 @@ defmodule Alloy.SchedulerTest do
     test "skips tick if job is still running" do
       test_pid = self()
 
-      # Provider that takes a while to respond (simulated by many responses)
-      {:ok, provider_pid} =
-        TestProvider.start_link([
-          TestProvider.text_response("slow response"),
-          TestProvider.text_response("second response")
-        ])
-
-      # Use a very short interval — the job should overlap
+      # Use a blocking provider — the job runs until we say "unblock"
       {:ok, pid} =
         Scheduler.start_link(
           jobs: [
@@ -108,18 +161,27 @@ defmodule Alloy.SchedulerTest do
               every: 30,
               prompt: "Slow tick",
               agent_opts: [
-                provider: {Alloy.Provider.Test, agent_pid: provider_pid},
+                provider: {BlockingProvider, notify_pid: test_pid},
                 tools: []
-              ],
-              on_result: fn result -> send(test_pid, {:slow_result, result}) end
+              ]
             }
           ]
         )
 
-      # First should fire
-      assert_receive {:slow_result, {:ok, _}}, 2000
-      # Scheduler should still be alive (didn't crash from overlap)
+      # First tick fires and calls the provider — job is now running
+      assert_receive {:provider_called, task_pid}, 1000
+
+      # Let many ticks fire while job is blocked (~200ms / 30ms = ~6 ticks)
+      Process.sleep(200)
+
+      # Provider should NOT have been called again (all ticks skipped)
+      refute_receive {:provider_called, _}
+
+      # Scheduler is still alive
       assert Process.alive?(pid)
+
+      # Clean up
+      send(task_pid, :unblock)
       GenServer.stop(pid)
     end
   end
@@ -144,6 +206,97 @@ defmodule Alloy.SchedulerTest do
       assert length(Scheduler.list_jobs(pid)) == 1
       assert_receive {:dynamic_result, {:ok, result}}, 2000
       assert result.text == "dynamic reply"
+      GenServer.stop(pid)
+    end
+
+    test "replacing a running job discards stale task result" do
+      test_pid = self()
+
+      # Start a blocking job with callback A
+      {:ok, pid} =
+        Scheduler.start_link(
+          jobs: [
+            %{
+              name: :replaceable,
+              every: :timer.minutes(60),
+              prompt: "Old prompt",
+              agent_opts: [
+                provider: {BlockingProvider, notify_pid: test_pid},
+                tools: []
+              ],
+              on_result: fn result -> send(test_pid, {:old_callback, result}) end
+            }
+          ]
+        )
+
+      # Trigger the job — it blocks in the provider
+      :ok = Scheduler.trigger(pid, :replaceable)
+      assert_receive {:provider_called, task_pid}, 1000
+
+      # Replace the job while the old one is still running
+      new_agent_opts = make_agent_opts([TestProvider.text_response("new response")])
+
+      :ok =
+        Scheduler.add_job(pid, %{
+          name: :replaceable,
+          every: :timer.minutes(60),
+          prompt: "New prompt",
+          agent_opts: new_agent_opts,
+          on_result: fn result -> send(test_pid, {:new_callback, result}) end
+        })
+
+      # Unblock the old task — it completes with the old provider's result
+      send(task_pid, :unblock)
+
+      # Neither callback should be called — the result is stale
+      refute_receive {:old_callback, _}, 200
+      refute_receive {:new_callback, _}, 100
+
+      GenServer.stop(pid)
+    end
+
+    test "replacing a job with same name cancels old timer" do
+      test_pid = self()
+
+      agent_opts =
+        make_agent_opts([
+          TestProvider.text_response("old response"),
+          TestProvider.text_response("should not fire")
+        ])
+
+      # Start with a fast-ticking job
+      {:ok, pid} =
+        Scheduler.start_link(
+          jobs: [
+            %{
+              name: :alpha,
+              every: 100,
+              prompt: "Old prompt",
+              agent_opts: agent_opts,
+              on_result: fn result -> send(test_pid, {:alpha_result, result}) end
+            }
+          ]
+        )
+
+      # Replace with a very long interval — old timer should be cancelled
+      new_agent_opts = make_agent_opts([TestProvider.text_response("new response")])
+
+      :ok =
+        Scheduler.add_job(pid, %{
+          name: :alpha,
+          every: :timer.minutes(60),
+          prompt: "New prompt",
+          agent_opts: new_agent_opts,
+          on_result: fn result -> send(test_pid, {:alpha_result, result}) end
+        })
+
+      # Should only have 1 job registered
+      assert length(Scheduler.list_jobs(pid)) == 1
+
+      # If old timer was properly cancelled, no tick fires within 300ms
+      # (old timer would fire at ~100ms if not cancelled)
+      refute_receive {:alpha_result, _}, 300
+
       GenServer.stop(pid)
     end
 
@@ -183,6 +336,38 @@ defmodule Alloy.SchedulerTest do
       :ok = Scheduler.trigger(pid, :manual_job)
       assert_receive {:manual_result, {:ok, result}}, 2000
       assert result.text == "manual reply"
+      GenServer.stop(pid)
+    end
+
+    test "returns error when job is already running" do
+      test_pid = self()
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          jobs: [
+            %{
+              name: :blocking_job,
+              every: :timer.minutes(60),
+              prompt: "Block",
+              agent_opts: [
+                provider: {BlockingProvider, notify_pid: test_pid},
+                tools: []
+              ]
+            }
+          ]
+        )
+
+      # Trigger the job — provider blocks until we send :unblock
+      :ok = Scheduler.trigger(pid, :blocking_job)
+
+      # Wait for the provider to actually be called (job is now running)
+      assert_receive {:provider_called, task_pid}, 1000
+
+      # Second trigger should fail — job is still running
+      assert {:error, :already_running} = Scheduler.trigger(pid, :blocking_job)
+
+      # Clean up — unblock the provider so the task completes
+      send(task_pid, :unblock)
       GenServer.stop(pid)
     end
 

@@ -45,10 +45,29 @@ defmodule Alloy.Scheduler do
           on_result: (term() -> any()) | nil
         }
 
+  defmodule State do
+    @moduledoc false
+    defstruct jobs: %{},
+              timers: %{},
+              running: MapSet.new(),
+              task_refs: %{},
+              generations: %{},
+              task_supervisor: nil
+  end
+
   # ── Client API ──────────────────────────────────────────────────────────
 
   @doc """
   Starts the scheduler with initial jobs.
+
+  ## Options
+
+  - `:jobs` — list of job specs (see module docs)
+  - `:name` — optional GenServer name for registration
+  - `:task_supervisor` — optional pid or name of an external `Task.Supervisor`.
+    When omitted, the scheduler starts its own anonymous supervisor. For
+    production use, prefer passing a named supervisor from your application's
+    supervision tree for better observability in `:observer` and telemetry.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -82,8 +101,10 @@ defmodule Alloy.Scheduler do
 
   @doc """
   Manually triggers a job immediately, ignoring its schedule.
+
+  Returns `{:error, :already_running}` if the job is currently executing.
   """
-  @spec trigger(GenServer.server(), atom()) :: :ok | {:error, :not_found}
+  @spec trigger(GenServer.server(), atom()) :: :ok | {:error, :not_found | :already_running}
   def trigger(server, name) do
     GenServer.call(server, {:trigger, name})
   end
@@ -92,15 +113,20 @@ defmodule Alloy.Scheduler do
 
   @impl GenServer
   def init(opts) do
-    {:ok, task_sup} = Task.Supervisor.start_link()
+    task_sup =
+      case Keyword.get(opts, :task_supervisor) do
+        nil ->
+          {:ok, pid} = Task.Supervisor.start_link()
+          pid
 
-    state = %{
-      jobs: %{},
-      timers: %{},
-      running: MapSet.new(),
-      task_refs: %{},
-      task_supervisor: task_sup
-    }
+        pid when is_pid(pid) ->
+          pid
+
+        name when is_atom(name) ->
+          name
+      end
+
+    state = %State{task_supervisor: task_sup}
 
     jobs = Keyword.get(opts, :jobs, [])
 
@@ -118,21 +144,32 @@ defmodule Alloy.Scheduler do
     {:reply, jobs, state}
   end
 
+  @impl GenServer
   def handle_call({:add_job, job}, _from, state) do
+    state = cancel_job(state, job.name)
+
+    gen = Map.get(state.generations, job.name, 0) + 1
+    state = %{state | generations: Map.put(state.generations, job.name, gen)}
     state = schedule_job(state, job)
     {:reply, :ok, state}
   end
 
+  @impl GenServer
   def handle_call({:remove_job, name}, _from, state) do
     state = cancel_job(state, name)
     {:reply, :ok, state}
   end
 
+  @impl GenServer
   def handle_call({:trigger, name}, _from, state) do
     case Map.fetch(state.jobs, name) do
       {:ok, _job} ->
-        state = run_job(state, name)
-        {:reply, :ok, state}
+        if MapSet.member?(state.running, name) do
+          {:reply, {:error, :already_running}, state}
+        else
+          state = run_job(state, name)
+          {:reply, :ok, state}
+        end
 
       :error ->
         {:reply, {:error, :not_found}, state}
@@ -154,6 +191,7 @@ defmodule Alloy.Scheduler do
   end
 
   # Task completed successfully
+  @impl GenServer
   def handle_info({ref, result}, state) when is_reference(ref) do
     Process.demonitor(ref, [:flush])
 
@@ -161,10 +199,16 @@ defmodule Alloy.Scheduler do
       {nil, _} ->
         {:noreply, state}
 
-      {name, task_refs} ->
-        job = Map.get(state.jobs, name)
-        callback = (job && job[:on_result]) || (&default_on_result/1)
-        callback.(result)
+      {{name, gen}, task_refs} ->
+        current_gen = Map.get(state.generations, name, 0)
+
+        if gen == current_gen do
+          job = Map.get(state.jobs, name)
+          callback = (job && job[:on_result]) || (&default_on_result/1)
+          callback.(result)
+        else
+          Logger.warning("Alloy.Scheduler: discarding stale result for #{name} (gen #{gen} != #{current_gen})")
+        end
 
         state = %{state | running: MapSet.delete(state.running, name), task_refs: task_refs}
         {:noreply, state}
@@ -172,12 +216,13 @@ defmodule Alloy.Scheduler do
   end
 
   # Task crashed
+  @impl GenServer
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     case Map.pop(state.task_refs, ref) do
       {nil, _} ->
         {:noreply, state}
 
-      {name, task_refs} ->
+      {{name, _gen}, task_refs} ->
         Logger.error("Alloy.Scheduler: job #{name} crashed: #{inspect(reason)}")
         state = %{state | running: MapSet.delete(state.running, name), task_refs: task_refs}
         {:noreply, state}
@@ -226,6 +271,8 @@ defmodule Alloy.Scheduler do
         state
 
       job ->
+        gen = Map.get(state.generations, name, 0)
+
         task =
           Task.Supervisor.async_nolink(state.task_supervisor, fn ->
             Alloy.run(job.prompt, job.agent_opts)
@@ -234,7 +281,7 @@ defmodule Alloy.Scheduler do
         %{
           state
           | running: MapSet.put(state.running, name),
-            task_refs: Map.put(state.task_refs, task.ref, name)
+            task_refs: Map.put(state.task_refs, task.ref, {name, gen})
         }
     end
   end
