@@ -70,7 +70,7 @@ defmodule Alloy.SchedulerTest do
 
       # The external supervisor should have children (proves it was used)
       children = Task.Supervisor.children(sup)
-      assert length(children) > 0
+      assert children != []
 
       # Clean up
       send(task_pid, :unblock)

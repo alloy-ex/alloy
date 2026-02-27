@@ -182,26 +182,7 @@ defmodule Alloy.Agent.Server do
         # Subscribe to PubSub topics if configured.
         # Use state.config (post-middleware) so session_start middleware can update
         # pubsub/subscribe fields and have them reflected in actual subscriptions.
-        if state.config.pubsub do
-          unless Code.ensure_loaded?(Phoenix.PubSub) do
-            raise ArgumentError,
-                  "Alloy: pubsub: is configured but :phoenix_pubsub is not available. " <>
-                    "Add {:phoenix_pubsub, \">= 0.0.0\"} to your mix.exs dependencies."
-          end
-
-          for topic <- state.config.subscribe do
-            case Phoenix.PubSub.subscribe(state.config.pubsub, topic) do
-              :ok ->
-                :ok
-
-              {:error, reason} ->
-                Logger.warning(
-                  "Alloy: failed to subscribe to PubSub topic #{inspect(topic)}: #{inspect(reason)}"
-                )
-            end
-          end
-        end
-
+        maybe_subscribe_pubsub(state)
         {:ok, state}
     end
   end
@@ -368,6 +349,28 @@ defmodule Alloy.Agent.Server do
   end
 
   # ── Private ───────────────────────────────────────────────────────────────
+
+  defp maybe_subscribe_pubsub(%State{config: %{pubsub: nil}}), do: :ok
+
+  defp maybe_subscribe_pubsub(%State{config: config}) do
+    unless Code.ensure_loaded?(Phoenix.PubSub) do
+      raise ArgumentError,
+            "Alloy: pubsub: is configured but :phoenix_pubsub is not available. " <>
+              "Add {:phoenix_pubsub, \"~> 2.1\"} to your mix.exs dependencies."
+    end
+
+    for topic <- config.subscribe do
+      case Phoenix.PubSub.subscribe(config.pubsub, topic) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "Alloy: failed to subscribe to PubSub topic #{inspect(topic)}: #{inspect(reason)}"
+          )
+      end
+    end
+  end
 
   defp reset_for_new_run(state) do
     %{state | turn: 0, status: :running, error: nil}
