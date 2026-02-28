@@ -4,6 +4,10 @@ defmodule Alloy.Context.TokenCounter do
 
   Good enough for budget decisions (when to compact, whether we're
   approaching limits). Not meant for billing accuracy.
+
+  Accounts for all content block types including text, tool use, tool results,
+  and extended thinking/reasoning blocks. Thinking block tokens count toward
+  the context budget even though they are not part of the final response text.
   """
 
   alias Alloy.Message

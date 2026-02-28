@@ -62,7 +62,7 @@ defmodule Alloy.Agent.Turn do
                function_exported?(provider, :stream, 4))
 
         on_chunk = Keyword.get(opts, :on_chunk, fn _chunk -> :ok end)
-        on_event = Keyword.get(opts, :on_event, fn _event -> :ok end)
+        on_event = Keyword.get(opts, :on_event) || fn _event -> :ok end
 
         provider_config =
           if streaming?,
@@ -218,12 +218,13 @@ defmodule Alloy.Agent.Turn do
   defp call_provider(provider, state, provider_config, true = _streaming?, on_chunk) do
     ref = :atomics.new(1, signed: false)
 
+    original_on_event = Map.get(provider_config, :on_event, fn _ -> :ok end)
+
     wrapped_chunk = fn chunk ->
       :atomics.put(ref, 1, 1)
       on_chunk.(chunk)
+      original_on_event.({:text_delta, chunk})
     end
-
-    original_on_event = Map.get(provider_config, :on_event, fn _ -> :ok end)
 
     wrapped_on_event = fn event ->
       :atomics.put(ref, 1, 1)

@@ -272,6 +272,16 @@ defmodule Alloy.StreamingTest do
       assert_raise KeyError, fn -> Map.fetch!(state.config, :streaming) end
     end
 
+    test "on_event: nil is treated as no-op (does not crash)" do
+      {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Hello")])
+
+      {:ok, agent} =
+        Server.start_link(provider: {TestProvider, agent_pid: provider})
+
+      # Explicitly passing nil should be treated as no-op, not crash with BadFunctionError
+      assert {:ok, _} = Server.stream_chat(agent, "Hi", fn _ -> :ok end, on_event: nil)
+    end
+
     test "raises ArgumentError when on_event is not a function" do
       {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Hi")])
 

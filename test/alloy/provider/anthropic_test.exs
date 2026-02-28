@@ -609,10 +609,11 @@ defmodule Alloy.Provider.AnthropicTest do
       assert_received {:chunk, "Answer."}
       refute_received {:chunk, _}
 
-      # on_event receives thinking and text deltas
+      # on_event receives thinking deltas from the provider.
+      # :text_delta is emitted by Turn.wrapped_chunk, not by the provider directly.
       assert_received {:event, {:thinking_delta, "Let me think..."}}
       assert_received {:event, {:thinking_delta, " Step 2."}}
-      assert_received {:event, {:text_delta, "Answer."}}
+      refute_received {:event, {:text_delta, _}}
 
       # Result text is text-only
       assert Message.text(hd(result.messages)) == "Answer."
@@ -623,7 +624,9 @@ defmodule Alloy.Provider.AnthropicTest do
       assert thinking_block.thinking == "Let me think... Step 2."
     end
 
-    test "on_event fires text_delta for text chunks too" do
+    test "provider does not emit :text_delta directly (Turn.wrapped_chunk handles it)" do
+      # :text_delta is emitted by Turn.wrapped_chunk for all providers universally.
+      # The Anthropic provider itself only emits :thinking_delta via on_event.
       config =
         config_with_sse_stream([
           ant_event("message_start", %{
@@ -651,7 +654,8 @@ defmodule Alloy.Provider.AnthropicTest do
 
       Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      assert_received {:event, {:text_delta, "Hello"}}
+      # Provider does NOT emit :text_delta — Turn.wrapped_chunk does
+      refute_received {:event, {:text_delta, _}}
     end
 
     test "signature_delta is captured in streamed thinking block" do

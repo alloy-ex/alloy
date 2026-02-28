@@ -60,13 +60,13 @@ defmodule Alloy.Provider.Test do
 
     case pop_response(pid) do
       {:ok, %{stop_reason: :end_turn, messages: messages} = response} ->
-        # Stream each character of text content
+        # Stream each character of text content.
+        # :text_delta on_event is emitted by Turn.wrapped_chunk universally.
         for msg <- messages,
             text = Alloy.Message.text(msg),
             text != nil,
             char <- String.graphemes(text) do
           on_chunk.(char)
-          on_event.({:text_delta, char})
         end
 
         {:ok, response}

@@ -177,8 +177,8 @@ defmodule Alloy.Provider.Anthropic do
          "index" => index,
          "delta" => %{"type" => "text_delta", "text" => text}
        }) do
+    # :text_delta on_event is emitted by Turn.wrapped_chunk universally.
     acc.on_chunk.(text)
-    acc.on_event.({:text_delta, text})
 
     current = Map.get(acc.content_blocks, index, %{"type" => "text", "text" => ""})
     updated = Map.update!(current, "text", &(&1 <> text))
@@ -296,12 +296,8 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp format_content_block(%{type: "thinking", thinking: thinking} = block) do
-    base = %{"type" => "thinking", "thinking" => thinking}
-
-    case Map.get(block, :signature) do
-      nil -> base
-      sig -> Map.put(base, "signature", sig)
-    end
+    %{"type" => "thinking", "thinking" => thinking}
+    |> maybe_put("signature", block[:signature])
   end
 
   defp format_content_block(%{type: "text", text: text}) do
@@ -400,12 +396,8 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp parse_content_block(%{"type" => "thinking", "thinking" => thinking} = block) do
-    base = %{type: "thinking", thinking: thinking}
-
-    case Map.get(block, "signature") do
-      nil -> base
-      sig -> Map.put(base, :signature, sig)
-    end
+    %{type: "thinking", thinking: thinking}
+    |> maybe_put(:signature, block["signature"])
   end
 
   defp parse_content_block(%{"type" => "text", "text" => text}) do
@@ -422,6 +414,9 @@ defmodule Alloy.Provider.Anthropic do
   rescue
     ArgumentError -> block
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, val), do: Map.put(map, key, val)
 
   defp parse_usage(usage) do
     %{
