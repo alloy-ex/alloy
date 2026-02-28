@@ -1,8 +1,8 @@
 defmodule Alloy.Context.DiscoveryTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Context.Discovery
   alias Alloy.Agent.Config
+  alias Alloy.Context.Discovery
 
   setup do
     base = Path.join(System.tmp_dir!(), "alloy_discovery_#{System.unique_integer([:positive])}")

@@ -1,9 +1,9 @@
 defmodule Alloy.PubSubTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.PubSub
   alias Alloy.Agent.Server
   alias Alloy.Provider.Test, as: TestProvider
+  alias Alloy.PubSub
 
   # Start a test PubSub instance for each test
   setup do

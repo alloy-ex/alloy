@@ -39,6 +39,10 @@ defmodule Mix.Tasks.Alloy do
       OPENAI_API_KEY      Required for --provider openai
   """
 
+  alias Alloy.Agent.Server
+  alias Alloy.Message
+  alias Alloy.Skill
+
   # ── Module Attributes ───────────────────────────────────────────────────
 
   @providers %{
@@ -138,7 +142,7 @@ defmodule Mix.Tasks.Alloy do
   defp run_interactive(opening_message, agent_opts, provider_name, model, tools, streaming?) do
     Mix.shell().info("[alloy] #{provider_name}/#{model}" <> tool_label(tools) <> " · interactive")
 
-    skills = Alloy.Skill.discover()
+    skills = Skill.discover()
 
     if skills != [] do
       skill_names = Enum.map_join(skills, ", ", &"/#{&1.name}")
@@ -147,7 +151,7 @@ defmodule Mix.Tasks.Alloy do
 
     Mix.shell().info("Type 'exit' or Ctrl+C to quit.\n")
 
-    {:ok, pid} = Alloy.Agent.Server.start_link(agent_opts)
+    {:ok, pid} = Server.start_link(agent_opts)
 
     if opening_message != "" do
       chat_and_print(pid, opening_message, streaming?)
@@ -252,7 +256,7 @@ defmodule Mix.Tasks.Alloy do
         end
 
       skill ->
-        expanded = Alloy.Skill.apply(skill, input)
+        expanded = Skill.apply(skill, input)
         chat_and_print(pid, expanded, streaming?)
     end
   end
@@ -279,7 +283,7 @@ defmodule Mix.Tasks.Alloy do
   end
 
   defp handle_usage(pid) do
-    usage = Alloy.Agent.Server.usage(pid)
+    usage = Server.usage(pid)
 
     Mix.shell().info("""
 
@@ -293,7 +297,7 @@ defmodule Mix.Tasks.Alloy do
   end
 
   defp handle_history(pid) do
-    messages = Alloy.Agent.Server.messages(pid)
+    messages = Server.messages(pid)
 
     if messages == [] do
       Mix.shell().info("\n(no messages yet)\n")
@@ -309,14 +313,14 @@ defmodule Mix.Tasks.Alloy do
     end
   end
 
-  defp format_history_line(%Alloy.Message{role: role, content: content})
+  defp format_history_line(%Message{role: role, content: content})
        when is_binary(content) do
     truncated = String.slice(content, 0, 80)
     suffix = if String.length(content) > 80, do: "...", else: ""
     "  #{role}: #{truncated}#{suffix}"
   end
 
-  defp format_history_line(%Alloy.Message{role: role, content: blocks})
+  defp format_history_line(%Message{role: role, content: blocks})
        when is_list(blocks) do
     parts =
       Enum.map(blocks, fn
@@ -339,7 +343,7 @@ defmodule Mix.Tasks.Alloy do
   end
 
   defp handle_reset(pid) do
-    :ok = Alloy.Agent.Server.reset(pid)
+    :ok = Server.reset(pid)
     Mix.shell().info("\nConversation history cleared.\n")
   end
 
@@ -375,7 +379,7 @@ defmodule Mix.Tasks.Alloy do
             model = model_override || default_model
 
             :ok =
-              Alloy.Agent.Server.set_model(pid,
+              Server.set_model(pid,
                 provider: {mod, api_key: api_key, model: model}
               )
 
@@ -401,7 +405,7 @@ defmodule Mix.Tasks.Alloy do
 
       on_chunk = fn chunk -> IO.write(chunk) end
 
-      case Alloy.Agent.Server.stream_chat(pid, message, on_chunk) do
+      case Server.stream_chat(pid, message, on_chunk) do
         {:ok, result} ->
           IO.write("\n")
           tokens = result.usage.input_tokens + result.usage.output_tokens
@@ -415,7 +419,7 @@ defmodule Mix.Tasks.Alloy do
           Mix.shell().error("Error: #{inspect(result.error)}")
       end
     else
-      case Alloy.Agent.Server.chat(pid, message) do
+      case Server.chat(pid, message) do
         {:ok, result} ->
           Mix.shell().info("\nAlloy: #{result.text || "(no text response)"}")
           tokens = result.usage.input_tokens + result.usage.output_tokens

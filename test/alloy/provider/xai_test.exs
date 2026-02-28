@@ -3,8 +3,8 @@ defmodule Alloy.Provider.XAITest do
 
   import Alloy.StreamTestHelpers
 
-  alias Alloy.Provider.XAI
   alias Alloy.Message
+  alias Alloy.Provider.XAI
 
   describe "complete/3 with text response" do
     test "returns normalized end_turn response" do

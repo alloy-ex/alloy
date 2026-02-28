@@ -1,7 +1,7 @@
 defmodule Alloy.StreamingTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Agent.{Config, State, Turn, Server}
+  alias Alloy.Agent.{Config, Server, State, Turn}
   alias Alloy.Message
   alias Alloy.Provider.Test, as: TestProvider
 

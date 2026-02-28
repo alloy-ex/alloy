@@ -1,9 +1,9 @@
 defmodule Alloy.TeamTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Team
   alias Alloy.Agent.Server
   alias Alloy.Provider.Test, as: TestProvider
+  alias Alloy.Team
 
   defp start_provider(responses) do
     {:ok, pid} = TestProvider.start_link(responses)

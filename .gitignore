@@ -28,3 +28,4 @@ alloy-*.tar
 # Local tooling state.
 .claude/specs/
 
+priv/plts/

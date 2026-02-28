@@ -50,6 +50,9 @@ defmodule Alloy.Agent.Config do
   @doc """
   Builds a config from `Alloy.run/2` options.
   """
+  alias Alloy.Context.Discovery
+  alias Alloy.Context.SystemPrompt
+
   @spec from_opts(keyword()) :: t()
   def from_opts(opts) do
     {provider_mod, provider_config} = parse_provider(opts[:provider])
@@ -65,8 +68,8 @@ defmodule Alloy.Agent.Config do
           working_directory: working_directory
         ]
 
-        sections = Alloy.Context.Discovery.discover(discovery_opts)
-        Alloy.Context.SystemPrompt.build(base_prompt || "", sections)
+        sections = Discovery.discover(discovery_opts)
+        SystemPrompt.build(base_prompt || "", sections)
       else
         base_prompt
       end

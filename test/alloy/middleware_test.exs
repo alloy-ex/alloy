@@ -1,8 +1,8 @@
 defmodule Alloy.MiddlewareTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Middleware
   alias Alloy.Agent.{Config, State}
+  alias Alloy.Middleware
   alias Alloy.Provider.Test, as: TestProvider
 
   # A middleware that blocks a specific tool

@@ -10,8 +10,8 @@ defmodule Alloy.Agent.Turn do
   """
 
   alias Alloy.Agent.State
-  alias Alloy.{Message, Middleware}
   alias Alloy.Context.Compactor
+  alias Alloy.{Message, Middleware}
   alias Alloy.Tool.Executor
 
   # Buffer subtracted from timeout_ms when computing the retry deadline.

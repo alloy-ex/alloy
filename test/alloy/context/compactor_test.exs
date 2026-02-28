@@ -1,8 +1,8 @@
 defmodule Alloy.Context.CompactorTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Context.Compactor
   alias Alloy.Agent.{Config, State}
+  alias Alloy.Context.Compactor
   alias Alloy.Message
 
   defp build_state(messages, max_tokens \\ 200_000) do

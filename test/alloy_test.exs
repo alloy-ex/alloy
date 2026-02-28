@@ -1,8 +1,8 @@
 defmodule AlloyTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Provider.Test, as: TestProvider
   alias Alloy.Message
+  alias Alloy.Provider.Test, as: TestProvider
 
   # A simple tool for integration testing
   defmodule UpperTool do

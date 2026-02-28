@@ -3,8 +3,8 @@ defmodule Alloy.Provider.MistralTest do
 
   import Alloy.StreamTestHelpers
 
-  alias Alloy.Provider.Mistral
   alias Alloy.Message
+  alias Alloy.Provider.Mistral
 
   describe "complete/3 with text response" do
     test "returns normalized end_turn response" do

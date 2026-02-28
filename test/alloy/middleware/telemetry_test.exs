@@ -1,8 +1,8 @@
 defmodule Alloy.Middleware.TelemetryTest do
   use ExUnit.Case, async: false
 
-  alias Alloy.Middleware.Telemetry
   alias Alloy.Agent.{Config, State}
+  alias Alloy.Middleware.Telemetry
   alias Alloy.Usage
 
   defp build_state(attrs \\ []) do

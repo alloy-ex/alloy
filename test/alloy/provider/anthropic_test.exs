@@ -1,8 +1,8 @@
 defmodule Alloy.Provider.AnthropicTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Provider.Anthropic
   alias Alloy.Message
+  alias Alloy.Provider.Anthropic
 
   # We test by intercepting the HTTP call via a custom Req adapter
   # that returns canned responses.

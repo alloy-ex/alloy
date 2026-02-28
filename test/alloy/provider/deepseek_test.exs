@@ -3,8 +3,8 @@ defmodule Alloy.Provider.DeepSeekTest do
 
   import Alloy.StreamTestHelpers
 
-  alias Alloy.Provider.DeepSeek
   alias Alloy.Message
+  alias Alloy.Provider.DeepSeek
 
   describe "complete/3 with text response" do
     test "returns normalized end_turn response" do

@@ -1,8 +1,8 @@
 defmodule Alloy.Provider.GoogleTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Provider.Google
   alias Alloy.Message
+  alias Alloy.Provider.Google
 
   describe "complete/3 with text response" do
     test "returns normalized end_turn response" do

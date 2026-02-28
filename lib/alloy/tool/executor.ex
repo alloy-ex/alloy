@@ -7,8 +7,8 @@ defmodule Alloy.Tool.Executor do
   executed concurrently.
   """
 
-  alias Alloy.Message
   alias Alloy.Agent.State
+  alias Alloy.Message
   alias Alloy.Middleware
 
   @doc """

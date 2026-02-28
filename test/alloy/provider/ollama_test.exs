@@ -3,8 +3,8 @@ defmodule Alloy.Provider.OllamaTest do
 
   import Alloy.StreamTestHelpers
 
-  alias Alloy.Provider.Ollama
   alias Alloy.Message
+  alias Alloy.Provider.Ollama
 
   describe "complete/3 with text response" do
     test "returns normalized end_turn response" do

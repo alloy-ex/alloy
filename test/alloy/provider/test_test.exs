@@ -1,8 +1,8 @@
 defmodule Alloy.Provider.TestTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Provider.Test, as: TestProvider
   alias Alloy.Message
+  alias Alloy.Provider.Test, as: TestProvider
 
   describe "text_response/1" do
     test "builds an end_turn completion response with text" do

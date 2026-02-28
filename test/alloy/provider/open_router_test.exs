@@ -3,8 +3,8 @@ defmodule Alloy.Provider.OpenRouterTest do
 
   import Alloy.StreamTestHelpers
 
-  alias Alloy.Provider.OpenRouter
   alias Alloy.Message
+  alias Alloy.Provider.OpenRouter
 
   describe "complete/3 with text response" do
     test "returns normalized end_turn response" do

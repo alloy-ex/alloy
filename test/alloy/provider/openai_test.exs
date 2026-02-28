@@ -3,8 +3,8 @@ defmodule Alloy.Provider.OpenAITest do
 
   import Alloy.StreamTestHelpers
 
-  alias Alloy.Provider.OpenAI
   alias Alloy.Message
+  alias Alloy.Provider.OpenAI
 
   describe "complete/3 with text response" do
     test "returns normalized end_turn response" do

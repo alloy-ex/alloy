@@ -39,8 +39,16 @@ jobs:
           key: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
 
+      - name: Cache PLT
+        uses: actions/cache@v4
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-plt-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-plt-${{ matrix.elixir }}-${{ matrix.otp }}-
+
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix test
       - run: mix format --check-formatted
-      - run: mix credo
+      - run: mix credo --strict
+      - run: mix dialyzer

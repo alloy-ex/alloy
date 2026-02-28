@@ -3,8 +3,8 @@ defmodule Alloy.Middleware.LoggerTest do
 
   import ExUnit.CaptureLog
 
-  alias Alloy.Middleware.Logger, as: AlloyLogger
   alias Alloy.Agent.{Config, State}
+  alias Alloy.Middleware.Logger, as: AlloyLogger
   alias Alloy.Usage
 
   defp build_state(attrs \\ []) do

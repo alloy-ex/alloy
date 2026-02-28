@@ -24,8 +24,8 @@ end
 defmodule Alloy.SchedulerTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Scheduler
   alias Alloy.Provider.Test, as: TestProvider
+  alias Alloy.Scheduler
   alias Alloy.SchedulerTest.BlockingProvider
 
   defp make_agent_opts(responses) do

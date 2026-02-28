@@ -1,9 +1,9 @@
 defmodule Alloy.Tool.ExecutorTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Tool.Executor
   alias Alloy.Agent.{Config, State}
   alias Alloy.Message
+  alias Alloy.Tool.Executor
 
   # --- Test Tool Modules ---
 

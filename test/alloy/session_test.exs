@@ -1,8 +1,8 @@
 defmodule Alloy.SessionTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Session
   alias Alloy.{Message, Usage}
+  alias Alloy.Session
 
   describe "new/0" do
     test "creates a session with a generated ID" do

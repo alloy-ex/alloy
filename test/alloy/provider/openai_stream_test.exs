@@ -1,8 +1,8 @@
 defmodule Alloy.Provider.OpenAIStreamTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Provider.OpenAIStream
   alias Alloy.Message
+  alias Alloy.Provider.OpenAIStream
 
   # ── Helper: build SSE chunks ─────────────────────────────────────────
 
