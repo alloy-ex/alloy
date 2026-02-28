@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.4.0"
+  @version "0.4.1"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -62,6 +62,7 @@ defmodule Alloy.MixProject do
           Alloy.Agent.State,
           Alloy.Agent.Turn,
           Alloy.Message,
+          Alloy.Persistence,
           Alloy.Session,
           Alloy.Usage
         ],
