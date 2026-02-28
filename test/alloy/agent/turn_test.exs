@@ -1151,4 +1151,73 @@ defmodule Alloy.Agent.TurnTest do
       assert result.usage.output_tokens == 10
     end
   end
+
+  describe "run_loop/2 on_event threading" do
+    test "on_event callback from opts is fired for each chunk during streaming" do
+      test_pid = self()
+
+      {:ok, pid} = TestProvider.start_link([TestProvider.text_response("Hi")])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid}
+      }
+
+      state = State.init(config, [Message.user("Hello")])
+
+      on_event = fn event -> send(test_pid, {:event, event}) end
+
+      result = Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
+
+      assert result.status == :completed
+      # "Hi" has 2 chars — expect 2 {:text_delta, char} events
+      assert_received {:event, {:text_delta, "H"}}
+      assert_received {:event, {:text_delta, "i"}}
+    end
+
+    test "on_event defaults to no-op when not provided (no crash)" do
+      {:ok, pid} = TestProvider.start_link([TestProvider.text_response("Hello")])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid}
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+
+      # Should not crash without on_event in opts
+      result = Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end)
+      assert result.status == :completed
+    end
+
+    test "on_event emission marks chunks_emitted — no retry after thinking_delta fires" do
+      test_pid = self()
+
+      # Two retryable thinking-then-error responses, then success.
+      # Without the fix, the thinking delta fires once per attempt (3 total).
+      # With the fix, it fires on the first attempt and blocks retries entirely.
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.thinking_error_response("Let me reason...", "HTTP 429: Too Many Requests"),
+          TestProvider.thinking_error_response("Let me reason...", "HTTP 429: Too Many Requests"),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_retries: 3,
+        retry_backoff_ms: 1
+      }
+
+      on_event = fn event -> send(test_pid, {:event, event}) end
+
+      state = State.init(config, [Message.user("Think")])
+      _result = Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
+
+      # The thinking delta should be emitted exactly once — NOT again on retry.
+      assert_received {:event, {:thinking_delta, "Let me reason..."}}
+      refute_received {:event, {:thinking_delta, "Let me reason..."}}
+    end
+  end
 end

@@ -100,6 +100,28 @@ end)
 All 8 providers support streaming. If a custom provider doesn't implement
 `stream/4`, the turn loop falls back to `complete/3` automatically.
 
+For Anthropic extended thinking with streaming events:
+
+```elixir
+{:ok, agent} = Alloy.Agent.Server.start_link(
+  provider: {Alloy.Provider.Anthropic,
+    api_key: "...",
+    model: "claude-opus-4-6",
+    extended_thinking: [budget_tokens: 5000]
+  }
+)
+
+on_event = fn
+  {:text_delta, chunk}     -> IO.write(chunk)
+  {:thinking_delta, chunk} -> IO.write("[thinking: #{chunk}]")
+end
+
+{:ok, result} = Alloy.Agent.Server.stream_chat(agent, "Solve this step by step",
+  fn _chunk -> :ok end,
+  on_event: on_event
+)
+```
+
 ### Supervised GenServer agent
 
 ```elixir

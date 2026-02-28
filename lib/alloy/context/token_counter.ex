@@ -73,6 +73,10 @@ defmodule Alloy.Context.TokenCounter do
     estimate_tokens(content)
   end
 
+  defp estimate_block_tokens(%{type: "thinking", thinking: text}) when is_binary(text) do
+    estimate_tokens(text)
+  end
+
   defp estimate_block_tokens(%{type: "image"}), do: @image_tokens
   defp estimate_block_tokens(%{type: "audio"}), do: @audio_tokens
   defp estimate_block_tokens(%{type: "video"}), do: @video_tokens

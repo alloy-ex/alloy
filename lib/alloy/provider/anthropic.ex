@@ -18,6 +18,15 @@ defmodule Alloy.Provider.Anthropic do
   - `:api_url` - Base URL (default: "https://api.anthropic.com")
   - `:api_version` - API version header (default: "2023-06-01")
   - `:req_options` - Additional options passed to Req (useful for testing)
+  - `:extended_thinking` - Enable extended thinking. Pass a keyword list with
+    `:budget_tokens` (e.g., `[budget_tokens: 5000]`). Thinking blocks are
+    returned in the message content and must be round-tripped verbatim in
+    subsequent turns (Anthropic requires the `signature` field).
+  - `:on_event` - Streaming event callback `(event -> :ok)`. Called for each
+    streaming delta with a tagged tuple:
+      - `{:text_delta, text}` — a chunk of normal response text
+      - `{:thinking_delta, text}` — a chunk of extended thinking text
+    Pass via `Server.stream_chat/4` opts: `on_event: fn event -> ... end`.
 
   ## Example
 
@@ -80,13 +89,16 @@ defmodule Alloy.Provider.Anthropic do
       build_request_body(messages, tool_defs, config)
       |> Map.put("stream", true)
 
+    on_event = Map.get(config, :on_event, fn _ -> :ok end)
+
     initial_acc = %{
       buffer: "",
       content_blocks: %{},
       input_json_buffers: %{},
       stop_reason: nil,
       usage: %{},
-      on_chunk: on_chunk
+      on_chunk: on_chunk,
+      on_event: on_event
     }
 
     stream_handler = SSE.req_stream_handler(initial_acc, &handle_sse_raw_event/2)
@@ -143,12 +155,31 @@ defmodule Alloy.Provider.Anthropic do
 
   defp handle_sse_event(acc, "content_block_delta", %{
          "index" => index,
+         "delta" => %{"type" => "thinking_delta", "thinking" => text}
+       }) do
+    acc.on_event.({:thinking_delta, text})
+
+    current = Map.get(acc.content_blocks, index, %{"type" => "thinking", "thinking" => ""})
+    updated = Map.update!(current, "thinking", &(&1 <> text))
+    put_in(acc.content_blocks[index], updated)
+  end
+
+  defp handle_sse_event(acc, "content_block_delta", %{
+         "index" => index,
+         "delta" => %{"type" => "signature_delta", "signature" => sig}
+       }) do
+    current = Map.get(acc.content_blocks, index, %{"type" => "thinking", "thinking" => ""})
+    updated = Map.put(current, "signature", sig)
+    put_in(acc.content_blocks[index], updated)
+  end
+
+  defp handle_sse_event(acc, "content_block_delta", %{
+         "index" => index,
          "delta" => %{"type" => "text_delta", "text" => text}
        }) do
-    # Call on_chunk for text deltas
     acc.on_chunk.(text)
+    acc.on_event.({:text_delta, text})
 
-    # Accumulate text into the content block
     current = Map.get(acc.content_blocks, index, %{"type" => "text", "text" => ""})
     updated = Map.update!(current, "text", &(&1 <> text))
     put_in(acc.content_blocks[index], updated)
@@ -240,7 +271,20 @@ defmodule Alloy.Provider.Anthropic do
         defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
       end
 
-    body
+    case Map.get(config, :extended_thinking) do
+      nil ->
+        body
+
+      opts ->
+        budget = opts[:budget_tokens]
+
+        unless is_integer(budget) and budget > 0 do
+          raise ArgumentError,
+                "extended_thinking requires a positive integer :budget_tokens, got: #{inspect(budget)}"
+        end
+
+        Map.put(body, "thinking", %{"type" => "enabled", "budget_tokens" => budget})
+    end
   end
 
   defp format_message(%Message{role: role, content: content}) when is_binary(content) do
@@ -249,6 +293,15 @@ defmodule Alloy.Provider.Anthropic do
 
   defp format_message(%Message{role: role, content: blocks}) when is_list(blocks) do
     %{"role" => to_string(role), "content" => Enum.map(blocks, &format_content_block/1)}
+  end
+
+  defp format_content_block(%{type: "thinking", thinking: thinking} = block) do
+    base = %{"type" => "thinking", "thinking" => thinking}
+
+    case Map.get(block, :signature) do
+      nil -> base
+      sig -> Map.put(base, "signature", sig)
+    end
   end
 
   defp format_content_block(%{type: "text", text: text}) do
@@ -344,6 +397,15 @@ defmodule Alloy.Provider.Anthropic do
 
   defp parse_content_blocks(blocks) do
     Enum.map(blocks, &parse_content_block/1)
+  end
+
+  defp parse_content_block(%{"type" => "thinking", "thinking" => thinking} = block) do
+    base = %{type: "thinking", thinking: thinking}
+
+    case Map.get(block, "signature") do
+      nil -> base
+      sig -> Map.put(base, :signature, sig)
+    end
   end
 
   defp parse_content_block(%{"type" => "text", "text" => text}) do

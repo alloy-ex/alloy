@@ -271,6 +271,34 @@ defmodule Alloy.StreamingTest do
       # Config struct should not have :streaming — accessing it raises KeyError
       assert_raise KeyError, fn -> Map.fetch!(state.config, :streaming) end
     end
+
+    test "raises ArgumentError when on_event is not a function" do
+      {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Hi")])
+
+      {:ok, agent} =
+        Server.start_link(provider: {TestProvider, agent_pid: provider})
+
+      assert_raise ArgumentError, ~r/on_event must be a 1-arity function/, fn ->
+        Server.stream_chat(agent, "Hello", fn _ -> :ok end, on_event: "not_a_function")
+      end
+    end
+
+    test "on_event opt is threaded through to the provider" do
+      {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Hi")])
+
+      {:ok, agent} =
+        Server.start_link(provider: {TestProvider, agent_pid: provider})
+
+      test_pid = self()
+      on_event = fn event -> send(test_pid, {:event, event}) end
+
+      {:ok, result} = Server.stream_chat(agent, "Hello", fn _ -> :ok end, on_event: on_event)
+      assert result.status == :completed
+
+      # "Hi" = 2 chars, each fires a :text_delta event
+      assert_received {:event, {:text_delta, "H"}}
+      assert_received {:event, {:text_delta, "i"}}
+    end
   end
 
   # ── Helpers ────────────────────────────────────────────────────────────

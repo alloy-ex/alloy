@@ -152,6 +152,33 @@ defmodule Alloy.Context.TokenCounterTest do
     end
   end
 
+  describe "estimate_block_tokens/1 with thinking blocks" do
+    test "counts thinking text toward token estimate" do
+      msg = %Message{
+        role: :assistant,
+        content: [
+          %{type: "thinking", thinking: String.duplicate("a", 400)},
+          %{type: "text", text: "Answer."}
+        ]
+      }
+
+      # thinking: 400/4 = 100 tokens; text: 7/4 = 1 token
+      result = TokenCounter.estimate_message_tokens(msg)
+      assert result >= 100
+    end
+
+    test "thinking block with no thinking field returns 0" do
+      # Defensive: block has type thinking but malformed — should not crash
+      msg = %Message{
+        role: :assistant,
+        content: [%{type: "thinking"}]
+      }
+
+      # Falls through to catch-all, returns 0 (no crash)
+      assert TokenCounter.estimate_message_tokens(msg) == 0
+    end
+  end
+
   describe "within_budget?/2" do
     test "returns true when well within budget" do
       messages = [Message.user("hello")]

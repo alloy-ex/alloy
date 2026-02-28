@@ -62,6 +62,12 @@ defmodule Alloy.Agent.Turn do
                function_exported?(provider, :stream, 4))
 
         on_chunk = Keyword.get(opts, :on_chunk, fn _chunk -> :ok end)
+        on_event = Keyword.get(opts, :on_event, fn _event -> :ok end)
+
+        provider_config =
+          if streaming?,
+            do: Map.put(provider_config, :on_event, on_event),
+            else: provider_config
 
         result =
           call_provider_with_retry(
@@ -216,6 +222,15 @@ defmodule Alloy.Agent.Turn do
       :atomics.put(ref, 1, 1)
       on_chunk.(chunk)
     end
+
+    original_on_event = Map.get(provider_config, :on_event, fn _ -> :ok end)
+
+    wrapped_on_event = fn event ->
+      :atomics.put(ref, 1, 1)
+      original_on_event.(event)
+    end
+
+    provider_config = Map.put(provider_config, :on_event, wrapped_on_event)
 
     result = provider.stream(state.messages, state.tool_defs, provider_config, wrapped_chunk)
     {result, :atomics.get(ref, 1) == 1}

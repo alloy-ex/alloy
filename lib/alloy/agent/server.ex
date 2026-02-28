@@ -147,7 +147,15 @@ defmodule Alloy.Agent.Server do
   def stream_chat(server, message, on_chunk, opts \\ [])
       when is_binary(message) and is_function(on_chunk, 1) do
     timeout = Keyword.get(opts, :timeout, :infinity)
-    GenServer.call(server, {:stream_chat, message, on_chunk}, timeout)
+    stream_opts = Keyword.drop(opts, [:timeout])
+
+    case Keyword.get(stream_opts, :on_event) do
+      nil -> :ok
+      f when is_function(f, 1) -> :ok
+      bad -> raise ArgumentError, "on_event must be a 1-arity function, got: #{inspect(bad)}"
+    end
+
+    GenServer.call(server, {:stream_chat, message, on_chunk, stream_opts}, timeout)
   end
 
   @doc """
@@ -316,19 +324,23 @@ defmodule Alloy.Agent.Server do
 
   # Reject synchronous stream_chat while an async Turn is in flight.
   @impl GenServer
-  def handle_call({:stream_chat, _message, _on_chunk}, _from, %{current_task: {_, _, _}} = state) do
+  def handle_call(
+        {:stream_chat, _message, _on_chunk, _stream_opts},
+        _from,
+        %{current_task: {_, _, _}} = state
+      ) do
     {:reply, {:error, :busy}, state}
   end
 
   @impl GenServer
-  def handle_call({:stream_chat, message, on_chunk}, _from, state) do
+  def handle_call({:stream_chat, message, on_chunk, stream_opts}, _from, state) do
     state =
       state
       |> State.append_messages([Message.user(message)])
       |> reset_for_new_run()
 
-    # Pass streaming as opts — no config mutation needed
-    final_state = Turn.run_loop(state, streaming: true, on_chunk: on_chunk)
+    turn_opts = Keyword.merge(stream_opts, streaming: true, on_chunk: on_chunk)
+    final_state = Turn.run_loop(state, turn_opts)
 
     result = build_result(final_state)
     new_state = reset_for_new_run(final_state)
@@ -483,7 +495,9 @@ defmodule Alloy.Agent.Server do
         %{current_task: {ref, _, request_id}} = state
       )
       when is_reference(ref) do
-    Logger.error("[Alloy] Async Turn crashed (request_id=#{inspect(request_id)}): #{inspect(reason)}")
+    Logger.error(
+      "[Alloy] Async Turn crashed (request_id=#{inspect(request_id)}): #{inspect(reason)}"
+    )
 
     if state.config.pubsub do
       topic = "agent:#{effective_session_id(state)}:responses"

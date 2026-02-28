@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-02-28
+
+### Added
+
+- **Extended thinking (Anthropic)** — pass `extended_thinking: [budget_tokens: N]` in provider config to enable Claude's reasoning mode. Thinking blocks are parsed and stored as first-class content (`%{type: "thinking", thinking: text, signature: sig}`) for correct round-trip. Non-Anthropic providers silently ignore this opt.
+- **`on_event` streaming callback** — pass `on_event: fn {:text_delta, t} | {:thinking_delta, t} -> :ok end` alongside `on_chunk` to receive tagged stream events. `on_chunk` remains unchanged for backward compatibility. Anthropic emits both `:text_delta` and `:thinking_delta`; all other providers emit only `:text_delta`.
+- **Thinking token counting** — `TokenCounter.estimate_block_tokens/1` now counts thinking blocks toward context budget. Prevents compaction from underestimating context size when extended thinking is in use.
+
+### Fixed
+
+- `on_event` now validated as a 1-arity function at `stream_chat/4` call site — invalid values raise `ArgumentError` before reaching the provider instead of crashing deep in the pipeline.
+- `extended_thinking: [budget_tokens: nil]` now raises `ArgumentError` immediately rather than sending `null` to the Anthropic API and receiving a cryptic HTTP 400.
+- `stream_opts` can no longer override internal `:streaming` and `:on_chunk` flags via `Keyword.merge/2` (previously used `++` which could theoretically be shadowed by user opts).
+- `on_event` emissions (thinking deltas) now correctly mark `chunks_emitted?` in the retry guard — previously, a retryable error after a thinking delta but before any text chunk would re-emit the thinking delta on retry.
+
 ## [0.4.1] - 2026-02-28
 
 ### Added

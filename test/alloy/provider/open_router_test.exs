@@ -364,12 +364,20 @@ defmodule Alloy.Provider.OpenRouterTest do
   # --- SSE Streaming Helpers ---
 
   defp config_with_sse_stream(chunks) do
-    %{api_key: "or-test-key", model: "anthropic/claude-haiku-4-5-20251001", req_options: [plug: {Req.Test, __MODULE__}, retry: false]}
+    %{
+      api_key: "or-test-key",
+      model: "anthropic/claude-haiku-4-5-20251001",
+      req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+    }
     |> tap(fn _ -> Req.Test.stub(__MODULE__, sse_chunks_plug(chunks)) end)
   end
 
   defp config_with_sse_stream_capturing_request(chunks) do
-    %{api_key: "or-test-key", model: "anthropic/claude-haiku-4-5-20251001", req_options: [plug: {Req.Test, __MODULE__}, retry: false]}
+    %{
+      api_key: "or-test-key",
+      model: "anthropic/claude-haiku-4-5-20251001",
+      req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+    }
     |> tap(fn _ -> Req.Test.stub(__MODULE__, sse_chunks_capturing_plug(self(), chunks)) end)
   end
 end

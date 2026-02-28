@@ -54,7 +54,10 @@ defmodule Alloy.Provider.Test do
   streaming. Consumes from the same script queue as `complete/3`.
   """
   @impl Alloy.Provider
-  def stream(_messages, _tool_defs, %{agent_pid: pid}, on_chunk) when is_function(on_chunk, 1) do
+  def stream(_messages, _tool_defs, %{agent_pid: pid} = config, on_chunk)
+      when is_function(on_chunk, 1) do
+    on_event = Map.get(config, :on_event, fn _ -> :ok end)
+
     case pop_response(pid) do
       {:ok, %{stop_reason: :end_turn, messages: messages} = response} ->
         # Stream each character of text content
@@ -63,9 +66,16 @@ defmodule Alloy.Provider.Test do
             text != nil,
             char <- String.graphemes(text) do
           on_chunk.(char)
+          on_event.({:text_delta, char})
         end
 
         {:ok, response}
+
+      {:thinking_then_error, thinking_text, error} ->
+        # Emit a thinking delta, then return a retryable error.
+        # Used to test that chunks_emitted? also tracks on_event emissions.
+        on_event.({:thinking_delta, thinking_text})
+        {:error, error}
 
       other ->
         # Tool use or error -- return as-is without streaming
@@ -147,5 +157,15 @@ defmodule Alloy.Provider.Test do
   @spec error_response(term()) :: {:error, term()}
   def error_response(reason) do
     {:error, reason}
+  end
+
+  @doc """
+  Builds a scripted response that emits a thinking delta via `on_event`, then
+  returns a retryable error. Used to test that `chunks_emitted?` tracks
+  `on_event` emissions so retries don't re-emit thinking deltas.
+  """
+  @spec thinking_error_response(String.t(), term()) :: {:thinking_then_error, String.t(), term()}
+  def thinking_error_response(thinking_text, error_reason) do
+    {:thinking_then_error, thinking_text, error_reason}
   end
 end

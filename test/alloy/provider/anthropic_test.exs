@@ -361,7 +361,9 @@ defmodule Alloy.Provider.AnthropicTest do
       test_pid = self()
       on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
 
-      assert {:ok, result} = Anthropic.stream([Message.user("Read mix.exs")], [], config, on_chunk)
+      assert {:ok, result} =
+               Anthropic.stream([Message.user("Read mix.exs")], [], config, on_chunk)
+
       assert result.stop_reason == :tool_use
       assert [%Message{role: :assistant, content: blocks}] = result.messages
 
@@ -431,7 +433,10 @@ defmodule Alloy.Provider.AnthropicTest do
           }),
           ant_event("content_block_delta", %{
             "index" => 1,
-            "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"file_path\": \"mix.exs\"}"}
+            "delta" => %{
+              "type" => "input_json_delta",
+              "partial_json" => "{\"file_path\": \"mix.exs\"}"
+            }
           }),
           ant_event("content_block_stop", %{"index" => 1}),
           ant_event("message_delta", %{
@@ -444,7 +449,9 @@ defmodule Alloy.Provider.AnthropicTest do
       test_pid = self()
       on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
 
-      assert {:ok, result} = Anthropic.stream([Message.user("Read mix.exs")], [], config, on_chunk)
+      assert {:ok, result} =
+               Anthropic.stream([Message.user("Read mix.exs")], [], config, on_chunk)
+
       assert result.stop_reason == :tool_use
       assert [%Message{role: :assistant, content: blocks}] = result.messages
 
@@ -452,6 +459,286 @@ defmodule Alloy.Provider.AnthropicTest do
       assert Enum.find(blocks, &(&1.type == "tool_use"))
 
       assert_received {:chunk, "Let me read that."}
+    end
+  end
+
+  # ── Extended Thinking ────────────────────────────────────────────────
+
+  describe "complete/3 with thinking blocks" do
+    test "returns thinking block in message content for round-trip" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "msg_think_01",
+              "type" => "message",
+              "role" => "assistant",
+              "content" => [
+                %{
+                  "type" => "thinking",
+                  "thinking" => "Let me reason through this...",
+                  "signature" => "sig_abc123"
+                },
+                %{"type" => "text", "text" => "The answer is 42."}
+              ],
+              "stop_reason" => "end_turn",
+              "usage" => %{"input_tokens" => 10, "output_tokens" => 30}
+            })
+        })
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Hard question")], [], config)
+
+      # text/1 returns only the text content
+      assert Message.text(hd(result.messages)) == "The answer is 42."
+
+      # thinking block is preserved in content for round-trip
+      [thinking_block, _text_block] = hd(result.messages).content
+      assert thinking_block.type == "thinking"
+      assert thinking_block.thinking == "Let me reason through this..."
+      assert thinking_block.signature == "sig_abc123"
+    end
+
+    test "includes thinking in request body when extended_thinking opt set" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:extended_thinking, budget_tokens: 5_000)
+
+      Anthropic.complete([Message.user("Think hard")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert %{"type" => "enabled", "budget_tokens" => 5_000} = decoded["thinking"]
+    end
+
+    test "raises ArgumentError when extended_thinking is set without budget_tokens" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:extended_thinking, [])
+
+      assert_raise ArgumentError, ~r/budget_tokens/, fn ->
+        Anthropic.complete([Message.user("Think hard")], [], config)
+      end
+    end
+
+    test "no thinking key in request body when extended_thinking not set" do
+      config = config_that_captures_request()
+
+      Anthropic.complete([Message.user("Simple question")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      refute Map.has_key?(decoded, "thinking")
+    end
+
+    test "thinking block round-trips correctly through format_content_block" do
+      # A message with a thinking block should be serialisable back to Anthropic's
+      # wire format so subsequent turns include the thinking block verbatim.
+      config = config_that_captures_request()
+
+      thinking_block = %{type: "thinking", thinking: "My reasoning...", signature: "sig_xyz"}
+      text_block = %{type: "text", text: "My answer."}
+
+      messages = [
+        Message.user("Question"),
+        %Message{role: :assistant, content: [thinking_block, text_block]}
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assistant_msg = Enum.find(decoded["messages"], &(&1["role"] == "assistant"))
+      thinking_wire = Enum.find(assistant_msg["content"], &(&1["type"] == "thinking"))
+
+      assert thinking_wire["thinking"] == "My reasoning..."
+      assert thinking_wire["signature"] == "sig_xyz"
+    end
+  end
+
+  describe "stream/4 with thinking blocks" do
+    test "emits thinking deltas via on_event, not on_chunk" do
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 10, "output_tokens" => 0}}
+          }),
+          # Thinking block at index 0
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "thinking", "thinking" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "thinking_delta", "thinking" => "Let me think..."}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "thinking_delta", "thinking" => " Step 2."}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          # Text block at index 1
+          ant_event("content_block_start", %{
+            "index" => 1,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 1,
+            "delta" => %{"type" => "text_delta", "text" => "Answer."}
+          }),
+          ant_event("content_block_stop", %{"index" => 1}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{"output_tokens" => 20}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      on_event = fn event -> send(test_pid, {:event, event}) end
+      config = Map.put(config, :on_event, on_event)
+
+      assert {:ok, result} = Anthropic.stream([Message.user("Think")], [], config, on_chunk)
+
+      # on_chunk receives only text deltas
+      assert_received {:chunk, "Answer."}
+      refute_received {:chunk, _}
+
+      # on_event receives thinking and text deltas
+      assert_received {:event, {:thinking_delta, "Let me think..."}}
+      assert_received {:event, {:thinking_delta, " Step 2."}}
+      assert_received {:event, {:text_delta, "Answer."}}
+
+      # Result text is text-only
+      assert Message.text(hd(result.messages)) == "Answer."
+
+      # Thinking block is in content for round-trip
+      [thinking_block | _] = hd(result.messages).content
+      assert thinking_block.type == "thinking"
+      assert thinking_block.thinking == "Let me think... Step 2."
+    end
+
+    test "on_event fires text_delta for text chunks too" do
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 5, "output_tokens" => 0}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "Hello"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{"output_tokens" => 3}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      test_pid = self()
+      on_event = fn event -> send(test_pid, {:event, event}) end
+      config = Map.put(config, :on_event, on_event)
+
+      Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert_received {:event, {:text_delta, "Hello"}}
+    end
+
+    test "signature_delta is captured in streamed thinking block" do
+      # Anthropic streams thinking in three delta phases:
+      # thinking_delta (text), signature_delta (signature), then content_block_stop.
+      # The signature must survive into the parsed thinking block for round-trip.
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 10, "output_tokens" => 0}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "thinking", "thinking" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "thinking_delta", "thinking" => "My reasoning."}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "signature_delta", "signature" => "sig_streamed123"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("content_block_start", %{
+            "index" => 1,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 1,
+            "delta" => %{"type" => "text_delta", "text" => "Done."}
+          }),
+          ant_event("content_block_stop", %{"index" => 1}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{"output_tokens" => 5}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      assert {:ok, result} =
+               Anthropic.stream([Message.user("Think")], [], config, fn _ -> :ok end)
+
+      [thinking_block | _] = hd(result.messages).content
+      assert thinking_block.type == "thinking"
+      assert thinking_block.thinking == "My reasoning."
+      assert thinking_block.signature == "sig_streamed123"
+    end
+
+    test "works normally when on_event is not set" do
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 5, "output_tokens" => 0}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "thinking", "thinking" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "thinking_delta", "thinking" => "thinking..."}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("content_block_start", %{
+            "index" => 1,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 1,
+            "delta" => %{"type" => "text_delta", "text" => "Done."}
+          }),
+          ant_event("content_block_stop", %{"index" => 1}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{"output_tokens" => 10}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      # No on_event in config — should work fine, no crash
+      assert {:ok, result} = Anthropic.stream([Message.user("Hi")], [], config, on_chunk)
+      assert Message.text(hd(result.messages)) == "Done."
+      assert_received {:chunk, "Done."}
     end
   end
 
