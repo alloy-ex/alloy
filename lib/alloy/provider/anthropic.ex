@@ -23,10 +23,14 @@ defmodule Alloy.Provider.Anthropic do
     returned in the message content and must be round-tripped verbatim in
     subsequent turns (Anthropic requires the `signature` field).
   - `:on_event` - Streaming event callback `(event -> :ok)`. Called for each
-    streaming delta with a tagged tuple:
-      - `{:text_delta, text}` — a chunk of normal response text
-      - `{:thinking_delta, text}` — a chunk of extended thinking text
+    streaming delta with a tagged tuple. When used via `Server.stream_chat/4`:
+      - `{:text_delta, text}` — a chunk of normal response text (emitted by
+        `Turn` for all providers)
+      - `{:thinking_delta, text}` — a chunk of extended thinking text (emitted
+        directly by this provider when `extended_thinking` is enabled)
     Pass via `Server.stream_chat/4` opts: `on_event: fn event -> ... end`.
+    Note: direct callers of `Alloy.Provider.Anthropic.stream/4` receive only
+    `{:thinking_delta}` events; `{:text_delta}` is Turn's responsibility.
 
   ## Example
 
@@ -275,8 +279,8 @@ defmodule Alloy.Provider.Anthropic do
       nil ->
         body
 
-      opts ->
-        budget = opts[:budget_tokens]
+      opts when is_list(opts) ->
+        budget = Keyword.get(opts, :budget_tokens)
 
         unless is_integer(budget) and budget > 0 do
           raise ArgumentError,
@@ -284,6 +288,10 @@ defmodule Alloy.Provider.Anthropic do
         end
 
         Map.put(body, "thinking", %{"type" => "enabled", "budget_tokens" => budget})
+
+      _opts ->
+        # Non-list value (e.g., extended_thinking: true) — silently ignore
+        body
     end
   end
 

@@ -533,6 +533,25 @@ defmodule Alloy.Provider.AnthropicTest do
       refute Map.has_key?(decoded, "thinking")
     end
 
+    test "ignores extended_thinking when value is not a keyword list" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "msg_ignore_thinking",
+              "type" => "message",
+              "role" => "assistant",
+              "content" => [%{"type" => "text", "text" => "ok"}],
+              "stop_reason" => "end_turn",
+              "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+            })
+        })
+        |> Map.put(:extended_thinking, true)
+
+      assert {:ok, _result} = Anthropic.complete([Message.user("Think hard")], [], config)
+    end
+
     test "thinking block round-trips correctly through format_content_block" do
       # A message with a thinking block should be serialisable back to Anthropic's
       # wire format so subsequent turns include the thinking block verbatim.
