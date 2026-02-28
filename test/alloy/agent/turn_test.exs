@@ -1167,7 +1167,8 @@ defmodule Alloy.Agent.TurnTest do
 
       on_event = fn event -> send(test_pid, {:event, event}) end
 
-      result = Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
+      result =
+        Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
 
       assert result.status == :completed
       # "Hi" has 2 chars — expect 2 {:text_delta, char} events
@@ -1213,7 +1214,9 @@ defmodule Alloy.Agent.TurnTest do
       on_event = fn event -> send(test_pid, {:event, event}) end
 
       state = State.init(config, [Message.user("Think")])
-      _result = Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
+
+      _result =
+        Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
 
       # The thinking delta should be emitted exactly once — NOT again on retry.
       assert_received {:event, {:thinking_delta, "Let me reason..."}}
