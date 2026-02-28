@@ -193,7 +193,11 @@ defmodule Alloy.Agent.Server do
           {:ok, binary()} | {:error, :busy | :no_pubsub}
   def send_message(server, message, opts \\ []) when is_binary(message) do
     request_id = Keyword.get(opts, :request_id, generate_request_id())
-    GenServer.call(server, {:send_message, message, request_id}, 5_000)
+    # Use :infinity — the handler spawns a Task and replies immediately (no I/O),
+    # but the GenServer may be blocked by a long synchronous chat/3 call ahead
+    # of this request in the mailbox. A hard timeout here would crash the caller
+    # while the GenServer still processes the message later, spawning a ghost Turn.
+    GenServer.call(server, {:send_message, message, request_id}, :infinity)
   end
 
   @doc """

@@ -25,6 +25,15 @@ defmodule Alloy.Provider.SSE do
     # server or proxy line-ending style. Normalize only the incoming
     # chunk (not the entire buffer) to avoid rescanning accumulated
     # bytes on every chunk, keeping total CRLF-scan work O(stream size).
+    #
+    # Cross-chunk boundary: if the buffer ends with \r and the chunk
+    # starts with \n, the \r\n pair is split — strip the dangling \r
+    # so the boundary becomes a clean \n after concatenation.
+    buffer =
+      if String.ends_with?(buffer, "\r") and String.starts_with?(chunk, "\n"),
+        do: binary_part(buffer, 0, byte_size(buffer) - 1),
+        else: buffer
+
     combined = buffer <> String.replace(chunk, "\r\n", "\n")
     {raw_events, remaining} = split_events(combined)
 
