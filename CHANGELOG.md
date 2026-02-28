@@ -9,7 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Persistence behaviour** — `Alloy.Persistence` defines the formal contract for session persistence backends (`save_session/1`, `load_session/1`, `delete_session/1`, `list_sessions/0`). Alloy itself remains in-memory only — this behaviour is the architectural seam between the engine and any runtime (AnvilOS, or your own Ecto/SQLite/Redis adapter).
+- **Unified streaming across all 8 providers** — `Alloy.Provider.SSE` now handles all transport-level SSE framing (CRLF normalisation, event boundary splitting, cross-chunk boundary handling). Anthropic, OpenAI, Google, Ollama, OpenRouter, xAI, DeepSeek, and Mistral all stream through the same pipeline. Each provider pattern-matches on parsed events. Adding a new streaming provider is ~50 lines.
+- **`send_message/2`** — async non-blocking dispatch for `Alloy.Agent.Server`. Returns `:ok` immediately; the agent runs its Turn loop in a supervised `Task` and broadcasts the result via Phoenix.PubSub when done. Returns `{:error, :busy}` if the agent is mid-turn. Designed for Phoenix LiveView and background jobs that cannot block.
+- **`Alloy.Application`** — proper OTP application entry point. Starts `Alloy.TaskSupervisor` (a `Task.Supervisor`) under `Alloy.Supervisor`. Required for `send_message/2`. Add `alloy` to your `extra_applications` list if using an umbrella.
+- **Persistence behaviour** — `Alloy.Persistence` defines the formal contract for session persistence backends (`save_session/1`, `load_session/1`, `delete_session/1`, `list_sessions/0`). Alloy itself remains in-memory only — this behaviour is the seam for your own Ecto/SQLite/Redis adapter.
 
 ## [0.4.0] - 2026-02-26
 

@@ -26,7 +26,8 @@ Most agent frameworks target Python and single-script usage. Alloy targets what 
 - **5 built-in tools** — read, write, edit, bash, scratchpad
 - **GenServer agents** — supervised, stateful, message-passing
 - **Multi-agent teams** — delegate, broadcast, handoff, fault isolation
-- **Streaming** — token-by-token from any provider
+- **Streaming** — token-by-token from any provider, unified interface
+- **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
 - **Middleware** — telemetry, logging, custom hooks, tool blocking
 - **Context compaction** — automatic summarization when approaching token limits
 - **OTP-native** — supervision trees, hot code reloading, real parallel tool execution
@@ -38,7 +39,7 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.4.0"}
+    {:alloy, "~> 0.4"}
   ]
 end
 ```
@@ -110,6 +111,25 @@ All 8 providers support streaming. If a custom provider doesn't implement
 
 {:ok, response} = Alloy.Agent.Server.chat(agent, "What does this project do?")
 {:ok, response} = Alloy.Agent.Server.chat(agent, "Now refactor the main module")
+```
+
+### Async dispatch (Phoenix LiveView)
+
+Fire a message without blocking the caller — ideal for LiveView and background jobs:
+
+```elixir
+# Subscribe to receive the result
+Phoenix.PubSub.subscribe(Alloy.PubSub, "agent:#{agent_id}")
+
+# Returns :ok immediately — agent works in the background
+:ok = Alloy.Agent.Server.send_message(agent, "Summarise this report",
+  request_id: "req-123"
+)
+
+# Handle the result whenever it arrives
+def handle_info({:agent_response, %{text: text, request_id: "req-123"}}, socket) do
+  {:noreply, assign(socket, :response, text)}
+end
 ```
 
 ### Multi-agent teams
