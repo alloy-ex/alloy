@@ -89,7 +89,7 @@ defmodule Alloy.Provider.OpenAI do
 
     body = %{
       "model" => config.model,
-      "max_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
+      "max_completion_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
       "messages" => openai_messages
     }
 
