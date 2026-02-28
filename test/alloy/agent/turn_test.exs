@@ -1323,4 +1323,46 @@ defmodule Alloy.Agent.TurnTest do
       refute_received {:event, {:thinking_delta, "Let me reason..."}}
     end
   end
+
+  describe "inject_receive_timeout floor" do
+    defmodule TimeoutFloorProvider do
+      @moduledoc false
+      @behaviour Alloy.Provider
+
+      @impl true
+      def complete(_messages, _tool_defs, config) do
+        send(config[:test_pid], {:captured_timeout_config, config})
+
+        {:ok,
+         %{
+           stop_reason: :end_turn,
+           messages: [Message.assistant("Done")],
+           usage: %{input_tokens: 10, output_tokens: 5}
+         }}
+      end
+
+      @impl true
+      def stream(_, _, _, _), do: {:error, :not_supported}
+    end
+
+    test "receive_timeout floor does not overshoot deadline" do
+      test_pid = self()
+
+      config = %Config{
+        provider: TimeoutFloorProvider,
+        provider_config: %{test_pid: test_pid},
+        # 8s total timeout - 5s headroom = 3s remaining at start of first call
+        timeout_ms: 8_000
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      _result = Turn.run_loop(state)
+
+      assert_received {:captured_timeout_config, captured}
+      receive_timeout = Keyword.get(captured.req_options, :receive_timeout)
+      # remaining is ~3_000ms. With floor=1_000, max(3000, 1000) = 3000.
+      # With floor=5_000 (bug), max(3000, 5000) = 5000 — overshoots deadline.
+      assert receive_timeout <= 4_000
+    end
+  end
 end

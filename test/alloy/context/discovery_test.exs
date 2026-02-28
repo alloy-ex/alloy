@@ -124,6 +124,20 @@ defmodule Alloy.Context.DiscoveryTest do
       assert length(result) == 1
       assert {"only_once", "Once"} in result
     end
+
+    test "find_git_root terminates when no .git exists anywhere", %{home: home, base: base} do
+      # Create a directory tree with NO .git directory at any level.
+      # On the old code, find_git_root would only stop at "/" — on Windows
+      # (Path.dirname("C:\\") == "C:\\") this would infinite loop.
+      # The fix uses `parent == dir` as the base case, which works on all OSes.
+      no_git = Path.join(base, "no_git_project/deep/nested")
+      File.mkdir_p!(no_git)
+
+      # This should return [] without hanging — find_git_root returns nil
+      result = Discovery.discover(home: home, working_directory: no_git)
+      # Only home tier is searched (no git root found)
+      assert is_list(result)
+    end
   end
 
   describe "Config integration" do

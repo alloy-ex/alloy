@@ -60,13 +60,13 @@ defmodule Alloy.Context.Discovery do
     end
   end
 
-  defp find_git_root("/"), do: nil
-
   defp find_git_root(dir) do
-    if File.dir?(Path.join(dir, ".git")) do
-      dir
-    else
-      find_git_root(Path.dirname(dir))
+    parent = Path.dirname(dir)
+
+    cond do
+      File.exists?(Path.join(dir, ".git")) -> dir
+      parent == dir -> nil
+      true -> find_git_root(parent)
     end
   end
 end

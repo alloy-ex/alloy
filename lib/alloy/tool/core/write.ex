@@ -39,14 +39,18 @@ defmodule Alloy.Tool.Core.Write do
   def execute(input, context) do
     path = Alloy.Tool.resolve_path(input["file_path"], context)
 
-    path |> Path.dirname() |> File.mkdir_p!()
-
-    case File.write(path, input["content"]) do
+    case path |> Path.dirname() |> File.mkdir_p() do
       :ok ->
-        {:ok, "Successfully wrote to #{path}"}
+        case File.write(path, input["content"]) do
+          :ok ->
+            {:ok, "Successfully wrote to #{path}"}
+
+          {:error, reason} ->
+            {:error, "Failed to write to #{path}: #{inspect(reason)}"}
+        end
 
       {:error, reason} ->
-        {:error, "Failed to write to #{path}: #{reason}"}
+        {:error, "Cannot create directory: #{inspect(reason)}"}
     end
   end
 end

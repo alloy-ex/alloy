@@ -72,13 +72,18 @@ defmodule Alloy.MessageTest do
       assert Message.text(msg) == "describe this"
     end
 
-    test "returns nil when only media blocks are present" do
+    test "returns empty string when only media blocks are present" do
       msg = %Message{
         role: :user,
         content: [Message.image("image/jpeg", "data")]
       }
 
-      assert Message.text(msg) == nil
+      assert Message.text(msg) == ""
+    end
+
+    test "returns empty string for empty block list" do
+      msg = %Message{role: :user, content: []}
+      assert Message.text(msg) == ""
     end
   end
 end

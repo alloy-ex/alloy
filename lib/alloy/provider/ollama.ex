@@ -164,19 +164,31 @@ defmodule Alloy.Provider.Ollama do
   end
 
   defp format_message(%Message{role: :user, content: blocks}) when is_list(blocks) do
-    Enum.map(blocks, fn
-      %{type: "tool_result", tool_use_id: tool_call_id, content: content} ->
-        %{
-          "role" => "tool",
-          "tool_call_id" => tool_call_id,
-          "content" => content
-        }
+    if Enum.any?(blocks, &(&1[:type] == "tool_result")) do
+      blocks
+      |> Enum.map(fn
+        %{type: "tool_result", tool_use_id: tool_call_id, content: content} ->
+          %{"role" => "tool", "tool_call_id" => tool_call_id, "content" => content}
 
-      _other ->
-        nil
-    end)
-    |> Enum.reject(&is_nil/1)
+        _other ->
+          nil
+      end)
+      |> Enum.reject(&is_nil/1)
+    else
+      parts = blocks |> Enum.map(&format_user_content_block/1) |> Enum.reject(&is_nil/1)
+      [%{"role" => "user", "content" => parts}]
+    end
   end
+
+  defp format_user_content_block(%{type: "text", text: text}) do
+    %{"type" => "text", "text" => text}
+  end
+
+  defp format_user_content_block(%{type: "image", mime_type: mime_type, data: data}) do
+    %{"type" => "image_url", "image_url" => %{"url" => "data:#{mime_type};base64,#{data}"}}
+  end
+
+  defp format_user_content_block(_block), do: nil
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do
     %{
@@ -201,24 +213,30 @@ defmodule Alloy.Provider.Ollama do
   defp parse_response(%{"choices" => [choice | _]} = resp) do
     message = choice["message"]
     finish_reason = choice["finish_reason"]
-    content_blocks = parse_message_to_blocks(message)
-    stop_reason = parse_finish_reason(finish_reason)
     usage = resp["usage"] || %{}
 
-    alloy_msg = %Message{
-      role: :assistant,
-      content: content_blocks
-    }
+    case parse_message_to_blocks(message) do
+      {:ok, content_blocks} ->
+        stop_reason = parse_finish_reason(finish_reason)
 
-    {:ok,
-     %{
-       stop_reason: stop_reason,
-       messages: [alloy_msg],
-       usage: %{
-         input_tokens: Map.get(usage, "prompt_tokens", 0),
-         output_tokens: Map.get(usage, "completion_tokens", 0)
-       }
-     }}
+        alloy_msg = %Message{
+          role: :assistant,
+          content: content_blocks
+        }
+
+        {:ok,
+         %{
+           stop_reason: stop_reason,
+           messages: [alloy_msg],
+           usage: %{
+             input_tokens: Map.get(usage, "prompt_tokens", 0),
+             output_tokens: Map.get(usage, "completion_tokens", 0)
+           }
+         }}
+
+      {:error, _} = err ->
+        err
+    end
   end
 
   defp parse_response(%{"error" => error}) do
@@ -235,16 +253,29 @@ defmodule Alloy.Provider.Ollama do
 
     tool_blocks =
       (message["tool_calls"] || [])
-      |> Enum.map(fn tc ->
-        %{
-          type: "tool_use",
-          id: tc["id"],
-          name: tc["function"]["name"],
-          input: Jason.decode!(tc["function"]["arguments"])
-        }
+      |> Enum.reduce_while([], fn tc, acc ->
+        case Jason.decode(tc["function"]["arguments"]) do
+          {:ok, input} ->
+            {:cont,
+             acc ++
+               [
+                 %{
+                   type: "tool_use",
+                   id: tc["id"],
+                   name: tc["function"]["name"],
+                   input: input
+                 }
+               ]}
+
+          {:error, _} ->
+            {:halt, {:error, "Invalid JSON in tool call arguments for #{tc["function"]["name"]}"}}
+        end
       end)
 
-    text_blocks ++ tool_blocks
+    case tool_blocks do
+      {:error, _} = err -> err
+      blocks -> {:ok, text_blocks ++ blocks}
+    end
   end
 
   defp parse_finish_reason("stop"), do: :end_turn

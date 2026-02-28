@@ -239,26 +239,33 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp parse_response(%{"choices" => [choice | _], "usage" => usage}) do
+  defp parse_response(%{"choices" => [choice | _]} = resp) do
     message = choice["message"]
     finish_reason = choice["finish_reason"]
-    content_blocks = parse_message_to_blocks(message)
-    stop_reason = parse_finish_reason(finish_reason)
+    usage = resp["usage"] || %{}
 
-    alloy_msg = %Message{
-      role: :assistant,
-      content: content_blocks
-    }
+    case parse_message_to_blocks(message) do
+      {:ok, content_blocks} ->
+        stop_reason = parse_finish_reason(finish_reason)
 
-    {:ok,
-     %{
-       stop_reason: stop_reason,
-       messages: [alloy_msg],
-       usage: %{
-         input_tokens: Map.get(usage, "prompt_tokens", 0),
-         output_tokens: Map.get(usage, "completion_tokens", 0)
-       }
-     }}
+        alloy_msg = %Message{
+          role: :assistant,
+          content: content_blocks
+        }
+
+        {:ok,
+         %{
+           stop_reason: stop_reason,
+           messages: [alloy_msg],
+           usage: %{
+             input_tokens: Map.get(usage, "prompt_tokens", 0),
+             output_tokens: Map.get(usage, "completion_tokens", 0)
+           }
+         }}
+
+      {:error, _} = err ->
+        err
+    end
   end
 
   defp parse_response(%{"error" => error}) do
@@ -275,16 +282,29 @@ defmodule Alloy.Provider.OpenAI do
 
     tool_blocks =
       (message["tool_calls"] || [])
-      |> Enum.map(fn tc ->
-        %{
-          type: "tool_use",
-          id: tc["id"],
-          name: tc["function"]["name"],
-          input: Jason.decode!(tc["function"]["arguments"])
-        }
+      |> Enum.reduce_while([], fn tc, acc ->
+        case Jason.decode(tc["function"]["arguments"]) do
+          {:ok, input} ->
+            {:cont,
+             acc ++
+               [
+                 %{
+                   type: "tool_use",
+                   id: tc["id"],
+                   name: tc["function"]["name"],
+                   input: input
+                 }
+               ]}
+
+          {:error, _} ->
+            {:halt, {:error, "Invalid JSON in tool call arguments for #{tc["function"]["name"]}"}}
+        end
       end)
 
-    text_blocks ++ tool_blocks
+    case tool_blocks do
+      {:error, _} = err -> err
+      blocks -> {:ok, text_blocks ++ blocks}
+    end
   end
 
   defp parse_finish_reason("stop"), do: :end_turn

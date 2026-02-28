@@ -41,14 +41,19 @@ defmodule Alloy.Tool.Executor do
               {:blocked, call, reason} -> error_result(call[:id], "Blocked: #{reason}")
             end,
             timeout: tool_timeout,
-            ordered: true
+            ordered: true,
+            on_timeout: :kill_task
           )
+          |> Enum.zip(tagged)
           |> Enum.map(fn
-            {:ok, result} ->
+            {{:ok, result}, _call} ->
               result
 
-            {:exit, reason} ->
-              error_result("unknown", "Tool execution crashed: #{inspect(reason)}")
+            {{:exit, reason}, {_tag, call}} ->
+              error_result(call[:id], "Tool execution crashed: #{inspect(reason)}")
+
+            {{:exit, reason}, {_tag, call, _reason}} ->
+              error_result(call[:id], "Tool execution crashed: #{inspect(reason)}")
           end)
 
         Message.tool_results(results)

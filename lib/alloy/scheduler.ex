@@ -201,15 +201,21 @@ defmodule Alloy.Scheduler do
 
       {{name, gen}, task_refs} ->
         current_gen = Map.get(state.generations, name, 0)
+        job = Map.get(state.jobs, name)
 
-        if gen == current_gen do
-          job = Map.get(state.jobs, name)
-          callback = (job && job[:on_result]) || (&default_on_result/1)
-          callback.(result)
-        else
-          Logger.warning(
-            "Alloy.Scheduler: discarding stale result for #{name} (gen #{gen} != #{current_gen})"
-          )
+        cond do
+          job == nil ->
+            # Job was removed while task was in-flight — drop result silently.
+            :ok
+
+          gen != current_gen ->
+            Logger.warning(
+              "Alloy.Scheduler: discarding stale result for #{name} (gen #{gen} != #{current_gen})"
+            )
+
+          true ->
+            callback = job[:on_result] || (&default_on_result/1)
+            callback.(result)
         end
 
         state = %{state | running: MapSet.delete(state.running, name), task_refs: task_refs}

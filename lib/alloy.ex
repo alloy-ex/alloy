@@ -78,7 +78,7 @@ defmodule Alloy do
   def run(message \\ nil, opts) do
     config = Config.from_opts(opts)
     messages = build_messages(message, opts)
-    state = State.init(config, messages)
+    state = %{State.init(config, messages) | status: :running}
 
     try do
       final_state = Turn.run_loop(state)

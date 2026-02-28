@@ -342,6 +342,73 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
+  describe "complete/3 with malformed tool call arguments" do
+    test "returns error instead of crashing on invalid JSON arguments" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "chatcmpl-bad",
+              "object" => "chat.completion",
+              "choices" => [
+                %{
+                  "index" => 0,
+                  "message" => %{
+                    "role" => "assistant",
+                    "content" => nil,
+                    "tool_calls" => [
+                      %{
+                        "id" => "call_bad",
+                        "type" => "function",
+                        "function" => %{
+                          "name" => "read",
+                          "arguments" => "{invalid json"
+                        }
+                      }
+                    ]
+                  },
+                  "finish_reason" => "tool_calls"
+                }
+              ],
+              "usage" => %{"prompt_tokens" => 5, "completion_tokens" => 3, "total_tokens" => 8}
+            })
+        })
+
+      assert {:error, reason} = OpenAI.complete([Message.user("Hi")], [], config)
+      assert reason =~ "invalid" or reason =~ "JSON" or reason =~ "decode"
+    end
+  end
+
+  describe "complete/3 with missing usage field" do
+    test "returns zero counts when usage is absent from response" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "chatcmpl-no-usage",
+              "object" => "chat.completion",
+              "choices" => [
+                %{
+                  "index" => 0,
+                  "message" => %{
+                    "role" => "assistant",
+                    "content" => "Hello!"
+                  },
+                  "finish_reason" => "stop"
+                }
+              ]
+            })
+        })
+
+      assert {:ok, result} = OpenAI.complete([Message.user("Hi")], [], config)
+      assert result.stop_reason == :end_turn
+      assert result.usage.input_tokens == 0
+      assert result.usage.output_tokens == 0
+    end
+  end
+
   describe "complete/3 error handling" do
     test "returns error on HTTP failure" do
       config = config_with_response(%{status: 500, body: "Internal Server Error"})

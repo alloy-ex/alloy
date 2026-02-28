@@ -44,7 +44,7 @@ defmodule Alloy.Tool.Core.Read do
     offset = input["offset"] || 1
     limit = input["limit"] || @default_limit
 
-    if File.exists?(path) do
+    if File.regular?(path) do
       lines =
         path
         |> File.stream!()
@@ -60,7 +60,7 @@ defmodule Alloy.Tool.Core.Read do
         {:ok, format_lines(lines)}
       end
     else
-      {:error, "File does not exist or cannot be read: #{path} (enoent)"}
+      {:error, "File does not exist or is not a readable file: #{path}"}
     end
   end
 

@@ -323,6 +323,41 @@ defmodule Alloy.Provider.GoogleTest do
     end
   end
 
+  describe "complete/3 with unknown part type in response" do
+    test "does not crash on unknown part types from API" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "candidates" => [
+                %{
+                  "content" => %{
+                    "parts" => [
+                      %{"text" => "Hello!"},
+                      %{"executableCode" => %{"language" => "PYTHON", "code" => "print(1)"}}
+                    ],
+                    "role" => "model"
+                  },
+                  "finishReason" => "STOP"
+                }
+              ],
+              "usageMetadata" => %{
+                "promptTokenCount" => 10,
+                "candidatesTokenCount" => 5,
+                "totalTokenCount" => 15
+              }
+            })
+        })
+
+      assert {:ok, result} = Google.complete([Message.user("Hi")], [], config)
+      assert result.stop_reason == :end_turn
+      assert [%Message{role: :assistant, content: blocks}] = result.messages
+      # The text block should be preserved, unknown parts should not crash
+      assert Enum.any?(blocks, &(&1.type == "text"))
+    end
+  end
+
   describe "complete/3 error handling" do
     test "returns error on HTTP failure" do
       config = config_with_response(%{status: 500, body: "Internal Server Error"})

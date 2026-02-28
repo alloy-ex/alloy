@@ -232,4 +232,35 @@ defmodule AlloyTest do
       assert result.usage.output_tokens == 10
     end
   end
+
+  describe "Alloy.run/2 sets :running status" do
+    test "middleware sees :running status during execution" do
+      test_pid = self()
+
+      defmodule StatusMiddleware do
+        @behaviour Alloy.Middleware
+
+        def call(:before_completion, state) do
+          send(state.config.context[:test_pid], {:status_during_run, state.status})
+          state
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Done")
+        ])
+
+      assert {:ok, _result} =
+               Alloy.run("Hi",
+                 provider: {TestProvider, agent_pid: pid},
+                 middleware: [StatusMiddleware],
+                 context: %{test_pid: test_pid}
+               )
+
+      assert_received {:status_during_run, :running}
+    end
+  end
 end

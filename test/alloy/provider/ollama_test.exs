@@ -175,6 +175,34 @@ defmodule Alloy.Provider.OllamaTest do
     end
   end
 
+  describe "complete/3 multimodal formatting" do
+    test "text block in user message is preserved (not silently dropped)" do
+      config = config_that_captures_request()
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            %{type: "text", text: "What is in this image?"},
+            Message.image("image/jpeg", "base64img==")
+          ]
+        }
+      ]
+
+      Ollama.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
+      assert is_list(user_msg["content"])
+
+      text_block = Enum.find(user_msg["content"], &(&1["type"] == "text"))
+      assert text_block != nil
+      assert text_block["text"] == "What is in this image?"
+    end
+  end
+
   describe "complete/3 with optional API key" do
     test "includes authorization header when api_key is provided" do
       config =
@@ -186,6 +214,44 @@ defmodule Alloy.Provider.OllamaTest do
       assert_received {:request_headers, headers}
       auth = Enum.find(headers, fn {k, _v} -> k == "authorization" end)
       assert {"authorization", "Bearer ollama-key-123"} = auth
+    end
+  end
+
+  describe "complete/3 with malformed tool call arguments" do
+    test "returns error instead of crashing on invalid JSON arguments" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "chatcmpl-bad",
+              "object" => "chat.completion",
+              "choices" => [
+                %{
+                  "index" => 0,
+                  "message" => %{
+                    "role" => "assistant",
+                    "content" => nil,
+                    "tool_calls" => [
+                      %{
+                        "id" => "call_bad",
+                        "type" => "function",
+                        "function" => %{
+                          "name" => "read",
+                          "arguments" => "{invalid json"
+                        }
+                      }
+                    ]
+                  },
+                  "finish_reason" => "tool_calls"
+                }
+              ],
+              "usage" => %{"prompt_tokens" => 5, "completion_tokens" => 3, "total_tokens" => 8}
+            })
+        })
+
+      assert {:error, reason} = Ollama.complete([Message.user("Hi")], [], config)
+      assert reason =~ "invalid" or reason =~ "JSON" or reason =~ "decode"
     end
   end
 

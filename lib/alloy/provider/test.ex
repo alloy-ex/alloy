@@ -64,7 +64,7 @@ defmodule Alloy.Provider.Test do
         # :text_delta on_event is emitted by Turn.wrapped_chunk universally.
         for msg <- messages,
             text = Alloy.Message.text(msg),
-            text != nil,
+            text != "",
             char <- String.graphemes(text) do
           on_chunk.(char)
         end

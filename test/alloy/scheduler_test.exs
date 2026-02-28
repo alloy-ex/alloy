@@ -377,4 +377,49 @@ defmodule Alloy.SchedulerTest do
       GenServer.stop(pid)
     end
   end
+
+  describe "remove_job while task is in-flight" do
+    test "silently drops result for removed job (no default callback)" do
+      test_pid = self()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {:ok, pid} =
+            Scheduler.start_link(
+              jobs: [
+                %{
+                  name: :drop_result,
+                  every: :timer.minutes(60),
+                  prompt: "Block",
+                  agent_opts: [
+                    provider: {BlockingProvider, notify_pid: test_pid},
+                    tools: []
+                  ],
+                  on_result: fn result -> send(test_pid, {:should_not_fire, result}) end
+                }
+              ]
+            )
+
+          # Trigger the job — it blocks in the provider
+          :ok = Scheduler.trigger(pid, :drop_result)
+          assert_receive {:provider_called, task_pid}, 1000
+
+          # Remove the job while the task is still running
+          :ok = Scheduler.remove_job(pid, :drop_result)
+
+          # Unblock the task — it completes
+          send(task_pid, :unblock)
+
+          # Wait for the task result to be processed by the scheduler
+          Process.sleep(200)
+
+          GenServer.stop(pid)
+        end)
+
+      # The default_on_result callback should NOT have logged anything
+      refute log =~ "job completed"
+      # The user callback should not have fired
+      refute_received {:should_not_fire, _}
+    end
+  end
 end

@@ -70,17 +70,13 @@ defmodule Alloy.Message do
   Extracts plain text from a message, ignoring tool blocks.
   Returns nil if no text content exists.
   """
-  @spec text(t()) :: String.t() | nil
+  @spec text(t()) :: String.t()
   def text(%__MODULE__{content: content}) when is_binary(content), do: content
 
   def text(%__MODULE__{content: blocks}) when is_list(blocks) do
     blocks
     |> Enum.filter(&(is_map(&1) && &1[:type] == "text"))
     |> Enum.map_join("\n", & &1[:text])
-    |> case do
-      "" -> nil
-      text -> text
-    end
   end
 
   @doc """

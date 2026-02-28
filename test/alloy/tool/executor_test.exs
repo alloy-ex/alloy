@@ -239,7 +239,7 @@ defmodule Alloy.Tool.ExecutorTest do
   end
 
   describe "execute_all/3 — configurable tool_timeout" do
-    test "tool exceeding tool_timeout produces an exit" do
+    test "tool exceeding tool_timeout returns error with original tool_use_id" do
       state = build_state([Alloy.Test.SlowEchoTool], tool_timeout: 50)
 
       tool_call = %{
@@ -249,8 +249,38 @@ defmodule Alloy.Tool.ExecutorTest do
         input: %{"text" => "hi", "sleep_ms" => 200}
       }
 
-      # Task.async_stream with default on_timeout: :exit raises on timeout
-      assert catch_exit(Executor.execute_all([tool_call], state.tool_fns, state))
+      result = Executor.execute_all([tool_call], state.tool_fns, state)
+
+      assert %Message{role: :user, content: [block]} = result
+      assert block.tool_use_id == "call_slow"
+      assert block.content =~ "crashed"
+      assert block.is_error == true
+    end
+
+    test "multiple tools where one times out preserves all tool_use_ids" do
+      state = build_state([SuccessTool, Alloy.Test.SlowEchoTool], tool_timeout: 50)
+
+      calls = [
+        %{id: "c_fast", name: "success", type: "tool_use", input: %{}},
+        %{
+          id: "c_slow",
+          name: "slow_echo",
+          type: "tool_use",
+          input: %{"text" => "hi", "sleep_ms" => 200}
+        }
+      ]
+
+      result = Executor.execute_all(calls, state.tool_fns, state)
+
+      assert %Message{role: :user, content: blocks} = result
+      assert length(blocks) == 2
+
+      fast_block = Enum.find(blocks, &(&1.tool_use_id == "c_fast"))
+      slow_block = Enum.find(blocks, &(&1.tool_use_id == "c_slow"))
+
+      assert fast_block.content == "it worked"
+      assert slow_block.tool_use_id == "c_slow"
+      assert slow_block.is_error == true
     end
 
     test "tool_timeout defaults to 120_000 in config" do

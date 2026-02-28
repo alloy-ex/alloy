@@ -69,5 +69,22 @@ defmodule Alloy.Tool.Core.WriteTest do
 
       assert File.read!(file) == "abs"
     end
+
+    test "returns error when parent directory cannot be created", %{tmp_dir: tmp_dir} do
+      # Create a read-only parent to prevent mkdir_p from creating children
+      locked_dir = Path.join(tmp_dir, "locked")
+      File.mkdir_p!(locked_dir)
+      File.chmod!(locked_dir, 0o444)
+
+      file = Path.join(locked_dir, "subdir/file.txt")
+
+      result = Write.execute(%{"file_path" => file, "content" => "nope"}, %{})
+
+      # Restore permissions for cleanup
+      File.chmod!(locked_dir, 0o755)
+
+      assert {:error, msg} = result
+      assert msg =~ "Cannot create directory"
+    end
   end
 end

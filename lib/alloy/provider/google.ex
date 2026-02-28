@@ -356,17 +356,23 @@ defmodule Alloy.Provider.Google do
   end
 
   defp parse_parts_to_blocks(parts) do
-    Enum.map(parts, fn
+    parts
+    |> Enum.flat_map(fn
       %{"text" => text} ->
-        %{type: "text", text: text}
+        [%{type: "text", text: text}]
 
       %{"functionCall" => %{"name" => name, "args" => args}} ->
-        %{
-          type: "tool_use",
-          id: generate_tool_id(name),
-          name: name,
-          input: args
-        }
+        [
+          %{
+            type: "tool_use",
+            id: generate_tool_id(name),
+            name: name,
+            input: args
+          }
+        ]
+
+      _other ->
+        []
     end)
   end
 

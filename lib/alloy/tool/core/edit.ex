@@ -85,9 +85,6 @@ defmodule Alloy.Tool.Core.Edit do
   end
 
   defp count_occurrences(content, substring) do
-    content
-    |> String.split(substring)
-    |> length()
-    |> Kernel.-(1)
+    length(String.split(content, substring)) - 1
   end
 end

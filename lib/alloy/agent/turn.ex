@@ -293,8 +293,9 @@ defmodule Alloy.Agent.Turn do
   # Uses Keyword.put to override any user-set value — the deadline takes precedence.
   defp inject_receive_timeout(provider_config, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
-    # Floor at 5s so we don't set absurdly short timeouts on the first call
-    timeout = max(remaining, 5_000)
+    # Floor at 1s so we don't set absurdly short timeouts, but also
+    # don't overshoot the deadline when remaining time is under 5s.
+    timeout = max(remaining, 1_000)
     existing = Map.get(provider_config, :req_options, [])
     Map.put(provider_config, :req_options, Keyword.put(existing, :receive_timeout, timeout))
   end

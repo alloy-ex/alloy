@@ -85,7 +85,15 @@ defmodule Alloy.Tool.Core.ReadTest do
 
     test "returns error for missing file" do
       assert {:error, msg} = Read.execute(%{"file_path" => "/nonexistent/file.txt"}, %{})
-      assert msg =~ "not found" or msg =~ "no such file" or msg =~ "does not exist"
+      assert msg =~ "does not exist" or msg =~ "not a readable file"
+    end
+
+    test "returns error when path is a directory", %{tmp_dir: tmp_dir} do
+      dir = Path.join(tmp_dir, "subdir")
+      File.mkdir_p!(dir)
+
+      assert {:error, msg} = Read.execute(%{"file_path" => dir}, %{})
+      assert msg =~ "not a readable file" or msg =~ "does not exist"
     end
 
     test "respects working_directory from context", %{tmp_dir: tmp_dir} do
