@@ -126,11 +126,25 @@ defmodule Alloy.Provider.Anthropic do
         sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
         build_stream_response(sse_acc)
 
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, parse_error(status, resp_body)}
+      {:ok, %{status: status} = resp} ->
+        error_body = streaming_error_body(resp, initial_acc)
+        {:error, parse_error(status, error_body)}
 
       {:error, reason} ->
         {:error, "HTTP request failed: #{inspect(reason)}"}
+    end
+  end
+
+  # When streaming (into: handler), the error body is consumed by the SSE
+  # callback and resp.body is left as "". Recover it from the SSE buffer.
+  defp streaming_error_body(resp, initial_acc) do
+    case resp.body do
+      "" ->
+        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
+        sse_acc.buffer
+
+      body ->
+        body
     end
   end
 
