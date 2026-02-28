@@ -6,8 +6,8 @@ defmodule Alloy.Agent.State do
   current status. Passed through each iteration of the agent loop.
   """
 
-  alias Alloy.{Message, Usage}
   alias Alloy.Agent.Config
+  alias Alloy.{Message, Usage}
 
   @type status :: :running | :completed | :error | :max_turns | :halted
 
@@ -22,7 +22,8 @@ defmodule Alloy.Agent.State do
           tool_fns: %{String.t() => {module(), map()}},
           scratchpad: pid() | nil,
           started_at: integer() | nil,
-          agent_id: String.t()
+          agent_id: String.t(),
+          current_task: {reference(), pid(), binary()} | nil
         }
 
   @enforce_keys [:config]
@@ -37,7 +38,8 @@ defmodule Alloy.Agent.State do
     tool_defs: [],
     tool_fns: %{},
     started_at: nil,
-    agent_id: ""
+    agent_id: "",
+    current_task: nil
   ]
 
   @doc """

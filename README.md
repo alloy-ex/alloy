@@ -81,6 +81,24 @@ Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", m
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Ollama, model: "llama4"}} | opts])
 ```
 
+### Streaming
+
+Stream tokens as they arrive — works with every provider:
+
+```elixir
+{:ok, agent} = Alloy.Agent.Server.start_link(
+  provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.2"},
+  tools: [Alloy.Tool.Core.Read]
+)
+
+{:ok, result} = Alloy.Agent.Server.stream_chat(agent, "Explain OTP", fn chunk ->
+  IO.write(chunk)  # Print each token as it arrives
+end)
+```
+
+All 8 providers support streaming. If a custom provider doesn't implement
+`stream/4`, the turn loop falls back to `complete/3` automatically.
+
 ### Supervised GenServer agent
 
 ```elixir

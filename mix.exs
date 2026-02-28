@@ -21,6 +21,7 @@ defmodule Alloy.MixProject do
 
   def application do
     [
+      mod: {Alloy.Application, []},
       extra_applications: [:logger]
     ]
   end

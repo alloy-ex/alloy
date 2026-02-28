@@ -1,6 +1,8 @@
 defmodule Alloy.Provider.OpenAITest do
   use ExUnit.Case, async: true
 
+  import Alloy.StreamTestHelpers
+
   alias Alloy.Provider.OpenAI
   alias Alloy.Message
 
@@ -382,6 +384,64 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
+  # ── stream/4 ──────────────────────────────────────────────────────────
+
+  describe "stream/4" do
+    test "emits text chunks and returns correct response" do
+      config =
+        config_with_sse_stream([
+          sse_text_delta("Hello"),
+          sse_text_delta(" world"),
+          sse_finish("stop"),
+          sse_usage(10, 5),
+          "data: [DONE]\n\n"
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = OpenAI.stream([Message.user("Hi")], [], config, on_chunk)
+      assert result.stop_reason == :end_turn
+      assert [%Message{role: :assistant}] = result.messages
+      assert Message.text(hd(result.messages)) == "Hello world"
+
+      assert_received {:chunk, "Hello"}
+      assert_received {:chunk, " world"}
+    end
+
+    test "accumulates tool calls without emitting chunks" do
+      config =
+        config_with_sse_stream([
+          sse_tool_call_start(0, "call_1", "read"),
+          sse_tool_call_args(0, "{\"file_path\":\"mix.exs\"}"),
+          sse_finish("tool_calls"),
+          "data: [DONE]\n\n"
+        ])
+
+      chunks =
+        collect_chunks(fn on_chunk ->
+          OpenAI.stream([Message.user("Read mix.exs")], [], config, on_chunk)
+        end)
+
+      assert chunks == []
+    end
+
+    test "request body includes stream: true" do
+      config =
+        config_with_sse_stream_capturing_request([
+          sse_text_delta("ok"),
+          sse_finish("stop"),
+          "data: [DONE]\n\n"
+        ])
+
+      OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+      assert decoded["stream"] == true
+    end
+  end
+
   # --- Test Helpers ---
 
   defp config_with_response(response) do
@@ -436,5 +496,17 @@ defmodule Alloy.Provider.OpenAITest do
         )
       end)
     end)
+  end
+
+  # --- SSE Streaming Helpers ---
+
+  defp config_with_sse_stream(chunks) do
+    %{api_key: "sk-test-key", model: "gpt-5.2", max_tokens: 4096, req_options: [plug: {Req.Test, __MODULE__}, retry: false]}
+    |> tap(fn _ -> Req.Test.stub(__MODULE__, sse_chunks_plug(chunks)) end)
+  end
+
+  defp config_with_sse_stream_capturing_request(chunks) do
+    %{api_key: "sk-test-key", model: "gpt-5.2", max_tokens: 4096, req_options: [plug: {Req.Test, __MODULE__}, retry: false]}
+    |> tap(fn _ -> Req.Test.stub(__MODULE__, sse_chunks_capturing_plug(self(), chunks)) end)
   end
 end

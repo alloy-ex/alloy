@@ -42,7 +42,7 @@ defmodule Alloy do
   - `:context` - arbitrary map passed to tools and middleware (default: `%{}`)
   """
 
-  alias Alloy.Agent.{Config, State, Turn}
+  alias Alloy.Agent.{Config, Server, State, Turn}
   alias Alloy.Message
 
   @type result :: %{
@@ -53,6 +53,18 @@ defmodule Alloy do
           turns: non_neg_integer(),
           error: term() | nil
         }
+
+  @doc """
+  Send a message to a running agent without blocking the caller.
+
+  Non-blocking fire-and-forget. Returns `{:ok, request_id}` immediately.
+  Results are broadcast via PubSub. See `Alloy.Agent.Server.send_message/3`
+  for full documentation.
+  """
+  @spec send_message(GenServer.server(), String.t(), keyword()) ::
+          {:ok, binary()} | {:error, :busy | :no_pubsub}
+  def send_message(server, message, opts \\ [])
+  defdelegate send_message(server, message, opts), to: Server
 
   @doc """
   Run the agent loop with a message and options.

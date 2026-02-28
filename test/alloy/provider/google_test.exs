@@ -349,6 +349,184 @@ defmodule Alloy.Provider.GoogleTest do
     end
   end
 
+  # ── stream/4 ──────────────────────────────────────────────────────────
+
+  describe "stream/4" do
+    test "emits text chunks and returns correct response" do
+      config =
+        config_with_sse_stream([
+          google_sse_event(%{
+            "candidates" => [
+              %{"content" => %{"parts" => [%{"text" => "Hello"}], "role" => "model"}}
+            ]
+          }),
+          google_sse_event(%{
+            "candidates" => [
+              %{"content" => %{"parts" => [%{"text" => "Hello world"}], "role" => "model"}}
+            ]
+          }),
+          google_sse_event(%{
+            "candidates" => [
+              %{
+                "content" => %{"parts" => [%{"text" => "Hello world!"}], "role" => "model"},
+                "finishReason" => "STOP"
+              }
+            ],
+            "usageMetadata" => %{"promptTokenCount" => 10, "candidatesTokenCount" => 5}
+          })
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = Google.stream([Message.user("Hi")], [], config, on_chunk)
+      assert result.stop_reason == :end_turn
+      assert [%Message{role: :assistant}] = result.messages
+      assert Message.text(hd(result.messages)) == "Hello world!"
+      assert result.usage.input_tokens == 10
+      assert result.usage.output_tokens == 5
+
+      # Should receive incremental deltas
+      assert_received {:chunk, "Hello"}
+      assert_received {:chunk, " world"}
+      assert_received {:chunk, "!"}
+    end
+
+    test "handles function call responses" do
+      config =
+        config_with_sse_stream([
+          google_sse_event(%{
+            "candidates" => [
+              %{
+                "content" => %{
+                  "parts" => [
+                    %{"functionCall" => %{"name" => "read", "args" => %{"path" => "mix.exs"}}}
+                  ],
+                  "role" => "model"
+                },
+                "finishReason" => "STOP"
+              }
+            ]
+          })
+        ])
+
+      chunks =
+        collect_chunks(fn on_chunk ->
+          Google.stream([Message.user("Read")], [], config, on_chunk)
+        end)
+
+      # No text chunks for function calls
+      assert chunks == []
+    end
+
+    test "uses streamGenerateContent endpoint" do
+      config =
+        config_with_sse_stream_capturing_request([
+          google_sse_event(%{
+            "candidates" => [
+              %{
+                "content" => %{"parts" => [%{"text" => "ok"}], "role" => "model"},
+                "finishReason" => "STOP"
+              }
+            ]
+          })
+        ])
+
+      Google.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert_received {:request_url, url}
+      assert String.contains?(url, ":streamGenerateContent")
+      assert String.contains?(url, "alt=sse")
+    end
+
+    test "does not emit a duplicate chunk when snapshot length is equal to previous" do
+      # Google sends full cumulative snapshots. If two events have the same text
+      # length (stall or retransmit), no duplicate chunk should be emitted.
+      config =
+        config_with_sse_stream([
+          google_sse_event(%{
+            "candidates" => [
+              %{"content" => %{"parts" => [%{"text" => "Hello"}], "role" => "model"}}
+            ]
+          }),
+          # Same length snapshot (retransmit scenario)
+          google_sse_event(%{
+            "candidates" => [
+              %{
+                "content" => %{"parts" => [%{"text" => "Hello"}], "role" => "model"},
+                "finishReason" => "STOP"
+              }
+            ]
+          })
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = Google.stream([Message.user("Hi")], [], config, on_chunk)
+      assert Message.text(hd(result.messages)) == "Hello"
+
+      # Only one chunk for "Hello", not two
+      assert_received {:chunk, "Hello"}
+      refute_received {:chunk, _}
+    end
+
+    test "handles incremental mode where each event contains only new text" do
+      # Exercises the true -> branch of the snapshot/incremental cond:
+      # when the event text does NOT prefix-match the accumulated text,
+      # it is treated as a new chunk to append rather than a full snapshot.
+      config =
+        config_with_sse_stream([
+          google_sse_event(%{
+            "candidates" => [
+              %{"content" => %{"parts" => [%{"text" => "Hello"}], "role" => "model"}}
+            ]
+          }),
+          # " world" does not start with "Hello", so it falls to incremental mode.
+          google_sse_event(%{
+            "candidates" => [
+              %{
+                "content" => %{"parts" => [%{"text" => " world"}], "role" => "model"},
+                "finishReason" => "STOP"
+              }
+            ],
+            "usageMetadata" => %{"promptTokenCount" => 5, "candidatesTokenCount" => 3}
+          })
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = Google.stream([Message.user("Hi")], [], config, on_chunk)
+      assert result.stop_reason == :end_turn
+      assert Message.text(hd(result.messages)) == "Hello world"
+
+      assert_received {:chunk, "Hello"}
+      assert_received {:chunk, " world"}
+      refute_received {:chunk, _}
+    end
+
+    test "request body does NOT include stream: true" do
+      config =
+        config_with_sse_stream_capturing_request([
+          google_sse_event(%{
+            "candidates" => [
+              %{
+                "content" => %{"parts" => [%{"text" => "ok"}], "role" => "model"},
+                "finishReason" => "STOP"
+              }
+            ]
+          })
+        ])
+
+      Google.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+      refute Map.has_key?(decoded, "stream")
+    end
+  end
+
   # --- Test Helpers ---
 
   defp config_with_response(response) do
@@ -407,5 +585,80 @@ defmodule Alloy.Provider.GoogleTest do
         )
       end)
     end)
+  end
+
+  # --- SSE Streaming Helpers ---
+
+  defp google_sse_event(data) do
+    "data: #{Jason.encode!(data)}\n\n"
+  end
+
+  defp config_with_sse_stream(chunks) do
+    %{
+      api_key: "test-api-key",
+      model: "gemini-2.5-flash",
+      max_tokens: 4096,
+      req_options: [
+        plug: {Req.Test, __MODULE__},
+        retry: false
+      ]
+    }
+    |> tap(fn _ ->
+      Req.Test.stub(__MODULE__, fn conn ->
+        conn = Plug.Conn.send_chunked(conn, 200)
+
+        Enum.reduce(chunks, conn, fn chunk, conn ->
+          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
+          conn
+        end)
+      end)
+    end)
+  end
+
+  defp config_with_sse_stream_capturing_request(chunks) do
+    test_pid = self()
+
+    %{
+      api_key: "test-api-key",
+      model: "gemini-2.5-flash",
+      max_tokens: 4096,
+      req_options: [
+        plug: {Req.Test, __MODULE__},
+        retry: false
+      ]
+    }
+    |> tap(fn _ ->
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, body})
+
+        send(
+          test_pid,
+          {:request_url, "#{conn.scheme}://#{conn.host}#{conn.request_path}?#{conn.query_string}"}
+        )
+
+        conn = Plug.Conn.send_chunked(conn, 200)
+
+        Enum.reduce(chunks, conn, fn chunk, conn ->
+          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
+          conn
+        end)
+      end)
+    end)
+  end
+
+  defp collect_chunks(fun) do
+    test_pid = self()
+    on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+    fun.(on_chunk)
+    collect_messages([])
+  end
+
+  defp collect_messages(acc) do
+    receive do
+      {:chunk, chunk} -> collect_messages(acc ++ [chunk])
+    after
+      100 -> acc
+    end
   end
 end

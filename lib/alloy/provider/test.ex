@@ -74,10 +74,26 @@ defmodule Alloy.Provider.Test do
   end
 
   defp pop_response(pid) do
-    Agent.get_and_update(pid, fn
-      [] -> {{:error, :no_more_responses}, []}
-      [response | rest] -> {response, rest}
-    end)
+    result =
+      Agent.get_and_update(pid, fn
+        [] ->
+          {{:error, :no_more_responses}, []}
+
+        [{:with_delay, ms, response} | rest] ->
+          {{:delayed, ms, response}, rest}
+
+        [response | rest] ->
+          {response, rest}
+      end)
+
+    case result do
+      {:delayed, ms, response} ->
+        Process.sleep(ms)
+        response
+
+      other ->
+        other
+    end
   end
 
   # --- Helper functions for building scripted responses ---
@@ -112,6 +128,17 @@ defmodule Alloy.Provider.Test do
        messages: [Alloy.Message.assistant_blocks(blocks)],
        usage: %{input_tokens: 10, output_tokens: 5}
      }}
+  end
+
+  @doc """
+  Builds a scripted response that sleeps for `delay_ms` milliseconds before
+  returning. Useful for testing that callers remain responsive during long
+  LLM turns.
+  """
+  @spec slow_text_response(String.t(), non_neg_integer()) ::
+          {:with_delay, non_neg_integer(), {:ok, Alloy.Provider.completion_response()}}
+  def slow_text_response(text, delay_ms \\ 200) when is_binary(text) and is_integer(delay_ms) do
+    {:with_delay, delay_ms, text_response(text)}
   end
 
   @doc """

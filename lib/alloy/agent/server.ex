@@ -85,6 +85,10 @@ defmodule Alloy.Agent.Server do
 
   @doc """
   Return the full conversation message history.
+
+  Note: if an async Turn is in progress via `send_message/3`, this returns a
+  snapshot of the conversation *before* that Turn started. The in-flight
+  assistant response will appear only after the Turn completes.
   """
   @spec messages(GenServer.server()) :: [Message.t()]
   def messages(server) do
@@ -101,8 +105,10 @@ defmodule Alloy.Agent.Server do
 
   @doc """
   Clear conversation history. Config and tools are preserved.
+
+  Returns `{:error, :busy}` if an async Turn is currently running via `send_message/3`.
   """
-  @spec reset(GenServer.server()) :: :ok
+  @spec reset(GenServer.server()) :: :ok | {:error, :busy}
   def reset(server) do
     GenServer.call(server, :reset)
   end
@@ -118,8 +124,10 @@ defmodule Alloy.Agent.Server do
 
       Server.set_model(pid, provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-haiku-4-5-20251001"})
       Server.set_model(pid, provider: Alloy.Provider.OpenAI)
+
+  Returns `{:error, :busy}` if an async Turn is currently running via `send_message/3`.
   """
-  @spec set_model(GenServer.server(), keyword()) :: :ok
+  @spec set_model(GenServer.server(), keyword()) :: :ok | {:error, :busy}
   def set_model(server, provider_opts) when is_list(provider_opts) do
     GenServer.call(server, {:set_model, provider_opts})
   end
@@ -143,6 +151,56 @@ defmodule Alloy.Agent.Server do
   end
 
   @doc """
+  Send a message to the agent without blocking the caller.
+
+  Returns `{:ok, request_id}` immediately. The agent runs its full Turn loop
+  in a supervised Task, then broadcasts the result via PubSub to
+  `"agent:<id>:responses"` as `{:agent_response, result}` where `result`
+  includes a `:request_id` field matching the returned ID.
+
+  Returns `{:error, :busy}` if a Turn is already in progress. The caller
+  is responsible for retry or backpressure logic.
+
+  Returns `{:error, :no_pubsub}` if the agent was started without a `:pubsub`
+  option — without PubSub there is no way to receive results.
+
+  ## Requirements
+
+  PubSub must be configured on the agent. Add `pubsub: MyApp.PubSub` to the
+  agent start options.
+
+  ## Options
+
+    - `:request_id` - supply your own correlation ID (binary). Defaults to
+      a random URL-safe ID.
+
+  ## Example
+
+      {:ok, agent} = Alloy.Agent.Server.start_link(
+        provider: {...},
+        pubsub: MyApp.PubSub
+      )
+
+      Phoenix.PubSub.subscribe(MyApp.PubSub, "agent:\#{session_id}:responses")
+
+      {:ok, req_id} = Alloy.Agent.Server.send_message(agent, "Summarise the logs")
+
+      receive do
+        {:agent_response, %{request_id: ^req_id, text: text}} -> IO.puts(text)
+      end
+  """
+  @spec send_message(GenServer.server(), String.t(), keyword()) ::
+          {:ok, binary()} | {:error, :busy | :no_pubsub}
+  def send_message(server, message, opts \\ []) when is_binary(message) do
+    request_id = Keyword.get(opts, :request_id, generate_request_id())
+    # Use :infinity — the handler spawns a Task and replies immediately (no I/O),
+    # but the GenServer may be blocked by a long synchronous chat/3 call ahead
+    # of this request in the mailbox. A hard timeout here would crash the caller
+    # while the GenServer still processes the message later, spawning a ghost Turn.
+    GenServer.call(server, {:send_message, message, request_id}, :infinity)
+  end
+
+  @doc """
   Stop the agent process.
   """
   @spec stop(GenServer.server()) :: :ok
@@ -152,6 +210,9 @@ defmodule Alloy.Agent.Server do
 
   @doc """
   Export the current conversation as a serializable Session struct.
+
+  Note: if an async Turn is in progress via `send_message/3`, the exported
+  session reflects the state *before* that Turn started (a pre-Turn snapshot).
   """
   @spec export_session(GenServer.server()) :: Session.t()
   def export_session(server) do
@@ -189,6 +250,15 @@ defmodule Alloy.Agent.Server do
 
   @impl GenServer
   def terminate(_reason, state) do
+    # Kill any running async Turn task — prevents orphaned tasks after shutdown.
+    if state.current_task do
+      {_ref, task_pid, _request_id} = state.current_task
+      # terminate_child/2 may return {:error, :not_found} if the Task already
+      # finished between the GenServer receiving :stop and terminate/2 running.
+      # This is safe to ignore — the Task is gone either way.
+      Task.Supervisor.terminate_child(Alloy.TaskSupervisor, task_pid)
+    end
+
     state =
       case Middleware.run(:session_end, state) do
         {:halted, reason} ->
@@ -217,6 +287,12 @@ defmodule Alloy.Agent.Server do
     :ok
   end
 
+  # Reject synchronous chat while an async Turn is in flight — prevents state clobbering.
+  @impl GenServer
+  def handle_call({:chat, _message}, _from, %{current_task: {_, _, _}} = state) do
+    {:reply, {:error, :busy}, state}
+  end
+
   @impl GenServer
   def handle_call({:chat, message}, _from, state) do
     # Append user message and run the full loop
@@ -236,6 +312,12 @@ defmodule Alloy.Agent.Server do
       status when status in [:error, :halted] -> {:reply, {:error, result}, new_state}
       _ -> {:reply, {:ok, result}, new_state}
     end
+  end
+
+  # Reject synchronous stream_chat while an async Turn is in flight.
+  @impl GenServer
+  def handle_call({:stream_chat, _message, _on_chunk}, _from, %{current_task: {_, _, _}} = state) do
+    {:reply, {:error, :busy}, state}
   end
 
   @impl GenServer
@@ -267,10 +349,22 @@ defmodule Alloy.Agent.Server do
     {:reply, state.usage, state}
   end
 
+  # Reject reset while an async Turn is in flight — prevents state clobbering.
+  @impl GenServer
+  def handle_call(:reset, _from, %{current_task: {_, _, _}} = state) do
+    {:reply, {:error, :busy}, state}
+  end
+
   @impl GenServer
   def handle_call(:reset, _from, state) do
     new_state = %{state | messages: []} |> reset_for_new_run()
     {:reply, :ok, new_state}
+  end
+
+  # Reject set_model while an async Turn is in flight — prevents state clobbering.
+  @impl GenServer
+  def handle_call({:set_model, _}, _from, %{current_task: {_, _, _}} = state) do
+    {:reply, {:error, :busy}, state}
   end
 
   @impl GenServer
@@ -298,8 +392,48 @@ defmodule Alloy.Agent.Server do
        turns: state.turn,
        message_count: length(state.messages),
        usage: state.usage,
-       uptime_ms: System.monotonic_time(:millisecond) - (state.started_at || 0)
+       uptime_ms: System.monotonic_time(:millisecond) - (state.started_at || 0),
+       busy: state.current_task != nil
      }, state}
+  end
+
+  # Reject if PubSub is not configured — caller would wait forever for a broadcast.
+  @impl GenServer
+  def handle_call({:send_message, _, _}, _from, %{config: %{pubsub: nil}} = state) do
+    {:reply, {:error, :no_pubsub}, state}
+  end
+
+  # Reject if a Turn is already running in a Task.
+  @impl GenServer
+  def handle_call(
+        {:send_message, _message, _request_id},
+        _from,
+        %{current_task: {_, _, _}} = state
+      ) do
+    {:reply, {:error, :busy}, state}
+  end
+
+  # Accept the message, snapshot state for the Task, spawn, return immediately.
+  @impl GenServer
+  def handle_call({:send_message, message, request_id}, _from, state) do
+    turn_state =
+      state
+      |> State.append_messages([Message.user(message)])
+      |> reset_for_new_run()
+
+    task =
+      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
+        Turn.run_loop(turn_state)
+      end)
+
+    {:reply, {:ok, request_id}, %{turn_state | current_task: {task.ref, task.pid, request_id}}}
+  end
+
+  # Drop agent_event while an async Turn is in flight — prevents concurrent Turns.
+  @impl GenServer
+  def handle_info({:agent_event, _message}, %{current_task: {_, _, _}} = state) do
+    Logger.warning("[Alloy] Dropping agent_event — async Turn already in progress")
+    {:noreply, state}
   end
 
   @impl GenServer
@@ -319,16 +453,55 @@ defmodule Alloy.Agent.Server do
     # that subscribe using the session ID.
     if state.config.pubsub do
       topic = "agent:#{effective_session_id(final_state)}:responses"
-
-      Phoenix.PubSub.broadcast(
-        state.config.pubsub,
-        topic,
-        {:agent_response, build_result(final_state)}
-      )
+      broadcast(state.config.pubsub, topic, {:agent_response, build_result(final_state)})
     end
 
-    new_state = reset_for_new_run(final_state)
-    {:noreply, new_state}
+    {:noreply, final_state}
+  end
+
+  # Task completed successfully — broadcast result and free the agent.
+  # Preserve final_state's actual status/turn/error — do NOT reset_for_new_run
+  # which would overwrite :completed with :running and zero the turn counter.
+  @impl GenServer
+  def handle_info({ref, final_state}, %{current_task: {ref, _pid, request_id}} = _state)
+      when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+
+    if final_state.config.pubsub do
+      topic = "agent:#{effective_session_id(final_state)}:responses"
+      result = final_state |> build_result() |> Map.put(:request_id, request_id)
+      broadcast(final_state.config.pubsub, topic, {:agent_response, result})
+    end
+
+    {:noreply, %{final_state | current_task: nil}}
+  end
+
+  # Task crashed — broadcast the error, free the agent so it can recover.
+  @impl GenServer
+  def handle_info(
+        {:DOWN, ref, :process, _pid, reason},
+        %{current_task: {ref, _, request_id}} = state
+      )
+      when is_reference(ref) do
+    Logger.error("[Alloy] Async Turn crashed (request_id=#{inspect(request_id)}): #{inspect(reason)}")
+
+    if state.config.pubsub do
+      topic = "agent:#{effective_session_id(state)}:responses"
+
+      result =
+        state
+        |> build_result()
+        |> Map.merge(%{status: :error, error: reason, request_id: request_id})
+
+      broadcast(state.config.pubsub, topic, {:agent_response, result})
+    end
+
+    # NOTE: state here is the pre-Turn snapshot (including the user message that
+    # triggered the Turn). If the caller retries via send_message/3, that will
+    # append another user message, leaving two consecutive user messages in
+    # history. Anthropic enforces strict user/assistant alternation — callers
+    # should call reset/1 before retrying to clear the failed message.
+    {:noreply, %{state | current_task: nil, status: :error, error: reason}}
   end
 
   @impl GenServer
@@ -349,6 +522,20 @@ defmodule Alloy.Agent.Server do
   end
 
   # ── Private ───────────────────────────────────────────────────────────────
+
+  defp broadcast(pubsub, topic, message) do
+    case Phoenix.PubSub.broadcast(pubsub, topic, message) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("[Alloy] PubSub broadcast failed on #{inspect(topic)}: #{inspect(reason)}")
+    end
+  end
+
+  defp generate_request_id do
+    :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
+  end
 
   defp maybe_subscribe_pubsub(%State{config: %{pubsub: nil}}), do: :ok
 
