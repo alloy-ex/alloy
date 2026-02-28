@@ -128,12 +128,16 @@ defmodule Alloy.Provider.Google do
       |> Enum.filter(&Map.has_key?(&1, "text"))
       |> Enum.map_join("", & &1["text"])
 
-    # Emit only the new portion since last event
+    # Emit only the new portion since last event.
+    # Use byte_size/1 (O(1)) instead of String.length/1 (O(n)) to avoid
+    # O(n²) total work over a long streamed response. Safe because each
+    # Gemini snapshot is a valid, complete UTF-8 string with no split
+    # multi-byte sequences.
     acc =
-      if String.length(full_text) > acc.last_text_length do
-        delta = String.slice(full_text, acc.last_text_length..-1//1)
+      if byte_size(full_text) > acc.last_text_length do
+        delta = :binary.part(full_text, acc.last_text_length, byte_size(full_text) - acc.last_text_length)
         acc.on_chunk.(delta)
-        %{acc | last_text_length: String.length(full_text)}
+        %{acc | last_text_length: byte_size(full_text)}
       else
         acc
       end

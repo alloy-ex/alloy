@@ -32,6 +32,11 @@ defmodule Alloy.Provider.OpenAIStream do
     body =
       body
       |> Map.put("stream", true)
+      # stream_options is an OpenAI extension for usage counts in streaming
+      # responses. All officially supported providers (OpenAI, DeepSeek,
+      # Mistral, Ollama, OpenRouter, xAI) either support it or silently ignore
+      # it. If a custom provider rejects unknown fields, set
+      # `stream_options: false` in the provider config to skip this injection.
       |> Map.put("stream_options", %{"include_usage" => true})
 
     initial_acc = %{

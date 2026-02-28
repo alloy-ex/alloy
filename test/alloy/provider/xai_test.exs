@@ -1,6 +1,8 @@
 defmodule Alloy.Provider.XAITest do
   use ExUnit.Case, async: true
 
+  import Alloy.StreamTestHelpers
+
   alias Alloy.Provider.XAI
   alias Alloy.Message
 
@@ -316,86 +318,12 @@ defmodule Alloy.Provider.XAITest do
   # --- SSE Streaming Helpers ---
 
   defp config_with_sse_stream(chunks) do
-    %{
-      api_key: "xai-test-key",
-      model: "grok-3",
-      req_options: [
-        plug: {Req.Test, __MODULE__},
-        retry: false
-      ]
-    }
-    |> tap(fn _ ->
-      Req.Test.stub(__MODULE__, fn conn ->
-        conn = Plug.Conn.send_chunked(conn, 200)
-
-        Enum.reduce(chunks, conn, fn chunk, conn ->
-          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
-          conn
-        end)
-      end)
-    end)
+    %{api_key: "xai-test-key", model: "grok-3", req_options: [plug: {Req.Test, __MODULE__}, retry: false]}
+    |> tap(fn _ -> Req.Test.stub(__MODULE__, sse_chunks_plug(chunks)) end)
   end
 
   defp config_with_sse_stream_capturing_request(chunks) do
-    test_pid = self()
-
-    %{
-      api_key: "xai-test-key",
-      model: "grok-3",
-      req_options: [
-        plug: {Req.Test, __MODULE__},
-        retry: false
-      ]
-    }
-    |> tap(fn _ ->
-      Req.Test.stub(__MODULE__, fn conn ->
-        {:ok, body, conn} = Plug.Conn.read_body(conn)
-        send(test_pid, {:request_body, body})
-
-        conn = Plug.Conn.send_chunked(conn, 200)
-
-        Enum.reduce(chunks, conn, fn chunk, conn ->
-          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
-          conn
-        end)
-      end)
-    end)
-  end
-
-  defp sse_text_delta(text) do
-    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{"content" => text}, "finish_reason" => nil}]})}\n\n"
-  end
-
-  defp sse_tool_call_start(index, id, name) do
-    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{"tool_calls" => [%{"index" => index, "id" => id, "type" => "function", "function" => %{"name" => name, "arguments" => ""}}]}, "finish_reason" => nil}]})}\n\n"
-  end
-
-  defp sse_tool_call_args(index, args) do
-    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{"tool_calls" => [%{"index" => index, "function" => %{"arguments" => args}}]}, "finish_reason" => nil}]})}\n\n"
-  end
-
-  defp sse_finish(reason) do
-    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => reason}]})}\n\n"
-  end
-
-  defp sse_usage(prompt, completion) do
-    "data: #{Jason.encode!(%{"id" => "test", "choices" => [], "usage" => %{"prompt_tokens" => prompt, "completion_tokens" => completion}})}\n\n"
-  end
-
-  defp collect_chunks(fun) do
-    test_pid = self()
-    on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
-
-    fun.(on_chunk)
-
-    collect_messages([])
-  end
-
-  defp collect_messages(acc) do
-    receive do
-      {:chunk, chunk} -> collect_messages(acc ++ [chunk])
-    after
-      100 -> acc
-    end
+    %{api_key: "xai-test-key", model: "grok-3", req_options: [plug: {Req.Test, __MODULE__}, retry: false]}
+    |> tap(fn _ -> Req.Test.stub(__MODULE__, sse_chunks_capturing_plug(self(), chunks)) end)
   end
 end

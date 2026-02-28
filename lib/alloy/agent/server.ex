@@ -193,7 +193,7 @@ defmodule Alloy.Agent.Server do
           {:ok, binary()} | {:error, :busy | :no_pubsub}
   def send_message(server, message, opts \\ []) when is_binary(message) do
     request_id = Keyword.get(opts, :request_id, generate_request_id())
-    GenServer.call(server, {:send_message, message, request_id}, :infinity)
+    GenServer.call(server, {:send_message, message, request_id}, 5_000)
   end
 
   @doc """
@@ -497,6 +497,11 @@ defmodule Alloy.Agent.Server do
       Phoenix.PubSub.broadcast(state.config.pubsub, topic, {:agent_response, result})
     end
 
+    # NOTE: state here is the pre-Turn snapshot (including the user message that
+    # triggered the Turn). If the caller retries via send_message/3, that will
+    # append another user message, leaving two consecutive user messages in
+    # history. Anthropic enforces strict user/assistant alternation — callers
+    # should call reset/1 before retrying to clear the failed message.
     {:noreply, %{state | current_task: nil, status: :error, error: reason}}
   end
 
@@ -520,7 +525,7 @@ defmodule Alloy.Agent.Server do
   # ── Private ───────────────────────────────────────────────────────────────
 
   defp generate_request_id do
-    :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
+    :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
   end
 
   defp maybe_subscribe_pubsub(%State{config: %{pubsub: nil}}), do: :ok
