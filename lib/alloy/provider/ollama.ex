@@ -30,6 +30,7 @@ defmodule Alloy.Provider.Ollama do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
+  alias Alloy.Provider.OpenAIStream
 
   @default_api_url "http://localhost:11434"
   @default_max_tokens 4096
@@ -65,6 +66,28 @@ defmodule Alloy.Provider.Ollama do
       {:error, reason} ->
         {:error, "HTTP request failed: #{inspect(reason)}"}
     end
+  end
+
+  @impl true
+  def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
+    body = build_request_body(messages, tool_defs, config)
+    url = "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions"
+
+    headers = [{"content-type", "application/json"}]
+
+    headers =
+      case Map.get(config, :api_key) do
+        nil -> headers
+        key -> [{"authorization", "Bearer #{key}"} | headers]
+      end
+
+    OpenAIStream.stream(
+      url,
+      headers,
+      body,
+      on_chunk,
+      Map.get(config, :req_options, [])
+    )
   end
 
   # --- Request Building ---

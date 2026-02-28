@@ -32,6 +32,7 @@ defmodule Alloy.Provider.Anthropic do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
+  alias Alloy.Provider.SSE
 
   @default_api_url "https://api.anthropic.com"
   @default_api_version "2023-06-01"
@@ -79,8 +80,6 @@ defmodule Alloy.Provider.Anthropic do
       build_request_body(messages, tool_defs, config)
       |> Map.put("stream", true)
 
-    # Mutable accumulator for SSE state, held in a process dictionary-free
-    # approach using the Req `into:` callback accumulator pattern.
     initial_acc = %{
       buffer: "",
       content_blocks: %{},
@@ -90,13 +89,7 @@ defmodule Alloy.Provider.Anthropic do
       on_chunk: on_chunk
     }
 
-    stream_handler = fn {:data, chunk}, {req, resp} ->
-      # Store our SSE accumulator in the response private map
-      sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
-      sse_acc = process_sse_chunk(sse_acc, chunk)
-      resp = put_in(resp.private[:sse_acc], sse_acc)
-      {:cont, {req, resp}}
-    end
+    stream_handler = SSE.req_stream_handler(initial_acc, &handle_sse_raw_event/2)
 
     req_opts =
       ([
@@ -125,61 +118,16 @@ defmodule Alloy.Provider.Anthropic do
     end
   end
 
-  # Process a raw SSE chunk. Chunks may contain partial events, so we buffer
-  # and split on double-newline boundaries.
-  defp process_sse_chunk(acc, chunk) do
-    buffer = acc.buffer <> chunk
-
-    # Split on double-newline (SSE event boundary)
-    {events, remaining} = split_sse_events(buffer)
-
-    acc = %{acc | buffer: remaining}
-
-    Enum.reduce(events, acc, fn event, acc ->
-      process_sse_event(acc, event)
-    end)
-  end
-
-  defp split_sse_events(buffer) do
-    # SSE events are separated by \n\n
-    parts = String.split(buffer, "\n\n")
-
-    case parts do
-      # Only one part means no complete event yet
-      [only] ->
-        {[], only}
-
-      # Last part is the incomplete remainder
-      _ ->
-        {complete, [remainder]} = Enum.split(parts, length(parts) - 1)
-        {complete, remainder}
+  # Bridge from SSE module's raw events to Anthropic's typed event handler.
+  # Anthropic events always have an event type and JSON-decodable data.
+  defp handle_sse_raw_event(acc, %{event: event_type, data: data}) when is_binary(event_type) do
+    case Jason.decode(data) do
+      {:ok, parsed} -> handle_sse_event(acc, event_type, parsed)
+      {:error, _} -> acc
     end
   end
 
-  defp process_sse_event(acc, event_str) do
-    lines = String.split(event_str, "\n")
-
-    event_type =
-      Enum.find_value(lines, fn
-        "event: " <> type -> String.trim(type)
-        _ -> nil
-      end)
-
-    data =
-      Enum.find_value(lines, fn
-        "data: " <> json -> json
-        _ -> nil
-      end)
-
-    if event_type && data do
-      case Jason.decode(data) do
-        {:ok, parsed} -> handle_sse_event(acc, event_type, parsed)
-        {:error, _} -> acc
-      end
-    else
-      acc
-    end
-  end
+  defp handle_sse_raw_event(acc, _event), do: acc
 
   defp handle_sse_event(acc, "message_start", %{"message" => msg}) do
     usage = Map.get(msg, "usage", %{})

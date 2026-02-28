@@ -30,6 +30,7 @@ defmodule Alloy.Provider.OpenAI do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
+  alias Alloy.Provider.OpenAIStream
 
   @default_api_url "https://api.openai.com"
   @default_max_tokens 4096
@@ -60,6 +61,25 @@ defmodule Alloy.Provider.OpenAI do
       {:error, reason} ->
         {:error, "HTTP request failed: #{inspect(reason)}"}
     end
+  end
+
+  @impl true
+  def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
+    body = build_request_body(messages, tool_defs, config)
+    url = "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions"
+
+    headers = [
+      {"authorization", "Bearer #{config.api_key}"},
+      {"content-type", "application/json"}
+    ]
+
+    OpenAIStream.stream(
+      url,
+      headers,
+      body,
+      on_chunk,
+      Map.get(config, :req_options, [])
+    )
   end
 
   # --- Request Building ---

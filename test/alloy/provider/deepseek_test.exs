@@ -170,6 +170,64 @@ defmodule Alloy.Provider.DeepSeekTest do
     end
   end
 
+  # ── stream/4 ──────────────────────────────────────────────────────────
+
+  describe "stream/4" do
+    test "emits text chunks and returns correct response" do
+      config =
+        config_with_sse_stream([
+          sse_text_delta("Hello"),
+          sse_text_delta(" world"),
+          sse_finish("stop"),
+          sse_usage(10, 5),
+          "data: [DONE]\n\n"
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = DeepSeek.stream([Message.user("Hi")], [], config, on_chunk)
+      assert result.stop_reason == :end_turn
+      assert [%Message{role: :assistant}] = result.messages
+      assert Message.text(hd(result.messages)) == "Hello world"
+
+      assert_received {:chunk, "Hello"}
+      assert_received {:chunk, " world"}
+    end
+
+    test "accumulates tool calls without emitting chunks" do
+      config =
+        config_with_sse_stream([
+          sse_tool_call_start(0, "call_1", "read"),
+          sse_tool_call_args(0, "{\"file_path\":\"mix.exs\"}"),
+          sse_finish("tool_calls"),
+          "data: [DONE]\n\n"
+        ])
+
+      chunks =
+        collect_chunks(fn on_chunk ->
+          DeepSeek.stream([Message.user("Read mix.exs")], [], config, on_chunk)
+        end)
+
+      assert chunks == []
+    end
+
+    test "request body includes stream: true" do
+      config =
+        config_with_sse_stream_capturing_request([
+          sse_text_delta("ok"),
+          sse_finish("stop"),
+          "data: [DONE]\n\n"
+        ])
+
+      DeepSeek.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+      assert decoded["stream"] == true
+    end
+  end
+
   # --- Test Helpers ---
 
   defp config_with_response(response) do
@@ -226,5 +284,91 @@ defmodule Alloy.Provider.DeepSeekTest do
         )
       end)
     end)
+  end
+
+  # --- SSE Streaming Helpers ---
+
+  defp config_with_sse_stream(chunks) do
+    %{
+      api_key: "ds-test-key",
+      model: "deepseek-chat",
+      req_options: [
+        plug: {Req.Test, __MODULE__},
+        retry: false
+      ]
+    }
+    |> tap(fn _ ->
+      Req.Test.stub(__MODULE__, fn conn ->
+        conn = Plug.Conn.send_chunked(conn, 200)
+
+        Enum.reduce(chunks, conn, fn chunk, conn ->
+          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
+          conn
+        end)
+      end)
+    end)
+  end
+
+  defp config_with_sse_stream_capturing_request(chunks) do
+    test_pid = self()
+
+    %{
+      api_key: "ds-test-key",
+      model: "deepseek-chat",
+      req_options: [
+        plug: {Req.Test, __MODULE__},
+        retry: false
+      ]
+    }
+    |> tap(fn _ ->
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, body})
+
+        conn = Plug.Conn.send_chunked(conn, 200)
+
+        Enum.reduce(chunks, conn, fn chunk, conn ->
+          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
+          conn
+        end)
+      end)
+    end)
+  end
+
+  defp sse_text_delta(text) do
+    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{"content" => text}, "finish_reason" => nil}]})}\n\n"
+  end
+
+  defp sse_tool_call_start(index, id, name) do
+    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{"tool_calls" => [%{"index" => index, "id" => id, "type" => "function", "function" => %{"name" => name, "arguments" => ""}}]}, "finish_reason" => nil}]})}\n\n"
+  end
+
+  defp sse_tool_call_args(index, args) do
+    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{"tool_calls" => [%{"index" => index, "function" => %{"arguments" => args}}]}, "finish_reason" => nil}]})}\n\n"
+  end
+
+  defp sse_finish(reason) do
+    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => reason}]})}\n\n"
+  end
+
+  defp sse_usage(prompt, completion) do
+    "data: #{Jason.encode!(%{"id" => "test", "choices" => [], "usage" => %{"prompt_tokens" => prompt, "completion_tokens" => completion}})}\n\n"
+  end
+
+  defp collect_chunks(fun) do
+    test_pid = self()
+    on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+    fun.(on_chunk)
+
+    collect_messages([])
+  end
+
+  defp collect_messages(acc) do
+    receive do
+      {:chunk, chunk} -> collect_messages(acc ++ [chunk])
+    after
+      100 -> acc
+    end
   end
 end
