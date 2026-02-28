@@ -55,7 +55,7 @@ defmodule Alloy.Persistence do
 
         @impl true
         def call(:after_completion, state) do
-          session = Alloy.Session.new(messages: state.messages, usage: state.usage)
+          session = Alloy.Session.new(messages: Alloy.Agent.State.messages(state), usage: state.usage)
           MyApp.SessionStore.save_session(session)
           state
         end

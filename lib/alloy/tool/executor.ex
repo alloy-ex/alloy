@@ -25,6 +25,7 @@ defmodule Alloy.Tool.Executor do
           Message.t() | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state) do
     context = build_context(state)
+    tool_timeout = state.config.tool_timeout
 
     # Check middleware before execution — short-circuit on halt
     case tag_tool_calls(state, tool_calls) do
@@ -39,7 +40,7 @@ defmodule Alloy.Tool.Executor do
               {:execute, call} -> execute_one(call, tool_fns, context)
               {:blocked, call, reason} -> error_result(call[:id], "Blocked: #{reason}")
             end,
-            timeout: 120_000,
+            timeout: tool_timeout,
             ordered: true
           )
           |> Enum.map(fn

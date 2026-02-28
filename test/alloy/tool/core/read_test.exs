@@ -107,5 +107,35 @@ defmodule Alloy.Tool.Core.ReadTest do
 
       assert result =~ "absolute"
     end
+
+    test "does not load entire file into memory for pagination", %{tmp_dir: tmp_dir} do
+      # Create a file with 10_000 lines — streaming should only materialise the
+      # requested window (lines 9_998..10_000), never the whole file.
+      file = Path.join(tmp_dir, "large.txt")
+      content = Enum.map_join(1..10_000, "\n", &"line #{&1}")
+      File.write!(file, content)
+
+      assert {:ok, result} =
+               Read.execute(%{"file_path" => file, "offset" => 9_998, "limit" => 3}, %{})
+
+      assert result =~ "9998\tline 9998"
+      assert result =~ "9999\tline 9999"
+      assert result =~ "10000\tline 10000"
+      refute result =~ "9997\tline 9997"
+    end
+
+    test "handles file without trailing newline via streaming", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "no_trailing.txt")
+      # No trailing newline — should still read 3 lines, not 4
+      File.write!(file, "alpha\nbeta\ngamma")
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file}, %{})
+
+      lines = String.split(result, "\n", trim: true)
+      assert length(lines) == 3
+      assert result =~ "1\talpha"
+      assert result =~ "2\tbeta"
+      assert result =~ "3\tgamma"
+    end
   end
 end

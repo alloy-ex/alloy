@@ -44,26 +44,24 @@ defmodule Alloy.Tool.Core.Read do
     offset = input["offset"] || 1
     limit = input["limit"] || @default_limit
 
-    case File.read(path) do
-      {:ok, content} ->
-        result =
-          content
-          |> String.split("\n")
-          |> maybe_drop_trailing_empty()
-          |> Enum.with_index(1)
-          |> Enum.drop(offset - 1)
-          |> Enum.take(limit)
-          |> format_lines()
+    if File.exists?(path) do
+      lines =
+        path
+        |> File.stream!()
+        |> Stream.map(&String.trim_trailing(&1, "\n"))
+        |> Stream.with_index(1)
+        |> Stream.drop(offset - 1)
+        |> Stream.take(limit)
+        |> Enum.to_list()
 
-        {:ok, result}
-
-      {:error, reason} ->
-        {:error, "File does not exist or cannot be read: #{path} (#{reason})"}
+      if lines == [] do
+        {:ok, ""}
+      else
+        {:ok, format_lines(lines)}
+      end
+    else
+      {:error, "File does not exist or cannot be read: #{path} (enoent)"}
     end
-  end
-
-  defp maybe_drop_trailing_empty(lines) do
-    if List.last(lines) == "", do: List.delete_at(lines, -1), else: lines
   end
 
   defp format_lines(numbered_lines) do

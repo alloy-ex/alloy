@@ -20,13 +20,17 @@ defmodule Alloy.Context.Compactor do
   """
   @spec maybe_compact(State.t()) :: State.t()
   def maybe_compact(%State{} = state) do
-    if TokenCounter.within_budget?(state.messages, state.config.max_tokens) do
+    messages = State.messages(state)
+
+    if TokenCounter.within_budget?(messages, state.config.max_tokens) do
       state
     else
       # Use dynamic keep_recent: at most default, but ensure at least 1 message gets compacted
-      msg_count = length(state.messages)
+      msg_count = length(messages)
       keep_recent = min(@default_keep_recent, max(1, msg_count - 2))
-      %{state | messages: compact_messages(state.messages, keep_recent: keep_recent)}
+      compacted = compact_messages(messages, keep_recent: keep_recent)
+      # Store compacted messages and clear the accumulator
+      %{state | messages: compacted, messages_new: []}
     end
   end
 

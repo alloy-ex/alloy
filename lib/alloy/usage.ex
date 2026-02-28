@@ -11,7 +11,7 @@ defmodule Alloy.Usage do
           output_tokens: non_neg_integer(),
           cache_creation_input_tokens: non_neg_integer(),
           cache_read_input_tokens: non_neg_integer(),
-          estimated_cost_cents: non_neg_integer()
+          estimated_cost_cents: number()
         }
 
   defstruct input_tokens: 0,
@@ -58,12 +58,8 @@ defmodule Alloy.Usage do
   If you need to accumulate costs across multiple turns, use `merge/2` which
   preserves and sums `estimated_cost_cents`.
 
-  Prices are in USD per million tokens. The result is stored as integer cents
-  (rounded) to avoid floating-point accumulation errors across turns.
-
-  Costs are computed in whole cents and fractional cents are truncated (not
-  rounded). For high-volume, low-token workloads this may under-report by up
-  to 1 cent per call.
+  Prices are in USD per million tokens. The result is stored as a float
+  representing cents, preserving sub-cent precision for small token counts.
 
   ## Examples
 
@@ -79,8 +75,8 @@ defmodule Alloy.Usage do
     # so any imprecision is limited to sub-cent rounding of the rate itself.
     input_cents_per_m = round(input_price_per_m * 100)
     output_cents_per_m = round(output_price_per_m * 100)
-    input_cost = div(usage.input_tokens * input_cents_per_m, 1_000_000)
-    output_cost = div(usage.output_tokens * output_cents_per_m, 1_000_000)
+    input_cost = usage.input_tokens * input_cents_per_m / 1_000_000
+    output_cost = usage.output_tokens * output_cents_per_m / 1_000_000
     %{usage | estimated_cost_cents: input_cost + output_cost}
   end
 end

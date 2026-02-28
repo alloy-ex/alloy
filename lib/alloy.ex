@@ -80,21 +80,25 @@ defmodule Alloy do
     messages = build_messages(message, opts)
     state = State.init(config, messages)
 
-    final_state = Turn.run_loop(state)
+    try do
+      final_state = Turn.run_loop(state)
 
-    result = %{
-      text: State.last_assistant_text(final_state),
-      messages: final_state.messages,
-      usage: final_state.usage,
-      status: final_state.status,
-      turns: final_state.turn,
-      error: final_state.error
-    }
+      result = %{
+        text: State.last_assistant_text(final_state),
+        messages: State.messages(final_state),
+        usage: final_state.usage,
+        status: final_state.status,
+        turns: final_state.turn,
+        error: final_state.error
+      }
 
-    case final_state.status do
-      :completed -> {:ok, result}
-      :max_turns -> {:ok, result}
-      _ -> {:error, result}
+      case final_state.status do
+        :completed -> {:ok, result}
+        :max_turns -> {:ok, result}
+        _ -> {:error, result}
+      end
+    after
+      State.cleanup(state)
     end
   end
 

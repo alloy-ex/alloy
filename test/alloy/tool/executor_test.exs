@@ -238,6 +238,32 @@ defmodule Alloy.Tool.ExecutorTest do
     end
   end
 
+  describe "execute_all/3 — configurable tool_timeout" do
+    test "tool exceeding tool_timeout produces an exit" do
+      state = build_state([Alloy.Test.SlowEchoTool], tool_timeout: 50)
+
+      tool_call = %{
+        id: "call_slow",
+        name: "slow_echo",
+        type: "tool_use",
+        input: %{"text" => "hi", "sleep_ms" => 200}
+      }
+
+      # Task.async_stream with default on_timeout: :exit raises on timeout
+      assert catch_exit(Executor.execute_all([tool_call], state.tool_fns, state))
+    end
+
+    test "tool_timeout defaults to 120_000 in config" do
+      config = Config.from_opts(provider: {Alloy.Provider.Test, []})
+      assert config.tool_timeout == 120_000
+    end
+
+    test "tool_timeout is configurable via Config.from_opts/1" do
+      config = Config.from_opts(provider: {Alloy.Provider.Test, []}, tool_timeout: 30_000)
+      assert config.tool_timeout == 30_000
+    end
+  end
+
   # --- Helpers ---
 
   defp build_state(tools, opts \\ []) do
@@ -247,7 +273,8 @@ defmodule Alloy.Tool.ExecutorTest do
       tools: tools,
       middleware: Keyword.get(opts, :middleware, []),
       working_directory: Keyword.get(opts, :working_directory, "."),
-      context: Keyword.get(opts, :context, %{})
+      context: Keyword.get(opts, :context, %{}),
+      tool_timeout: Keyword.get(opts, :tool_timeout, 120_000)
     }
 
     State.init(config)

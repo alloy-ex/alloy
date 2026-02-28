@@ -267,6 +267,9 @@ defmodule Alloy.Agent.Server do
       Task.Supervisor.terminate_child(Alloy.TaskSupervisor, task_pid)
     end
 
+    # Stop the scratchpad Agent process to prevent leaks.
+    State.cleanup(state)
+
     state =
       case Middleware.run(:session_end, state) do
         {:halted, reason} ->
@@ -308,6 +311,7 @@ defmodule Alloy.Agent.Server do
       state
       |> State.append_messages([Message.user(message)])
       |> reset_for_new_run()
+      |> set_running()
 
     final_state = Turn.run_loop(state)
 
@@ -338,6 +342,7 @@ defmodule Alloy.Agent.Server do
       state
       |> State.append_messages([Message.user(message)])
       |> reset_for_new_run()
+      |> set_running()
 
     turn_opts = Keyword.merge(stream_opts, streaming: true, on_chunk: on_chunk)
     final_state = Turn.run_loop(state, turn_opts)
@@ -353,7 +358,7 @@ defmodule Alloy.Agent.Server do
 
   @impl GenServer
   def handle_call(:messages, _from, state) do
-    {:reply, state.messages, state}
+    {:reply, State.messages(state), state}
   end
 
   @impl GenServer
@@ -369,7 +374,7 @@ defmodule Alloy.Agent.Server do
 
   @impl GenServer
   def handle_call(:reset, _from, state) do
-    new_state = %{state | messages: []} |> reset_for_new_run()
+    new_state = %{state | messages: [], messages_new: []} |> reset_for_new_run()
     {:reply, :ok, new_state}
   end
 
@@ -432,6 +437,7 @@ defmodule Alloy.Agent.Server do
       state
       |> State.append_messages([Message.user(message)])
       |> reset_for_new_run()
+      |> set_running()
 
     task =
       Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
@@ -454,6 +460,7 @@ defmodule Alloy.Agent.Server do
       state
       |> State.append_messages([Message.user(message)])
       |> reset_for_new_run()
+      |> set_running()
 
     final_state = Turn.run_loop(state)
 
@@ -573,14 +580,18 @@ defmodule Alloy.Agent.Server do
     end
   end
 
+  defp set_running(state) do
+    %{state | status: :running}
+  end
+
   defp reset_for_new_run(state) do
-    %{state | turn: 0, status: :running, error: nil}
+    %{state | turn: 0, status: :idle, error: nil}
   end
 
   defp build_result(%State{} = state) do
     %{
       text: State.last_assistant_text(state),
-      messages: state.messages,
+      messages: State.messages(state),
       usage: state.usage,
       status: state.status,
       turns: state.turn,
@@ -602,7 +613,7 @@ defmodule Alloy.Agent.Server do
   defp build_export_session(%State{} = state) do
     Session.new(
       id: effective_session_id(state),
-      messages: state.messages,
+      messages: State.messages(state),
       usage: state.usage,
       metadata: %{
         status: state.status,

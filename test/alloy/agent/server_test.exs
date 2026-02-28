@@ -166,8 +166,8 @@ defmodule Alloy.Agent.ServerTest do
       assert %Alloy.Session{} = session
       assert length(session.messages) == 2
       assert %Alloy.Usage{} = session.usage
-      # After chat completes, server resets to :running for the next call
-      assert session.metadata.status == :running
+      # After chat completes, server resets to :idle for the next call
+      assert session.metadata.status == :idle
     end
 
     test "session ID comes from context if provided" do
@@ -683,7 +683,7 @@ defmodule Alloy.Agent.ServerTest do
       assert Map.has_key?(health, :message_count)
       assert Map.has_key?(health, :usage)
       assert Map.has_key?(health, :uptime_ms)
-      assert health.status == :running
+      assert health.status == :idle
       assert health.turns == 0
       assert health.message_count == 0
     end

@@ -9,7 +9,7 @@ defmodule Alloy.Agent.State do
   alias Alloy.Agent.Config
   alias Alloy.{Message, Usage}
 
-  @type status :: :running | :completed | :error | :max_turns | :halted
+  @type status :: :idle | :running | :completed | :error | :max_turns | :halted
 
   @type t :: %__MODULE__{
           config: Config.t(),
@@ -32,9 +32,10 @@ defmodule Alloy.Agent.State do
     :error,
     :scratchpad,
     messages: [],
+    messages_new: [],
     turn: 0,
     usage: %Usage{},
-    status: :running,
+    status: :idle,
     tool_defs: [],
     tool_fns: %{},
     started_at: nil,
@@ -65,14 +66,47 @@ defmodule Alloy.Agent.State do
 
   @doc """
   Append messages to the conversation history.
+
+  Uses an internal accumulator for O(1) append. Call `messages/1` to
+  retrieve the full list in chronological order.
   """
   @spec append_messages(t(), [Message.t()] | Message.t()) :: t()
   def append_messages(%__MODULE__{} = state, messages) when is_list(messages) do
-    %{state | messages: state.messages ++ messages}
+    # Prepend new messages (reversed) onto the accumulator for O(1) per message.
+    new_acc = Enum.reduce(messages, state.messages_new, fn msg, acc -> [msg | acc] end)
+    %{state | messages_new: new_acc}
   end
 
   def append_messages(%__MODULE__{} = state, %Message{} = message) do
-    append_messages(state, [message])
+    %{state | messages_new: [message | state.messages_new]}
+  end
+
+  @doc """
+  Return messages in chronological order.
+
+  Flushes the internal accumulator and returns the full message list.
+  """
+  @spec messages(t()) :: [Message.t()]
+  def messages(%__MODULE__{messages: base, messages_new: []}) do
+    base
+  end
+
+  def messages(%__MODULE__{messages: base, messages_new: new}) do
+    base ++ Enum.reverse(new)
+  end
+
+  @doc """
+  Flush the accumulator into the messages field.
+
+  After this call, `state.messages` contains the full chronological
+  list and `state.messages_new` is empty. Call at process boundaries
+  where code reads `state.messages` directly.
+  """
+  @spec materialize(t()) :: t()
+  def materialize(%__MODULE__{messages_new: []} = state), do: state
+
+  def materialize(%__MODULE__{} = state) do
+    %{state | messages: messages(state), messages_new: []}
   end
 
   @doc """
@@ -95,7 +129,36 @@ defmodule Alloy.Agent.State do
   Extract the text from the last assistant message.
   """
   @spec last_assistant_text(t()) :: String.t() | nil
-  def last_assistant_text(%__MODULE__{messages: messages}) do
+  def last_assistant_text(%__MODULE__{} = state) do
+    # Check the accumulator (newest messages) first, then fall back to base.
+    find_assistant_text(state.messages_new) ||
+      find_assistant_text_reversed(state.messages)
+  end
+
+  @doc """
+  Clean up resources owned by this state.
+
+  Stops the scratchpad Agent process if one was started. Safe to call
+  multiple times or when scratchpad is nil.
+  """
+  @spec cleanup(t()) :: :ok
+  def cleanup(%__MODULE__{scratchpad: pid}) when is_pid(pid) do
+    if Process.alive?(pid), do: Agent.stop(pid)
+    :ok
+  end
+
+  def cleanup(%__MODULE__{}), do: :ok
+
+  # Search newest-first in the accumulator (already reversed / newest-first).
+  defp find_assistant_text(messages_new) do
+    Enum.find_value(messages_new, fn
+      %Message{role: :assistant} = msg -> Message.text(msg)
+      _ -> nil
+    end)
+  end
+
+  # Search newest-first in the base messages (chronological, so reverse).
+  defp find_assistant_text_reversed(messages) do
     messages
     |> Enum.reverse()
     |> Enum.find_value(fn

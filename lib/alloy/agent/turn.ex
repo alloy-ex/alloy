@@ -37,7 +37,9 @@ defmodule Alloy.Agent.Turn do
     deadline =
       System.monotonic_time(:millisecond) + state.config.timeout_ms - @deadline_headroom_ms
 
-    do_turn(state, opts, deadline)
+    state
+    |> do_turn(opts, deadline)
+    |> State.materialize()
   end
 
   defp do_turn(%State{turn: turn, config: config} = state, _opts, _deadline)
@@ -233,12 +235,14 @@ defmodule Alloy.Agent.Turn do
 
     provider_config = Map.put(provider_config, :on_event, wrapped_on_event)
 
-    result = provider.stream(state.messages, state.tool_defs, provider_config, wrapped_chunk)
+    messages = State.messages(state)
+    result = provider.stream(messages, state.tool_defs, provider_config, wrapped_chunk)
     {result, :atomics.get(ref, 1) == 1}
   end
 
   defp call_provider(provider, state, provider_config, false = _streaming?, _on_chunk) do
-    {provider.complete(state.messages, state.tool_defs, provider_config), false}
+    messages = State.messages(state)
+    {provider.complete(messages, state.tool_defs, provider_config), false}
   end
 
   # HTTP status errors — providers return strings via parse_error/2.
@@ -270,12 +274,14 @@ defmodule Alloy.Agent.Turn do
 
   # Network-level failures from Req/Finch/Mint.
   # Providers wrap these as: "HTTP request failed: #{inspect(reason)}"
-  # The inspect output includes the error reason atoms as text.
+  # Match the bare atom name (e.g. "econnrefused") rather than the
+  # inspect-formatted version (":econnrefused") so that changes in
+  # Req/Mint struct formatting don't silently break retry matching.
   defp retryable?("HTTP request failed: " <> rest) do
-    String.contains?(rest, ":econnrefused") or
-      String.contains?(rest, ":closed") or
-      String.contains?(rest, ":timeout") or
-      String.contains?(rest, ":unprocessed")
+    String.contains?(rest, "econnrefused") or
+      String.contains?(rest, "closed") or
+      String.contains?(rest, "timeout") or
+      String.contains?(rest, "unprocessed")
   end
 
   # Atom :timeout kept for any caller that passes atoms directly.

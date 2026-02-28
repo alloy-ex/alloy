@@ -1156,6 +1156,102 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  describe "run_loop/1 retries network errors without colon prefix" do
+    test "retries econnrefused without colon in inspect output" do
+      # If Mint/Req changes how it formats errors (e.g., drops the colon prefix
+      # from inspect output), the retry logic should still match.
+      bare_econnrefused_msg = "HTTP request failed: econnrefused"
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response(bare_econnrefused_msg),
+          TestProvider.text_response("Connected")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_retries: 2,
+        retry_backoff_ms: 1
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert Message.text(State.messages(result) |> List.last()) == "Connected"
+    end
+
+    test "retries timeout without colon in inspect output" do
+      bare_timeout_msg = "HTTP request failed: timeout"
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response(bare_timeout_msg),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_retries: 2,
+        retry_backoff_ms: 1
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert Message.text(State.messages(result) |> List.last()) == "Done"
+    end
+
+    test "retries closed without colon in inspect output" do
+      bare_closed_msg = "HTTP request failed: closed"
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response(bare_closed_msg),
+          TestProvider.text_response("Reconnected")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_retries: 2,
+        retry_backoff_ms: 1
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert Message.text(State.messages(result) |> List.last()) == "Reconnected"
+    end
+
+    test "retries unprocessed without colon in inspect output" do
+      bare_unprocessed_msg = "HTTP request failed: unprocessed"
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response(bare_unprocessed_msg),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_retries: 2,
+        retry_backoff_ms: 1
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert Message.text(State.messages(result) |> List.last()) == "Done"
+    end
+  end
+
   describe "run_loop/2 on_event threading" do
     test "on_event callback from opts is fired for each chunk during streaming" do
       test_pid = self()

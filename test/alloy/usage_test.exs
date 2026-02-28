@@ -47,14 +47,25 @@ defmodule Alloy.UsageTest do
     end
   end
 
-  describe "estimate_cost/3 integer arithmetic" do
-    test "uses integer division — does not round 333_333 tokens up to 100 cents" do
-      # Float path: 333_333 / 1_000_000 * 3.0 * 100 = 99.9999 → round = 100 (wrong)
-      # Integer path: div(333_333 * 300, 1_000_000) = div(99_999_900, 1_000_000) = 99 (correct)
-      usage = %Usage{input_tokens: 333_333, output_tokens: 0}
+  describe "estimate_cost/3 small token counts" do
+    test "does not truncate cost to zero for small token counts" do
+      # 1000 input tokens at $3/M = 0.3 cents (not 0)
+      # Old integer div: div(1000 * 300, 1_000_000) = 0 (BUG)
+      # Float division: 1000 * 300 / 1_000_000 = 0.3 (correct)
+      usage = %Usage{input_tokens: 1_000, output_tokens: 0}
       result = Usage.estimate_cost(usage, 3.0, 15.0)
 
-      assert result.estimated_cost_cents == 99
+      assert result.estimated_cost_cents > 0
+      assert_in_delta result.estimated_cost_cents, 0.3, 0.001
+    end
+
+    test "small output tokens produce non-zero cost" do
+      # 500 output tokens at $15/M = 0.75 cents (not 0)
+      usage = %Usage{input_tokens: 0, output_tokens: 500}
+      result = Usage.estimate_cost(usage, 3.0, 15.0)
+
+      assert result.estimated_cost_cents > 0
+      assert_in_delta result.estimated_cost_cents, 0.75, 0.001
     end
   end
 
@@ -99,7 +110,7 @@ defmodule Alloy.UsageTest do
       updated = Usage.estimate_cost(usage, 1.0, 2.0)
       refute updated.estimated_cost_cents == 999
       # The new value is based on the token counts, not 999 + new_cost
-      assert is_integer(updated.estimated_cost_cents)
+      assert is_number(updated.estimated_cost_cents)
     end
   end
 

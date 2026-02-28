@@ -93,7 +93,7 @@ defmodule Alloy.Middleware.TelemetryTest do
       result = Telemetry.call(:after_tool_execution, state)
 
       assert_receive {:telemetry_event, [:alloy, :tool_execution, :stop], %{turn: 1, tokens: 150},
-                      %{status: :running}}
+                      %{status: :idle}}
 
       assert result == state
 
