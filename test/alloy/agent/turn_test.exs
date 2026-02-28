@@ -1028,21 +1028,25 @@ defmodule Alloy.Agent.TurnTest do
       # This test distinguishes per-loop from per-call deadline.
       #
       # Setup: timeout_ms: 5_500 → effective budget = 500ms (after 5s headroom)
-      # 1. Provider returns tool_use → tool sleeps 350ms
+      # 1. Provider returns tool_use → tool sleeps 600ms (deliberately > 500ms budget)
       # 2. Provider returns retryable 429 error
       #
-      # Per-loop deadline: budget started at run_loop. After 350ms tool sleep,
-      #   only ~150ms remaining. Backoff of 400ms > 150ms → immediate abort.
+      # After the tool finishes, the deadline has already passed (remaining < 0).
+      # Since remaining is negative and backoff is always >= 1ms (full jitter),
+      # `remaining < backoff` is unconditionally true → immediate abort.
       #
-      # Per-call deadline (current bug): fresh 500ms budget on second call.
-      #   400ms backoff < 500ms → would sleep and retry → would succeed.
+      # Using sleep_ms > budget makes the test robust to full jitter: no matter
+      # what random backoff is drawn, a negative remaining is always smaller.
+      #
+      # Per-call deadline (the bug this tests for): fresh 500ms budget on second call.
+      #   Any backoff < 500ms → would sleep and retry → would succeed.
       #
       # Assert: result is error (per-loop aborted), not completed (per-call retried).
 
       {:ok, pid} =
         TestProvider.start_link([
           TestProvider.tool_use_response([
-            %{id: "t1", name: "slow_echo", input: %{"text" => "hi", "sleep_ms" => 350}}
+            %{id: "t1", name: "slow_echo", input: %{"text" => "hi", "sleep_ms" => 600}}
           ]),
           TestProvider.error_response("HTTP 429: Too Many Requests"),
           TestProvider.text_response("Should not reach with per-loop deadline")
@@ -1063,16 +1067,16 @@ defmodule Alloy.Agent.TurnTest do
       result = Turn.run_loop(state)
       elapsed = System.monotonic_time(:millisecond) - start_time
 
-      # Per-loop: ~350ms tool + instant abort = ~350-500ms, status: error
-      # Per-call: ~350ms tool + 400ms sleep + success = ~750ms, status: completed
+      # Per-loop: ~600ms tool (overruns budget) + instant abort, status: error
+      # Per-call: ~600ms tool + up to 800ms jitter sleep + success, status: completed
       assert result.status == :error,
              "Expected :error (per-loop deadline abort) but got :#{result.status} — " <>
                "deadline may be resetting per-call"
 
       assert result.error == "HTTP 429: Too Many Requests"
 
-      assert elapsed < 1_000,
-             "Expected quick abort (~350ms) but took #{elapsed}ms"
+      assert elapsed < 1_500,
+             "Expected quick abort (~600ms) but took #{elapsed}ms"
     end
   end
 
