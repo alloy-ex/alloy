@@ -460,6 +460,35 @@ defmodule Alloy.Provider.AnthropicTest do
 
       assert_received {:chunk, "Let me read that."}
     end
+
+    test "returns parsed error when stream response is non-200" do
+      error_body =
+        Jason.encode!(%{
+          "type" => "error",
+          "error" => %{
+            "type" => "invalid_request_error",
+            "message" => "max_tokens: must be less than 8192"
+          }
+        })
+
+      config = config_with_sse_error_stream(400, error_body)
+
+      assert {:error, reason} =
+               Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert reason =~ "invalid_request_error"
+      assert reason =~ "max_tokens"
+    end
+
+    test "returns raw body when stream error is not JSON" do
+      config = config_with_sse_error_stream(502, "Bad Gateway")
+
+      assert {:error, reason} =
+               Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert reason =~ "502"
+      assert reason =~ "Bad Gateway"
+    end
   end
 
   # ── Extended Thinking ────────────────────────────────────────────────
@@ -877,6 +906,22 @@ defmodule Alloy.Provider.AnthropicTest do
           {:ok, conn} = Plug.Conn.chunk(conn, chunk)
           conn
         end)
+      end)
+    end)
+  end
+
+  defp config_with_sse_error_stream(status, body) do
+    %{
+      api_key: "sk-ant-test-key",
+      model: "claude-sonnet-4-6-20250514",
+      max_tokens: 4096,
+      req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+    }
+    |> tap(fn _ ->
+      Req.Test.stub(__MODULE__, fn conn ->
+        conn = Plug.Conn.send_chunked(conn, status)
+        {:ok, conn} = Plug.Conn.chunk(conn, body)
+        conn
       end)
     end)
   end

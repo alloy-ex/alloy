@@ -493,6 +493,34 @@ defmodule Alloy.Provider.OpenAITest do
       assert chunks == []
     end
 
+    test "returns parsed error when stream response is non-200" do
+      error_body =
+        Jason.encode!(%{
+          "error" => %{
+            "type" => "invalid_request_error",
+            "message" => "Unsupported parameter: 'max_tokens'"
+          }
+        })
+
+      config = config_with_sse_error_stream(400, error_body)
+
+      assert {:error, reason} =
+               OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert reason =~ "invalid_request_error"
+      assert reason =~ "max_tokens"
+    end
+
+    test "returns raw body when stream error response is not JSON" do
+      config = config_with_sse_error_stream(503, "Service Unavailable")
+
+      assert {:error, reason} =
+               OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert reason =~ "503"
+      assert reason =~ "Service Unavailable"
+    end
+
     test "request body includes stream: true" do
       config =
         config_with_sse_stream_capturing_request([
@@ -575,6 +603,16 @@ defmodule Alloy.Provider.OpenAITest do
       req_options: [plug: {Req.Test, __MODULE__}, retry: false]
     }
     |> tap(fn _ -> Req.Test.stub(__MODULE__, sse_chunks_plug(chunks)) end)
+  end
+
+  defp config_with_sse_error_stream(status, body) do
+    %{
+      api_key: "sk-test-key",
+      model: "gpt-5.2",
+      max_tokens: 4096,
+      req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+    }
+    |> tap(fn _ -> Req.Test.stub(__MODULE__, sse_error_plug(status, body)) end)
   end
 
   defp config_with_sse_stream_capturing_request(chunks) do

@@ -79,6 +79,25 @@ defmodule Alloy.StreamTestHelpers do
     end
   end
 
+  @doc """
+  Returns a `Req.Test` plug that sends a chunked error response.
+
+  Simulates what happens when an API returns a non-200 status during streaming:
+  the `into:` handler consumes the body, so `resp.body` is empty and the error
+  must be recovered from the SSE buffer.
+
+  Use with `Req.Test.stub/2`:
+
+      Req.Test.stub(__MODULE__, sse_error_plug(400, error_json))
+  """
+  def sse_error_plug(status, body) do
+    fn conn ->
+      conn = Plug.Conn.send_chunked(conn, status)
+      {:ok, conn} = Plug.Conn.chunk(conn, body)
+      conn
+    end
+  end
+
   # ── Chunk Collection ──────────────────────────────────────────────────────
 
   @doc """
