@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-03-01
+
+### Fixed
+
+- **Jason.decode! crash on malformed tool args** — all 6 OpenAI-compatible providers now use `Jason.decode/1` instead of `Jason.decode!/1` when parsing model-produced tool call arguments. Invalid JSON returns `{:error, reason}` instead of crashing the agent GenServer.
+- **Multimodal user messages silently dropped** — DeepSeek, Mistral, Ollama, OpenRouter, and XAI providers now correctly format text and image blocks in list-content user messages (previously the `_other -> nil` catch-all discarded them).
+- **Tool executor preserves tool_use_id on timeout/crash** — timed-out or crashed tool calls now return the original tool_use_id (was `"unknown"`, which broke provider protocol state).
+- **File.stream! on directories** — `Tool.Core.Read` now uses `File.regular?/1` instead of `File.exists?/1`, returning a clean error for directories instead of raising `File.Error`.
+- **File.mkdir_p! in Write tool** — replaced with `File.mkdir_p/1` + structured error return on permission failure.
+- **One-shot Alloy.run/2 status** — now sets `status: :running` before entering the turn loop, consistent with `Server.chat/3`. Middleware no longer sees `:idle` during execution.
+- **Timeout floor overshoot** — `inject_receive_timeout/2` floor reduced from 5,000ms to 1,000ms to prevent HTTP requests from outliving the agent's overall deadline.
+- **Scheduler stale callbacks** — `remove_job/2` no longer fires callbacks for in-flight tasks that complete after the job is removed.
+- **Context.Discovery cross-platform** — `find_git_root/1` now terminates correctly on all OS filesystem roots (was hardcoded to `"/"`).
+- **Message.text/1 consistency** — always returns `String.t()` (never `nil`). Empty text returns `""` instead of `nil`.
+- **OpenAI missing usage key** — `parse_response` now handles responses without a `"usage"` field (zero-count fallback) instead of raising `FunctionClauseError`.
+- **Google unknown part types** — `parse_parts_to_blocks` now skips unrecognised part shapes instead of raising.
+
+### Changed
+
+- **Credo strict + Dialyzer in CI** — `mix credo --strict` and `mix dialyzer` now run on every push/PR. All 34 pre-existing Credo violations resolved. PLT caching added.
+- **Scratchpad Agent cleanup** — `State.cleanup/1` stops the scratchpad process in `terminate/2` and `try/after` blocks. Prevents process leak on crash.
+- **O(1) message append** — `State` uses a prepend accumulator (`messages_new`) instead of `++` for O(1) append per turn, materialised at turn boundaries.
+- **Float cost precision** — `Usage.estimate_cost/3` uses float division instead of `div/2` to avoid truncating sub-cent costs to zero.
+- **Agent :idle status** — `State` default status changed from `:running` to `:idle`. Agents are only `:running` during active turn execution.
+
 ## [0.4.2] - 2026-02-28
 
 ### Added
