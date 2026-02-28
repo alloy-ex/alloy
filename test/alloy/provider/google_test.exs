@@ -471,6 +471,41 @@ defmodule Alloy.Provider.GoogleTest do
       refute_received {:chunk, _}
     end
 
+    test "handles incremental mode where each event contains only new text" do
+      # Exercises the true -> branch of the snapshot/incremental cond:
+      # when the event text does NOT prefix-match the accumulated text,
+      # it is treated as a new chunk to append rather than a full snapshot.
+      config =
+        config_with_sse_stream([
+          google_sse_event(%{
+            "candidates" => [
+              %{"content" => %{"parts" => [%{"text" => "Hello"}], "role" => "model"}}
+            ]
+          }),
+          # " world" does not start with "Hello", so it falls to incremental mode.
+          google_sse_event(%{
+            "candidates" => [
+              %{
+                "content" => %{"parts" => [%{"text" => " world"}], "role" => "model"},
+                "finishReason" => "STOP"
+              }
+            ],
+            "usageMetadata" => %{"promptTokenCount" => 5, "candidatesTokenCount" => 3}
+          })
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = Google.stream([Message.user("Hi")], [], config, on_chunk)
+      assert result.stop_reason == :end_turn
+      assert Message.text(hd(result.messages)) == "Hello world"
+
+      assert_received {:chunk, "Hello"}
+      assert_received {:chunk, " world"}
+      refute_received {:chunk, _}
+    end
+
     test "request body does NOT include stream: true" do
       config =
         config_with_sse_stream_capturing_request([

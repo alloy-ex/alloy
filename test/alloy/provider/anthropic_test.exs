@@ -283,6 +283,178 @@ defmodule Alloy.Provider.AnthropicTest do
     end
   end
 
+  # ── stream/4 ──────────────────────────────────────────────────────────
+
+  describe "stream/4" do
+    test "emits text chunks and returns correct response" do
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 10, "output_tokens" => 0}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "Hello"}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => " world"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{"output_tokens" => 5}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = Anthropic.stream([Message.user("Hi")], [], config, on_chunk)
+      assert result.stop_reason == :end_turn
+      assert [%Message{role: :assistant}] = result.messages
+      assert Message.text(hd(result.messages)) == "Hello world"
+      assert result.usage.input_tokens == 10
+      assert result.usage.output_tokens == 5
+
+      assert_received {:chunk, "Hello"}
+      assert_received {:chunk, " world"}
+      refute_received {:chunk, _}
+    end
+
+    test "accumulates tool call input_json_delta without emitting chunks" do
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 20, "output_tokens" => 0}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{
+              "type" => "tool_use",
+              "id" => "toolu_01",
+              "name" => "read",
+              "input" => %{}
+            }
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"file_path\""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => ": \"mix.exs\"}"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "tool_use"},
+            "usage" => %{"output_tokens" => 15}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = Anthropic.stream([Message.user("Read mix.exs")], [], config, on_chunk)
+      assert result.stop_reason == :tool_use
+      assert [%Message{role: :assistant, content: blocks}] = result.messages
+
+      tool_call = Enum.find(blocks, &(&1.type == "tool_use"))
+      assert tool_call.name == "read"
+      assert tool_call.id == "toolu_01"
+      assert tool_call.input == %{"file_path" => "mix.exs"}
+
+      # No text chunks emitted for tool calls
+      refute_received {:chunk, _}
+    end
+
+    test "request body includes stream: true" do
+      config =
+        config_with_sse_stream_capturing_request([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 0}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "ok"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{"output_tokens" => 1}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+      assert decoded["stream"] == true
+    end
+
+    test "handles mixed text and tool use in same stream" do
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 15, "output_tokens" => 0}}
+          }),
+          # Text block at index 0
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "Let me read that."}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          # Tool use block at index 1
+          ant_event("content_block_start", %{
+            "index" => 1,
+            "content_block" => %{
+              "type" => "tool_use",
+              "id" => "toolu_02",
+              "name" => "read",
+              "input" => %{}
+            }
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 1,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"file_path\": \"mix.exs\"}"}
+          }),
+          ant_event("content_block_stop", %{"index" => 1}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "tool_use"},
+            "usage" => %{"output_tokens" => 20}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = Anthropic.stream([Message.user("Read mix.exs")], [], config, on_chunk)
+      assert result.stop_reason == :tool_use
+      assert [%Message{role: :assistant, content: blocks}] = result.messages
+
+      assert Enum.find(blocks, &(&1.type == "text"))
+      assert Enum.find(blocks, &(&1.type == "tool_use"))
+
+      assert_received {:chunk, "Let me read that."}
+    end
+  end
+
   describe "complete/3 retry behavior" do
     test "returns error on 429 (retry is handled by Turn, not the provider)" do
       # Req retry is disabled — providers return errors immediately for Turn to retry.
@@ -346,6 +518,55 @@ defmodule Alloy.Provider.AnthropicTest do
     |> tap(fn _ ->
       Req.Test.stub(__MODULE__, fn conn ->
         Plug.Conn.send_resp(conn, response.status, response.body)
+      end)
+    end)
+  end
+
+  # --- SSE Streaming Helpers ---
+
+  # Build an Anthropic-format SSE event string: "event: <type>\ndata: <json>\n\n"
+  defp ant_event(type, data) do
+    "event: #{type}\ndata: #{Jason.encode!(data)}\n\n"
+  end
+
+  defp config_with_sse_stream(chunks) do
+    %{
+      api_key: "sk-ant-test-key",
+      model: "claude-sonnet-4-6-20250514",
+      max_tokens: 4096,
+      req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+    }
+    |> tap(fn _ ->
+      Req.Test.stub(__MODULE__, fn conn ->
+        conn = Plug.Conn.send_chunked(conn, 200)
+
+        Enum.reduce(chunks, conn, fn chunk, conn ->
+          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
+          conn
+        end)
+      end)
+    end)
+  end
+
+  defp config_with_sse_stream_capturing_request(chunks) do
+    test_pid = self()
+
+    %{
+      api_key: "sk-ant-test-key",
+      model: "claude-sonnet-4-6-20250514",
+      max_tokens: 4096,
+      req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+    }
+    |> tap(fn _ ->
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, body})
+        conn = Plug.Conn.send_chunked(conn, 200)
+
+        Enum.reduce(chunks, conn, fn chunk, conn ->
+          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
+          conn
+        end)
       end)
     end)
   end

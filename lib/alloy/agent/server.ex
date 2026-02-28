@@ -449,12 +449,7 @@ defmodule Alloy.Agent.Server do
     # that subscribe using the session ID.
     if state.config.pubsub do
       topic = "agent:#{effective_session_id(final_state)}:responses"
-
-      Phoenix.PubSub.broadcast(
-        state.config.pubsub,
-        topic,
-        {:agent_response, build_result(final_state)}
-      )
+      broadcast(state.config.pubsub, topic, {:agent_response, build_result(final_state)})
     end
 
     {:noreply, final_state}
@@ -471,7 +466,7 @@ defmodule Alloy.Agent.Server do
     if final_state.config.pubsub do
       topic = "agent:#{effective_session_id(final_state)}:responses"
       result = final_state |> build_result() |> Map.put(:request_id, request_id)
-      Phoenix.PubSub.broadcast(final_state.config.pubsub, topic, {:agent_response, result})
+      broadcast(final_state.config.pubsub, topic, {:agent_response, result})
     end
 
     {:noreply, %{final_state | current_task: nil}}
@@ -494,7 +489,7 @@ defmodule Alloy.Agent.Server do
         |> build_result()
         |> Map.merge(%{status: :error, error: reason, request_id: request_id})
 
-      Phoenix.PubSub.broadcast(state.config.pubsub, topic, {:agent_response, result})
+      broadcast(state.config.pubsub, topic, {:agent_response, result})
     end
 
     # NOTE: state here is the pre-Turn snapshot (including the user message that
@@ -523,6 +518,16 @@ defmodule Alloy.Agent.Server do
   end
 
   # ── Private ───────────────────────────────────────────────────────────────
+
+  defp broadcast(pubsub, topic, message) do
+    case Phoenix.PubSub.broadcast(pubsub, topic, message) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("[Alloy] PubSub broadcast failed on #{inspect(topic)}: #{inspect(reason)}")
+    end
+  end
 
   defp generate_request_id do
     :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)

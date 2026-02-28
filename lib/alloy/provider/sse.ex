@@ -22,8 +22,10 @@ defmodule Alloy.Provider.SSE do
   @spec process_chunk(String.t(), String.t()) :: {[sse_event()], String.t()}
   def process_chunk(buffer, chunk) do
     # Normalize CRLF to LF so split_events works correctly with any
-    # server or proxy line-ending style.
-    combined = String.replace(buffer <> chunk, "\r\n", "\n")
+    # server or proxy line-ending style. Normalize only the incoming
+    # chunk (not the entire buffer) to avoid rescanning accumulated
+    # bytes on every chunk, keeping total CRLF-scan work O(stream size).
+    combined = buffer <> String.replace(chunk, "\r\n", "\n")
     {raw_events, remaining} = split_events(combined)
 
     events =
@@ -70,7 +72,7 @@ defmodule Alloy.Provider.SSE do
         {[], only}
 
       _ ->
-        {complete, [remainder]} = Enum.split(parts, length(parts) - 1)
+        {complete, [remainder]} = Enum.split(parts, -1)
         {complete, remainder}
     end
   end

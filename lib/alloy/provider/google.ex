@@ -73,8 +73,8 @@ defmodule Alloy.Provider.Google do
 
     initial_acc = %{
       buffer: "",
-      last_text_length: 0,
-      parts: [],
+      accumulated_text: "",
+      non_text_parts: [],
       usage: %{},
       on_chunk: on_chunk
     }
@@ -110,8 +110,8 @@ defmodule Alloy.Provider.Google do
     end
   end
 
-  # Google sends full snapshots per event. We compute the delta by comparing
-  # the current text length against what we've already emitted.
+  # Gemini streaming can send either full snapshots (text grows each event) or
+  # incremental chunks (each event is new text only). We detect and handle both.
   defp handle_google_event(acc, %{data: data}) do
     case Jason.decode(data) do
       {:ok, parsed} -> process_google_event(acc, parsed)
@@ -122,28 +122,47 @@ defmodule Alloy.Provider.Google do
   defp process_google_event(acc, %{"candidates" => [candidate | _]} = event) do
     parts = get_in(candidate, ["content", "parts"]) || []
 
-    # Compute full text from all text parts in this snapshot
-    full_text =
+    event_text =
       parts
       |> Enum.filter(&Map.has_key?(&1, "text"))
       |> Enum.map_join("", & &1["text"])
 
-    # Emit only the new portion since last event.
-    # Use byte_size/1 (O(1)) instead of String.length/1 (O(n)) to avoid
-    # O(n²) total work over a long streamed response. Safe because each
-    # Gemini snapshot is a valid, complete UTF-8 string with no split
-    # multi-byte sequences.
-    acc =
-      if byte_size(full_text) > acc.last_text_length do
-        delta = :binary.part(full_text, acc.last_text_length, byte_size(full_text) - acc.last_text_length)
-        acc.on_chunk.(delta)
-        %{acc | last_text_length: byte_size(full_text)}
-      else
-        acc
+    acc_size = byte_size(acc.accumulated_text)
+
+    # Detect snapshot vs incremental: if the event text is at least as long
+    # as what we've accumulated AND starts with the same bytes, it's a snapshot.
+    # Otherwise treat it as an incremental chunk.
+    {new_accumulated, delta} =
+      cond do
+        byte_size(event_text) == 0 ->
+          {acc.accumulated_text, ""}
+
+        byte_size(event_text) >= acc_size and
+            (acc_size == 0 or :binary.part(event_text, 0, acc_size) == acc.accumulated_text) ->
+          # Snapshot mode: event_text contains all text so far
+          delta_size = byte_size(event_text) - acc_size
+
+          delta =
+            if delta_size > 0,
+              do: :binary.part(event_text, acc_size, delta_size),
+              else: ""
+
+          {event_text, delta}
+
+        true ->
+          # Incremental mode: event_text is a new chunk to append
+          {acc.accumulated_text <> event_text, event_text}
       end
 
-    # Store latest parts for final response building
-    acc = %{acc | parts: parts}
+    if byte_size(delta) > 0, do: acc.on_chunk.(delta)
+
+    # Keep non-text parts (tool calls) from latest event
+    non_text = Enum.reject(parts, &Map.has_key?(&1, "text"))
+
+    non_text_parts =
+      if non_text != [], do: non_text, else: acc.non_text_parts
+
+    acc = %{acc | accumulated_text: new_accumulated, non_text_parts: non_text_parts}
 
     # Capture usage from final event
     case event do
@@ -155,7 +174,17 @@ defmodule Alloy.Provider.Google do
   defp process_google_event(acc, _), do: acc
 
   defp build_stream_response(acc) do
-    content_blocks = parse_parts_to_blocks(acc.parts)
+    # Build text block from accumulated text (reliable across snapshot + incremental modes)
+    text_blocks =
+      if acc.accumulated_text != "" do
+        [%{type: "text", text: acc.accumulated_text}]
+      else
+        []
+      end
+
+    tool_blocks = parse_parts_to_blocks(acc.non_text_parts)
+    content_blocks = text_blocks ++ tool_blocks
+
     stop_reason = parse_finish_reason(nil, content_blocks)
     usage = parse_usage(acc.usage)
 

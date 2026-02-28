@@ -95,9 +95,9 @@ defmodule Alloy.StreamTestHelpers do
   @doc false
   def collect_messages(acc) do
     receive do
-      {:chunk, chunk} -> collect_messages(acc ++ [chunk])
+      {:chunk, chunk} -> collect_messages([chunk | acc])
     after
-      100 -> acc
+      100 -> Enum.reverse(acc)
     end
   end
 end
