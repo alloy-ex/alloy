@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-03-01
+
+### Added
+
+- **Docs coverage gate** — added `mix docs.check` and wired it into CI and publish workflows to enforce `@moduledoc` and `@doc` coverage on public Alloy APIs.
+
+### Fixed
+
+- **Missing test helper docs** — added `@doc` for `Alloy.Testing.assert_tool_called/3` so public test helper macro docs are complete.
+
 ## [0.5.0] - 2026-03-01
 
 ### Breaking

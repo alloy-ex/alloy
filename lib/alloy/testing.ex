@@ -165,6 +165,9 @@ defmodule Alloy.Testing do
     end
   end
 
+  @doc """
+  Assert that a tool was called with input matching a partial map.
+  """
   defmacro assert_tool_called(result, tool_name, input_match) do
     quote do
       calls = Alloy.Testing.tool_calls(unquote(result))
