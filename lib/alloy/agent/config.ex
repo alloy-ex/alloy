@@ -23,7 +23,8 @@ defmodule Alloy.Agent.Config do
           context_discovery: boolean(),
           on_shutdown: (Alloy.Session.t() -> any()) | nil,
           pubsub: module() | nil,
-          subscribe: [String.t()]
+          subscribe: [String.t()],
+          max_pending: non_neg_integer()
         }
 
   @enforce_keys [:provider, :provider_config]
@@ -44,7 +45,8 @@ defmodule Alloy.Agent.Config do
     context_discovery: false,
     on_shutdown: nil,
     pubsub: nil,
-    subscribe: []
+    subscribe: [],
+    max_pending: 0
   ]
 
   @doc """
@@ -91,7 +93,8 @@ defmodule Alloy.Agent.Config do
       context_discovery: context_discovery,
       on_shutdown: Keyword.get(opts, :on_shutdown, nil),
       pubsub: Keyword.get(opts, :pubsub, nil),
-      subscribe: Keyword.get(opts, :subscribe, [])
+      subscribe: Keyword.get(opts, :subscribe, []),
+      max_pending: Keyword.get(opts, :max_pending, 0)
     }
   end
 

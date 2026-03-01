@@ -112,8 +112,20 @@ For Anthropic extended thinking with streaming events:
 )
 
 on_event = fn
-  {:text_delta, chunk}     -> IO.write(chunk)
-  {:thinking_delta, chunk} -> IO.write("[thinking: #{chunk}]")
+  %{v: 1, event: :text_delta, payload: chunk} ->
+    IO.write(chunk)
+
+  %{v: 1, event: :thinking_delta, payload: chunk} ->
+    IO.write("[thinking: #{chunk}]")
+
+  %{v: 1, event: :tool_start, seq: seq, correlation_id: corr, payload: %{name: name, input: input}} ->
+    IO.puts("\n[tool:start ##{seq} #{corr}] #{name} #{inspect(input)}")
+
+  %{v: 1, event: :tool_end, seq: seq, correlation_id: corr, payload: %{name: name, duration_ms: ms, error: nil}} ->
+    IO.puts("[tool:end ##{seq} #{corr}] #{name} (#{ms}ms)")
+
+  %{v: 1, event: :tool_end, seq: seq, correlation_id: corr, payload: %{name: name, error: error}} ->
+    IO.puts("[tool:end ##{seq} #{corr}] #{name} error=#{inspect(error)}")
 end
 
 {:ok, result} = Alloy.Agent.Server.stream_chat(agent, "Solve this step by step",
@@ -143,8 +155,8 @@ Fire a message without blocking the caller — ideal for LiveView and background
 # Subscribe to receive the result
 Phoenix.PubSub.subscribe(Alloy.PubSub, "agent:#{agent_id}")
 
-# Returns :ok immediately — agent works in the background
-:ok = Alloy.Agent.Server.send_message(agent, "Summarise this report",
+# Returns {:ok, request_id} immediately — agent works in the background
+{:ok, req_id} = Alloy.Agent.Server.send_message(agent, "Summarise this report",
   request_id: "req-123"
 )
 
@@ -152,6 +164,19 @@ Phoenix.PubSub.subscribe(Alloy.PubSub, "agent:#{agent_id}")
 def handle_info({:agent_response, %{text: text, request_id: "req-123"}}, socket) do
   {:noreply, assign(socket, :response, text)}
 end
+```
+
+Optional backpressure and cancellation:
+
+```elixir
+{:ok, agent} = Alloy.Agent.Server.start_link(
+  provider: {...},
+  pubsub: MyApp.PubSub,
+  max_pending: 10
+)
+
+{:ok, request_id} = Alloy.Agent.Server.send_message(agent, "Long task")
+:ok = Alloy.Agent.Server.cancel_request(agent, request_id)
 ```
 
 ### Multi-agent teams

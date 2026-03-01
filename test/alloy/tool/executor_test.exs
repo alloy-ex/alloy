@@ -294,6 +294,173 @@ defmodule Alloy.Tool.ExecutorTest do
     end
   end
 
+  describe "execute_all/4 — events and metadata" do
+    test "emits tool_start/tool_end and returns tool metadata" do
+      state = build_state([SuccessTool])
+      call = %{id: "call_1", name: "success", type: "tool_use", input: %{"x" => 1}}
+
+      test_pid = self()
+      on_event = fn event -> send(test_pid, {:event, event}) end
+      seq_ref = :atomics.new(1, signed: false)
+
+      assert {:ok, %Message{role: :user, content: [block]}, [meta]} =
+               Executor.execute_all([call], state.tool_fns, state,
+                 on_event: on_event,
+                 event_seq_ref: seq_ref,
+                 event_correlation_id: "corr-1",
+                 event_turn: 5
+               )
+
+      assert block.tool_use_id == "call_1"
+      assert block.content == "it worked"
+
+      assert meta.id == "call_1"
+      assert meta.name == "success"
+      assert meta.input == %{"x" => 1}
+      assert meta.error == nil
+      assert meta.correlation_id == "corr-1"
+      assert is_integer(meta.duration_ms)
+      assert meta.duration_ms >= 0
+      assert is_integer(meta.start_event_seq)
+      assert is_integer(meta.end_event_seq)
+      assert meta.end_event_seq > meta.start_event_seq
+
+      assert_received {:event,
+                       {:tool_start,
+                        %{
+                          id: "call_1",
+                          name: "success",
+                          input: %{"x" => 1},
+                          event_seq: 1,
+                          correlation_id: "corr-1"
+                        }}}
+
+      assert_received {:event,
+                       {:tool_end,
+                        %{
+                          id: "call_1",
+                          name: "success",
+                          input: %{"x" => 1},
+                          event_seq: 2,
+                          start_event_seq: 1,
+                          correlation_id: "corr-1",
+                          duration_ms: _,
+                          error: nil
+                        }}}
+    end
+
+    test "blocked tools emit tool_start/tool_end with error metadata" do
+      state = build_state([SuccessTool], middleware: [BlockingMiddleware])
+      call = %{id: "blocked_1", name: "success", type: "tool_use", input: %{}}
+
+      test_pid = self()
+      on_event = fn event -> send(test_pid, {:event, event}) end
+      seq_ref = :atomics.new(1, signed: false)
+
+      assert {:ok, %Message{role: :user, content: [block]}, [meta]} =
+               Executor.execute_all([call], state.tool_fns, state,
+                 on_event: on_event,
+                 event_seq_ref: seq_ref,
+                 event_correlation_id: "corr-blocked",
+                 event_turn: 2
+               )
+
+      assert block.tool_use_id == "blocked_1"
+      assert block.is_error == true
+      assert block.content =~ "Blocked: not allowed"
+
+      assert meta.id == "blocked_1"
+      assert meta.name == "success"
+      assert meta.error == "Blocked: not allowed"
+      assert meta.correlation_id == "corr-blocked"
+      assert meta.start_event_seq == 1
+      assert meta.end_event_seq == 2
+
+      assert_received {:event,
+                       {:tool_start,
+                        %{
+                          id: "blocked_1",
+                          name: "success",
+                          input: %{},
+                          event_seq: 1,
+                          correlation_id: "corr-blocked"
+                        }}}
+
+      assert_received {:event,
+                       {:tool_end,
+                        %{
+                          id: "blocked_1",
+                          name: "success",
+                          input: %{},
+                          event_seq: 2,
+                          start_event_seq: 1,
+                          correlation_id: "corr-blocked",
+                          duration_ms: _,
+                          error: "Blocked: not allowed"
+                        }}}
+    end
+
+    test "emits telemetry envelope with correlation and ordered sequence" do
+      state = build_state([SuccessTool])
+      call = %{id: "call_telemetry", name: "success", type: "tool_use", input: %{}}
+      seq_ref = :atomics.new(1, signed: false)
+      correlation = "corr-telemetry"
+      test_pid = self()
+
+      start_handler_id = "test-tool-start-#{inspect(make_ref())}"
+      stop_handler_id = "test-tool-stop-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        start_handler_id,
+        [:alloy, :tool, :start],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:telemetry_event, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      :telemetry.attach(
+        stop_handler_id,
+        [:alloy, :tool, :stop],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:telemetry_event, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      try do
+        assert {:ok, %Message{}, [_meta]} =
+                 Executor.execute_all([call], state.tool_fns, state,
+                   event_seq_ref: seq_ref,
+                   event_correlation_id: correlation,
+                   event_turn: 9
+                 )
+
+        assert_receive {:telemetry_event, [:alloy, :tool, :start], %{event_seq: 1},
+                        %{
+                          correlation_id: ^correlation,
+                          turn: 9,
+                          tool_id: "call_telemetry",
+                          tool_name: "success"
+                        }}
+
+        assert_receive {:telemetry_event, [:alloy, :tool, :stop],
+                        %{event_seq: 2, duration_ms: _duration_ms},
+                        %{
+                          correlation_id: ^correlation,
+                          turn: 9,
+                          tool_id: "call_telemetry",
+                          tool_name: "success",
+                          start_event_seq: 1,
+                          error: nil
+                        }}
+      after
+        :telemetry.detach(start_handler_id)
+        :telemetry.detach(stop_handler_id)
+      end
+    end
+  end
+
   # --- Helpers ---
 
   defp build_state(tools, opts \\ []) do

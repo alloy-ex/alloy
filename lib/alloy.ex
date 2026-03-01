@@ -40,6 +40,7 @@ defmodule Alloy do
   - `:middleware` - list of `Alloy.Middleware` modules (default: `[]`)
   - `:working_directory` - base path for file tools (default: `"."`)
   - `:context` - arbitrary map passed to tools and middleware (default: `%{}`)
+  - `:max_pending` - max queued async `send_message/3` requests while one is running (default: `0`)
   """
 
   alias Alloy.Agent.{Config, Server, State, Turn}
@@ -49,6 +50,7 @@ defmodule Alloy do
           text: String.t() | nil,
           messages: [Message.t()],
           usage: Alloy.Usage.t(),
+          tool_calls: [map()],
           status: State.status(),
           turns: non_neg_integer(),
           error: term() | nil
@@ -62,9 +64,15 @@ defmodule Alloy do
   for full documentation.
   """
   @spec send_message(GenServer.server(), String.t(), keyword()) ::
-          {:ok, binary()} | {:error, :busy | :no_pubsub}
+          {:ok, binary()} | {:error, :busy | :queue_full | :no_pubsub}
   def send_message(server, message, opts \\ [])
   defdelegate send_message(server, message, opts), to: Server
+
+  @doc """
+  Cancel an async request by `request_id`.
+  """
+  @spec cancel_request(GenServer.server(), binary()) :: :ok | {:error, :not_found}
+  defdelegate cancel_request(server, request_id), to: Server
 
   @doc """
   Run the agent loop with a message and options.
@@ -87,6 +95,7 @@ defmodule Alloy do
         text: State.last_assistant_text(final_state),
         messages: State.messages(final_state),
         usage: final_state.usage,
+        tool_calls: final_state.tool_calls,
         status: final_state.status,
         turns: final_state.turn,
         error: final_state.error

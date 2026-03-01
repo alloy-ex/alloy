@@ -23,14 +23,13 @@ defmodule Alloy.Provider.Anthropic do
     returned in the message content and must be round-tripped verbatim in
     subsequent turns (Anthropic requires the `signature` field).
   - `:on_event` - Streaming event callback `(event -> :ok)`. Called for each
-    streaming delta with a tagged tuple. When used via `Server.stream_chat/4`:
-      - `{:text_delta, text}` — a chunk of normal response text (emitted by
-        `Turn` for all providers)
-      - `{:thinking_delta, text}` — a chunk of extended thinking text (emitted
-        directly by this provider when `extended_thinking` is enabled)
+    streaming delta. When used via `Server.stream_chat/4`, `event` is a
+    normalized envelope map:
+      - `%{v: 1, seq:, correlation_id:, turn:, ts_ms:, event: :text_delta, payload: text}`
+      - `%{v: 1, seq:, correlation_id:, turn:, ts_ms:, event: :thinking_delta, payload: text}`
     Pass via `Server.stream_chat/4` opts: `on_event: fn event -> ... end`.
-    Note: direct callers of `Alloy.Provider.Anthropic.stream/4` receive only
-    `{:thinking_delta}` events; `{:text_delta}` is Turn's responsibility.
+    Note: direct callers of `Alloy.Provider.Anthropic.stream/4` (without Turn)
+    receive provider-native tuples (for example `{:thinking_delta, text}`).
 
   ## Example
 

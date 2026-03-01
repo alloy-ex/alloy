@@ -47,6 +47,7 @@ defmodule Alloy.Agent.Server do
           text: String.t() | nil,
           messages: [Message.t()],
           usage: Usage.t(),
+          tool_calls: [map()],
           status: State.status(),
           turns: non_neg_integer(),
           error: term() | nil
@@ -166,8 +167,12 @@ defmodule Alloy.Agent.Server do
   `"agent:<id>:responses"` as `{:agent_response, result}` where `result`
   includes a `:request_id` field matching the returned ID.
 
-  Returns `{:error, :busy}` if a Turn is already in progress. The caller
-  is responsible for retry or backpressure logic.
+  Backpressure behavior:
+
+  - If no Turn is running, the request starts immediately.
+  - If a Turn is running and `:max_pending > 0`, the request is queued.
+  - If the queue is full, returns `{:error, :queue_full}`.
+  - If `:max_pending == 0`, returns `{:error, :busy}` while running.
 
   Returns `{:error, :no_pubsub}` if the agent was started without a `:pubsub`
   option — without PubSub there is no way to receive results.
@@ -198,7 +203,7 @@ defmodule Alloy.Agent.Server do
       end
   """
   @spec send_message(GenServer.server(), String.t(), keyword()) ::
-          {:ok, binary()} | {:error, :busy | :no_pubsub}
+          {:ok, binary()} | {:error, :busy | :queue_full | :no_pubsub}
   def send_message(server, message, opts \\ []) when is_binary(message) do
     request_id = Keyword.get(opts, :request_id, generate_request_id())
     # Use :infinity — the handler spawns a Task and replies immediately (no I/O),
@@ -206,6 +211,20 @@ defmodule Alloy.Agent.Server do
     # of this request in the mailbox. A hard timeout here would crash the caller
     # while the GenServer still processes the message later, spawning a ghost Turn.
     GenServer.call(server, {:send_message, message, request_id}, :infinity)
+  end
+
+  @doc """
+  Cancel an async request by `request_id`.
+
+  If the request is currently running, the active task is terminated.
+  If the request is queued, it is removed from the queue.
+
+  When cancelled, the server broadcasts an `{:agent_response, result}` payload
+  with `status: :error`, `error: :cancelled`, and the matching `:request_id`.
+  """
+  @spec cancel_request(GenServer.server(), binary()) :: :ok | {:error, :not_found}
+  def cancel_request(server, request_id) when is_binary(request_id) do
+    GenServer.call(server, {:cancel_request, request_id})
   end
 
   @doc """
@@ -410,7 +429,9 @@ defmodule Alloy.Agent.Server do
        message_count: length(state.messages),
        usage: state.usage,
        uptime_ms: System.monotonic_time(:millisecond) - (state.started_at || 0),
-       busy: state.current_task != nil
+       busy: state.current_task != nil,
+       pending_count: length(state.pending_requests),
+       max_pending: state.config.max_pending
      }, state}
   end
 
@@ -420,31 +441,66 @@ defmodule Alloy.Agent.Server do
     {:reply, {:error, :no_pubsub}, state}
   end
 
-  # Reject if a Turn is already running in a Task.
-  @impl GenServer
-  def handle_call(
-        {:send_message, _message, _request_id},
-        _from,
-        %{current_task: {_, _, _}} = state
-      ) do
-    {:reply, {:error, :busy}, state}
-  end
-
-  # Accept the message, snapshot state for the Task, spawn, return immediately.
   @impl GenServer
   def handle_call({:send_message, message, request_id}, _from, state) do
-    turn_state =
-      state
-      |> State.append_messages([Message.user(message)])
-      |> reset_for_new_run()
-      |> set_running()
+    cond do
+      state.current_task == nil ->
+        {:reply, {:ok, request_id}, start_async_turn(state, message, request_id)}
 
-    task =
-      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-        Turn.run_loop(turn_state)
-      end)
+      length(state.pending_requests) < state.config.max_pending ->
+        {:reply, {:ok, request_id}, enqueue_pending_request(state, message, request_id)}
 
-    {:reply, {:ok, request_id}, %{turn_state | current_task: {task.ref, task.pid, request_id}}}
+      state.config.max_pending == 0 ->
+        {:reply, {:error, :busy}, state}
+
+      true ->
+        {:reply, {:error, :queue_full}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call(
+        {:cancel_request, request_id},
+        _from,
+        %{current_task: {ref, pid, request_id}} = state
+      )
+      when is_reference(ref) do
+    case Task.Supervisor.terminate_child(Alloy.TaskSupervisor, pid) do
+      :ok ->
+        Process.demonitor(ref, [:flush])
+        broadcast_cancelled(state, request_id, :running)
+
+        state =
+          state
+          |> Map.put(:current_task, nil)
+          |> Map.put(:status, :error)
+          |> Map.put(:error, :cancelled)
+          |> maybe_start_next_pending()
+
+        {:reply, :ok, state}
+
+      {:error, :not_found} ->
+        {:reply, {:error, :not_found}, state}
+
+      {:error, reason} ->
+        Logger.warning(
+          "[Alloy] Failed to cancel request #{inspect(request_id)}: #{inspect(reason)}"
+        )
+
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call({:cancel_request, request_id}, _from, state) do
+    case remove_pending_request(state, request_id) do
+      {:ok, state} ->
+        broadcast_cancelled(state, request_id, :queued)
+        {:reply, :ok, state}
+
+      :not_found ->
+        {:reply, {:error, :not_found}, state}
+    end
   end
 
   # Drop agent_event while an async Turn is in flight — prevents concurrent Turns.
@@ -482,7 +538,7 @@ defmodule Alloy.Agent.Server do
   # Preserve final_state's actual status/turn/error — do NOT reset_for_new_run
   # which would overwrite :completed with :running and zero the turn counter.
   @impl GenServer
-  def handle_info({ref, final_state}, %{current_task: {ref, _pid, request_id}} = _state)
+  def handle_info({ref, final_state}, %{current_task: {ref, _pid, request_id}} = state)
       when is_reference(ref) do
     Process.demonitor(ref, [:flush])
 
@@ -492,7 +548,16 @@ defmodule Alloy.Agent.Server do
       broadcast(final_state.config.pubsub, topic, {:agent_response, result})
     end
 
-    {:noreply, %{final_state | current_task: nil}}
+    state =
+      final_state
+      |> Map.put(:current_task, nil)
+      # Preserve queue mutations performed while the async turn was running.
+      # The Task returns a snapshot taken at task start, which does not include
+      # requests enqueued by later send_message/3 calls.
+      |> Map.put(:pending_requests, state.pending_requests)
+      |> maybe_start_next_pending()
+
+    {:noreply, state}
   end
 
   # Task crashed — broadcast the error, free the agent so it can recover.
@@ -522,7 +587,14 @@ defmodule Alloy.Agent.Server do
     # append another user message, leaving two consecutive user messages in
     # history. Anthropic enforces strict user/assistant alternation — callers
     # should call reset/1 before retrying to clear the failed message.
-    {:noreply, %{state | current_task: nil, status: :error, error: reason}}
+    state =
+      state
+      |> Map.put(:current_task, nil)
+      |> Map.put(:status, :error)
+      |> Map.put(:error, reason)
+      |> maybe_start_next_pending()
+
+    {:noreply, state}
   end
 
   @impl GenServer
@@ -584,8 +656,76 @@ defmodule Alloy.Agent.Server do
     %{state | status: :running}
   end
 
+  defp start_async_turn(%State{} = state, message, request_id)
+       when is_binary(message) and is_binary(request_id) do
+    turn_state =
+      state
+      |> State.append_messages([Message.user(message)])
+      |> reset_for_new_run()
+      |> set_running()
+
+    task =
+      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
+        Turn.run_loop(turn_state, event_correlation_id: request_id)
+      end)
+
+    %{turn_state | current_task: {task.ref, task.pid, request_id}}
+  end
+
+  defp enqueue_pending_request(%State{} = state, message, request_id)
+       when is_binary(message) and is_binary(request_id) do
+    %{state | pending_requests: state.pending_requests ++ [{message, request_id}]}
+  end
+
+  defp maybe_start_next_pending(%State{current_task: nil, pending_requests: []} = state),
+    do: state
+
+  defp maybe_start_next_pending(%State{current_task: {_, _, _}} = state), do: state
+
+  defp maybe_start_next_pending(%State{pending_requests: [{message, request_id} | rest]} = state) do
+    state
+    |> Map.put(:pending_requests, rest)
+    |> start_async_turn(message, request_id)
+  end
+
+  defp remove_pending_request(%State{} = state, request_id) when is_binary(request_id) do
+    {removed?, pending_requests} = pop_pending_request(state.pending_requests, request_id, [])
+
+    if removed? do
+      {:ok, %{state | pending_requests: pending_requests}}
+    else
+      :not_found
+    end
+  end
+
+  defp pop_pending_request([], _request_id, acc), do: {false, Enum.reverse(acc)}
+
+  defp pop_pending_request([{_message, request_id} | rest], request_id, acc),
+    do: {true, Enum.reverse(acc) ++ rest}
+
+  defp pop_pending_request([entry | rest], request_id, acc),
+    do: pop_pending_request(rest, request_id, [entry | acc])
+
+  defp broadcast_cancelled(%State{config: %{pubsub: nil}}, _request_id, _phase), do: :ok
+
+  defp broadcast_cancelled(%State{} = state, request_id, phase) do
+    topic = "agent:#{effective_session_id(state)}:responses"
+
+    result =
+      state
+      |> build_result()
+      |> Map.merge(%{
+        status: :error,
+        error: :cancelled,
+        request_id: request_id,
+        cancelled_phase: phase
+      })
+
+    broadcast(state.config.pubsub, topic, {:agent_response, result})
+  end
+
   defp reset_for_new_run(state) do
-    %{state | turn: 0, status: :idle, error: nil}
+    %{state | turn: 0, status: :idle, error: nil, tool_calls: []}
   end
 
   defp build_result(%State{} = state) do
@@ -593,6 +733,7 @@ defmodule Alloy.Agent.Server do
       text: State.last_assistant_text(state),
       messages: State.messages(state),
       usage: state.usage,
+      tool_calls: state.tool_calls,
       status: state.status,
       turns: state.turn,
       error: state.error

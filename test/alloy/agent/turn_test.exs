@@ -64,6 +64,47 @@ defmodule Alloy.Agent.TurnTest do
       assert length(result.messages) == 4
     end
 
+    test "records tool execution metadata in state.tool_calls" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "world"}}
+          ]),
+          TestProvider.text_response("Tool said: Echo: world")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool]
+      }
+
+      state = State.init(config, [Message.user("Echo world")])
+      result = Turn.run_loop(state)
+
+      assert length(result.tool_calls) == 1
+
+      assert [
+               %{
+                 id: "tool_1",
+                 name: "echo",
+                 input: %{"text" => "world"},
+                 duration_ms: duration_ms,
+                 error: nil,
+                 correlation_id: correlation_id,
+                 start_event_seq: start_event_seq,
+                 end_event_seq: end_event_seq
+               }
+             ] = result.tool_calls
+
+      assert is_integer(duration_ms)
+      assert duration_ms >= 0
+      assert is_binary(correlation_id)
+      assert is_integer(start_event_seq)
+      assert is_integer(end_event_seq)
+      assert end_event_seq > start_event_seq
+    end
+
     test "handles multiple tool calls in one turn" do
       {:ok, pid} =
         TestProvider.start_link([
@@ -92,6 +133,97 @@ defmodule Alloy.Agent.TurnTest do
       tool_result_msg = Enum.at(result.messages, 2)
       assert tool_result_msg.role == :user
       assert length(tool_result_msg.content) == 2
+    end
+
+    test "emits tool_start and tool_end events through on_event" do
+      test_pid = self()
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "world"}}
+          ]),
+          TestProvider.text_response("Tool said: Echo: world")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool]
+      }
+
+      state = State.init(config, [Message.user("Echo world")])
+      on_event = fn event -> send(test_pid, {:event, event}) end
+
+      result =
+        Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
+
+      assert result.status == :completed
+
+      assert_received {:event,
+                       %{
+                         v: 1,
+                         event: :tool_start,
+                         correlation_id: correlation_id,
+                         payload: tool_start_payload
+                       } = tool_start}
+
+      assert tool_start_payload.id == "tool_1"
+      assert tool_start_payload.name == "echo"
+      assert tool_start_payload.input == %{"text" => "world"}
+      assert is_integer(tool_start.seq)
+      assert is_integer(tool_start.ts_ms)
+      assert is_binary(correlation_id)
+
+      assert_received {:event,
+                       %{
+                         v: 1,
+                         event: :tool_end,
+                         correlation_id: ^correlation_id,
+                         payload: tool_end_payload
+                       } = tool_end}
+
+      assert tool_end_payload.id == "tool_1"
+      assert tool_end_payload.name == "echo"
+      assert tool_end_payload.input == %{"text" => "world"}
+      assert tool_end_payload.error == nil
+      duration_ms = tool_end_payload.duration_ms
+      assert is_integer(duration_ms)
+      assert duration_ms >= 0
+      assert tool_end_payload.start_event_seq == tool_start.seq
+      assert tool_end.seq > tool_start.seq
+    end
+
+    test "uses caller-supplied event_correlation_id for tool events" do
+      test_pid = self()
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "world"}}
+          ]),
+          TestProvider.text_response("Tool said: Echo: world")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool]
+      }
+
+      state = State.init(config, [Message.user("Echo world")])
+      on_event = fn event -> send(test_pid, {:event, event}) end
+
+      _result =
+        Turn.run_loop(state,
+          streaming: true,
+          on_chunk: fn _ -> :ok end,
+          on_event: on_event,
+          event_correlation_id: "req-42"
+        )
+
+      assert_received {:event, %{event: :tool_start, correlation_id: "req-42"}}
+      assert_received {:event, %{event: :tool_end, correlation_id: "req-42"}}
     end
   end
 
@@ -1271,9 +1403,18 @@ defmodule Alloy.Agent.TurnTest do
         Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
 
       assert result.status == :completed
-      # "Hi" has 2 chars — expect 2 {:text_delta, char} events
-      assert_received {:event, {:text_delta, "H"}}
-      assert_received {:event, {:text_delta, "i"}}
+      # "Hi" has 2 chars — expect 2 text_delta envelopes
+      assert_received {:event,
+                       %{v: 1, event: :text_delta, correlation_id: correlation_id, payload: "H"} =
+                         first}
+
+      assert_received {:event,
+                       %{v: 1, event: :text_delta, correlation_id: ^correlation_id, payload: "i"} =
+                         second}
+
+      assert is_integer(first.seq)
+      assert is_integer(second.seq)
+      assert second.seq > first.seq
     end
 
     test "on_event defaults to no-op when not provided (no crash)" do
@@ -1319,8 +1460,8 @@ defmodule Alloy.Agent.TurnTest do
         Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
 
       # The thinking delta should be emitted exactly once — NOT again on retry.
-      assert_received {:event, {:thinking_delta, "Let me reason..."}}
-      refute_received {:event, {:thinking_delta, "Let me reason..."}}
+      assert_received {:event, %{event: :thinking_delta, payload: "Let me reason..."}}
+      refute_received {:event, %{event: :thinking_delta, payload: "Let me reason..."}}
     end
   end
 

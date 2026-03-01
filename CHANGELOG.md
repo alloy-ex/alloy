@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-01
+
+### Breaking
+
+- **`on_event` contract is now a versioned envelope map** — runtime stream/tool events are emitted as `%{v: 1, seq:, correlation_id:, turn:, ts_ms:, event:, payload:}` instead of tagged tuples.
+
+  Migration example:
+  - before: `{:text_delta, chunk}`
+  - after: `%{v: 1, event: :text_delta, payload: chunk}`
+
+### Added
+
+- **Unified runtime event protocol** — `:text_delta`, `:thinking_delta`, `:tool_start`, and `:tool_end` now share the same event envelope with deterministic sequencing and correlation IDs.
+- **Per-tool lifecycle telemetry** — added `[:alloy, :tool, :start]` and `[:alloy, :tool, :stop]` events with correlation, turn, tool identity, and timing metadata.
+- **Per-run runtime telemetry envelope** — added `[:alloy, :event]` with normalized event metadata (`seq`, `event`, `correlation_id`, `turn`).
+- **Async request cancellation API** — `Alloy.cancel_request/2` and `Alloy.Agent.Server.cancel_request/2` cancel both queued and in-flight async requests by `request_id`.
+- **Bounded async backpressure** — `send_message/3` now supports bounded queuing via `max_pending` and explicit rejections (`:busy`, `:queue_full`).
+
+### Changed
+
+- **`send_message/3` result contract** — now returns `{:ok, request_id}` (instead of bare `:ok`) for robust caller correlation.
+- **Async run correlation propagation** — async turns now set event correlation to the async `request_id` by default.
+- **Result maps now include `tool_calls` metadata** — one-shot and server flows expose structured tool execution details (`duration_ms`, `error`, correlation and event sequence data).
+- **Agent health payload** — now includes queue metrics (`pending_count`, `max_pending`).
+
 ## [0.4.3] - 2026-03-01
 
 ### Fixed
@@ -145,6 +170,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.5.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.5.0
+[0.4.3]: https://github.com/alloy-ex/alloy/releases/tag/v0.4.3
+[0.4.2]: https://github.com/alloy-ex/alloy/releases/tag/v0.4.2
+[0.4.1]: https://github.com/alloy-ex/alloy/releases/tag/v0.4.1
+[0.4.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.4.0
 [0.3.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.3.0
 [0.2.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.2.0
 [0.1.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.1.0

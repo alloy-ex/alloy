@@ -88,6 +88,97 @@ defmodule Alloy.Agent.ServerSendMessageTest do
     end
   end
 
+  describe "send_message/2 — bounded queue (max_pending)" do
+    setup :start_pubsub
+
+    test "queues pending requests and executes them FIFO", %{pubsub: pubsub} do
+      pid =
+        start_provider([
+          TestProvider.slow_text_response("First done", 250),
+          TestProvider.text_response("Second done"),
+          TestProvider.text_response("Third done")
+        ])
+
+      {:ok, agent} = Server.start_link(opts(pid, pubsub: pubsub, max_pending: 2))
+
+      topic = "agent:#{agent_session_id(agent)}:responses"
+      Phoenix.PubSub.subscribe(pubsub, topic)
+
+      assert {:ok, req1} = Server.send_message(agent, "first")
+      assert {:ok, req2} = Server.send_message(agent, "second")
+      assert {:ok, req3} = Server.send_message(agent, "third")
+      assert {:error, :queue_full} = Server.send_message(agent, "fourth")
+
+      health_during = Server.health(agent)
+      assert health_during.busy == true
+      assert health_during.pending_count == 2
+
+      assert_receive {:agent_response, %{request_id: ^req1, text: "First done"}}, 2_000
+      assert_receive {:agent_response, %{request_id: ^req2, text: "Second done"}}, 2_000
+      assert_receive {:agent_response, %{request_id: ^req3, text: "Third done"}}, 2_000
+    end
+
+    test "still returns {:error, :busy} when max_pending is 0", %{pubsub: pubsub} do
+      pid = start_provider([TestProvider.slow_text_response("Done", 250)])
+      {:ok, agent} = Server.start_link(opts(pid, pubsub: pubsub, max_pending: 0))
+
+      assert {:ok, _} = Server.send_message(agent, "first")
+      assert {:error, :busy} = Server.send_message(agent, "second")
+    end
+  end
+
+  describe "cancel_request/2" do
+    setup :start_pubsub
+
+    test "cancels a queued request by request_id", %{pubsub: pubsub} do
+      pid =
+        start_provider([
+          TestProvider.slow_text_response("First done", 250),
+          TestProvider.text_response("Second done")
+        ])
+
+      {:ok, agent} = Server.start_link(opts(pid, pubsub: pubsub, max_pending: 2))
+      topic = "agent:#{agent_session_id(agent)}:responses"
+      Phoenix.PubSub.subscribe(pubsub, topic)
+
+      assert {:ok, req1} = Server.send_message(agent, "first")
+      assert {:ok, req2} = Server.send_message(agent, "second")
+
+      assert :ok = Server.cancel_request(agent, req2)
+
+      assert_receive {:agent_response, %{request_id: ^req2, error: :cancelled}}, 1_000
+      assert_receive {:agent_response, %{request_id: ^req1, text: "First done"}}, 2_000
+      refute_receive {:agent_response, %{request_id: ^req2, text: "Second done"}}, 300
+    end
+
+    test "cancels a running request and starts next queued request", %{pubsub: pubsub} do
+      pid =
+        start_provider([
+          TestProvider.slow_text_response("First done", 500),
+          TestProvider.text_response("Second done")
+        ])
+
+      {:ok, agent} = Server.start_link(opts(pid, pubsub: pubsub, max_pending: 2))
+      topic = "agent:#{agent_session_id(agent)}:responses"
+      Phoenix.PubSub.subscribe(pubsub, topic)
+
+      assert {:ok, req1} = Server.send_message(agent, "first")
+      assert {:ok, req2} = Server.send_message(agent, "second")
+
+      assert :ok = Server.cancel_request(agent, req1)
+
+      assert_receive {:agent_response, %{request_id: ^req1, error: :cancelled}}, 1_000
+      assert_receive {:agent_response, %{request_id: ^req2, text: "Second done"}}, 2_000
+    end
+
+    test "returns {:error, :not_found} for unknown request", %{pubsub: pubsub} do
+      pid = start_provider([TestProvider.text_response("Hello")])
+      {:ok, agent} = Server.start_link(opts(pid, pubsub: pubsub, max_pending: 2))
+
+      assert {:error, :not_found} = Server.cancel_request(agent, "missing-request")
+    end
+  end
+
   # ── PubSub broadcast ────────────────────────────────────────────────────────
 
   describe "send_message/2 — PubSub broadcast" do
@@ -122,9 +213,10 @@ defmodule Alloy.Agent.ServerSendMessageTest do
       assert result.request_id == req_id
     end
 
-    test "result includes standard fields (text, messages, usage, status, turns, error)", %{
-      pubsub: pubsub
-    } do
+    test "result includes standard fields (text, messages, usage, tool_calls, status, turns, error)",
+         %{
+           pubsub: pubsub
+         } do
       pid = start_provider([TestProvider.text_response("Full result")])
       {:ok, agent} = Server.start_link(opts(pid, pubsub: pubsub))
 
@@ -137,6 +229,7 @@ defmodule Alloy.Agent.ServerSendMessageTest do
       assert Map.has_key?(result, :text)
       assert Map.has_key?(result, :messages)
       assert Map.has_key?(result, :usage)
+      assert Map.has_key?(result, :tool_calls)
       assert Map.has_key?(result, :status)
       assert Map.has_key?(result, :turns)
       assert Map.has_key?(result, :error)
@@ -287,6 +380,8 @@ defmodule Alloy.Agent.ServerSendMessageTest do
 
       health = Server.health(agent)
       assert health.busy == false
+      assert health.pending_count == 0
+      assert health.max_pending == 0
     end
 
     test "health returns busy: true while async Turn is running", %{pubsub: pubsub} do
@@ -306,6 +401,7 @@ defmodule Alloy.Agent.ServerSendMessageTest do
       # After Turn completes, should be idle again
       health_after = Server.health(agent)
       assert health_after.busy == false
+      assert health_after.pending_count == 0
     end
   end
 
@@ -390,7 +486,7 @@ defmodule Alloy.Agent.ServerSendMessageTest do
 
   # ── Alloy top-level API ─────────────────────────────────────────────────────
 
-  describe "Alloy.send_message/3 top-level delegate" do
+  describe "Alloy async top-level delegates" do
     setup :start_pubsub
 
     test "Alloy.send_message/3 delegates to Server.send_message/3", %{pubsub: pubsub} do
@@ -406,6 +502,19 @@ defmodule Alloy.Agent.ServerSendMessageTest do
       assert_receive {:agent_response, result}, 2000
       assert result.text == "Top level"
       assert result.request_id == req_id
+    end
+
+    test "Alloy.cancel_request/2 delegates to Server.cancel_request/2", %{pubsub: pubsub} do
+      pid = start_provider([TestProvider.slow_text_response("Never finishes", 500)])
+      {:ok, agent} = Server.start_link(opts(pid, pubsub: pubsub))
+
+      topic = "agent:#{agent_session_id(agent)}:responses"
+      Phoenix.PubSub.subscribe(pubsub, topic)
+
+      assert {:ok, req_id} = Alloy.send_message(agent, "cancel me")
+      assert :ok = Alloy.cancel_request(agent, req_id)
+
+      assert_receive {:agent_response, %{request_id: ^req_id, error: :cancelled}}, 1_000
     end
   end
 

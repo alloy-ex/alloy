@@ -18,12 +18,14 @@ defmodule Alloy.Agent.State do
           usage: Usage.t(),
           status: status(),
           error: term() | nil,
+          tool_calls: [map()],
           tool_defs: [map()],
-          tool_fns: %{String.t() => {module(), map()}},
+          tool_fns: %{String.t() => module()},
           scratchpad: pid() | nil,
           started_at: integer() | nil,
           agent_id: String.t(),
-          current_task: {reference(), pid(), binary()} | nil
+          current_task: {reference(), pid(), binary()} | nil,
+          pending_requests: [{String.t(), binary()}]
         }
 
   @enforce_keys [:config]
@@ -35,12 +37,14 @@ defmodule Alloy.Agent.State do
     messages_new: [],
     turn: 0,
     usage: %Usage{},
+    tool_calls: [],
     status: :idle,
     tool_defs: [],
     tool_fns: %{},
     started_at: nil,
     agent_id: "",
-    current_task: nil
+    current_task: nil,
+    pending_requests: []
   ]
 
   @doc """
@@ -79,6 +83,14 @@ defmodule Alloy.Agent.State do
 
   def append_messages(%__MODULE__{} = state, %Message{} = message) do
     %{state | messages_new: [message | state.messages_new]}
+  end
+
+  @doc """
+  Append tool execution metadata for the current run.
+  """
+  @spec append_tool_calls(t(), [map()]) :: t()
+  def append_tool_calls(%__MODULE__{} = state, tool_calls) when is_list(tool_calls) do
+    %{state | tool_calls: state.tool_calls ++ tool_calls}
   end
 
   @doc """

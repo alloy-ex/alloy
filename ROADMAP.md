@@ -9,6 +9,7 @@ Last updated: 2026-02-26
 - **Providers**: Anthropic, Google (Gemini), OpenAI, Ollama (local), OpenRouter (100+ models), xAI (Grok), DeepSeek, Mistral
 - **Tools**: read, write, edit, bash, scratchpad
 - **Core**: Turn loop, GenServer wrapper, middleware pipeline, telemetry, context compaction, streaming, multi-agent teams
+- **Async runtime**: `send_message/3` supports bounded queueing (`max_pending`) and cancellation by `request_id` (`cancel_request/2`)
 
 ### Completed (v0.1)
 

@@ -305,9 +305,76 @@ defmodule Alloy.StreamingTest do
       {:ok, result} = Server.stream_chat(agent, "Hello", fn _ -> :ok end, on_event: on_event)
       assert result.status == :completed
 
-      # "Hi" = 2 chars, each fires a :text_delta event
-      assert_received {:event, {:text_delta, "H"}}
-      assert_received {:event, {:text_delta, "i"}}
+      # "Hi" = 2 chars, each fires a text_delta envelope
+      assert_received {:event,
+                       %{v: 1, event: :text_delta, correlation_id: correlation_id, payload: "H"} =
+                         first}
+
+      assert_received {:event,
+                       %{v: 1, event: :text_delta, correlation_id: ^correlation_id, payload: "i"} =
+                         second}
+
+      assert is_integer(first.seq)
+      assert is_integer(second.seq)
+      assert second.seq > first.seq
+    end
+
+    test "on_event includes tool_start/tool_end during tool execution" do
+      {:ok, provider} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "world"}}
+          ]),
+          TestProvider.text_response("Tool said: Echo: world")
+        ])
+
+      {:ok, agent} =
+        Server.start_link(
+          provider: {TestProvider, agent_pid: provider},
+          tools: [EchoTool]
+        )
+
+      test_pid = self()
+      on_event = fn event -> send(test_pid, {:event, event}) end
+
+      {:ok, result} =
+        Server.stream_chat(agent, "Echo world", fn _ -> :ok end, on_event: on_event)
+
+      assert result.status == :completed
+
+      assert_received {:event,
+                       %{
+                         v: 1,
+                         event: :tool_start,
+                         correlation_id: correlation_id,
+                         payload: start_payload
+                       } =
+                         tool_start}
+
+      assert start_payload.id == "tool_1"
+      assert start_payload.name == "echo"
+      assert start_payload.input == %{"text" => "world"}
+      assert is_integer(tool_start.seq)
+      assert is_binary(correlation_id)
+
+      assert_received {:event,
+                       %{
+                         v: 1,
+                         event: :tool_end,
+                         correlation_id: ^correlation_id,
+                         payload: end_payload
+                       } =
+                         tool_end}
+
+      assert end_payload.id == "tool_1"
+      assert end_payload.name == "echo"
+      assert end_payload.input == %{"text" => "world"}
+      assert end_payload.error == nil
+      duration_ms = end_payload.duration_ms
+      assert is_integer(duration_ms)
+      assert duration_ms >= 0
+      assert end_payload.start_event_seq == tool_start.seq
+      assert tool_end.seq > tool_start.seq
     end
   end
 
