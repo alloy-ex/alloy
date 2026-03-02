@@ -29,3 +29,13 @@ alloy-*.tar
 .claude/specs/
 
 priv/plts/
+
+# Local demo scripts and video project.
+/scripts/
+/video/
+
+# macOS cruft.
+.DS_Store
+
+# Launch / marketing content (internal only).
+alloy-launch-content.md

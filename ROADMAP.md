@@ -1,11 +1,12 @@
 # Alloy Roadmap
 
-Last updated: 2026-02-26
+Last updated: 2026-03-02
 
 ## Current State
 
-- **LOC**: ~5,400 (lib/) + ~5,500 (test/)
-- **Tests**: 272, 0 failures
+- **Version**: 0.5.1
+- **LOC**: ~6,800 (lib/) + ~7,200 (test/)
+- **Tests**: 551, 0 failures
 - **Providers**: Anthropic, Google (Gemini), OpenAI, Ollama (local), OpenRouter (100+ models), xAI (Grok), DeepSeek, Mistral
 - **Tools**: read, write, edit, bash, scratchpad
 - **Core**: Turn loop, GenServer wrapper, middleware pipeline, telemetry, context compaction, streaming, multi-agent teams
