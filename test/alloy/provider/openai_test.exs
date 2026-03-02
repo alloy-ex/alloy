@@ -12,25 +12,12 @@ defmodule Alloy.Provider.OpenAITest do
         config_with_response(%{
           status: 200,
           body:
-            Jason.encode!(%{
-              "id" => "chatcmpl-01",
-              "object" => "chat.completion",
-              "choices" => [
-                %{
-                  "index" => 0,
-                  "message" => %{
-                    "role" => "assistant",
-                    "content" => "Hello!"
-                  },
-                  "finish_reason" => "stop"
-                }
-              ],
-              "usage" => %{
-                "prompt_tokens" => 10,
-                "completion_tokens" => 5,
-                "total_tokens" => 15
-              }
-            })
+            Jason.encode!(
+              response_payload(
+                [assistant_text_item("Hello!")],
+                %{"input_tokens" => 10, "output_tokens" => 5, "total_tokens" => 15}
+              )
+            )
         })
 
       messages = [Message.user("Hi")]
@@ -44,37 +31,24 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
-  describe "complete/3 with tool_calls response" do
+  describe "complete/3 with tool calls response" do
     test "returns normalized tool_use response" do
       config =
         config_with_response(%{
           status: 200,
           body:
-            Jason.encode!(%{
-              "id" => "chatcmpl-02",
-              "object" => "chat.completion",
-              "choices" => [
-                %{
-                  "index" => 0,
-                  "message" => %{
-                    "role" => "assistant",
-                    "content" => nil,
-                    "tool_calls" => [
-                      %{
-                        "id" => "call_abc123",
-                        "type" => "function",
-                        "function" => %{
-                          "name" => "read",
-                          "arguments" => Jason.encode!(%{"file_path" => "mix.exs"})
-                        }
-                      }
-                    ]
-                  },
-                  "finish_reason" => "tool_calls"
-                }
-              ],
-              "usage" => %{"prompt_tokens" => 20, "completion_tokens" => 15, "total_tokens" => 35}
-            })
+            Jason.encode!(
+              response_payload(
+                [
+                  function_call_item(
+                    "call_abc123",
+                    "read",
+                    Jason.encode!(%{"file_path" => "mix.exs"})
+                  )
+                ],
+                %{"input_tokens" => 20, "output_tokens" => 15, "total_tokens" => 35}
+              )
+            )
         })
 
       messages = [Message.user("Read mix.exs")]
@@ -90,36 +64,24 @@ defmodule Alloy.Provider.OpenAITest do
       assert tool_call.input == %{"file_path" => "mix.exs"}
     end
 
-    test "handles text + tool_calls in same response" do
+    test "handles text + tool calls in same response" do
       config =
         config_with_response(%{
           status: 200,
           body:
-            Jason.encode!(%{
-              "id" => "chatcmpl-03",
-              "object" => "chat.completion",
-              "choices" => [
-                %{
-                  "index" => 0,
-                  "message" => %{
-                    "role" => "assistant",
-                    "content" => "Let me read that file.",
-                    "tool_calls" => [
-                      %{
-                        "id" => "call_def456",
-                        "type" => "function",
-                        "function" => %{
-                          "name" => "read",
-                          "arguments" => Jason.encode!(%{"file_path" => "mix.exs"})
-                        }
-                      }
-                    ]
-                  },
-                  "finish_reason" => "tool_calls"
-                }
-              ],
-              "usage" => %{"prompt_tokens" => 20, "completion_tokens" => 15, "total_tokens" => 35}
-            })
+            Jason.encode!(
+              response_payload(
+                [
+                  assistant_text_item("Let me read that file."),
+                  function_call_item(
+                    "call_def456",
+                    "read",
+                    Jason.encode!(%{"file_path" => "mix.exs"})
+                  )
+                ],
+                %{"input_tokens" => 20, "output_tokens" => 15, "total_tokens" => 35}
+              )
+            )
         })
 
       assert {:ok, result} = OpenAI.complete([Message.user("Read")], [], config)
@@ -134,7 +96,7 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
-  describe "complete/3 message formatting" do
+  describe "complete/3 request formatting" do
     test "formats user messages correctly" do
       config = config_that_captures_request()
 
@@ -149,12 +111,11 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      # OpenAI uses system prompt as first message, then user/assistant
-      user_msgs = Enum.filter(decoded["messages"], &(&1["role"] == "user"))
+      user_msgs = Enum.filter(decoded["input"], &(&1["role"] == "user"))
       assert length(user_msgs) == 2
     end
 
-    test "includes system prompt as system message" do
+    test "includes system prompt as system input item" do
       config =
         config_that_captures_request()
         |> Map.put(:system_prompt, "You are helpful.")
@@ -164,12 +125,12 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      system_msg = hd(decoded["messages"])
+      system_msg = hd(decoded["input"])
       assert system_msg["role"] == "system"
       assert system_msg["content"] == "You are helpful."
     end
 
-    test "includes tool definitions in request" do
+    test "includes tool definitions in Responses format" do
       config = config_that_captures_request()
 
       tool_defs = [
@@ -191,12 +152,12 @@ defmodule Alloy.Provider.OpenAITest do
 
       assert [tool] = decoded["tools"]
       assert tool["type"] == "function"
-      assert tool["function"]["name"] == "read"
-      assert tool["function"]["description"] == "Read a file"
-      assert tool["function"]["parameters"]["type"] == "object"
+      assert tool["name"] == "read"
+      assert tool["description"] == "Read a file"
+      assert tool["parameters"]["type"] == "object"
     end
 
-    test "formats tool_result messages as role:tool" do
+    test "formats tool flow as function_call + function_call_output input items" do
       config = config_that_captures_request()
 
       messages = [
@@ -214,19 +175,18 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      # The assistant message should have tool_calls
-      assistant_msg = Enum.find(decoded["messages"], &(&1["role"] == "assistant"))
-      assert assistant_msg["tool_calls"] != nil
+      function_call = Enum.find(decoded["input"], &(&1["type"] == "function_call"))
+      assert function_call["call_id"] == "call_abc"
+      assert function_call["name"] == "read"
 
-      # The tool_result should become a role: "tool" message
-      tool_msg = Enum.find(decoded["messages"], &(&1["role"] == "tool"))
-      assert tool_msg["tool_call_id"] == "call_abc"
-      assert tool_msg["content"] == "file contents here"
+      function_output = Enum.find(decoded["input"], &(&1["type"] == "function_call_output"))
+      assert function_output["call_id"] == "call_abc"
+      assert function_output["output"] == "file contents here"
     end
   end
 
   describe "complete/3 multimodal formatting" do
-    test "image block in user message formats to image_url data URL" do
+    test "image block in user message formats to input_image data URL" do
       config = config_that_captures_request()
 
       messages = [
@@ -244,15 +204,15 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
+      user_msg = Enum.find(decoded["input"], &(&1["role"] == "user"))
       assert is_list(user_msg["content"])
 
-      img_block = Enum.find(user_msg["content"], &(&1["type"] == "image_url"))
+      img_block = Enum.find(user_msg["content"], &(&1["type"] == "input_image"))
       assert img_block != nil
-      assert img_block["image_url"]["url"] == "data:image/jpeg;base64,base64img=="
+      assert img_block["image_url"] == "data:image/jpeg;base64,base64img=="
     end
 
-    test "audio block in user message formats to input_audio" do
+    test "audio block falls back to input_text notice" do
       config = config_that_captures_request()
 
       messages = [
@@ -267,36 +227,13 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
-      assert is_list(user_msg["content"])
-
+      user_msg = Enum.find(decoded["input"], &(&1["role"] == "user"))
       [audio_block] = user_msg["content"]
-      assert audio_block["type"] == "input_audio"
-      assert audio_block["input_audio"]["data"] == "base64audio=="
-      assert audio_block["input_audio"]["format"] == "mp3"
+      assert audio_block["type"] == "input_text"
+      assert String.contains?(audio_block["text"], "Unsupported")
     end
 
-    test "wav audio mime maps to wav format string" do
-      config = config_that_captures_request()
-
-      messages = [
-        %Alloy.Message{
-          role: :user,
-          content: [Message.audio("audio/wav", "wavdata==")]
-        }
-      ]
-
-      OpenAI.complete(messages, [], config)
-
-      assert_received {:request_body, body}
-      decoded = Jason.decode!(body)
-
-      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
-      [audio_block] = user_msg["content"]
-      assert audio_block["input_audio"]["format"] == "wav"
-    end
-
-    test "video block in user message formats to text notice instead of being dropped" do
+    test "video block in user message formats to input_text notice instead of being dropped" do
       config = config_that_captures_request()
 
       messages = [
@@ -311,15 +248,14 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
-      # Must NOT be nil/empty — the block should appear as a text notice
+      user_msg = Enum.find(decoded["input"], &(&1["role"] == "user"))
       assert is_list(user_msg["content"])
       [block] = user_msg["content"]
-      assert block["type"] == "text"
+      assert block["type"] == "input_text"
       assert String.contains?(block["text"], "Unsupported")
     end
 
-    test "document block in user message formats to text notice instead of being dropped" do
+    test "document block in user message formats to input_text notice instead of being dropped" do
       config = config_that_captures_request()
 
       messages = [
@@ -334,10 +270,10 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      user_msg = Enum.find(decoded["messages"], &(&1["role"] == "user"))
+      user_msg = Enum.find(decoded["input"], &(&1["role"] == "user"))
       assert is_list(user_msg["content"])
       [block] = user_msg["content"]
-      assert block["type"] == "text"
+      assert block["type"] == "input_text"
       assert String.contains?(block["text"], "Unsupported")
     end
   end
@@ -348,35 +284,15 @@ defmodule Alloy.Provider.OpenAITest do
         config_with_response(%{
           status: 200,
           body:
-            Jason.encode!(%{
-              "id" => "chatcmpl-bad",
-              "object" => "chat.completion",
-              "choices" => [
-                %{
-                  "index" => 0,
-                  "message" => %{
-                    "role" => "assistant",
-                    "content" => nil,
-                    "tool_calls" => [
-                      %{
-                        "id" => "call_bad",
-                        "type" => "function",
-                        "function" => %{
-                          "name" => "read",
-                          "arguments" => "{invalid json"
-                        }
-                      }
-                    ]
-                  },
-                  "finish_reason" => "tool_calls"
-                }
-              ],
-              "usage" => %{"prompt_tokens" => 5, "completion_tokens" => 3, "total_tokens" => 8}
-            })
+            Jason.encode!(
+              response_payload([
+                function_call_item("call_bad", "read", "{invalid json")
+              ])
+            )
         })
 
       assert {:error, reason} = OpenAI.complete([Message.user("Hi")], [], config)
-      assert reason =~ "invalid" or reason =~ "JSON" or reason =~ "decode"
+      assert reason =~ "Invalid JSON"
     end
   end
 
@@ -385,21 +301,7 @@ defmodule Alloy.Provider.OpenAITest do
       config =
         config_with_response(%{
           status: 200,
-          body:
-            Jason.encode!(%{
-              "id" => "chatcmpl-no-usage",
-              "object" => "chat.completion",
-              "choices" => [
-                %{
-                  "index" => 0,
-                  "message" => %{
-                    "role" => "assistant",
-                    "content" => "Hello!"
-                  },
-                  "finish_reason" => "stop"
-                }
-              ]
-            })
+          body: Jason.encode!(response_payload([assistant_text_item("Hello!")]))
         })
 
       assert {:ok, result} = OpenAI.complete([Message.user("Hi")], [], config)
@@ -457,10 +359,12 @@ defmodule Alloy.Provider.OpenAITest do
     test "emits text chunks and returns correct response" do
       config =
         config_with_sse_stream([
-          sse_text_delta("Hello"),
-          sse_text_delta(" world"),
-          sse_finish("stop"),
-          sse_usage(10, 5),
+          sse_response_output_text_delta("Hello"),
+          sse_response_output_text_delta(" world"),
+          sse_response_completed(
+            [assistant_text_item("Hello world")],
+            %{"input_tokens" => 10, "output_tokens" => 5}
+          ),
           "data: [DONE]\n\n"
         ])
 
@@ -471,6 +375,8 @@ defmodule Alloy.Provider.OpenAITest do
       assert result.stop_reason == :end_turn
       assert [%Message{role: :assistant}] = result.messages
       assert Message.text(hd(result.messages)) == "Hello world"
+      assert result.usage.input_tokens == 10
+      assert result.usage.output_tokens == 5
 
       assert_received {:chunk, "Hello"}
       assert_received {:chunk, " world"}
@@ -479,9 +385,9 @@ defmodule Alloy.Provider.OpenAITest do
     test "accumulates tool calls without emitting chunks" do
       config =
         config_with_sse_stream([
-          sse_tool_call_start(0, "call_1", "read"),
-          sse_tool_call_args(0, "{\"file_path\":\"mix.exs\"}"),
-          sse_finish("tool_calls"),
+          sse_response_completed([
+            function_call_item("call_1", "read", Jason.encode!(%{"file_path" => "mix.exs"}))
+          ]),
           "data: [DONE]\n\n"
         ])
 
@@ -498,7 +404,7 @@ defmodule Alloy.Provider.OpenAITest do
         Jason.encode!(%{
           "error" => %{
             "type" => "invalid_request_error",
-            "message" => "Unsupported parameter: 'max_tokens'"
+            "message" => "Unsupported parameter: 'max_output_tokens'"
           }
         })
 
@@ -508,7 +414,7 @@ defmodule Alloy.Provider.OpenAITest do
                OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
       assert reason =~ "invalid_request_error"
-      assert reason =~ "max_tokens"
+      assert reason =~ "max_output_tokens"
     end
 
     test "returns raw body when stream error response is not JSON" do
@@ -524,8 +430,8 @@ defmodule Alloy.Provider.OpenAITest do
     test "request body includes stream: true" do
       config =
         config_with_sse_stream_capturing_request([
-          sse_text_delta("ok"),
-          sse_finish("stop"),
+          sse_response_output_text_delta("ok"),
+          sse_response_completed([assistant_text_item("ok")]),
           "data: [DONE]\n\n"
         ])
 
@@ -534,10 +440,59 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
       assert decoded["stream"] == true
+      assert is_list(decoded["input"])
     end
   end
 
   # --- Test Helpers ---
+
+  defp response_payload(output, usage \\ %{}) do
+    base = %{
+      "id" => "resp_test",
+      "object" => "response",
+      "status" => "completed",
+      "output" => output
+    }
+
+    if usage == %{}, do: base, else: Map.put(base, "usage", usage)
+  end
+
+  defp assistant_text_item(text) do
+    %{
+      "id" => "msg_test",
+      "type" => "message",
+      "role" => "assistant",
+      "content" => [%{"type" => "output_text", "text" => text}]
+    }
+  end
+
+  defp function_call_item(call_id, name, arguments) do
+    %{
+      "id" => "fc_test",
+      "type" => "function_call",
+      "call_id" => call_id,
+      "name" => name,
+      "arguments" => arguments
+    }
+  end
+
+  defp sse_response_output_text_delta(text) do
+    sse_response_event("response.output_text.delta", %{
+      "type" => "response.output_text.delta",
+      "delta" => text
+    })
+  end
+
+  defp sse_response_completed(output_items, usage \\ %{}) do
+    sse_response_event("response.completed", %{
+      "type" => "response.completed",
+      "response" => response_payload(output_items, usage)
+    })
+  end
+
+  defp sse_response_event(event, payload) do
+    "event: #{event}\ndata: #{Jason.encode!(payload)}\n\n"
+  end
 
   defp config_with_response(response) do
     %{
@@ -576,18 +531,12 @@ defmodule Alloy.Provider.OpenAITest do
         Plug.Conn.send_resp(
           conn,
           200,
-          Jason.encode!(%{
-            "id" => "chatcmpl-capture",
-            "object" => "chat.completion",
-            "choices" => [
-              %{
-                "index" => 0,
-                "message" => %{"role" => "assistant", "content" => "ok"},
-                "finish_reason" => "stop"
-              }
-            ],
-            "usage" => %{"prompt_tokens" => 1, "completion_tokens" => 1, "total_tokens" => 2}
-          })
+          Jason.encode!(
+            response_payload([assistant_text_item("ok")], %{
+              "input_tokens" => 1,
+              "output_tokens" => 1
+            })
+          )
         )
       end)
     end)

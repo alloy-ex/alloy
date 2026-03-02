@@ -171,15 +171,73 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp call_provider_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline) do
-    do_provider_call(
-      state,
-      provider,
-      provider_config,
-      streaming?,
-      on_chunk,
-      state.config.max_retries,
-      deadline
-    )
+    {result, chunks_emitted?} =
+      do_provider_call(
+        state,
+        provider,
+        provider_config,
+        streaming?,
+        on_chunk,
+        state.config.max_retries,
+        deadline
+      )
+
+    case result do
+      {:ok, _} = success ->
+        success
+
+      # Once any streamed output/event was emitted, never switch providers:
+      # mixing chunks from multiple providers in one stream breaks turn semantics.
+      {:error, _reason} = error when chunks_emitted? ->
+        error
+
+      {:error, _reason} = error ->
+        try_fallback_providers(state, provider_config, streaming?, on_chunk, deadline, error)
+    end
+  end
+
+  defp try_fallback_providers(
+         state,
+         provider_config,
+         streaming?,
+         on_chunk,
+         deadline,
+         last_error
+       ) do
+    runtime_overrides = Map.take(provider_config, [:system_prompt, :on_event])
+
+    Enum.reduce_while(state.config.fallback_providers, last_error, fn
+      {fb_provider, fb_config}, acc ->
+        remaining = deadline - System.monotonic_time(:millisecond)
+
+        if remaining <= 0 do
+          {:halt, acc}
+        else
+          fb_provider_config = Map.merge(fb_config, runtime_overrides)
+
+          {result, chunks_emitted?} =
+            do_provider_call(
+              state,
+              fb_provider,
+              fb_provider_config,
+              streaming?,
+              on_chunk,
+              state.config.max_retries,
+              deadline
+            )
+
+          case result do
+            {:ok, _} = success ->
+              {:halt, success}
+
+            {:error, _} = error when chunks_emitted? ->
+              {:halt, error}
+
+            {:error, _} = error ->
+              {:cont, error}
+          end
+        end
+    end)
   end
 
   defp do_provider_call(
@@ -200,7 +258,7 @@ defmodule Alloy.Agent.Turn do
 
     case result do
       {:ok, _} = success ->
-        success
+        {success, chunks_emitted?}
 
       {:error, reason} when retries_left > 0 ->
         if retryable?(reason) and not chunks_emitted? do
@@ -214,7 +272,7 @@ defmodule Alloy.Agent.Turn do
           if remaining < backoff do
             # Not enough time left — return the error rather than sleeping
             # past the GenServer.call timeout.
-            {:error, reason}
+            {{:error, reason}, false}
           else
             Process.sleep(backoff)
 
@@ -229,11 +287,11 @@ defmodule Alloy.Agent.Turn do
             )
           end
         else
-          {:error, reason}
+          {{:error, reason}, chunks_emitted?}
         end
 
       {:error, _reason} = error ->
-        error
+        {error, chunks_emitted?}
     end
   end
 

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-03-02
+
+### Breaking
+
+- **OpenAI provider migrated from Chat Completions to Responses API** — requests now use `/v1/responses` with `input` items and `output` parsing instead of `/v1/chat/completions` with `messages`/`choices`. Streaming uses native SSE handler instead of the removed `OpenAIStream` module. Tool definitions use flat `{type, name, description, parameters}` instead of nested `{type, function: {name, description, parameters}}`.
+
+### Added
+
+- **Fallback providers** — configure `fallback_providers: [{Provider, config}, ...]` to automatically try alternative providers when the primary fails. Respects deadline budgets and never switches mid-stream (once chunks are emitted, the turn sticks with that provider).
+- **`on_compaction` callback** — configure `on_compaction: fn messages, state -> ... end` to extract facts from messages about to be compacted. Crash-safe: callback failures are logged but never prevent compaction.
+
+### Fixed
+
+- **Deduplicated `normalize_provider_config/1`** — removed redundant copy from `Turn` module; `Config` now handles all provider config normalization at construction time.
+- **Quadratic list concatenation in OpenAI response parsing** — `parse_output_to_blocks/1` now uses O(n) prepend+reverse instead of O(n²) `acc ++ blocks`.
+- **Double list traversal in compaction callback** — cached `length(rest)` to avoid traversing the message list twice.
+- **Silent callback failures now logged** — `fire_on_compaction` logs `Logger.warning` on callback crashes instead of silently swallowing.
+
 ## [0.5.1] - 2026-03-01
 
 ### Added

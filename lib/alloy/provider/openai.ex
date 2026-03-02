@@ -1,9 +1,9 @@
 defmodule Alloy.Provider.OpenAI do
   @moduledoc """
-  Provider for OpenAI's Chat Completions API.
+  Provider for OpenAI's Responses API.
 
-  Normalizes OpenAI's wire format (tool_calls array on assistant messages,
-  separate role:"tool" messages) to Alloy's content-block format.
+  Normalizes OpenAI's response output items (assistant messages + function
+  calls) to Alloy's content-block format.
 
   ## Config
 
@@ -30,7 +30,7 @@ defmodule Alloy.Provider.OpenAI do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.OpenAIStream
+  alias Alloy.Provider.SSE
 
   @default_api_url "https://api.openai.com"
   @default_max_tokens 4096
@@ -41,7 +41,7 @@ defmodule Alloy.Provider.OpenAI do
 
     req_opts =
       ([
-         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions",
+         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/responses",
          method: :post,
          headers: [
            {"authorization", "Bearer #{config.api_key}"},
@@ -65,32 +65,61 @@ defmodule Alloy.Provider.OpenAI do
 
   @impl true
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
-    body = build_request_body(messages, tool_defs, config)
-    url = "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions"
+    body =
+      messages
+      |> build_request_body(tool_defs, config)
+      |> Map.put("stream", true)
+
+    url = "#{Map.get(config, :api_url, @default_api_url)}/v1/responses"
 
     headers = [
       {"authorization", "Bearer #{config.api_key}"},
       {"content-type", "application/json"}
     ]
 
-    OpenAIStream.stream(
-      url,
-      headers,
-      body,
-      on_chunk,
-      Map.get(config, :req_options, [])
-    )
+    initial_acc = %{
+      buffer: "",
+      content: "",
+      response: nil,
+      stream_error: nil,
+      on_chunk: on_chunk
+    }
+
+    stream_handler = SSE.req_stream_handler(initial_acc, &handle_stream_event/2)
+
+    req_opts =
+      ([
+         url: url,
+         method: :post,
+         headers: headers,
+         body: Jason.encode!(body),
+         into: stream_handler
+       ] ++ Map.get(config, :req_options, []))
+      |> Keyword.put(:retry, false)
+
+    case Req.request(req_opts) do
+      {:ok, %{status: 200} = resp} ->
+        acc = Map.get(resp.private, :sse_acc, initial_acc)
+        build_stream_response(acc)
+
+      {:ok, %{status: status} = resp} ->
+        error_body = streaming_error_body(resp, initial_acc)
+        {:error, parse_error(status, error_body)}
+
+      {:error, reason} ->
+        {:error, "HTTP request failed: #{inspect(reason)}"}
+    end
   end
 
   # --- Request Building ---
 
   defp build_request_body(messages, tool_defs, config) do
-    openai_messages = build_openai_messages(messages, config)
+    input_items = build_input_items(messages, config)
 
     body = %{
       "model" => config.model,
-      "max_completion_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
-      "messages" => openai_messages
+      "max_output_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
+      "input" => input_items
     }
 
     case tool_defs do
@@ -99,75 +128,51 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp build_openai_messages(messages, config) do
-    system_msgs =
+  defp build_input_items(messages, config) do
+    system_items =
       case Map.get(config, :system_prompt) do
         nil -> []
         prompt -> [%{"role" => "system", "content" => prompt}]
       end
 
-    conv_msgs = Enum.flat_map(messages, &format_message/1)
-    system_msgs ++ conv_msgs
+    convo_items = Enum.flat_map(messages, &format_input_item/1)
+    system_items ++ convo_items
   end
 
-  # Simple text user message
-  defp format_message(%Message{role: :user, content: content}) when is_binary(content) do
+  defp format_input_item(%Message{role: :user, content: content}) when is_binary(content) do
     [%{"role" => "user", "content" => content}]
   end
 
-  # Simple text assistant message
-  defp format_message(%Message{role: :assistant, content: content}) when is_binary(content) do
+  defp format_input_item(%Message{role: :assistant, content: content}) when is_binary(content) do
     [%{"role" => "assistant", "content" => content}]
   end
 
-  # Assistant message with content blocks (may contain tool_use)
-  defp format_message(%Message{role: :assistant, content: blocks}) when is_list(blocks) do
-    tool_calls =
+  defp format_input_item(%Message{role: :assistant, content: blocks}) when is_list(blocks) do
+    function_calls =
       blocks
       |> Enum.filter(&(&1[:type] == "tool_use"))
-      |> Enum.map(fn call ->
-        %{
-          "id" => call.id,
-          "type" => "function",
-          "function" => %{
-            "name" => call.name,
-            "arguments" => Jason.encode!(call.input)
-          }
-        }
-      end)
+      |> Enum.map(&format_assistant_function_call_item/1)
 
     text_parts =
       blocks
       |> Enum.filter(&(&1[:type] == "text"))
       |> Enum.map_join("\n", & &1.text)
 
-    msg = %{"role" => "assistant"}
-
-    msg =
+    assistant_text_item =
       case text_parts do
-        "" -> Map.put(msg, "content", nil)
-        text -> Map.put(msg, "content", text)
+        "" -> []
+        text -> [%{"role" => "assistant", "content" => text}]
       end
 
-    msg =
-      case tool_calls do
-        [] -> msg
-        calls -> Map.put(msg, "tool_calls", calls)
-      end
-
-    [msg]
+    assistant_text_item ++ function_calls
   end
 
-  # User message with blocks. Two distinct cases:
-  #   1. Tool results (from the agent loop) -> separate role:"tool" wire messages
-  #   2. Media / text blocks (multimodal user turn) -> single user message with
-  #      an array content field (OpenAI's vision / audio format)
-  defp format_message(%Message{role: :user, content: blocks}) when is_list(blocks) do
+  defp format_input_item(%Message{role: :user, content: blocks}) when is_list(blocks) do
     if Enum.any?(blocks, &(&1[:type] == "tool_result")) do
       blocks
       |> Enum.map(fn
         %{type: "tool_result", tool_use_id: tool_call_id, content: content} ->
-          %{"role" => "tool", "tool_call_id" => tool_call_id, "content" => content}
+          %{"type" => "function_call_output", "call_id" => tool_call_id, "output" => content}
 
         _other ->
           nil
@@ -175,59 +180,133 @@ defmodule Alloy.Provider.OpenAI do
       |> Enum.reject(&is_nil/1)
     else
       parts = blocks |> Enum.map(&format_user_content_block/1) |> Enum.reject(&is_nil/1)
-      [%{"role" => "user", "content" => parts}]
+
+      case parts do
+        [] -> []
+        _ -> [%{"role" => "user", "content" => parts}]
+      end
     end
   end
 
   defp format_user_content_block(%{type: "text", text: text}) do
-    %{"type" => "text", "text" => text}
+    %{"type" => "input_text", "text" => text}
   end
 
   defp format_user_content_block(%{type: "image", mime_type: mime_type, data: data}) do
-    %{"type" => "image_url", "image_url" => %{"url" => "data:#{mime_type};base64,#{data}"}}
+    %{"type" => "input_image", "image_url" => "data:#{mime_type};base64,#{data}"}
   end
 
-  defp format_user_content_block(%{type: "audio", mime_type: mime_type, data: data}) do
-    %{
-      "type" => "input_audio",
-      "input_audio" => %{"data" => data, "format" => mime_to_audio_format(mime_type)}
-    }
+  defp format_user_content_block(%{type: "audio", mime_type: mime_type}) do
+    unsupported_media_notice(mime_type)
   end
 
   defp format_user_content_block(%{type: "video", mime_type: mime_type}) do
-    %{
-      "type" => "text",
-      "text" => "[Unsupported media type for OpenAI provider: video/#{mime_type}]"
-    }
+    unsupported_media_notice(mime_type)
   end
 
   defp format_user_content_block(%{type: "document", mime_type: mime_type}) do
-    %{
-      "type" => "text",
-      "text" => "[Unsupported media type for OpenAI provider: document/#{mime_type}]"
-    }
+    unsupported_media_notice(mime_type)
   end
 
   defp format_user_content_block(_block), do: nil
 
-  defp mime_to_audio_format("audio/mp3"), do: "mp3"
-  defp mime_to_audio_format("audio/mpeg"), do: "mp3"
-  defp mime_to_audio_format("audio/wav"), do: "wav"
-  defp mime_to_audio_format("audio/ogg"), do: "ogg"
-  defp mime_to_audio_format("audio/flac"), do: "flac"
-  defp mime_to_audio_format("audio/webm"), do: "webm"
-  # Generic fallback: take the subtype (e.g. "audio/x-m4a" -> "x-m4a")
-  defp mime_to_audio_format(mime), do: mime |> String.split("/") |> List.last()
+  defp unsupported_media_notice(mime_type) do
+    %{
+      "type" => "input_text",
+      "text" => "[Unsupported media type for OpenAI provider: #{mime_type}]"
+    }
+  end
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do
     %{
       "type" => "function",
-      "function" => %{
-        "name" => name,
-        "description" => desc,
-        "parameters" => Alloy.Provider.stringify_keys(schema)
-      }
+      "name" => name,
+      "description" => desc,
+      "parameters" => Alloy.Provider.stringify_keys(schema)
     }
+  end
+
+  defp format_assistant_function_call_item(%{id: id, name: name, input: input}) do
+    %{
+      "type" => "function_call",
+      "call_id" => id,
+      "name" => name,
+      "arguments" => Jason.encode!(input)
+    }
+  end
+
+  # --- Streaming ---
+
+  # When streaming (into: handler), a non-200 body can be consumed by the SSE
+  # callback and resp.body may be "". Recover it from the SSE buffer.
+  defp streaming_error_body(resp, initial_acc) do
+    case resp.body do
+      "" ->
+        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
+        sse_acc.buffer
+
+      body ->
+        body
+    end
+  end
+
+  defp handle_stream_event(acc, %{data: "[DONE]"}), do: acc
+
+  defp handle_stream_event(acc, %{event: event_name, data: data}) do
+    case Jason.decode(data) do
+      {:ok, parsed} ->
+        event_type = event_name || Map.get(parsed, "type")
+        process_stream_event(acc, event_type, parsed)
+
+      {:error, _} ->
+        acc
+    end
+  end
+
+  defp process_stream_event(acc, "response.output_text.delta", %{"delta" => delta})
+       when is_binary(delta) and delta != "" do
+    acc.on_chunk.(delta)
+    %{acc | content: acc.content <> delta}
+  end
+
+  defp process_stream_event(acc, "response.completed", %{"response" => response})
+       when is_map(response) do
+    %{acc | response: response}
+  end
+
+  defp process_stream_event(acc, "response.failed", payload) do
+    %{acc | stream_error: parse_stream_event_error(payload)}
+  end
+
+  defp process_stream_event(acc, "error", payload) do
+    %{acc | stream_error: parse_stream_event_error(payload)}
+  end
+
+  defp process_stream_event(acc, _event_type, _payload), do: acc
+
+  defp build_stream_response(%{stream_error: error}) when is_binary(error) do
+    {:error, error}
+  end
+
+  defp build_stream_response(%{response: response}) when is_map(response) do
+    parse_response(response)
+  end
+
+  defp build_stream_response(%{content: content}) do
+    content_blocks = if content == "", do: [], else: [%{type: "text", text: content}]
+
+    {:ok,
+     %{
+       stop_reason: :end_turn,
+       messages: [%Message{role: :assistant, content: content_blocks}],
+       usage: %{input_tokens: 0, output_tokens: 0}
+     }}
+  end
+
+  defp parse_stream_event_error(payload) do
+    payload
+    |> Map.get("error", payload)
+    |> format_error_payload()
   end
 
   # --- Response Parsing ---
@@ -239,14 +318,12 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp parse_response(%{"choices" => [choice | _]} = resp) do
-    message = choice["message"]
-    finish_reason = choice["finish_reason"]
+  defp parse_response(%{"output" => output} = resp) when is_list(output) do
     usage = resp["usage"] || %{}
 
-    case parse_message_to_blocks(message) do
+    case parse_output_to_blocks(output) do
       {:ok, content_blocks} ->
-        stop_reason = parse_finish_reason(finish_reason)
+        stop_reason = parse_stop_reason(content_blocks)
 
         alloy_msg = %Message{
           role: :assistant,
@@ -258,8 +335,8 @@ defmodule Alloy.Provider.OpenAI do
            stop_reason: stop_reason,
            messages: [alloy_msg],
            usage: %{
-             input_tokens: Map.get(usage, "prompt_tokens", 0),
-             output_tokens: Map.get(usage, "completion_tokens", 0)
+             input_tokens: Map.get(usage, "input_tokens", 0),
+             output_tokens: Map.get(usage, "output_tokens", 0)
            }
          }}
 
@@ -268,55 +345,125 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp parse_response(%{"error" => error}) do
-    {:error, "#{error["type"]}: #{error["message"]}"}
-  end
+  defp parse_response(%{"output_text" => text} = resp) when is_binary(text) do
+    usage = resp["usage"] || %{}
 
-  defp parse_message_to_blocks(message) do
-    text_blocks =
-      case message["content"] do
-        nil -> []
+    content_blocks =
+      case text do
         "" -> []
-        text -> [%{type: "text", text: text}]
+        _ -> [%{type: "text", text: text}]
       end
 
-    tool_blocks =
-      (message["tool_calls"] || [])
-      |> Enum.reduce_while([], fn tc, acc ->
-        case Jason.decode(tc["function"]["arguments"]) do
-          {:ok, input} ->
-            {:cont,
-             acc ++
-               [
-                 %{
-                   type: "tool_use",
-                   id: tc["id"],
-                   name: tc["function"]["name"],
-                   input: input
-                 }
-               ]}
+    {:ok,
+     %{
+       stop_reason: :end_turn,
+       messages: [%Message{role: :assistant, content: content_blocks}],
+       usage: %{
+         input_tokens: Map.get(usage, "input_tokens", 0),
+         output_tokens: Map.get(usage, "output_tokens", 0)
+       }
+     }}
+  end
 
-          {:error, _} ->
-            {:halt, {:error, "Invalid JSON in tool call arguments for #{tc["function"]["name"]}"}}
+  defp parse_response(%{"error" => error}) do
+    {:error, format_error_payload(error)}
+  end
+
+  defp parse_response(resp) do
+    {:error, "Unexpected OpenAI response payload: #{inspect(resp)}"}
+  end
+
+  defp parse_output_to_blocks(output) do
+    result =
+      Enum.reduce_while(output, {:ok, []}, fn item, {:ok, acc} ->
+        case parse_output_item(item) do
+          {:ok, blocks} -> {:cont, {:ok, [blocks | acc]}}
+          {:error, _} = err -> {:halt, err}
         end
       end)
 
-    case tool_blocks do
-      {:error, _} = err -> err
-      blocks -> {:ok, text_blocks ++ blocks}
+    case result do
+      {:ok, nested} -> {:ok, nested |> Enum.reverse() |> List.flatten()}
+      error -> error
     end
   end
 
-  defp parse_finish_reason("stop"), do: :end_turn
-  defp parse_finish_reason("tool_calls"), do: :tool_use
-  defp parse_finish_reason("length"), do: :end_turn
-  defp parse_finish_reason("content_filter"), do: :end_turn
-  defp parse_finish_reason(_), do: :end_turn
+  defp parse_output_item(%{"type" => "message", "role" => "assistant", "content" => content})
+       when is_list(content) do
+    {:ok, parse_assistant_content(content)}
+  end
+
+  defp parse_output_item(%{"type" => "message", "role" => "assistant", "content" => text})
+       when is_binary(text) do
+    blocks =
+      case text do
+        "" -> []
+        _ -> [%{type: "text", text: text}]
+      end
+
+    {:ok, blocks}
+  end
+
+  defp parse_output_item(%{"type" => "function_call", "name" => name} = call) do
+    case decode_function_call_arguments(call) do
+      {:ok, input} ->
+        {:ok, [%{type: "tool_use", id: call["call_id"] || call["id"], name: name, input: input}]}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp parse_output_item(_item), do: {:ok, []}
+
+  defp parse_assistant_content(content) when is_list(content) do
+    content
+    |> Enum.flat_map(fn
+      %{"type" => "output_text", "text" => text} when is_binary(text) and text != "" ->
+        [%{type: "text", text: text}]
+
+      %{"type" => "refusal", "refusal" => text} when is_binary(text) and text != "" ->
+        [%{type: "text", text: text}]
+
+      %{"type" => "refusal", "text" => text} when is_binary(text) and text != "" ->
+        [%{type: "text", text: text}]
+
+      _ ->
+        []
+    end)
+  end
+
+  defp parse_assistant_content(_content), do: []
+
+  defp parse_stop_reason(content_blocks) do
+    if Enum.any?(content_blocks, &(&1.type == "tool_use")), do: :tool_use, else: :end_turn
+  end
+
+  defp decode_function_call_arguments(%{"name" => name} = call) do
+    args = Map.get(call, "arguments", "")
+
+    case args do
+      "" ->
+        {:ok, %{}}
+
+      encoded when is_binary(encoded) ->
+        case Jason.decode(encoded) do
+          {:ok, input} -> {:ok, input}
+          {:error, _} -> {:error, "Invalid JSON in tool call arguments for #{name}"}
+        end
+
+      decoded when is_map(decoded) ->
+        {:ok, decoded}
+
+      _other ->
+        {:error, "Invalid tool call arguments payload for #{name}"}
+    end
+  end
 
   defp parse_error(status, body) when is_binary(body) do
     case Jason.decode(body) do
       {:ok, %{"error" => error}} ->
-        "#{error["type"]}: #{error["message"]}"
+        format_error_payload(error)
 
       _ ->
         "HTTP #{status}: #{body}"
@@ -325,8 +472,16 @@ defmodule Alloy.Provider.OpenAI do
 
   defp parse_error(status, body) when is_map(body) do
     case body do
-      %{"error" => error} -> "#{error["type"]}: #{error["message"]}"
+      %{"error" => error} -> format_error_payload(error)
       _ -> "HTTP #{status}: #{inspect(body)}"
     end
   end
+
+  defp format_error_payload(error) when is_map(error) do
+    type = Map.get(error, "type", "error")
+    message = Map.get(error, "message", inspect(error))
+    "#{type}: #{message}"
+  end
+
+  defp format_error_payload(error), do: inspect(error)
 end

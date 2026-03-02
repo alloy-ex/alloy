@@ -22,9 +22,11 @@ defmodule Alloy.Agent.Config do
           context: map(),
           context_discovery: boolean(),
           on_shutdown: (Alloy.Session.t() -> any()) | nil,
+          on_compaction: (list(), Alloy.Agent.State.t() -> any()) | nil,
           pubsub: module() | nil,
           subscribe: [String.t()],
-          max_pending: non_neg_integer()
+          max_pending: non_neg_integer(),
+          fallback_providers: [{module(), map()}]
         }
 
   @enforce_keys [:provider, :provider_config]
@@ -44,9 +46,11 @@ defmodule Alloy.Agent.Config do
     context: %{},
     context_discovery: false,
     on_shutdown: nil,
+    on_compaction: nil,
     pubsub: nil,
     subscribe: [],
-    max_pending: 0
+    max_pending: 0,
+    fallback_providers: []
   ]
 
   @doc """
@@ -92,9 +96,14 @@ defmodule Alloy.Agent.Config do
       context: context,
       context_discovery: context_discovery,
       on_shutdown: Keyword.get(opts, :on_shutdown, nil),
+      on_compaction: Keyword.get(opts, :on_compaction, nil),
       pubsub: Keyword.get(opts, :pubsub, nil),
       subscribe: Keyword.get(opts, :subscribe, []),
-      max_pending: Keyword.get(opts, :max_pending, 0)
+      max_pending: Keyword.get(opts, :max_pending, 0),
+      fallback_providers:
+        opts
+        |> Keyword.get(:fallback_providers, [])
+        |> Enum.map(&parse_fallback_provider/1)
     }
   end
 
@@ -105,4 +114,16 @@ defmodule Alloy.Agent.Config do
   defp parse_provider(module) when is_atom(module) do
     {module, []}
   end
+
+  defp parse_fallback_provider({module, provider_config}) when is_atom(module) do
+    {module, normalize_provider_config(provider_config)}
+  end
+
+  defp parse_fallback_provider(module) when is_atom(module) do
+    {module, %{}}
+  end
+
+  defp normalize_provider_config(config) when is_map(config), do: config
+  defp normalize_provider_config(config) when is_list(config), do: Map.new(config)
+  defp normalize_provider_config(nil), do: %{}
 end

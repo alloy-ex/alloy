@@ -7,6 +7,8 @@ defmodule Alloy.Context.Compactor do
   message (original request) and the most recent messages.
   """
 
+  require Logger
+
   alias Alloy.Agent.State
   alias Alloy.Context.TokenCounter
   alias Alloy.Message
@@ -28,11 +30,48 @@ defmodule Alloy.Context.Compactor do
       # Use dynamic keep_recent: at most default, but ensure at least 1 message gets compacted
       msg_count = length(messages)
       keep_recent = min(@default_keep_recent, max(1, msg_count - 2))
+
+      # Fire on_compaction callback BEFORE compacting, so the caller can
+      # extract facts from messages that are about to be compressed.
+      # Crash protection: callback failure must never prevent compaction.
+      fire_on_compaction(messages, keep_recent, state)
+
       compacted = compact_messages(messages, keep_recent: keep_recent)
       # Store compacted messages and clear the accumulator
       %{state | messages: compacted, messages_new: []}
     end
   end
+
+  # Fires the on_compaction callback with the middle messages (those about to be
+  # compacted). Extracts the same middle slice that compact_messages/2 will process.
+  # Any crash in the callback is swallowed — compaction must always proceed.
+  defp fire_on_compaction(_messages, _keep_recent, %State{config: %{on_compaction: nil}}), do: :ok
+
+  defp fire_on_compaction(
+         messages,
+         keep_recent,
+         %State{config: %{on_compaction: callback}} = state
+       )
+       when is_function(callback, 2) do
+    [_first | rest] = messages
+    rest_len = length(rest)
+    recent_count = min(keep_recent, rest_len)
+    {middle, _recent} = Enum.split(rest, rest_len - recent_count)
+
+    try do
+      callback.(middle, state)
+    rescue
+      e ->
+        Logger.warning("on_compaction callback crashed: #{Exception.message(e)}")
+        :ok
+    catch
+      kind, payload ->
+        Logger.warning("on_compaction callback error (#{kind}): #{inspect(payload)}")
+        :ok
+    end
+  end
+
+  defp fire_on_compaction(_, _, _), do: :ok
 
   @doc """
   Compacts messages, preserving the first message and the most recent N messages.

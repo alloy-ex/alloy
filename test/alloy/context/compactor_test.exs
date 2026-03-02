@@ -46,6 +46,135 @@ defmodule Alloy.Context.CompactorTest do
     end
   end
 
+  describe "on_compaction callback" do
+    test "fires callback with middle messages before compaction" do
+      test_pid = self()
+
+      callback = fn middle_messages, state ->
+        send(test_pid, {:compaction_fired, middle_messages, state})
+        :ok
+      end
+
+      # Build messages that exceed 90% of a small token budget
+      big_text = String.duplicate("x", 1200)
+
+      messages = [
+        Message.user("original request"),
+        Message.assistant(big_text),
+        Message.user("middle question"),
+        Message.assistant("middle answer"),
+        Message.assistant("recent reply"),
+        Message.user("latest")
+      ]
+
+      config = %Config{
+        provider: Alloy.Provider.Test,
+        provider_config: %{},
+        max_tokens: 250,
+        on_compaction: callback
+      }
+
+      state = %State{config: config, messages: messages, messages_new: []}
+
+      _compacted = Compactor.maybe_compact(state)
+
+      assert_received {:compaction_fired, middle_messages, received_state}
+      assert middle_messages != []
+      assert %State{} = received_state
+    end
+
+    test "does not fire callback when within budget" do
+      test_pid = self()
+
+      callback = fn _middle, _state ->
+        send(test_pid, :should_not_fire)
+        :ok
+      end
+
+      messages = [Message.user("hi"), Message.assistant("hello")]
+
+      config = %Config{
+        provider: Alloy.Provider.Test,
+        provider_config: %{},
+        max_tokens: 200_000,
+        on_compaction: callback
+      }
+
+      state = %State{config: config, messages: messages, messages_new: []}
+
+      _result = Compactor.maybe_compact(state)
+
+      refute_received :should_not_fire
+    end
+
+    test "compaction still works when on_compaction is nil" do
+      big_text = String.duplicate("x", 1200)
+
+      messages = [
+        Message.user("original"),
+        Message.assistant(big_text),
+        Message.user("middle"),
+        Message.assistant("recent"),
+        Message.user("latest")
+      ]
+
+      state = build_state(messages, 250)
+
+      compacted = Compactor.maybe_compact(state)
+      assert %State{} = compacted
+      refute compacted == state
+    end
+
+    test "compaction proceeds even when on_compaction crashes" do
+      callback = fn _middle, _state ->
+        raise "Boom! Callback crashed!"
+      end
+
+      big_text = String.duplicate("x", 1200)
+
+      messages = [
+        Message.user("original"),
+        Message.assistant(big_text),
+        Message.user("middle"),
+        Message.assistant("recent"),
+        Message.user("latest")
+      ]
+
+      config = %Config{
+        provider: Alloy.Provider.Test,
+        provider_config: %{},
+        max_tokens: 250,
+        on_compaction: callback
+      }
+
+      state = %State{config: config, messages: messages, messages_new: []}
+
+      # Should NOT raise — crash is swallowed
+      compacted = Compactor.maybe_compact(state)
+      assert %State{} = compacted
+    end
+  end
+
+  describe "Config parses on_compaction" do
+    test "from_opts accepts on_compaction function" do
+      callback = fn _msgs, _state -> :ok end
+
+      config =
+        Config.from_opts(
+          provider: Alloy.Provider.Test,
+          on_compaction: callback
+        )
+
+      assert config.on_compaction == callback
+    end
+
+    test "from_opts defaults on_compaction to nil" do
+      config = Config.from_opts(provider: Alloy.Provider.Test)
+
+      assert config.on_compaction == nil
+    end
+  end
+
   describe "compact_messages/2" do
     test "preserves first message" do
       messages = [

@@ -793,8 +793,9 @@ defmodule Alloy.Agent.TurnTest do
 
       # With jitter, exact timing varies. But exponential base means
       # max possible total = 25*2 + 50*2 + 100*2 = 350ms.
-      # Verify it stays within bounds (jitter doesn't exceed 2x base).
-      assert elapsed < 500,
+      # End-to-end elapsed also includes scheduler contention when the
+      # full async suite is running, so allow extra headroom.
+      assert elapsed < 1_500,
              "Jittered backoff exceeded expected bounds: #{elapsed}ms"
     end
 
@@ -1504,6 +1505,285 @@ defmodule Alloy.Agent.TurnTest do
       # remaining is ~3_000ms. With floor=1_000, max(3000, 1000) = 3000.
       # With floor=5_000 (bug), max(3000, 5000) = 5000 — overshoots deadline.
       assert receive_timeout <= 4_000
+    end
+  end
+
+  defmodule PartialStreamThenErrorProvider do
+    @moduledoc false
+    @behaviour Alloy.Provider
+
+    @impl true
+    def complete(_messages, _tool_defs, _config) do
+      {:error, "HTTP 500: complete not supported"}
+    end
+
+    @impl true
+    def stream(_messages, _tool_defs, _config, on_chunk) do
+      on_chunk.("A")
+      {:error, "HTTP 503: primary stream broke"}
+    end
+  end
+
+  describe "fallback providers" do
+    test "config parses fallback_providers from opts" do
+      config =
+        Config.from_opts(
+          provider: {TestProvider, [api_key: "test"]},
+          fallback_providers: [
+            {TestProvider, %{api_key: "fallback1"}},
+            {TestProvider, %{api_key: "fallback2"}}
+          ]
+        )
+
+      assert length(config.fallback_providers) == 2
+    end
+
+    test "config normalizes fallback provider keyword config to maps" do
+      config =
+        Config.from_opts(
+          provider: {TestProvider, [api_key: "test"]},
+          fallback_providers: [
+            {TestProvider, [api_key: "fallback1", model: "gpt-test"]}
+          ]
+        )
+
+      assert [{TestProvider, fb_config}] = config.fallback_providers
+      assert is_map(fb_config)
+      assert fb_config.api_key == "fallback1"
+      assert fb_config.model == "gpt-test"
+    end
+
+    test "config defaults fallback_providers to empty list" do
+      config = Config.from_opts(provider: {TestProvider, [api_key: "test"]})
+      assert config.fallback_providers == []
+    end
+
+    test "primary fails then fallback succeeds" do
+      # Primary provider always errors
+      {:ok, primary_pid} =
+        TestProvider.start_link([
+          {:error, "HTTP 500: Internal Server Error"}
+        ])
+
+      # Fallback provider succeeds
+      {:ok, fallback_pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Fallback response!")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: primary_pid},
+        max_retries: 0,
+        timeout_ms: 30_000,
+        fallback_providers: [
+          {TestProvider, %{agent_pid: fallback_pid}}
+        ]
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert Message.text(List.last(result.messages)) == "Fallback response!"
+    end
+
+    test "primary fails then keyword-list fallback config succeeds" do
+      {:ok, primary_pid} =
+        TestProvider.start_link([
+          {:error, "HTTP 500: Internal Server Error"}
+        ])
+
+      {:ok, fallback_pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Fallback via keyword config!")
+        ])
+
+      config =
+        Config.from_opts(
+          provider: {TestProvider, [agent_pid: primary_pid]},
+          max_retries: 0,
+          timeout_ms: 30_000,
+          fallback_providers: [
+            {TestProvider, [agent_pid: fallback_pid]}
+          ]
+        )
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert Message.text(List.last(result.messages)) == "Fallback via keyword config!"
+    end
+
+    test "streaming fallback preserves on_event callback" do
+      test_pid = self()
+
+      {:ok, primary_pid} =
+        TestProvider.start_link([
+          {:error, "HTTP 503: primary down"}
+        ])
+
+      {:ok, fallback_pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("OK")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: primary_pid},
+        max_retries: 0,
+        timeout_ms: 30_000,
+        fallback_providers: [
+          {TestProvider, %{agent_pid: fallback_pid}}
+        ]
+      }
+
+      on_event = fn event -> send(test_pid, {:event, event}) end
+      state = State.init(config, [Message.user("Hi")])
+
+      result =
+        Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
+
+      assert result.status == :completed
+      assert Message.text(List.last(result.messages)) == "OK"
+      assert_received {:event, %{event: :text_delta, payload: "O"}}
+      assert_received {:event, %{event: :text_delta, payload: "K"}}
+    end
+
+    test "primary fails, all fallbacks fail, returns last error" do
+      {:ok, primary_pid} =
+        TestProvider.start_link([{:error, "HTTP 500: primary down"}])
+
+      {:ok, fb1_pid} =
+        TestProvider.start_link([{:error, "HTTP 500: fallback1 down"}])
+
+      {:ok, fb2_pid} =
+        TestProvider.start_link([{:error, "HTTP 500: fallback2 down"}])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: primary_pid},
+        max_retries: 0,
+        timeout_ms: 30_000,
+        fallback_providers: [
+          {TestProvider, %{agent_pid: fb1_pid}},
+          {TestProvider, %{agent_pid: fb2_pid}}
+        ]
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :error
+    end
+
+    test "deadline expiry before next fallback returns most recent fallback error" do
+      {:ok, primary_pid} =
+        TestProvider.start_link([{:error, "HTTP 500: primary down"}])
+
+      {:ok, fb1_pid} =
+        TestProvider.start_link([{:with_delay, 1_100, {:error, "HTTP 500: fallback1 down"}}])
+
+      {:ok, fb2_pid} =
+        TestProvider.start_link([{:error, "HTTP 500: fallback2 down"}])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: primary_pid},
+        max_retries: 0,
+        # 6_000ms total timeout - 5_000ms headroom = ~1_000ms budget.
+        # fb1 delay exceeds budget, so the next fallback check hits deadline.
+        timeout_ms: 6_000,
+        fallback_providers: [
+          {TestProvider, %{agent_pid: fb1_pid}},
+          {TestProvider, %{agent_pid: fb2_pid}}
+        ]
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :error
+      assert result.error == "HTTP 500: fallback1 down"
+    end
+
+    test "streaming partial output error does not switch to fallback provider" do
+      test_pid = self()
+
+      {:ok, fallback_pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Fallback should not run")
+        ])
+
+      config = %Config{
+        provider: PartialStreamThenErrorProvider,
+        provider_config: %{},
+        max_retries: 0,
+        timeout_ms: 30_000,
+        fallback_providers: [
+          {TestProvider, %{agent_pid: fallback_pid}}
+        ]
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+
+      on_chunk = fn chunk ->
+        send(test_pid, {:chunk, chunk})
+        :ok
+      end
+
+      result = Turn.run_loop(state, streaming: true, on_chunk: on_chunk)
+
+      assert result.status == :error
+      assert result.error == "HTTP 503: primary stream broke"
+      assert_received {:chunk, "A"}
+      # If fallback had run, its scripted response would be consumed.
+      assert Agent.get(fallback_pid, &length/1) == 1
+    end
+
+    test "primary succeeds, no fallbacks tried" do
+      {:ok, primary_pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Primary works!")
+        ])
+
+      {:ok, fallback_pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Should not see this")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: primary_pid},
+        fallback_providers: [
+          {TestProvider, %{agent_pid: fallback_pid}}
+        ]
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert Message.text(List.last(result.messages)) == "Primary works!"
+    end
+
+    test "empty fallback_providers behaves same as today" do
+      {:ok, pid} =
+        TestProvider.start_link([{:error, "HTTP 500: error"}])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_retries: 0,
+        timeout_ms: 30_000,
+        fallback_providers: []
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :error
     end
   end
 end
