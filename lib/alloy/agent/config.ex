@@ -20,7 +20,6 @@ defmodule Alloy.Agent.Config do
           middleware: [module()],
           working_directory: String.t(),
           context: map(),
-          context_discovery: boolean(),
           on_shutdown: (Alloy.Session.t() -> any()) | nil,
           on_compaction: (list(), Alloy.Agent.State.t() -> any()) | nil,
           pubsub: module() | nil,
@@ -44,7 +43,6 @@ defmodule Alloy.Agent.Config do
     middleware: [],
     working_directory: ".",
     context: %{},
-    context_discovery: false,
     on_shutdown: nil,
     on_compaction: nil,
     pubsub: nil,
@@ -56,35 +54,15 @@ defmodule Alloy.Agent.Config do
   @doc """
   Builds a config from `Alloy.run/2` options.
   """
-  alias Alloy.Context.Discovery
-  alias Alloy.Context.SystemPrompt
-
   @spec from_opts(keyword()) :: t()
   def from_opts(opts) do
     {provider_mod, provider_config} = parse_provider(opts[:provider])
-    context_discovery = Keyword.get(opts, :context_discovery, false)
-    context = Keyword.get(opts, :context, %{})
-    working_directory = Keyword.get(opts, :working_directory, ".")
-    base_prompt = Keyword.get(opts, :system_prompt)
-
-    system_prompt =
-      if context_discovery do
-        discovery_opts = [
-          home: Map.get(context, :home, System.user_home!()),
-          working_directory: working_directory
-        ]
-
-        sections = Discovery.discover(discovery_opts)
-        SystemPrompt.build(base_prompt || "", sections)
-      else
-        base_prompt
-      end
 
     %__MODULE__{
       provider: provider_mod,
       provider_config: Map.new(provider_config),
       tools: Keyword.get(opts, :tools, []),
-      system_prompt: system_prompt,
+      system_prompt: Keyword.get(opts, :system_prompt),
       max_turns: Keyword.get(opts, :max_turns, 25),
       max_tokens: Keyword.get(opts, :max_tokens, 200_000),
       max_retries: Keyword.get(opts, :max_retries, 3),
@@ -92,9 +70,8 @@ defmodule Alloy.Agent.Config do
       timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
       tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
       middleware: Keyword.get(opts, :middleware, []),
-      working_directory: working_directory,
-      context: context,
-      context_discovery: context_discovery,
+      working_directory: Keyword.get(opts, :working_directory, "."),
+      context: Keyword.get(opts, :context, %{}),
       on_shutdown: Keyword.get(opts, :on_shutdown, nil),
       on_compaction: Keyword.get(opts, :on_compaction, nil),
       pubsub: Keyword.get(opts, :pubsub, nil),

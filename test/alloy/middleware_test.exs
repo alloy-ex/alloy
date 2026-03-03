@@ -45,25 +45,6 @@ defmodule Alloy.MiddlewareTest do
     State.init(config)
   end
 
-  describe "run/2 with new hooks" do
-    test "existing Logger middleware handles new hooks without crashing" do
-      state = build_state(middleware: [Alloy.Middleware.Logger])
-
-      # These should not raise FunctionClauseError
-      assert %State{} = Middleware.run(:before_tool_call, state)
-      assert %State{} = Middleware.run(:session_start, state)
-      assert %State{} = Middleware.run(:session_end, state)
-    end
-
-    test "existing Telemetry middleware handles new hooks without crashing" do
-      state = build_state(middleware: [Alloy.Middleware.Telemetry])
-
-      assert %State{} = Middleware.run(:before_tool_call, state)
-      assert %State{} = Middleware.run(:session_start, state)
-      assert %State{} = Middleware.run(:session_end, state)
-    end
-  end
-
   describe "run_before_tool_call/2" do
     test "returns :ok when no middleware blocks" do
       state = build_state(middleware: [TrackingMiddleware], context: %{tracker: self()})

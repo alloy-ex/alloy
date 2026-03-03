@@ -44,17 +44,22 @@ defmodule Alloy.Tool.Core.Edit do
 
   @impl true
   def execute(input, context) do
-    path = Alloy.Tool.resolve_path(input["file_path"], context)
-    old_string = input["old_string"]
-    new_string = input["new_string"]
-    replace_all = input["replace_all"] || false
+    case Alloy.Tool.resolve_path(input["file_path"], context) do
+      {:error, reason} ->
+        {:error, reason}
 
-    with {:ok, content} <- read_file(path),
-         {:ok, new_content} <- do_replace(content, old_string, new_string, replace_all) do
-      case File.write(path, new_content) do
-        :ok -> {:ok, "Successfully edited #{path}"}
-        {:error, reason} -> {:error, "Failed to write #{path}: #{reason}"}
-      end
+      {:ok, path} ->
+        old_string = input["old_string"]
+        new_string = input["new_string"]
+        replace_all = input["replace_all"] || false
+
+        with {:ok, content} <- read_file(path),
+             {:ok, new_content} <- do_replace(content, old_string, new_string, replace_all) do
+          case File.write(path, new_content) do
+            :ok -> {:ok, "Successfully edited #{path}"}
+            {:error, reason} -> {:error, "Failed to write #{path}: #{reason}"}
+          end
+        end
     end
   end
 

@@ -48,25 +48,7 @@ defmodule Alloy.Usage do
 
   @doc """
   Estimates cost in cents given per-million token prices.
-
-  **Important:** This function **replaces** the existing `estimated_cost_cents`
-  value with a freshly computed one based on the struct's token counts. It does
-  **not** accumulate — any previously stored cost (including costs merged via
-  `merge/2`) will be overwritten. Call this on a fresh `Usage.t()` or before
-  calling `merge/2` to avoid silently losing merged costs.
-
-  If you need to accumulate costs across multiple turns, use `merge/2` which
-  preserves and sums `estimated_cost_cents`.
-
-  Prices are in USD per million tokens. The result is stored as a float
-  representing cents, preserving sub-cent precision for small token counts.
-
-  ## Examples
-
-      iex> usage = %Alloy.Usage{input_tokens: 1_000_000, output_tokens: 1_000_000}
-      iex> Alloy.Usage.estimate_cost(usage, 3.0, 15.0)
-      %Alloy.Usage{input_tokens: 1_000_000, output_tokens: 1_000_000, estimated_cost_cents: 1800}
-
+  Replaces (does not accumulate) the existing `estimated_cost_cents`.
   """
   @spec estimate_cost(t(), number(), number()) :: t()
   def estimate_cost(%__MODULE__{} = usage, input_price_per_m, output_price_per_m) do

@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.6.0"
+  @version "0.7.0"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -15,7 +15,6 @@ defmodule Alloy.MixProject do
       package: package(),
       docs: docs(),
       dialyzer: [
-        plt_add_apps: [:mix],
         plt_local_path: "priv/plts/project.plt",
         plt_core_path: "priv/plts/core.plt"
       ],
@@ -67,7 +66,6 @@ defmodule Alloy.MixProject do
           Alloy.Agent.State,
           Alloy.Agent.Turn,
           Alloy.Message,
-          Alloy.Persistence,
           Alloy.Session,
           Alloy.Usage
         ],
@@ -75,12 +73,7 @@ defmodule Alloy.MixProject do
           Alloy.Provider,
           Alloy.Provider.Anthropic,
           Alloy.Provider.OpenAI,
-          Alloy.Provider.Google,
-          Alloy.Provider.Ollama,
-          Alloy.Provider.OpenRouter,
-          Alloy.Provider.XAI,
-          Alloy.Provider.DeepSeek,
-          Alloy.Provider.Mistral,
+          Alloy.Provider.OpenAICompat,
           Alloy.Provider.Test
         ],
         Tools: [
@@ -89,26 +82,15 @@ defmodule Alloy.MixProject do
           Alloy.Tool.Core.Read,
           Alloy.Tool.Core.Write,
           Alloy.Tool.Core.Edit,
-          Alloy.Tool.Core.Scratchpad,
           Alloy.Tool.Executor,
           Alloy.Tool.Registry
         ],
         Context: [
           Alloy.Context.Compactor,
-          Alloy.Context.Discovery,
-          Alloy.Context.SystemPrompt,
           Alloy.Context.TokenCounter
         ],
         Middleware: [
-          Alloy.Middleware,
-          Alloy.Middleware.Logger,
-          Alloy.Middleware.Telemetry
-        ],
-        Advanced: [
-          Alloy.Team,
-          Alloy.Scheduler,
-          Alloy.Skill,
-          Alloy.PubSub
+          Alloy.Middleware
         ],
         Testing: [
           Alloy.Testing

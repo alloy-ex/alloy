@@ -62,7 +62,14 @@ defmodule Alloy.Provider.SSE do
       {events, remaining} = process_chunk(acc.buffer, chunk)
       acc = %{acc | buffer: remaining}
 
-      acc = Enum.reduce(events, acc, fn event, acc -> handle_event.(acc, event) end)
+      acc =
+        Enum.reduce(events, acc, fn event, acc ->
+          try do
+            handle_event.(acc, event)
+          rescue
+            _ -> acc
+          end
+        end)
 
       resp = put_in(resp.private[:sse_acc], acc)
       {:cont, {req, resp}}

@@ -40,27 +40,32 @@ defmodule Alloy.Tool.Core.Read do
 
   @impl true
   def execute(input, context) do
-    path = Alloy.Tool.resolve_path(input["file_path"], context)
-    offset = input["offset"] || 1
-    limit = input["limit"] || @default_limit
+    case Alloy.Tool.resolve_path(input["file_path"], context) do
+      {:error, reason} ->
+        {:error, reason}
 
-    if File.regular?(path) do
-      lines =
-        path
-        |> File.stream!()
-        |> Stream.map(&String.trim_trailing(&1, "\n"))
-        |> Stream.with_index(1)
-        |> Stream.drop(offset - 1)
-        |> Stream.take(limit)
-        |> Enum.to_list()
+      {:ok, path} ->
+        offset = input["offset"] || 1
+        limit = input["limit"] || @default_limit
 
-      if lines == [] do
-        {:ok, ""}
-      else
-        {:ok, format_lines(lines)}
-      end
-    else
-      {:error, "File does not exist or is not a readable file: #{path}"}
+        if File.regular?(path) do
+          lines =
+            path
+            |> File.stream!()
+            |> Stream.map(&String.trim_trailing(&1, "\n"))
+            |> Stream.with_index(1)
+            |> Stream.drop(offset - 1)
+            |> Stream.take(limit)
+            |> Enum.to_list()
+
+          if lines == [] do
+            {:ok, ""}
+          else
+            {:ok, format_lines(lines)}
+          end
+        else
+          {:error, "File does not exist or is not a readable file: #{path}"}
+        end
     end
   end
 
