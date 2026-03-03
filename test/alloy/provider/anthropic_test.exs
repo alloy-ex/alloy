@@ -134,6 +134,49 @@ defmodule Alloy.Provider.AnthropicTest do
       assert tool["input_schema"]["type"] == "object"
     end
 
+    test "includes allowed_callers in tool definition when present" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{
+          name: "list_agents",
+          description: "List agents",
+          input_schema: %{type: "object", properties: %{}},
+          allowed_callers: [:human, :code_execution]
+        }
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [tool] = decoded["tools"]
+      assert tool["name"] == "list_agents"
+      assert tool["allowed_callers"] == ["human", "code_execution"]
+    end
+
+    test "omits allowed_callers from tool definition when not present" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{
+          name: "basic",
+          description: "A basic tool",
+          input_schema: %{type: "object", properties: %{}}
+        }
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [tool] = decoded["tools"]
+      assert tool["name"] == "basic"
+      refute Map.has_key?(tool, "allowed_callers")
+    end
+
     test "formats tool_result messages correctly" do
       config = config_that_captures_request()
 
@@ -158,6 +201,111 @@ defmodule Alloy.Provider.AnthropicTest do
       assert tool_result_msg["role"] == "user"
       assert is_list(tool_result_msg["content"])
       assert hd(tool_result_msg["content"])["type"] == "tool_result"
+    end
+  end
+
+  describe "code_execution support" do
+    test "includes code_execution tool in request when code_execution is configured" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:code_execution, true)
+
+      tool_defs = [
+        %{name: "read", description: "Read a file", input_schema: %{type: "object", properties: %{}}}
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      tools = decoded["tools"]
+      assert length(tools) == 2
+
+      code_exec_tool = Enum.find(tools, &(&1["type"] == "code_execution_20250522"))
+      assert code_exec_tool != nil
+      assert code_exec_tool["name"] == "code_execution"
+    end
+
+    test "does not include code_execution tool when code_execution is false" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{name: "read", description: "Read a file", input_schema: %{type: "object", properties: %{}}}
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      tools = decoded["tools"]
+      assert length(tools) == 1
+      refute Enum.any?(tools, &(&1["type"] == "code_execution_20250522"))
+    end
+
+    test "parses server_tool_use response blocks" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "msg_ce_01",
+              "type" => "message",
+              "role" => "assistant",
+              "content" => [
+                %{
+                  "type" => "server_tool_use",
+                  "id" => "srvtoolu_01",
+                  "name" => "read",
+                  "input" => %{"file_path" => "mix.exs"}
+                }
+              ],
+              "stop_reason" => "tool_use",
+              "usage" => %{"input_tokens" => 20, "output_tokens" => 15}
+            })
+        })
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Read mix.exs")], [], config)
+      assert result.stop_reason == :tool_use
+      assert [%Message{role: :assistant, content: blocks}] = result.messages
+
+      server_call = Enum.find(blocks, &(&1.type == "server_tool_use"))
+      assert server_call != nil
+      assert server_call.id == "srvtoolu_01"
+      assert server_call.name == "read"
+      assert server_call.input == %{"file_path" => "mix.exs"}
+    end
+
+    test "formats server_tool_result blocks for round-trip" do
+      config = config_that_captures_request()
+
+      messages = [
+        Message.user("Read mix.exs"),
+        Message.assistant_blocks([
+          %{type: "server_tool_use", id: "srvtoolu_01", name: "read", input: %{"file_path" => "mix.exs"}}
+        ]),
+        Message.tool_results([
+          %{type: "server_tool_result", tool_use_id: "srvtoolu_01", content: "file contents here"}
+        ])
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      # server_tool_use should be preserved in assistant message
+      assistant_msg = Enum.find(decoded["messages"], &(&1["role"] == "assistant"))
+      server_block = hd(assistant_msg["content"])
+      assert server_block["type"] == "server_tool_use"
+      assert server_block["id"] == "srvtoolu_01"
+
+      # server_tool_result should be preserved in user message
+      result_msg = List.last(decoded["messages"])
+      result_block = hd(result_msg["content"])
+      assert result_block["type"] == "server_tool_result"
+      assert result_block["tool_use_id"] == "srvtoolu_01"
     end
   end
 

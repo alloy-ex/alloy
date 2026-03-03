@@ -288,6 +288,8 @@ defmodule Alloy.Provider.Anthropic do
         defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
       end
 
+    body = maybe_add_code_execution(body, config)
+
     case Map.get(config, :extended_thinking) do
       nil ->
         body
@@ -305,6 +307,20 @@ defmodule Alloy.Provider.Anthropic do
       _opts ->
         # Non-list value (e.g., extended_thinking: true) — silently ignore
         body
+    end
+  end
+
+  defp maybe_add_code_execution(body, config) do
+    if Map.get(config, :code_execution, false) do
+      code_exec_tool = %{
+        "type" => "code_execution_20250522",
+        "name" => "code_execution"
+      }
+
+      existing_tools = Map.get(body, "tools", [])
+      Map.put(body, "tools", existing_tools ++ [code_exec_tool])
+    else
+      body
     end
   end
 
@@ -331,6 +347,19 @@ defmodule Alloy.Provider.Anthropic do
 
   defp format_content_block(%{type: "tool_result", tool_use_id: id, content: content} = block) do
     result = %{"type" => "tool_result", "tool_use_id" => id, "content" => content}
+    if Map.get(block, :is_error), do: Map.put(result, "is_error", true), else: result
+  end
+
+  defp format_content_block(%{type: "server_tool_use", id: id, name: name, input: input}) do
+    %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input}
+  end
+
+  defp format_content_block(%{
+         type: "server_tool_result",
+         tool_use_id: id,
+         content: content
+       } = block) do
+    result = %{"type" => "server_tool_result", "tool_use_id" => id, "content" => content}
     if Map.get(block, :is_error), do: Map.put(result, "is_error", true), else: result
   end
 
@@ -366,12 +395,17 @@ defmodule Alloy.Provider.Anthropic do
     Map.new(block, fn {k, v} -> {to_string(k), v} end)
   end
 
-  defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do
-    %{
+  defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do
+    base = %{
       "name" => name,
       "description" => desc,
       "input_schema" => Alloy.Provider.stringify_keys(schema)
     }
+
+    case Map.get(def_map, :allowed_callers) do
+      nil -> base
+      callers -> Map.put(base, "allowed_callers", Enum.map(callers, &to_string/1))
+    end
   end
 
   # --- Response Parsing ---
@@ -427,6 +461,15 @@ defmodule Alloy.Provider.Anthropic do
 
   defp parse_content_block(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
     %{type: "tool_use", id: id, name: name, input: input}
+  end
+
+  defp parse_content_block(%{
+         "type" => "server_tool_use",
+         "id" => id,
+         "name" => name,
+         "input" => input
+       }) do
+    %{type: "server_tool_use", id: id, name: name, input: input}
   end
 
   defp parse_content_block(block) do

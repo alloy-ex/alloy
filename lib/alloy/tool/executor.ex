@@ -148,27 +148,31 @@ defmodule Alloy.Tool.Executor do
     tool_name = call[:name]
     tool_use_id = call[:id]
     input = call[:input] || %{}
+    result_block_fn = result_block_fn(call[:type])
 
-    {result, error} =
+    {result, error, structured_data} =
       case Map.fetch(tool_fns, tool_name) do
         {:ok, module} ->
           try do
             case module.execute(input, context) do
+              {:ok, text, data} when is_map(data) ->
+                {result_block_fn.(tool_use_id, text, false), nil, data}
+
               {:ok, result} ->
-                {Message.tool_result_block(tool_use_id, result), nil}
+                {result_block_fn.(tool_use_id, result, false), nil, nil}
 
               {:error, reason} ->
-                {Message.tool_result_block(tool_use_id, reason, true), reason}
+                {result_block_fn.(tool_use_id, reason, true), reason, nil}
             end
           rescue
             e ->
               error = "Tool crashed: #{Exception.message(e)}"
-              {Message.tool_result_block(tool_use_id, error, true), error}
+              {result_block_fn.(tool_use_id, error, true), error, nil}
           end
 
         :error ->
           error = "Unknown tool: #{tool_name}"
-          {error_result(tool_use_id, error), error}
+          {result_block_fn.(tool_use_id, error, true), error, nil}
       end
 
     duration_ms = elapsed_ms(started_at)
@@ -185,11 +189,13 @@ defmodule Alloy.Tool.Executor do
       )
 
     meta =
-      Map.merge(base_meta, %{
+      base_meta
+      |> Map.merge(%{
         correlation_id: event_correlation_id,
         start_event_seq: start_event_seq,
         end_event_seq: end_event_seq
       })
+      |> maybe_put_structured_data(structured_data)
 
     {result, meta}
   end
@@ -221,7 +227,7 @@ defmodule Alloy.Tool.Executor do
         end_event_seq: end_event_seq
       })
 
-    {error_result(call[:id], error), meta}
+    {result_block_fn(call[:type]).(call[:id], error, true), meta}
   end
 
   defp crashed_result(call, reason, on_event, event_seq_ref, event_correlation_id, event_turn) do
@@ -245,7 +251,7 @@ defmodule Alloy.Tool.Executor do
         end_event_seq: end_event_seq
       })
 
-    {error_result(call[:id], error), meta}
+    {result_block_fn(call[:type]).(call[:id], error, true), meta}
   end
 
   defp call_from_tag({:execute, call}), do: call
@@ -329,9 +335,11 @@ defmodule Alloy.Tool.Executor do
     max(elapsed, 0)
   end
 
-  defp error_result(tool_use_id, message) do
-    Message.tool_result_block(tool_use_id, message, true)
-  end
+  defp result_block_fn("server_tool_use"), do: &Message.server_tool_result_block/3
+  defp result_block_fn(_), do: &Message.tool_result_block/3
+
+  defp maybe_put_structured_data(meta, nil), do: meta
+  defp maybe_put_structured_data(meta, data), do: Map.put(meta, :structured_data, data)
 
   defp build_context(%State{} = state) do
     Map.merge(state.config.context, %{
