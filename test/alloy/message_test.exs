@@ -57,11 +57,17 @@ defmodule Alloy.MessageTest do
 
   describe "tool_calls/1 with server_tool_use" do
     test "tool_calls returns both tool_use and server_tool_use blocks" do
-      msg = Message.assistant_blocks([
-        %{type: "text", text: "Running code..."},
-        %{type: "tool_use", id: "toolu_01", name: "read", input: %{}},
-        %{type: "server_tool_use", id: "srvtoolu_01", name: "write", input: %{"path" => "a.txt"}}
-      ])
+      msg =
+        Message.assistant_blocks([
+          %{type: "text", text: "Running code..."},
+          %{type: "tool_use", id: "toolu_01", name: "read", input: %{}},
+          %{
+            type: "server_tool_use",
+            id: "srvtoolu_01",
+            name: "write",
+            input: %{"path" => "a.txt"}
+          }
+        ])
 
       calls = Message.tool_calls(msg)
       assert length(calls) == 2
@@ -70,9 +76,10 @@ defmodule Alloy.MessageTest do
     end
 
     test "tool_calls returns only server_tool_use when no regular tool_use" do
-      msg = Message.assistant_blocks([
-        %{type: "server_tool_use", id: "srvtoolu_01", name: "read", input: %{}}
-      ])
+      msg =
+        Message.assistant_blocks([
+          %{type: "server_tool_use", id: "srvtoolu_01", name: "read", input: %{}}
+        ])
 
       calls = Message.tool_calls(msg)
       assert length(calls) == 1

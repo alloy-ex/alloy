@@ -364,7 +364,10 @@ defmodule Alloy.Tool.ExecutorTest do
       structured_meta = Enum.find(metas, &(&1.id == "c_structured"))
 
       refute Map.has_key?(plain_meta, :structured_data)
-      assert structured_meta.structured_data == %{agents: [%{name: "atlas"}, %{name: "researcher"}]}
+
+      assert structured_meta.structured_data == %{
+               agents: [%{name: "atlas"}, %{name: "researcher"}]
+             }
     end
   end
 

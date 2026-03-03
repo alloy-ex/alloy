@@ -211,7 +211,11 @@ defmodule Alloy.Provider.AnthropicTest do
         |> Map.put(:code_execution, true)
 
       tool_defs = [
-        %{name: "read", description: "Read a file", input_schema: %{type: "object", properties: %{}}}
+        %{
+          name: "read",
+          description: "Read a file",
+          input_schema: %{type: "object", properties: %{}}
+        }
       ]
 
       Anthropic.complete([Message.user("Hi")], tool_defs, config)
@@ -231,7 +235,11 @@ defmodule Alloy.Provider.AnthropicTest do
       config = config_that_captures_request()
 
       tool_defs = [
-        %{name: "read", description: "Read a file", input_schema: %{type: "object", properties: %{}}}
+        %{
+          name: "read",
+          description: "Read a file",
+          input_schema: %{type: "object", properties: %{}}
+        }
       ]
 
       Anthropic.complete([Message.user("Hi")], tool_defs, config)
@@ -283,7 +291,12 @@ defmodule Alloy.Provider.AnthropicTest do
       messages = [
         Message.user("Read mix.exs"),
         Message.assistant_blocks([
-          %{type: "server_tool_use", id: "srvtoolu_01", name: "read", input: %{"file_path" => "mix.exs"}}
+          %{
+            type: "server_tool_use",
+            id: "srvtoolu_01",
+            name: "read",
+            input: %{"file_path" => "mix.exs"}
+          }
         ]),
         Message.tool_results([
           %{type: "server_tool_result", tool_use_id: "srvtoolu_01", content: "file contents here"}

@@ -354,11 +354,13 @@ defmodule Alloy.Provider.Anthropic do
     %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input}
   end
 
-  defp format_content_block(%{
-         type: "server_tool_result",
-         tool_use_id: id,
-         content: content
-       } = block) do
+  defp format_content_block(
+         %{
+           type: "server_tool_result",
+           tool_use_id: id,
+           content: content
+         } = block
+       ) do
     result = %{"type" => "server_tool_result", "tool_use_id" => id, "content" => content}
     if Map.get(block, :is_error), do: Map.put(result, "is_error", true), else: result
   end
