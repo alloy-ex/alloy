@@ -65,17 +65,15 @@ defmodule Alloy.Context.Compactor do
          %State{config: %{on_compaction: callback}} = state
        )
        when is_function(callback, 2) do
-    try do
-      callback.(middle, state)
-    rescue
-      e ->
-        Logger.warning("on_compaction callback crashed: #{Exception.message(e)}")
-        :ok
-    catch
-      kind, payload ->
-        Logger.warning("on_compaction callback error (#{kind}): #{inspect(payload)}")
-        :ok
-    end
+    callback.(middle, state)
+  rescue
+    e ->
+      Logger.warning("on_compaction callback crashed: #{Exception.message(e)}")
+      :ok
+  catch
+    kind, payload ->
+      Logger.warning("on_compaction callback error (#{kind}): #{inspect(payload)}")
+      :ok
   end
 
   defp fire_on_compaction(_, _), do: :ok
