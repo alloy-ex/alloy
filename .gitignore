@@ -30,8 +30,9 @@ alloy-*.tar
 
 priv/plts/
 
-# Local demo scripts and video project.
-/scripts/
+# Local demo scripts and video project (except ci-check).
+/scripts/*
+!/scripts/ci-check
 /video/
 
 # macOS cruft.

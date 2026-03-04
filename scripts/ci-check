@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Mirrors .github/workflows/ci.yml exactly.
+# Install as a git hook:  ln -sf ../../scripts/ci-check .git/hooks/pre-push
+set -e
+
+echo "Running CI checks locally..."
+
+echo "  ▸ mix compile --warnings-as-errors"
+mix compile --warnings-as-errors
+
+echo "  ▸ mix test"
+mix test
+
+echo "  ▸ mix format --check-formatted"
+mix format --check-formatted
+
+echo "  ▸ mix credo --strict"
+mix credo --strict
+
+echo "  ▸ mix dialyzer"
+mix dialyzer
+
+echo "All CI checks passed ✓"
