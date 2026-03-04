@@ -66,6 +66,7 @@ defmodule Alloy.MixProject do
           Alloy.Agent.State,
           Alloy.Agent.Turn,
           Alloy.Message,
+          Alloy.Result,
           Alloy.Session,
           Alloy.Usage
         ],
