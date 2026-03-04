@@ -11,6 +11,8 @@ defmodule Alloy.Provider.SSE do
   on the parsed events returned here.
   """
 
+  require Logger
+
   @type sse_event :: %{event: String.t() | nil, data: String.t()}
 
   @doc """
@@ -67,7 +69,12 @@ defmodule Alloy.Provider.SSE do
           try do
             handle_event.(acc, event)
           rescue
-            _ -> acc
+            e ->
+              Logger.warning(
+                "SSE event handler crashed: #{Exception.message(e)}\n#{Exception.format_stacktrace(__STACKTRACE__)}"
+              )
+
+              acc
           end
         end)
 

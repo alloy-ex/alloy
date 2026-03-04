@@ -41,17 +41,9 @@ defmodule Alloy.Agent.Server do
   require Logger
 
   alias Alloy.Agent.{Config, State, Turn}
-  alias Alloy.{Message, Middleware, Session, Usage}
+  alias Alloy.{Message, Middleware, Result, Session, Usage}
 
-  @type result :: %{
-          text: String.t() | nil,
-          messages: [Message.t()],
-          usage: Usage.t(),
-          tool_calls: [map()],
-          status: State.status(),
-          turns: non_neg_integer(),
-          error: term() | nil
-        }
+  @type result :: Result.t()
 
   # ── Client API ────────────────────────────────────────────────────────────
 
@@ -297,9 +289,15 @@ defmodule Alloy.Agent.Server do
       try do
         state.config.on_shutdown.(session)
       rescue
-        _ -> :ok
+        e ->
+          Logger.warning(
+            "[Alloy] on_shutdown callback raised: #{inspect(e)}\n#{Exception.format_stacktrace(__STACKTRACE__)}"
+          )
       catch
-        _, _ -> :ok
+        kind, reason ->
+          Logger.warning(
+            "[Alloy] on_shutdown callback threw #{inspect(kind)}: #{inspect(reason)}"
+          )
       end
     end
 
@@ -382,7 +380,10 @@ defmodule Alloy.Agent.Server do
 
   @impl GenServer
   def handle_call(:reset, _from, state) do
-    new_state = %{state | messages: [], messages_new: []} |> reset_for_new_run()
+    new_state =
+      %{state | messages: [], messages_new: [], pending_requests: :queue.new()}
+      |> reset_for_new_run()
+
     {:reply, :ok, new_state}
   end
 
@@ -419,7 +420,7 @@ defmodule Alloy.Agent.Server do
        usage: state.usage,
        uptime_ms: System.monotonic_time(:millisecond) - (state.started_at || 0),
        busy: state.current_task != nil,
-       pending_count: length(state.pending_requests),
+       pending_count: :queue.len(state.pending_requests),
        max_pending: state.config.max_pending
      }, state}
   end
@@ -436,7 +437,7 @@ defmodule Alloy.Agent.Server do
       state.current_task == nil ->
         {:reply, {:ok, request_id}, start_async_turn(state, message, request_id)}
 
-      length(state.pending_requests) < state.config.max_pending ->
+      :queue.len(state.pending_requests) < state.config.max_pending ->
         {:reply, {:ok, request_id}, enqueue_pending_request(state, message, request_id)}
 
       state.config.max_pending == 0 ->
@@ -494,26 +495,8 @@ defmodule Alloy.Agent.Server do
 
   @impl GenServer
   def handle_info({:agent_event, message}, state) when is_binary(message) do
-    state =
-      state
-      |> State.append_messages([Message.user(message)])
-      |> reset_for_new_run()
-      |> set_running()
-
-    final_state = Turn.run_loop(state)
-
-    # Broadcast result if pubsub is configured.
-    # Use effective_session_id/1 so the topic matches what export_session/1
-    # returns as the session ID — a :session_start middleware that injects
-    # context[:session_id] would otherwise cause the broadcast topic to
-    # diverge from the exported session ID, dropping messages for subscribers
-    # that subscribe using the session ID.
-    if state.config.pubsub do
-      topic = "agent:#{effective_session_id(final_state)}:responses"
-      broadcast(state.config.pubsub, topic, {:agent_response, build_result(final_state)})
-    end
-
-    {:noreply, final_state}
+    request_id = generate_request_id()
+    {:noreply, start_async_turn(state, message, request_id)}
   end
 
   # Task completed successfully — broadcast result and free the agent.
@@ -526,7 +509,7 @@ defmodule Alloy.Agent.Server do
 
     if final_state.config.pubsub do
       topic = "agent:#{effective_session_id(final_state)}:responses"
-      result = final_state |> build_result() |> Map.put(:request_id, request_id)
+      result = %{build_result(final_state) | request_id: request_id}
       broadcast(final_state.config.pubsub, topic, {:agent_response, result})
     end
 
@@ -592,7 +575,8 @@ defmodule Alloy.Agent.Server do
   end
 
   @impl GenServer
-  def handle_info(_msg, state) do
+  def handle_info(msg, state) do
+    Logger.debug("[Alloy] Unexpected message: #{inspect(msg)}")
     {:noreply, state}
   end
 
@@ -656,35 +640,29 @@ defmodule Alloy.Agent.Server do
 
   defp enqueue_pending_request(%State{} = state, message, request_id)
        when is_binary(message) and is_binary(request_id) do
-    %{state | pending_requests: state.pending_requests ++ [{message, request_id}]}
+    %{state | pending_requests: :queue.in({message, request_id}, state.pending_requests)}
   end
 
-  defp maybe_start_next_pending(%State{current_task: nil, pending_requests: []} = state),
-    do: state
+  defp maybe_start_next_pending(%State{current_task: nil} = state) do
+    case :queue.out(state.pending_requests) do
+      {:empty, _} ->
+        state
 
-  defp maybe_start_next_pending(%State{pending_requests: [{message, request_id} | rest]} = state) do
-    state
-    |> Map.put(:pending_requests, rest)
-    |> start_async_turn(message, request_id)
-  end
-
-  defp remove_pending_request(%State{} = state, request_id) when is_binary(request_id) do
-    {removed?, pending_requests} = pop_pending_request(state.pending_requests, request_id, [])
-
-    if removed? do
-      {:ok, %{state | pending_requests: pending_requests}}
-    else
-      :not_found
+      {{:value, {message, request_id}}, rest} ->
+        state
+        |> Map.put(:pending_requests, rest)
+        |> start_async_turn(message, request_id)
     end
   end
 
-  defp pop_pending_request([], _request_id, acc), do: {false, Enum.reverse(acc)}
+  defp remove_pending_request(%State{} = state, request_id) when is_binary(request_id) do
+    items = :queue.to_list(state.pending_requests)
 
-  defp pop_pending_request([{_message, request_id} | rest], request_id, acc),
-    do: {true, Enum.reverse(acc) ++ rest}
-
-  defp pop_pending_request([entry | rest], request_id, acc),
-    do: pop_pending_request(rest, request_id, [entry | acc])
+    case Enum.reject(items, fn {_msg, rid} -> rid == request_id end) do
+      ^items -> :not_found
+      filtered -> {:ok, %{state | pending_requests: :queue.from_list(filtered)}}
+    end
+  end
 
   defp broadcast_cancelled(%State{config: %{pubsub: nil}}, _request_id, _phase), do: :ok
 
@@ -709,7 +687,7 @@ defmodule Alloy.Agent.Server do
   end
 
   defp build_result(%State{} = state) do
-    %{
+    %Result{
       text: State.last_assistant_text(state),
       messages: State.messages(state),
       usage: state.usage,

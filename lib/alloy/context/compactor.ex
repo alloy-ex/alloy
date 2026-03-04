@@ -101,8 +101,14 @@ defmodule Alloy.Context.Compactor do
   defp compact_message(%Message{content: blocks} = msg) when is_list(blocks) do
     compacted_blocks =
       Enum.map(blocks, fn
-        %{type: "tool_result"} = block -> %{block | content: "[compacted]"}
-        block -> block
+        %{type: "tool_result"} = block ->
+          %{block | content: "[compacted]"}
+
+        %{type: "thinking", thinking: text} = block when byte_size(text) > @truncate_length ->
+          %{block | thinking: String.slice(text, 0, @truncate_length) <> "..."}
+
+        block ->
+          block
       end)
 
     %{msg | content: compacted_blocks}

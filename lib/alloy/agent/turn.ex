@@ -130,7 +130,7 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp handle_tool_use(%State{} = state, new_msgs, opts, deadline) do
-    case Middleware.run(:after_completion, state) do
+    case Middleware.run(:after_tool_request, state) do
       {:halted, reason} ->
         %{state | status: :halted, error: "Halted by middleware: #{reason}"}
 

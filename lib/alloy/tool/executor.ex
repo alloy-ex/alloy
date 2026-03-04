@@ -11,6 +11,8 @@ defmodule Alloy.Tool.Executor do
   alias Alloy.Message
   alias Alloy.Middleware
 
+  require Logger
+
   @spec execute_all([map()], %{String.t() => module()}, State.t()) ::
           Message.t() | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state) do
@@ -95,7 +97,13 @@ defmodule Alloy.Tool.Executor do
             end
           rescue
             e ->
+              stacktrace = __STACKTRACE__
               err = "Tool crashed: #{Exception.message(e)}"
+
+              Logger.warning(
+                "Tool #{call[:name]} crashed: #{Exception.message(e)}\n#{Exception.format_stacktrace(stacktrace)}"
+              )
+
               {block_fn.(call[:id], err, true), err, nil}
           end
 

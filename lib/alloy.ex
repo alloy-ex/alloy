@@ -44,17 +44,9 @@ defmodule Alloy do
   """
 
   alias Alloy.Agent.{Config, Server, State, Turn}
-  alias Alloy.Message
+  alias Alloy.{Message, Result}
 
-  @type result :: %{
-          text: String.t() | nil,
-          messages: [Message.t()],
-          usage: Alloy.Usage.t(),
-          tool_calls: [map()],
-          status: State.status(),
-          turns: non_neg_integer(),
-          error: term() | nil
-        }
+  @type result :: Result.t()
 
   @doc """
   Send a message to a running agent without blocking the caller.
@@ -91,7 +83,7 @@ defmodule Alloy do
     try do
       final_state = Turn.run_loop(state)
 
-      result = %{
+      result = %Result{
         text: State.last_assistant_text(final_state),
         messages: State.messages(final_state),
         usage: final_state.usage,

@@ -4,7 +4,8 @@ defmodule Alloy.Middleware do
 
   Middleware runs at defined hook points:
   - `:before_completion` - Before calling the provider
-  - `:after_completion` - After provider response, before tool execution
+  - `:after_completion` - After provider response with :end_turn (final state)
+  - `:after_tool_request` - After provider response with :tool_use (gates tool execution)
   - `:after_tool_execution` - After tools have been executed
   - `:on_error` - When an error occurs
 
@@ -17,6 +18,7 @@ defmodule Alloy.Middleware do
   @type hook ::
           :before_completion
           | :after_completion
+          | :after_tool_request
           | :after_tool_execution
           | :on_error
           | :before_tool_call
