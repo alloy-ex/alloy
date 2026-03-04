@@ -115,6 +115,8 @@ defmodule Alloy.Testing do
   Returns `nil` if there are no assistant messages.
   """
   @spec last_text(State.t() | map()) :: String.t() | nil
+  def last_text(%State{} = state), do: State.last_assistant_text(state)
+
   def last_text(%{messages: messages}) do
     messages
     |> Enum.reverse()

@@ -9,17 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Alloy.Result` struct** — typed, `Access`-compatible return value from `Alloy.run/2` and `Server.chat/3`. Single source of truth for the 8-field result contract. Implements `Access` behaviour for bracket-syntax backwards compatibility (`result[:text]`).
 - **Anthropic code execution support** — configure `code_execution: true` to enable Anthropic's server-side Python sandbox. Alloy handles `server_tool_use` / `server_tool_result` round-trips across Message, Executor, and Anthropic provider layers. The `code_execution_20250522` tool type is appended to the request body when enabled.
 - **Optional tool callbacks** — `Alloy.Tool` behaviour gains `allowed_callers/0` and `result_type/0` as `@optional_callbacks`. Tools that don't implement them compile and work as before. Registry uses `function_exported?/3` to conditionally include metadata in tool definitions.
 - **Structured tool results** — tools can return `{:ok, text, data}` 3-tuples. Text goes into the result block (what the model sees), structured data goes into `meta.structured_data` for programmatic consumption (e.g., by a code execution sandbox).
 - **`allowed_callers` forwarding** — Anthropic provider includes `allowed_callers` in the tool definition sent to the API when present, enabling tools to declare whether they can be invoked from a code execution sandbox.
+- **`server_tool_use`/`server_tool_result` token counting** — `TokenCounter` now estimates tokens for server tool blocks, preventing compaction from underestimating context size when code execution is in use.
+- **Thinking block truncation in compactor** — thinking blocks exceeding the truncation length are sliced during compaction, reducing context size for extended thinking conversations.
+- **`Testing.last_text/1` accepts `%State{}`** — delegates to `State.last_assistant_text/1` when given a `%State{}` struct, avoiding redundant reverse-search logic.
 
 ### Changed
 
+- **`pending_requests` migrated to `:queue`** — `State.pending_requests` changed from a plain list to an Erlang `:queue` for O(1) enqueue/dequeue. All Server functions (`enqueue_pending_request`, `maybe_start_next_pending`, `remove_pending_request`, `health`) updated accordingly.
+- **`agent_event` handler now async** — `handle_info({:agent_event, message})` now dispatches via `start_async_turn/3` (supervised Task) instead of running the Turn synchronously in the GenServer process. Prevents blocking the GenServer mailbox during long-running turns.
+- **`handle_info` catchall logs unexpected messages** — the catch-all `handle_info/2` now logs via `Logger.debug/1` instead of silently discarding unknown messages.
+- **`on_shutdown` crash logging** — `terminate/2` now logs `Logger.warning` with the exception and stacktrace when `on_shutdown` callbacks crash, instead of silently swallowing.
+- **`:after_tool_request` middleware hook** — renamed from `:after_completion` in the tool-use code path. `:after_completion` now fires only on `:end_turn` (final response). `:after_tool_request` gates tool execution.
+- **`within_budget?/3` accepts configurable ratio** — third parameter (default `0.9`) replaces the hardcoded 90% budget threshold.
+- **SSE parser crash logging** — `SSE.parse_stream` now logs `Logger.warning` with exception message and stacktrace when an event handler crashes, instead of silently recovering.
+- **Executor crash logging** — `Executor.run_tagged` now captures `__STACKTRACE__` and logs `Logger.warning` with tool name and stacktrace when a tool crashes.
 - **Compactor refactor** — extracted `split_messages/2` to DRY message splitting between `compact/2` and `fire_on_compaction`. The `on_compaction` callback now receives the middle slice directly instead of the full message list + keep_recent count.
 - **Executor result dispatch** — `result_block_fn/1` dispatches to `Message.tool_result_block/3` or `Message.server_tool_result_block/3` based on call type, so timeout and crash results also respect the call type.
 - **`Message.tool_calls/1`** — now matches both `"tool_use"` and `"server_tool_use"` block types.
 - **`Alloy.Tool.execute/2` return type** — widened to `{:ok, String.t()} | {:ok, String.t(), map()} | {:error, String.t()}`.
+
+### Breaking
+
+- **Middleware hook `:after_completion` no longer fires on tool-use responses** — use `:after_tool_request` for middleware that should gate tool execution. `:after_completion` now only fires on `:end_turn` (the model's final response).
 
 ## [0.6.0] - 2026-03-02
 

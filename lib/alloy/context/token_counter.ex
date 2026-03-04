@@ -29,6 +29,7 @@ defmodule Alloy.Context.TokenCounter do
   }
 
   @default_limit 200_000
+  @default_budget_ratio 0.9
 
   @doc """
   Estimates tokens for a string or a list of messages.
@@ -69,8 +70,14 @@ defmodule Alloy.Context.TokenCounter do
 
   defp estimate_block_tokens(%{type: "tool_use", name: name, input: input}) do
     name_tokens = estimate_tokens(to_string(name))
-    input_tokens = estimate_tokens(Jason.encode!(input))
-    name_tokens + input_tokens
+
+    input_str =
+      case Jason.encode(input) do
+        {:ok, json} -> json
+        {:error, _} -> inspect(input)
+      end
+
+    name_tokens + estimate_tokens(input_str)
   end
 
   defp estimate_block_tokens(%{type: "tool_result", content: content}) when is_binary(content) do
@@ -79,6 +86,23 @@ defmodule Alloy.Context.TokenCounter do
 
   defp estimate_block_tokens(%{type: "thinking", thinking: text}) when is_binary(text) do
     estimate_tokens(text)
+  end
+
+  defp estimate_block_tokens(%{type: "server_tool_use", name: name, input: input}) do
+    name_tokens = estimate_tokens(to_string(name))
+
+    input_str =
+      case Jason.encode(input) do
+        {:ok, json} -> json
+        {:error, _} -> inspect(input)
+      end
+
+    name_tokens + estimate_tokens(input_str)
+  end
+
+  defp estimate_block_tokens(%{type: "server_tool_result", content: content})
+       when is_binary(content) do
+    estimate_tokens(content)
   end
 
   defp estimate_block_tokens(%{type: "image"}), do: @image_tokens
@@ -99,10 +123,10 @@ defmodule Alloy.Context.TokenCounter do
 
   @doc """
   Returns true if the estimated token count of messages is within
-  90% of the max_tokens budget.
+  the given ratio of the max_tokens budget (default #{@default_budget_ratio}).
   """
-  @spec within_budget?([Message.t()], pos_integer()) :: boolean()
-  def within_budget?(messages, max_tokens) do
-    estimate_tokens(messages) < max_tokens * 0.9
+  @spec within_budget?([Message.t()], pos_integer(), float()) :: boolean()
+  def within_budget?(messages, max_tokens, ratio \\ @default_budget_ratio) do
+    estimate_tokens(messages) < max_tokens * ratio
   end
 end

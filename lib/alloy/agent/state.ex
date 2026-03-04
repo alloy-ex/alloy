@@ -14,6 +14,7 @@ defmodule Alloy.Agent.State do
   @type t :: %__MODULE__{
           config: Config.t(),
           messages: [Message.t()],
+          messages_new: [Message.t()],
           turn: non_neg_integer(),
           usage: Usage.t(),
           status: status(),
@@ -24,7 +25,7 @@ defmodule Alloy.Agent.State do
           started_at: integer() | nil,
           agent_id: String.t(),
           current_task: {reference(), pid(), binary()} | nil,
-          pending_requests: [{String.t(), binary()}]
+          pending_requests: :queue.queue({String.t(), binary()})
         }
 
   @enforce_keys [:config]
@@ -42,7 +43,7 @@ defmodule Alloy.Agent.State do
     started_at: nil,
     agent_id: "",
     current_task: nil,
-    pending_requests: []
+    pending_requests: :queue.new()
   ]
 
   @doc """
