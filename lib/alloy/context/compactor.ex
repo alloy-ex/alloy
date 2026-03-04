@@ -31,47 +31,52 @@ defmodule Alloy.Context.Compactor do
       msg_count = length(messages)
       keep_recent = min(@default_keep_recent, max(1, msg_count - 2))
 
+      {first, middle, recent} = split_messages(messages, keep_recent)
+
       # Fire on_compaction callback BEFORE compacting, so the caller can
       # extract facts from messages that are about to be compressed.
       # Crash protection: callback failure must never prevent compaction.
-      fire_on_compaction(messages, keep_recent, state)
+      fire_on_compaction(middle, state)
 
-      compacted = compact_messages(messages, keep_recent: keep_recent)
+      compacted_middle = Enum.map(middle, &compact_message/1)
+      compacted = [first | compacted_middle] ++ recent
+
       # Store compacted messages and clear the accumulator
       %{state | messages: compacted, messages_new: []}
     end
   end
 
+  # Splits messages into {first, middle, recent} for compaction.
+  # The middle slice is what gets compacted; first and recent are preserved.
+  defp split_messages(messages, keep_recent) do
+    [first | rest] = messages
+    rest_len = length(rest)
+    recent_count = min(keep_recent, rest_len)
+    {middle, recent} = Enum.split(rest, rest_len - recent_count)
+    {first, middle, recent}
+  end
+
   # Fires the on_compaction callback with the middle messages (those about to be
-  # compacted). Extracts the same middle slice that compact_messages/2 will process.
-  # Any crash in the callback is swallowed — compaction must always proceed.
-  defp fire_on_compaction(_messages, _keep_recent, %State{config: %{on_compaction: nil}}), do: :ok
+  # compacted). Any crash in the callback is swallowed — compaction must always proceed.
+  defp fire_on_compaction(_middle, %State{config: %{on_compaction: nil}}), do: :ok
 
   defp fire_on_compaction(
-         messages,
-         keep_recent,
+         middle,
          %State{config: %{on_compaction: callback}} = state
        )
        when is_function(callback, 2) do
-    [_first | rest] = messages
-    rest_len = length(rest)
-    recent_count = min(keep_recent, rest_len)
-    {middle, _recent} = Enum.split(rest, rest_len - recent_count)
-
-    try do
-      callback.(middle, state)
-    rescue
-      e ->
-        Logger.warning("on_compaction callback crashed: #{Exception.message(e)}")
-        :ok
-    catch
-      kind, payload ->
-        Logger.warning("on_compaction callback error (#{kind}): #{inspect(payload)}")
-        :ok
-    end
+    callback.(middle, state)
+  rescue
+    e ->
+      Logger.warning("on_compaction callback crashed: #{Exception.message(e)}")
+      :ok
+  catch
+    kind, payload ->
+      Logger.warning("on_compaction callback error (#{kind}): #{inspect(payload)}")
+      :ok
   end
 
-  defp fire_on_compaction(_, _, _), do: :ok
+  defp fire_on_compaction(_, _), do: :ok
 
   @doc """
   Compacts messages, preserving the first message and the most recent N messages.
@@ -87,13 +92,8 @@ defmodule Alloy.Context.Compactor do
     if count <= keep_recent + 1 do
       messages
     else
-      # Split: first message | middle (to compact) | recent (to keep)
-      [first | rest] = messages
-      recent_count = min(keep_recent, length(rest))
-      {middle, recent} = Enum.split(rest, length(rest) - recent_count)
-
+      {first, middle, recent} = split_messages(messages, keep_recent)
       compacted_middle = Enum.map(middle, &compact_message/1)
-
       [first | compacted_middle] ++ recent
     end
   end

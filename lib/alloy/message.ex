@@ -84,7 +84,7 @@ defmodule Alloy.Message do
   """
   @spec tool_calls(t()) :: [content_block()]
   def tool_calls(%__MODULE__{content: blocks}) when is_list(blocks) do
-    Enum.filter(blocks, &(is_map(&1) && &1[:type] == "tool_use"))
+    Enum.filter(blocks, &(is_map(&1) && &1[:type] in ["tool_use", "server_tool_use"]))
   end
 
   def tool_calls(%__MODULE__{}), do: []
@@ -95,6 +95,15 @@ defmodule Alloy.Message do
   @spec tool_result_block(String.t(), String.t(), boolean()) :: content_block()
   def tool_result_block(tool_use_id, content, is_error \\ false) do
     result = %{type: "tool_result", tool_use_id: tool_use_id, content: content}
+    if is_error, do: Map.put(result, :is_error, true), else: result
+  end
+
+  @doc """
+  Builds a server_tool_result content block (for code_execution server tool calls).
+  """
+  @spec server_tool_result_block(String.t(), String.t(), boolean()) :: content_block()
+  def server_tool_result_block(tool_use_id, content, is_error \\ false) do
+    result = %{type: "server_tool_result", tool_use_id: tool_use_id, content: content}
     if is_error, do: Map.put(result, :is_error, true), else: result
   end
 

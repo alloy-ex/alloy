@@ -23,6 +23,8 @@ defmodule Alloy.Tool.Registry do
           description: mod.description(),
           input_schema: mod.input_schema()
         }
+        |> maybe_put_optional(mod, :allowed_callers, 0)
+        |> maybe_put_optional(mod, :result_type, 0)
       end)
 
     tool_fns =
@@ -31,5 +33,13 @@ defmodule Alloy.Tool.Registry do
       end)
 
     {tool_defs, tool_fns}
+  end
+
+  defp maybe_put_optional(map, mod, callback, arity) do
+    if function_exported?(mod, callback, arity) do
+      Map.put(map, callback, apply(mod, callback, []))
+    else
+      map
+    end
   end
 end

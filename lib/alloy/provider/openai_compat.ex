@@ -167,7 +167,13 @@ defmodule Alloy.Provider.OpenAICompat do
       |> Enum.map_join("\n", & &1.text)
 
     msg = %{"role" => "assistant"}
-    msg = if(text_parts == "", do: Map.put(msg, "content", nil), else: Map.put(msg, "content", text_parts))
+
+    msg =
+      if(text_parts == "",
+        do: Map.put(msg, "content", nil),
+        else: Map.put(msg, "content", text_parts)
+      )
+
     msg = if(tool_calls == [], do: msg, else: Map.put(msg, "tool_calls", tool_calls))
     [msg]
   end
@@ -257,7 +263,9 @@ defmodule Alloy.Provider.OpenAICompat do
       |> Enum.reduce_while([], fn tc, acc ->
         case Jason.decode(tc["function"]["arguments"]) do
           {:ok, input} ->
-            {:cont, acc ++ [%{type: "tool_use", id: tc["id"], name: tc["function"]["name"], input: input}]}
+            {:cont,
+             acc ++
+               [%{type: "tool_use", id: tc["id"], name: tc["function"]["name"], input: input}]}
 
           {:error, _} ->
             {:halt, {:error, "Invalid JSON in tool call arguments for #{tc["function"]["name"]}"}}

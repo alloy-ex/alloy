@@ -2,9 +2,25 @@ defmodule Alloy.Tool do
   @moduledoc """
   Behaviour for tools that agents can call.
 
-  Tools always return strings - if a tool produces structured data,
-  it should `Jason.encode!/1` it. This eliminates serialization bugs
-  at the boundary between tools and the agent loop.
+  ## Required Callbacks
+
+  Every tool must implement `name/0`, `description/0`, `input_schema/0`,
+  and `execute/2`.
+
+  ## Optional Callbacks
+
+  Tools may optionally implement:
+
+  - `allowed_callers/0` — declares which callers may invoke this tool
+    (`:human`, `:code_execution`). Defaults to `[:human]`.
+  - `result_type/0` — declares whether the tool returns `:text` or
+    `:structured` data. Defaults to `:text`.
+
+  ## Structured Results
+
+  Tools can return a 3-tuple `{:ok, text, data}` where `text` is the
+  human-readable result and `data` is a map of structured data for
+  programmatic consumption (e.g., by a code execution sandbox).
 
   ## Path Security
 
@@ -40,8 +56,14 @@ defmodule Alloy.Tool do
 
         @impl true
         def execute(%{"location" => loc}, _context) do
-          {:ok, Jason.encode!(%{temp: 72, condition: "sunny", location: loc})}
+          {:ok, "72°F, sunny in \#{loc}", %{temp: 72, condition: "sunny", location: loc}}
         end
+
+        @impl true
+        def allowed_callers, do: [:human, :code_execution]
+
+        @impl true
+        def result_type, do: :structured
       end
   """
 
@@ -63,10 +85,37 @@ defmodule Alloy.Tool do
   - `:allowed_paths` - list of allowed directory prefixes for file access
   - any custom keys added by middleware
 
-  Always returns `{:ok, string}` or `{:error, string}`.
+  Returns `{:ok, string}` or `{:error, string}` for text-only results.
+  Optionally returns `{:ok, string, map}` to include structured data
+  alongside the text (for programmatic consumption by code execution).
   """
   @callback execute(input :: map(), context :: map()) ::
-              {:ok, String.t()} | {:error, String.t()}
+              {:ok, String.t()} | {:ok, String.t(), map()} | {:error, String.t()}
+
+  @doc """
+  Declares which callers may invoke this tool.
+
+  - `:human` — the tool can be called by the model during normal conversation
+  - `:code_execution` — the tool can be called from a code execution sandbox
+
+  Defaults to `[:human]` when not implemented. Providers that support
+  `allowed_callers` (e.g., Anthropic) include this in the tool definition
+  sent to the API.
+  """
+  @callback allowed_callers() :: [:human | :code_execution]
+
+  @doc """
+  Declares the tool's result type.
+
+  - `:text` — tool returns `{:ok, String.t()}` (the default)
+  - `:structured` — tool returns `{:ok, String.t(), map()}`
+
+  Used by the executor and downstream consumers to know whether
+  structured data is available in the tool result metadata.
+  """
+  @callback result_type() :: :text | :structured
+
+  @optional_callbacks [allowed_callers: 0, result_type: 0]
 
   @doc """
   Resolve a file path against the working directory from context.
