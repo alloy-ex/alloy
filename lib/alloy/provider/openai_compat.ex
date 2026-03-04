@@ -1,29 +1,52 @@
-defmodule Alloy.Provider.Ollama do
+defmodule Alloy.Provider.OpenAICompat do
   @moduledoc """
-  Provider for Ollama's OpenAI-compatible API.
+  Generic OpenAI-compatible provider.
 
-  Ollama runs LLMs locally — no API key needed, no rate limits, no cost.
-  Uses the OpenAI-compatible endpoint (`/v1/chat/completions`) that Ollama
-  exposes by default.
+  Works with any API that implements the OpenAI chat completions format:
+  DeepSeek, Mistral, xAI/Grok, Ollama, OpenRouter, Together, Groq, etc.
 
   ## Config
 
   Required:
-  - `:model` - Model name (e.g., "llama4", "qwen3", "deepseek-r1", "gemma3",
-    "mistral", "phi4")
+  - `:api_url` - Base URL (e.g., "https://api.deepseek.com",
+    "https://api.mistral.ai", "http://localhost:11434")
+  - `:model` - Model name
 
   Optional:
-  - `:api_key` - API key (only if Ollama is behind an auth proxy)
-  - `:api_url` - Base URL (default: "http://localhost:11434")
+  - `:api_key` - API key (omit for local providers like Ollama)
   - `:max_tokens` - Max output tokens (default: 4096)
   - `:system_prompt` - System prompt string
+  - `:chat_path` - Path to completions endpoint (default: "/v1/chat/completions")
+  - `:extra_headers` - Additional headers as `[{name, value}]`
   - `:req_options` - Additional options passed to Req
 
-  ## Example
+  ## Examples
 
-      # No API key needed — runs locally
-      Alloy.run("Write a haiku about Elixir.",
-        provider: {Alloy.Provider.Ollama, model: "llama4"}
+      # DeepSeek
+      Alloy.run("Hello",
+        provider: {Alloy.Provider.OpenAICompat,
+          api_key: System.get_env("DEEPSEEK_API_KEY"),
+          api_url: "https://api.deepseek.com",
+          model: "deepseek-chat"
+        }
+      )
+
+      # Ollama (no API key)
+      Alloy.run("Hello",
+        provider: {Alloy.Provider.OpenAICompat,
+          api_url: "http://localhost:11434",
+          model: "llama4"
+        }
+      )
+
+      # OpenRouter
+      Alloy.run("Hello",
+        provider: {Alloy.Provider.OpenAICompat,
+          api_key: System.get_env("OPENROUTER_API_KEY"),
+          api_url: "https://openrouter.ai",
+          chat_path: "/api/v1/chat/completions",
+          model: "anthropic/claude-sonnet-4-6"
+        }
       )
   """
 
@@ -32,26 +55,19 @@ defmodule Alloy.Provider.Ollama do
   alias Alloy.Message
   alias Alloy.Provider.OpenAIStream
 
-  @default_api_url "http://localhost:11434"
   @default_max_tokens 4096
+  @default_chat_path "/v1/chat/completions"
 
   @impl true
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
-
-    headers = [{"content-type", "application/json"}]
-
-    headers =
-      case Map.get(config, :api_key) do
-        nil -> headers
-        key -> [{"authorization", "Bearer #{key}"} | headers]
-      end
+    url = "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
 
     req_opts =
       ([
-         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions",
+         url: url,
          method: :post,
-         headers: headers,
+         headers: build_headers(config),
          body: Jason.encode!(body)
        ] ++ Map.get(config, :req_options, []))
       |> Keyword.put(:retry, false)
@@ -71,23 +87,27 @@ defmodule Alloy.Provider.Ollama do
   @impl true
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     body = build_request_body(messages, tool_defs, config)
-    url = "#{Map.get(config, :api_url, @default_api_url)}/v1/chat/completions"
-
-    headers = [{"content-type", "application/json"}]
-
-    headers =
-      case Map.get(config, :api_key) do
-        nil -> headers
-        key -> [{"authorization", "Bearer #{key}"} | headers]
-      end
+    url = "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
 
     OpenAIStream.stream(
       url,
-      headers,
+      build_headers(config),
       body,
       on_chunk,
       Map.get(config, :req_options, [])
     )
+  end
+
+  defp build_headers(config) do
+    base = [{"content-type", "application/json"}]
+
+    base =
+      case Map.get(config, :api_key) do
+        nil -> base
+        key -> [{"authorization", "Bearer #{key}"} | base]
+      end
+
+    base ++ Map.get(config, :extra_headers, [])
   end
 
   # --- Request Building ---
@@ -149,46 +169,38 @@ defmodule Alloy.Provider.Ollama do
     msg = %{"role" => "assistant"}
 
     msg =
-      case text_parts do
-        "" -> Map.put(msg, "content", nil)
-        text -> Map.put(msg, "content", text)
-      end
+      if(text_parts == "",
+        do: Map.put(msg, "content", nil),
+        else: Map.put(msg, "content", text_parts)
+      )
 
-    msg =
-      case tool_calls do
-        [] -> msg
-        calls -> Map.put(msg, "tool_calls", calls)
-      end
-
+    msg = if(tool_calls == [], do: msg, else: Map.put(msg, "tool_calls", tool_calls))
     [msg]
   end
 
   defp format_message(%Message{role: :user, content: blocks}) when is_list(blocks) do
     if Enum.any?(blocks, &(&1[:type] == "tool_result")) do
       blocks
-      |> Enum.map(fn
-        %{type: "tool_result", tool_use_id: tool_call_id, content: content} ->
-          %{"role" => "tool", "tool_call_id" => tool_call_id, "content" => content}
+      |> Enum.flat_map(fn
+        %{type: "tool_result", tool_use_id: id, content: content} ->
+          [%{"role" => "tool", "tool_call_id" => id, "content" => content}]
 
-        _other ->
-          nil
+        _ ->
+          []
       end)
-      |> Enum.reject(&is_nil/1)
     else
       parts = blocks |> Enum.map(&format_user_content_block/1) |> Enum.reject(&is_nil/1)
       [%{"role" => "user", "content" => parts}]
     end
   end
 
-  defp format_user_content_block(%{type: "text", text: text}) do
-    %{"type" => "text", "text" => text}
-  end
+  defp format_user_content_block(%{type: "text", text: text}),
+    do: %{"type" => "text", "text" => text}
 
-  defp format_user_content_block(%{type: "image", mime_type: mime_type, data: data}) do
-    %{"type" => "image_url", "image_url" => %{"url" => "data:#{mime_type};base64,#{data}"}}
-  end
+  defp format_user_content_block(%{type: "image", mime_type: mime, data: data}),
+    do: %{"type" => "image_url", "image_url" => %{"url" => "data:#{mime};base64,#{data}"}}
 
-  defp format_user_content_block(_block), do: nil
+  defp format_user_content_block(_), do: nil
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do
     %{
@@ -219,15 +231,10 @@ defmodule Alloy.Provider.Ollama do
       {:ok, content_blocks} ->
         stop_reason = parse_finish_reason(finish_reason)
 
-        alloy_msg = %Message{
-          role: :assistant,
-          content: content_blocks
-        }
-
         {:ok,
          %{
            stop_reason: stop_reason,
-           messages: [alloy_msg],
+           messages: [%Message{role: :assistant, content: content_blocks}],
            usage: %{
              input_tokens: Map.get(usage, "prompt_tokens", 0),
              output_tokens: Map.get(usage, "completion_tokens", 0)
@@ -258,14 +265,7 @@ defmodule Alloy.Provider.Ollama do
           {:ok, input} ->
             {:cont,
              acc ++
-               [
-                 %{
-                   type: "tool_use",
-                   id: tc["id"],
-                   name: tc["function"]["name"],
-                   input: input
-                 }
-               ]}
+               [%{type: "tool_use", id: tc["id"], name: tc["function"]["name"], input: input}]}
 
           {:error, _} ->
             {:halt, {:error, "Invalid JSON in tool call arguments for #{tc["function"]["name"]}"}}
@@ -280,16 +280,12 @@ defmodule Alloy.Provider.Ollama do
 
   defp parse_finish_reason("stop"), do: :end_turn
   defp parse_finish_reason("tool_calls"), do: :tool_use
-  defp parse_finish_reason("length"), do: :end_turn
   defp parse_finish_reason(_), do: :end_turn
 
   defp parse_error(status, body) when is_binary(body) do
     case Jason.decode(body) do
-      {:ok, %{"error" => error}} ->
-        "#{error["type"]}: #{error["message"]}"
-
-      _ ->
-        "HTTP #{status}: #{body}"
+      {:ok, %{"error" => error}} -> "#{error["type"]}: #{error["message"]}"
+      _ -> "HTTP #{status}: #{body}"
     end
   end
 

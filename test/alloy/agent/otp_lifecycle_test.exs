@@ -6,119 +6,21 @@ defmodule Alloy.Agent.OTPLifecycleTest do
   alias Alloy.Message
   alias Alloy.Provider.Test, as: TestProvider
 
-  # ── Fix 1: Scratchpad Process Leak ─────────────────────────────────────────
+  # ── State.cleanup/1 ─────────────────────────────────────────────────────────
 
-  describe "State.cleanup/1 stops the scratchpad process" do
-    test "scratchpad process is stopped after cleanup" do
-      config = %Config{
-        provider: TestProvider,
-        provider_config: %{},
-        tools: [Alloy.Tool.Core.Scratchpad]
-      }
-
-      state = State.init(config)
-
-      # Scratchpad should be started
-      assert is_pid(state.scratchpad)
-      assert Process.alive?(state.scratchpad)
-
-      # Cleanup should stop it
-      State.cleanup(state)
-
-      # Give a moment for process to terminate
-      Process.sleep(10)
-      refute Process.alive?(state.scratchpad)
-    end
-
-    test "cleanup is safe when scratchpad is nil (no scratchpad tool)" do
+  describe "State.cleanup/1" do
+    test "cleanup is safe with no resources" do
       config = %Config{
         provider: TestProvider,
         provider_config: %{}
       }
 
       state = State.init(config)
-      assert is_nil(state.scratchpad)
-
-      # Should not raise
       assert :ok = State.cleanup(state)
     end
   end
 
-  defmodule ScratchpadCapture do
-    @behaviour Alloy.Middleware
-
-    def call(:before_completion, %Alloy.Agent.State{} = state) do
-      if state.scratchpad do
-        send(Process.get(:test_pid), {:scratchpad_pid, state.scratchpad})
-      end
-
-      state
-    end
-
-    def call(_hook, state), do: state
-  end
-
-  describe "Alloy.run/2 cleans up scratchpad process" do
-    test "scratchpad process is dead after Alloy.run completes" do
-      {:ok, provider_pid} = TestProvider.start_link([TestProvider.text_response("Done")])
-
-      # Start a helper process that will run Alloy.run and capture the scratchpad pid
-      test_pid = self()
-
-      spawn_link(fn ->
-        Process.put(:test_pid, test_pid)
-
-        {:ok, _result} =
-          Alloy.run("Hello",
-            provider: {TestProvider, agent_pid: provider_pid},
-            tools: [Alloy.Tool.Core.Scratchpad],
-            middleware: [ScratchpadCapture]
-          )
-
-        send(test_pid, :run_complete)
-      end)
-
-      # Wait for the middleware to capture the scratchpad pid
-      assert_receive {:scratchpad_pid, scratchpad_pid}, 5000
-      assert Process.alive?(scratchpad_pid)
-
-      # Wait for run to complete (cleanup happens in after block)
-      assert_receive :run_complete, 5000
-      Process.sleep(10)
-
-      refute Process.alive?(scratchpad_pid),
-             "Scratchpad process leaked after Alloy.run — pid #{inspect(scratchpad_pid)} still alive"
-    end
-  end
-
-  describe "Server.stop/1 cleans up scratchpad process" do
-    test "scratchpad process is dead after Server stops" do
-      {:ok, provider_pid} = TestProvider.start_link([TestProvider.text_response("Hi")])
-
-      {:ok, agent} =
-        Server.start_link(
-          provider: {TestProvider, agent_pid: provider_pid},
-          tools: [Alloy.Tool.Core.Scratchpad]
-        )
-
-      # Get the scratchpad pid from the agent state
-      agent_state = :sys.get_state(agent)
-      scratchpad_pid = agent_state.scratchpad
-
-      assert is_pid(scratchpad_pid)
-      assert Process.alive?(scratchpad_pid)
-
-      # Stop the agent
-      Server.stop(agent)
-      Process.sleep(10)
-
-      # Scratchpad must be dead
-      refute Process.alive?(scratchpad_pid),
-             "Scratchpad process leaked after Server.stop — pid #{inspect(scratchpad_pid)} still alive"
-    end
-  end
-
-  # ── Fix 2: O(N²) Message Append ────────────────────────────────────────────
+  # ── O(1) Message Append ────────────────────────────────────────────────────
 
   describe "append_messages/2 uses O(1) prepend internally" do
     test "messages are returned in chronological order from state" do
@@ -157,7 +59,7 @@ defmodule Alloy.Agent.OTPLifecycleTest do
     end
   end
 
-  # ── Fix 3: :idle Status ────────────────────────────────────────────────────
+  # ── :idle Status ────────────────────────────────────────────────────────────
 
   describe "agent status is :idle between runs, :running during" do
     test "Server starts with :idle status" do

@@ -1,10 +1,23 @@
 defmodule Alloy.Tool.Core.Bash do
   @moduledoc """
-  Built-in tool: execute shell commands via `bash -c`.
+  Built-in tool: execute shell commands via `bash -rc` (restricted shell).
 
   Returns stdout/stderr merged with the exit code appended. Output is
   truncated at 30,000 characters to prevent context overflow.
   Commands that exceed the timeout are killed and return an error.
+
+  ## Security
+
+  By default, commands run in restricted bash (`bash -r`), which prevents:
+  - Changing directories with `cd`
+  - Setting or unsetting `SHELL`, `ENV`, `BASH_ENV`, or `PATH`
+  - Specifying commands containing `/`
+  - Redirecting output with `>`, `>>`, etc.
+
+  Set `:bash_restricted` to `false` in the agent's `:context` map to
+  disable restricted mode.
+
+  Configure `:allowed_paths` in context to restrict file tool access.
 
   ## Usage
 
@@ -27,7 +40,7 @@ defmodule Alloy.Tool.Core.Bash do
   """
   @type executor :: (command :: String.t(), dir :: String.t() -> {String.t(), non_neg_integer()})
 
-  @default_timeout 120_000
+  @default_timeout 10_000
   @max_output 30_000
 
   @impl true
@@ -44,7 +57,7 @@ defmodule Alloy.Tool.Core.Bash do
         command: %{type: "string", description: "The shell command to execute"},
         timeout: %{
           type: "integer",
-          description: "Timeout in milliseconds (default: 120000)",
+          description: "Timeout in milliseconds (default: #{@default_timeout})",
           default: @default_timeout
         }
       },
@@ -55,25 +68,28 @@ defmodule Alloy.Tool.Core.Bash do
   @impl true
   def execute(input, context) do
     command = input["command"]
-    timeout = input["timeout"] || @default_timeout
+    timeout = min(input["timeout"] || @default_timeout, @default_timeout)
     working_dir = Map.get(context, :working_directory)
     executor = Map.get(context, :bash_executor)
 
     if executor do
       run_custom_executor(executor, command, working_dir, timeout)
     else
-      run_host(command, working_dir, timeout)
+      restricted? = Map.get(context, :bash_restricted, true)
+      run_host(command, working_dir, timeout, restricted?)
     end
   end
 
-  defp run_host(command, working_dir, timeout) do
+  defp run_host(command, working_dir, timeout, restricted?) do
     opts =
       [stderr_to_stdout: true]
       |> maybe_add_cd(working_dir)
 
+    shell_flag = if restricted?, do: "-rc", else: "-c"
+
     task =
       Task.async(fn ->
-        System.cmd("bash", ["-c", command], opts)
+        System.cmd("bash", [shell_flag, command], opts)
       end)
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do

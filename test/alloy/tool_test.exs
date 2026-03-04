@@ -64,40 +64,42 @@ defmodule Alloy.ToolTest do
 
   describe "resolve_path/2" do
     test "absolute paths are returned as-is" do
-      assert Tool.resolve_path("/usr/local/bin/elixir", %{}) == "/usr/local/bin/elixir"
-      assert Tool.resolve_path("/tmp/test.txt", %{working_directory: "/other"}) == "/tmp/test.txt"
+      assert {:ok, "/usr/local/bin/elixir"} = Tool.resolve_path("/usr/local/bin/elixir", %{})
+
+      assert {:ok, "/tmp/test.txt"} =
+               Tool.resolve_path("/tmp/test.txt", %{working_directory: "/other"})
     end
 
     test "relative paths are joined with working_directory" do
-      assert Tool.resolve_path("mix.exs", %{working_directory: "/project"}) ==
-               "/project/mix.exs"
+      assert {:ok, "/project/mix.exs"} =
+               Tool.resolve_path("mix.exs", %{working_directory: "/project"})
     end
 
     test "nested relative paths are joined correctly" do
-      assert Tool.resolve_path("lib/alloy.ex", %{working_directory: "/project"}) ==
-               "/project/lib/alloy.ex"
+      assert {:ok, "/project/lib/alloy.ex"} =
+               Tool.resolve_path("lib/alloy.ex", %{working_directory: "/project"})
     end
 
     test "relative paths without working_directory expand from cwd" do
-      result = Tool.resolve_path("mix.exs", %{})
+      assert {:ok, result} = Tool.resolve_path("mix.exs", %{})
       assert Path.type(result) == :absolute
       assert String.ends_with?(result, "/mix.exs")
     end
 
     test "relative paths with nil working_directory expand from cwd" do
-      result = Tool.resolve_path("mix.exs", %{working_directory: nil})
+      assert {:ok, result} = Tool.resolve_path("mix.exs", %{working_directory: nil})
       assert Path.type(result) == :absolute
       assert String.ends_with?(result, "/mix.exs")
     end
 
     test "handles dot-relative paths" do
-      assert Tool.resolve_path("./test.txt", %{working_directory: "/project"}) ==
-               "/project/./test.txt"
+      assert {:ok, "/project/test.txt"} =
+               Tool.resolve_path("./test.txt", %{working_directory: "/project"})
     end
 
     test "handles parent directory references" do
-      assert Tool.resolve_path("../other/file.ex", %{working_directory: "/project/lib"}) ==
-               "/project/lib/../other/file.ex"
+      assert {:ok, "/project/other/file.ex"} =
+               Tool.resolve_path("../other/file.ex", %{working_directory: "/project/lib"})
     end
   end
 end

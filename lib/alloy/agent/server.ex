@@ -72,15 +72,11 @@ defmodule Alloy.Agent.Server do
 
   ## Options
 
-    - `:timeout` - GenServer call timeout in milliseconds. Defaults to
-      `:infinity` because the Turn's deadline mechanism (driven by
-      `config.timeout_ms`) enforces the actual timeout internally,
-      guaranteeing a reply. Override only if you need a hard caller-side
-      safety net (e.g., `timeout: config.timeout_ms + 10_000`).
+    - `:timeout` - GenServer call timeout in milliseconds (default: `30_000`).
   """
   @spec chat(GenServer.server(), String.t(), keyword()) :: {:ok, result()} | {:error, result()}
   def chat(server, message, opts \\ []) when is_binary(message) do
-    timeout = Keyword.get(opts, :timeout, :infinity)
+    timeout = Keyword.get(opts, :timeout, 30_000)
     GenServer.call(server, {:chat, message}, timeout)
   end
 
@@ -139,15 +135,13 @@ defmodule Alloy.Agent.Server do
 
   ## Options
 
-    - `:timeout` - GenServer call timeout in milliseconds. Defaults to
-      `:infinity` because the Turn's deadline mechanism enforces the
-      actual timeout internally. See `chat/3` for details.
+    - `:timeout` - GenServer call timeout in milliseconds (default: `30_000`).
   """
   @spec stream_chat(GenServer.server(), String.t(), (String.t() -> :ok), keyword()) ::
           {:ok, result()} | {:error, result()}
   def stream_chat(server, message, on_chunk, opts \\ [])
       when is_binary(message) and is_function(on_chunk, 1) do
-    timeout = Keyword.get(opts, :timeout, :infinity)
+    timeout = Keyword.get(opts, :timeout, 30_000)
     stream_opts = Keyword.drop(opts, [:timeout])
 
     case Keyword.get(stream_opts, :on_event) do
@@ -206,11 +200,7 @@ defmodule Alloy.Agent.Server do
           {:ok, binary()} | {:error, :busy | :queue_full | :no_pubsub}
   def send_message(server, message, opts \\ []) when is_binary(message) do
     request_id = Keyword.get(opts, :request_id, generate_request_id())
-    # Use :infinity — the handler spawns a Task and replies immediately (no I/O),
-    # but the GenServer may be blocked by a long synchronous chat/3 call ahead
-    # of this request in the mailbox. A hard timeout here would crash the caller
-    # while the GenServer still processes the message later, spawning a ghost Turn.
-    GenServer.call(server, {:send_message, message, request_id}, :infinity)
+    GenServer.call(server, {:send_message, message, request_id}, 30_000)
   end
 
   @doc """
@@ -286,7 +276,6 @@ defmodule Alloy.Agent.Server do
       Task.Supervisor.terminate_child(Alloy.TaskSupervisor, task_pid)
     end
 
-    # Stop the scratchpad Agent process to prevent leaks.
     State.cleanup(state)
 
     state =

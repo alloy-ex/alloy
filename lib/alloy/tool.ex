@@ -22,6 +22,18 @@ defmodule Alloy.Tool do
   human-readable result and `data` is a map of structured data for
   programmatic consumption (e.g., by a code execution sandbox).
 
+  ## Path Security
+
+  Set `:allowed_paths` in the agent context to restrict file access:
+
+      Alloy.run("Read the config",
+        context: %{allowed_paths: ["/home/user/project"]},
+        tools: [Alloy.Tool.Core.Read]
+      )
+
+  When configured, `resolve_path/2` returns `{:error, reason}` for
+  paths outside the allowed directories.
+
   ## Example
 
       defmodule MyApp.Tools.Weather do
@@ -70,6 +82,7 @@ defmodule Alloy.Tool do
   Context is a map that may contain:
   - `:working_directory` - base path for file operations
   - `:config` - agent config struct
+  - `:allowed_paths` - list of allowed directory prefixes for file access
   - any custom keys added by middleware
 
   Returns `{:ok, string}` or `{:error, string}` for text-only results.
@@ -109,16 +122,33 @@ defmodule Alloy.Tool do
 
   Absolute paths are returned as-is. Relative paths are joined with
   the `:working_directory` from context, or expanded from cwd if not set.
+
+  When `:allowed_paths` is set in context, validates the resolved path
+  falls within one of the allowed directories. Returns `{:error, reason}`
+  if the path is outside the allowed directories.
   """
-  @spec resolve_path(String.t(), map()) :: String.t()
+  @spec resolve_path(String.t(), map()) :: {:ok, String.t()} | {:error, String.t()}
   def resolve_path(file_path, context) do
-    if Path.type(file_path) == :absolute do
-      file_path
-    else
-      case Map.get(context, :working_directory) do
-        nil -> Path.expand(file_path)
-        wd -> Path.join(wd, file_path)
+    resolved =
+      if Path.type(file_path) == :absolute do
+        Path.expand(file_path)
+      else
+        case Map.get(context, :working_directory) do
+          nil -> Path.expand(file_path)
+          wd -> Path.expand(Path.join(wd, file_path))
+        end
       end
+
+    case Map.get(context, :allowed_paths) do
+      nil ->
+        {:ok, resolved}
+
+      paths when is_list(paths) ->
+        if Enum.any?(paths, fn allowed -> String.starts_with?(resolved, Path.expand(allowed)) end) do
+          {:ok, resolved}
+        else
+          {:error, "Path #{resolved} is outside allowed directories"}
+        end
     end
   end
 end

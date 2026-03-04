@@ -49,10 +49,12 @@ defmodule Alloy.Provider.Anthropic do
   @default_api_url "https://api.anthropic.com"
   @default_api_version "2023-06-01"
   @default_max_tokens 4096
+  @default_provider_timeout 15_000
 
   @impl true
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
+    timeout = Map.get(config, :provider_timeout, @default_provider_timeout)
 
     req_opts =
       ([
@@ -63,19 +65,25 @@ defmodule Alloy.Provider.Anthropic do
            {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
            {"content-type", "application/json"}
          ],
-         body: Jason.encode!(body)
+         body: Jason.encode!(body),
+         receive_timeout: timeout
        ] ++ Map.get(config, :req_options, []))
       |> Keyword.put(:retry, false)
 
-    case Req.request(req_opts) do
-      {:ok, %{status: 200, body: resp_body}} ->
+    task = Task.async(fn -> Req.request(req_opts) end)
+
+    case Task.yield(task, timeout + 5_000) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {:ok, %{status: 200, body: resp_body}}} ->
         parse_response(resp_body)
 
-      {:ok, %{status: status, body: resp_body}} ->
+      {:ok, {:ok, %{status: status, body: resp_body}}} ->
         {:error, parse_error(status, resp_body)}
 
-      {:error, reason} ->
+      {:ok, {:error, reason}} ->
         {:error, "HTTP request failed: #{inspect(reason)}"}
+
+      nil ->
+        {:error, "HTTP request failed: provider timeout after #{timeout}ms"}
     end
   end
 

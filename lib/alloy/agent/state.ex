@@ -21,7 +21,6 @@ defmodule Alloy.Agent.State do
           tool_calls: [map()],
           tool_defs: [map()],
           tool_fns: %{String.t() => module()},
-          scratchpad: pid() | nil,
           started_at: integer() | nil,
           agent_id: String.t(),
           current_task: {reference(), pid(), binary()} | nil,
@@ -32,7 +31,6 @@ defmodule Alloy.Agent.State do
   defstruct [
     :config,
     :error,
-    :scratchpad,
     messages: [],
     messages_new: [],
     turn: 0,
@@ -62,7 +60,6 @@ defmodule Alloy.Agent.State do
       messages: messages,
       tool_defs: tool_defs,
       tool_fns: tool_fns,
-      scratchpad: maybe_start_scratchpad(config.tools),
       started_at: System.monotonic_time(:millisecond),
       agent_id: agent_id
     }
@@ -148,17 +145,10 @@ defmodule Alloy.Agent.State do
   end
 
   @doc """
-  Clean up resources owned by this state.
-
-  Stops the scratchpad Agent process if one was started. Safe to call
-  multiple times or when scratchpad is nil.
+  Clean up resources owned by this state. No-op currently; reserved
+  for future resource management.
   """
   @spec cleanup(t()) :: :ok
-  def cleanup(%__MODULE__{scratchpad: pid}) when is_pid(pid) do
-    if Process.alive?(pid), do: Agent.stop(pid)
-    :ok
-  end
-
   def cleanup(%__MODULE__{}), do: :ok
 
   # Search newest-first in the accumulator (already reversed / newest-first).
@@ -177,13 +167,6 @@ defmodule Alloy.Agent.State do
       %Message{role: :assistant} = msg -> Message.text(msg)
       _ -> nil
     end)
-  end
-
-  defp maybe_start_scratchpad(tools) do
-    if Alloy.Tool.Core.Scratchpad in tools do
-      {:ok, pid} = Agent.start_link(fn -> %{} end)
-      pid
-    end
   end
 
   defp generate_agent_id do
