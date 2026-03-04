@@ -26,7 +26,8 @@ defmodule Alloy.Agent.Config do
           pubsub: module() | nil,
           subscribe: [String.t()],
           max_pending: non_neg_integer(),
-          fallback_providers: [{module(), map()}]
+          fallback_providers: [{module(), map()}],
+          code_execution: boolean()
         }
 
   @enforce_keys [:provider, :provider_config]
@@ -50,7 +51,8 @@ defmodule Alloy.Agent.Config do
     pubsub: nil,
     subscribe: [],
     max_pending: 0,
-    fallback_providers: []
+    fallback_providers: [],
+    code_execution: false
   ]
 
   @doc """
@@ -103,7 +105,8 @@ defmodule Alloy.Agent.Config do
       fallback_providers:
         opts
         |> Keyword.get(:fallback_providers, [])
-        |> Enum.map(&parse_fallback_provider/1)
+        |> Enum.map(&parse_fallback_provider/1),
+      code_execution: Keyword.get(opts, :code_execution, false)
     }
   end
 

@@ -481,13 +481,6 @@ defmodule Alloy.Agent.Server do
 
       {:error, :not_found} ->
         {:reply, {:error, :not_found}, state}
-
-      {:error, reason} ->
-        Logger.warning(
-          "[Alloy] Failed to cancel request #{inspect(request_id)}: #{inspect(reason)}"
-        )
-
-        {:reply, {:error, :not_found}, state}
     end
   end
 
@@ -679,8 +672,6 @@ defmodule Alloy.Agent.Server do
 
   defp maybe_start_next_pending(%State{current_task: nil, pending_requests: []} = state),
     do: state
-
-  defp maybe_start_next_pending(%State{current_task: {_, _, _}} = state), do: state
 
   defp maybe_start_next_pending(%State{pending_requests: [{message, request_id} | rest]} = state) do
     state

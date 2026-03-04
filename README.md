@@ -39,7 +39,7 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.5"}
+    {:alloy, "~> 0.7"}
   ]
 end
 ```
@@ -268,6 +268,53 @@ defmodule MyApp.Tools.WebSearch do
   end
 end
 ```
+
+#### Optional tool callbacks
+
+Tools can declare richer metadata with two optional callbacks:
+
+```elixir
+defmodule MyApp.Tools.ListAgents do
+  @behaviour Alloy.Tool
+
+  @impl true
+  def name, do: "list_agents"
+  @impl true
+  def description, do: "List running agents with their status"
+  @impl true
+  def input_schema, do: %{type: "object", properties: %{}}
+
+  @impl true
+  def execute(_input, _context) do
+    agents = [%{name: "atlas", status: "idle"}, %{name: "researcher", status: "running"}]
+    {:ok, "Found 2 agents: atlas (idle), researcher (running)", %{agents: agents}}
+  end
+
+  # Optional: declare who may invoke this tool
+  @impl true
+  def allowed_callers, do: [:human, :code_execution]
+
+  # Optional: declare that this tool returns structured data
+  @impl true
+  def result_type, do: :structured
+end
+```
+
+- **`allowed_callers/0`** — `:human` (model during conversation) or `:code_execution` (from a sandbox). Defaults to `[:human]` when not implemented. Providers that support it (e.g., Anthropic) include it in the tool definition sent to the API.
+- **`result_type/0`** — `:text` or `:structured`. When `:structured`, the tool returns `{:ok, text, data}` — text goes to the model, data goes to `meta.structured_data` for programmatic consumption.
+
+### Code execution (Anthropic)
+
+Enable Anthropic's server-side code execution sandbox:
+
+```elixir
+{:ok, result} = Alloy.run("Calculate the first 20 Fibonacci numbers",
+  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"},
+  code_execution: true
+)
+```
+
+When enabled, the model can write and run Python code in Anthropic's sandbox. Alloy handles the `server_tool_use` / `server_tool_result` round-trip automatically — no custom tool implementation needed.
 
 ## Architecture
 

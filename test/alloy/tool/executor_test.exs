@@ -45,6 +45,27 @@ defmodule Alloy.Tool.ExecutorTest do
     end
   end
 
+  defmodule StructuredTool do
+    @behaviour Alloy.Tool
+    @impl true
+    def name, do: "structured"
+    @impl true
+    def description, do: "Returns structured data alongside text"
+    @impl true
+    def input_schema, do: %{type: "object", properties: %{}}
+
+    @impl true
+    def execute(_input, _ctx) do
+      {:ok, "Found 2 agents", %{agents: [%{name: "atlas"}, %{name: "researcher"}]}}
+    end
+
+    @impl true
+    def allowed_callers, do: [:human, :code_execution]
+
+    @impl true
+    def result_type, do: :structured
+  end
+
   defmodule BlockingMiddleware do
     @behaviour Alloy.Middleware
 
@@ -291,6 +312,111 @@ defmodule Alloy.Tool.ExecutorTest do
     test "tool_timeout is configurable via Config.from_opts/1" do
       config = Config.from_opts(provider: {Alloy.Provider.Test, []}, tool_timeout: 30_000)
       assert config.tool_timeout == 30_000
+    end
+  end
+
+  describe "execute_all/4 — structured results (3-tuple)" do
+    test "tool returning {ok, text, data} puts text in result block and data in metadata" do
+      state = build_state([StructuredTool])
+      call = %{id: "call_s", name: "structured", type: "tool_use", input: %{}}
+
+      assert {:ok, %Message{role: :user, content: [block]}, [meta]} =
+               Executor.execute_all([call], state.tool_fns, state, on_event: fn _ -> :ok end)
+
+      # Text goes into the tool_result block (what the model sees)
+      assert block.tool_use_id == "call_s"
+      assert block.content == "Found 2 agents"
+      refute Map.get(block, :is_error)
+
+      # Structured data goes into metadata
+      assert meta.id == "call_s"
+      assert meta.name == "structured"
+      assert meta.error == nil
+      assert meta.structured_data == %{agents: [%{name: "atlas"}, %{name: "researcher"}]}
+    end
+
+    test "tool returning {ok, text} 2-tuple has no structured_data in metadata" do
+      state = build_state([SuccessTool])
+      call = %{id: "call_plain", name: "success", type: "tool_use", input: %{}}
+
+      assert {:ok, %Message{role: :user, content: [block]}, [meta]} =
+               Executor.execute_all([call], state.tool_fns, state, on_event: fn _ -> :ok end)
+
+      assert block.content == "it worked"
+      refute Map.has_key?(meta, :structured_data)
+    end
+
+    test "mixed tools — structured and plain — both work in same batch" do
+      state = build_state([SuccessTool, StructuredTool])
+
+      calls = [
+        %{id: "c_plain", name: "success", type: "tool_use", input: %{}},
+        %{id: "c_structured", name: "structured", type: "tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{role: :user, content: blocks}, metas} =
+               Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
+
+      assert length(blocks) == 2
+      assert length(metas) == 2
+
+      plain_meta = Enum.find(metas, &(&1.id == "c_plain"))
+      structured_meta = Enum.find(metas, &(&1.id == "c_structured"))
+
+      refute Map.has_key?(plain_meta, :structured_data)
+
+      assert structured_meta.structured_data == %{
+               agents: [%{name: "atlas"}, %{name: "researcher"}]
+             }
+    end
+  end
+
+  describe "execute_all/4 — server_tool_use (code_execution)" do
+    test "server_tool_use call produces server_tool_result block" do
+      state = build_state([SuccessTool])
+      call = %{id: "srvtoolu_01", name: "success", type: "server_tool_use", input: %{}}
+
+      assert {:ok, %Message{role: :user, content: [block]}, [meta]} =
+               Executor.execute_all([call], state.tool_fns, state, on_event: fn _ -> :ok end)
+
+      assert block.type == "server_tool_result"
+      assert block.tool_use_id == "srvtoolu_01"
+      assert block.content == "it worked"
+      refute Map.get(block, :is_error)
+
+      assert meta.id == "srvtoolu_01"
+      assert meta.name == "success"
+    end
+
+    test "server_tool_use error produces server_tool_result error block" do
+      state = build_state([ErrorTool])
+      call = %{id: "srvtoolu_02", name: "error_tool", type: "server_tool_use", input: %{}}
+
+      assert {:ok, %Message{role: :user, content: [block]}, [_meta]} =
+               Executor.execute_all([call], state.tool_fns, state, on_event: fn _ -> :ok end)
+
+      assert block.type == "server_tool_result"
+      assert block.tool_use_id == "srvtoolu_02"
+      assert block.content == "something went wrong"
+      assert block.is_error == true
+    end
+
+    test "mixed server_tool_use and tool_use in same batch produce correct result types" do
+      state = build_state([SuccessTool, ErrorTool])
+
+      calls = [
+        %{id: "toolu_01", name: "success", type: "tool_use", input: %{}},
+        %{id: "srvtoolu_01", name: "error_tool", type: "server_tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{role: :user, content: blocks}, _metas} =
+               Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
+
+      regular = Enum.find(blocks, &(&1.tool_use_id == "toolu_01"))
+      server = Enum.find(blocks, &(&1.tool_use_id == "srvtoolu_01"))
+
+      assert regular.type == "tool_result"
+      assert server.type == "server_tool_result"
     end
   end
 
