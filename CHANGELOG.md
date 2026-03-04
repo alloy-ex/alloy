@@ -5,11 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.0] - 2026-03-04
+## [0.7.1] - 2026-03-04
 
 ### Added
 
 - **`Alloy.Result` struct** — typed, `Access`-compatible return value from `Alloy.run/2` and `Server.chat/3`. Single source of truth for the 8-field result contract. Implements `Access` behaviour for bracket-syntax backwards compatibility (`result[:text]`).
+- **`Alloy.Result` in hex docs** — added to the Core group in the sidebar.
+
+## [0.7.0] - 2026-03-04
+
+### Added
+
 - **Anthropic code execution support** — configure `code_execution: true` to enable Anthropic's server-side Python sandbox. Alloy handles `server_tool_use` / `server_tool_result` round-trips across Message, Executor, and Anthropic provider layers. The `code_execution_20250522` tool type is appended to the request body when enabled.
 - **Optional tool callbacks** — `Alloy.Tool` behaviour gains `allowed_callers/0` and `result_type/0` as `@optional_callbacks`. Tools that don't implement them compile and work as before. Registry uses `function_exported?/3` to conditionally include metadata in tool definitions.
 - **Structured tool results** — tools can return `{:ok, text, data}` 3-tuples. Text goes into the result block (what the model sees), structured data goes into `meta.structured_data` for programmatic consumption (e.g., by a code execution sandbox).
@@ -230,6 +236,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.7.1]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.1
 [0.7.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.0
 [0.6.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.6.0
 [0.5.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.5.0
