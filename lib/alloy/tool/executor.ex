@@ -308,7 +308,7 @@ defmodule Alloy.Tool.Executor do
 
     :telemetry.execute(
       [:alloy, :tool, :stop],
-      %{event_seq: event_seq, duration_ms: meta.duration_ms || 0},
+      %{event_seq: event_seq, duration_ms: meta.duration_ms},
       %{
         correlation_id: correlation_id,
         turn: turn,
