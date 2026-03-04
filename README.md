@@ -5,9 +5,9 @@
 [![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/alloy)
 [![License](https://img.shields.io/hexpm/l/alloy.svg)](LICENSE)
 
-**Model-agnostic agent harness for Elixir.**
+**Minimal, OTP-native agent loop for Elixir.**
 
-Alloy gives you the agent loop: send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. Run agents as supervised GenServers. Build multi-agent teams with fault isolation. Zero framework lock-in.
+Alloy is the completion-tool-call loop and nothing else. Send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. Run agents as supervised GenServers. No opinions on sessions, persistence, memory, scheduling, or UI — those belong in your application.
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and tell me the version",
@@ -15,22 +15,22 @@ Alloy gives you the agent loop: send messages to any LLM, execute tool calls, lo
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.1.0"
+result.text #=> "The version is 0.7.0"
 ```
 
 ## Why Alloy?
 
-Most agent frameworks target Python and single-script usage. Alloy targets what happens after — when you need agents running **in production** with supervision, fault isolation, concurrency, and multi-agent orchestration.
+Most agent frameworks try to be everything — sessions, memory, RAG, multi-agent orchestration, scheduling, UI. Alloy does one thing well: the agent loop. Inspired by [Pi Agent](https://github.com/badlogic/pi-mono)'s minimalism, Alloy brings the same philosophy to the BEAM with OTP's natural advantages: supervision, fault isolation, parallel tool execution, and real concurrency.
 
-- **8 providers** — Anthropic, OpenAI, Gemini, Ollama, OpenRouter, xAI, DeepSeek, Mistral
-- **5 built-in tools** — read, write, edit, bash, scratchpad
+- **3 providers** — Anthropic, OpenAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, Together, etc.)
+- **4 built-in tools** — read, write, edit, bash
 - **GenServer agents** — supervised, stateful, message-passing
-- **Multi-agent teams** — delegate, broadcast, handoff, fault isolation
 - **Streaming** — token-by-token from any provider, unified interface
 - **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
-- **Middleware** — telemetry, logging, custom hooks, tool blocking
+- **Middleware** — custom hooks, tool blocking
 - **Context compaction** — automatic summarization when approaching token limits
 - **OTP-native** — supervision trees, hot code reloading, real parallel tool execution
+- **~5,000 lines** — small enough to read, understand, and extend
 
 ## Installation
 
@@ -60,7 +60,10 @@ result.text #=> "4"
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and summarize the dependencies",
-  provider: {Alloy.Provider.Google, api_key: "...", model: "gemini-2.5-flash"},
+  provider: {Alloy.Provider.OpenAICompat,
+    api_url: "https://generativelanguage.googleapis.com",
+    chat_path: "/v1beta/openai/chat/completions",
+    api_key: "...", model: "gemini-2.5-flash"},
   tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Bash],
   max_turns: 10
 )
@@ -78,8 +81,8 @@ Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Anthropic, api_key: "..."
 # OpenAI
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.2"}} | opts])
 
-# Local (Ollama — no API key needed)
-Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Ollama, model: "llama4"}} | opts])
+# Any OpenAI-compatible API (Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, etc.)
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAICompat, api_url: "http://localhost:11434", model: "llama4"}} | opts])
 ```
 
 ### Streaming
@@ -97,42 +100,8 @@ Stream tokens as they arrive — works with every provider:
 end)
 ```
 
-All 8 providers support streaming. If a custom provider doesn't implement
+All providers support streaming. If a custom provider doesn't implement
 `stream/4`, the turn loop falls back to `complete/3` automatically.
-
-For Anthropic extended thinking with streaming events:
-
-```elixir
-{:ok, agent} = Alloy.Agent.Server.start_link(
-  provider: {Alloy.Provider.Anthropic,
-    api_key: "...",
-    model: "claude-opus-4-6",
-    extended_thinking: [budget_tokens: 5000]
-  }
-)
-
-on_event = fn
-  %{v: 1, event: :text_delta, payload: chunk} ->
-    IO.write(chunk)
-
-  %{v: 1, event: :thinking_delta, payload: chunk} ->
-    IO.write("[thinking: #{chunk}]")
-
-  %{v: 1, event: :tool_start, seq: seq, correlation_id: corr, payload: %{name: name, input: input}} ->
-    IO.puts("\n[tool:start ##{seq} #{corr}] #{name} #{inspect(input)}")
-
-  %{v: 1, event: :tool_end, seq: seq, correlation_id: corr, payload: %{name: name, duration_ms: ms, error: nil}} ->
-    IO.puts("[tool:end ##{seq} #{corr}] #{name} (#{ms}ms)")
-
-  %{v: 1, event: :tool_end, seq: seq, correlation_id: corr, payload: %{name: name, error: error}} ->
-    IO.puts("[tool:end ##{seq} #{corr}] #{name} error=#{inspect(error)}")
-end
-
-{:ok, result} = Alloy.Agent.Server.stream_chat(agent, "Solve this step by step",
-  fn _chunk -> :ok end,
-  on_event: on_event
-)
-```
 
 ### Supervised GenServer agent
 
@@ -153,7 +122,7 @@ Fire a message without blocking the caller — ideal for LiveView and background
 
 ```elixir
 # Subscribe to receive the result
-Phoenix.PubSub.subscribe(Alloy.PubSub, "agent:#{agent_id}")
+Phoenix.PubSub.subscribe(MyApp.PubSub, "agent:#{session_id}:responses")
 
 # Returns {:ok, request_id} immediately — agent works in the background
 {:ok, req_id} = Alloy.Agent.Server.send_message(agent, "Summarise this report",
@@ -166,69 +135,16 @@ def handle_info({:agent_response, %{text: text, request_id: "req-123"}}, socket)
 end
 ```
 
-Optional backpressure and cancellation:
-
-```elixir
-{:ok, agent} = Alloy.Agent.Server.start_link(
-  provider: {...},
-  pubsub: MyApp.PubSub,
-  max_pending: 10
-)
-
-{:ok, request_id} = Alloy.Agent.Server.send_message(agent, "Long task")
-:ok = Alloy.Agent.Server.cancel_request(agent, request_id)
-```
-
-### Multi-agent teams
-
-```elixir
-{:ok, team} = Alloy.Team.start_link(
-  agents: [
-    researcher: [
-      provider: {Alloy.Provider.Google, api_key: "...", model: "gemini-2.5-flash"},
-      system_prompt: "You are a research assistant."
-    ],
-    coder: [
-      provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"},
-      tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Write, Alloy.Tool.Core.Edit],
-      system_prompt: "You are a senior developer."
-    ]
-  ]
-)
-
-# Delegate tasks to specific agents
-{:ok, research} = Alloy.Team.delegate(team, :researcher, "Find the latest Elixir release notes")
-{:ok, code} = Alloy.Team.delegate(team, :coder, "Write a GenServer that #{research.text}")
-```
-
 ## Providers
 
-| Provider | Module | API Key Env Var | Example Model |
-|----------|--------|----------------|---------------|
-| Anthropic | `Alloy.Provider.Anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
-| OpenAI | `Alloy.Provider.OpenAI` | `OPENAI_API_KEY` | `gpt-5.2` |
-| Google Gemini | `Alloy.Provider.Google` | `GEMINI_API_KEY` | `gemini-2.5-flash` |
-| Ollama | `Alloy.Provider.Ollama` | _(none — local)_ | `llama4` |
-| OpenRouter | `Alloy.Provider.OpenRouter` | `OPENROUTER_API_KEY` | `anthropic/claude-sonnet-4-6` |
-| xAI (Grok) | `Alloy.Provider.XAI` | `XAI_API_KEY` | `grok-3` |
-| DeepSeek | `Alloy.Provider.DeepSeek` | `DEEPSEEK_API_KEY` | `deepseek-chat` |
-| Mistral | `Alloy.Provider.Mistral` | `MISTRAL_API_KEY` | `mistral-large-latest` |
+| Provider | Module | Example |
+|----------|--------|---------|
+| Anthropic | `Alloy.Provider.Anthropic` | `model: "claude-sonnet-4-6"` |
+| OpenAI | `Alloy.Provider.OpenAI` | `model: "gpt-5.2"` |
+| Any OpenAI-compatible | `Alloy.Provider.OpenAICompat` | Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, Together |
 
-Adding a provider is ~200 lines implementing the `Alloy.Provider` behaviour.
-
-## CLI
-
-Alloy ships with an interactive REPL:
-
-```bash
-# Interactive mode
-mix alloy
-mix alloy --provider gemini --tools read,bash
-
-# One-shot mode
-mix alloy -p "What is the capital of France?"
-mix alloy -p "Read mix.exs" --tools read --provider openai
-```
+`OpenAICompat` works with any API that implements the OpenAI chat completions format.
+Just set `api_url`, `model`, and optionally `api_key` and `chat_path`.
 
 ## Built-in Tools
 
@@ -237,8 +153,7 @@ mix alloy -p "Read mix.exs" --tools read --provider openai
 | **read** | `Alloy.Tool.Core.Read` | Read files from disk |
 | **write** | `Alloy.Tool.Core.Write` | Write files to disk |
 | **edit** | `Alloy.Tool.Core.Edit` | Search-and-replace editing |
-| **bash** | `Alloy.Tool.Core.Bash` | Execute shell commands |
-| **scratchpad** | `Alloy.Tool.Core.Scratchpad` | Persistent key-value notepad |
+| **bash** | `Alloy.Tool.Core.Bash` | Execute shell commands (restricted shell by default) |
 
 ### Custom tools
 
@@ -269,40 +184,6 @@ defmodule MyApp.Tools.WebSearch do
 end
 ```
 
-#### Optional tool callbacks
-
-Tools can declare richer metadata with two optional callbacks:
-
-```elixir
-defmodule MyApp.Tools.ListAgents do
-  @behaviour Alloy.Tool
-
-  @impl true
-  def name, do: "list_agents"
-  @impl true
-  def description, do: "List running agents with their status"
-  @impl true
-  def input_schema, do: %{type: "object", properties: %{}}
-
-  @impl true
-  def execute(_input, _context) do
-    agents = [%{name: "atlas", status: "idle"}, %{name: "researcher", status: "running"}]
-    {:ok, "Found 2 agents: atlas (idle), researcher (running)", %{agents: agents}}
-  end
-
-  # Optional: declare who may invoke this tool
-  @impl true
-  def allowed_callers, do: [:human, :code_execution]
-
-  # Optional: declare that this tool returns structured data
-  @impl true
-  def result_type, do: :structured
-end
-```
-
-- **`allowed_callers/0`** — `:human` (model during conversation) or `:code_execution` (from a sandbox). Defaults to `[:human]` when not implemented. Providers that support it (e.g., Anthropic) include it in the tool definition sent to the API.
-- **`result_type/0`** — `:text` or `:structured`. When `:structured`, the tool returns `{:ok, text, data}` — text goes to the model, data goes to `meta.structured_data` for programmatic consumption.
-
 ### Code execution (Anthropic)
 
 Enable Anthropic's server-side code execution sandbox:
@@ -314,21 +195,21 @@ Enable Anthropic's server-side code execution sandbox:
 )
 ```
 
-When enabled, the model can write and run Python code in Anthropic's sandbox. Alloy handles the `server_tool_use` / `server_tool_result` round-trip automatically — no custom tool implementation needed.
-
 ## Architecture
 
 ```
 Alloy.run/2                    One-shot agent loop (pure function)
 Alloy.Agent.Server             GenServer wrapper (stateful, supervisable)
-Alloy.Team                     Multi-agent supervisor (delegate, broadcast, handoff)
 Alloy.Agent.Turn               Single turn: call provider → execute tools → return
 Alloy.Provider                 Behaviour: translate wire format ↔ Alloy.Message
 Alloy.Tool                     Behaviour: name, description, input_schema, execute
-Alloy.Middleware               Pipeline: logger, telemetry, custom hooks
+Alloy.Middleware               Pipeline: custom hooks, tool blocking
 Alloy.Context.Compactor        Automatic conversation summarization
-Alloy.Scheduler                Cron/heartbeat for recurring agent runs
 ```
+
+Sessions, persistence, multi-agent coordination, scheduling, skills, and UI
+belong in your application layer. See [Anvil](https://github.com/alloy-ex/anvil)
+for a reference Phoenix application built on Alloy.
 
 ## License
 

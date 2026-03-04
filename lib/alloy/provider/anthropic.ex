@@ -70,7 +70,7 @@ defmodule Alloy.Provider.Anthropic do
        ] ++ Map.get(config, :req_options, []))
       |> Keyword.put(:retry, false)
 
-    task = Task.async(fn -> Req.request(req_opts) end)
+    task = Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn -> Req.request(req_opts) end)
 
     case Task.yield(task, timeout + 5_000) || Task.shutdown(task, :brutal_kill) do
       {:ok, {:ok, %{status: 200, body: resp_body}}} ->
@@ -483,10 +483,10 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp parse_content_block(block) do
-    # Unknown block type - preserve as-is with atom keys
-    Map.new(block, fn {k, v} -> {String.to_existing_atom(k), v} end)
-  rescue
-    ArgumentError -> block
+    # Unknown block type — preserve with string keys to avoid atom table
+    # pollution from untrusted API responses. Only convert known keys.
+    type = Map.get(block, "type", "unknown")
+    %{type: type} |> Map.merge(Map.delete(block, "type"))
   end
 
   defp maybe_put(map, _key, nil), do: map

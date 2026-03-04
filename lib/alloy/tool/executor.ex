@@ -2,9 +2,9 @@ defmodule Alloy.Tool.Executor do
   @moduledoc """
   Executes tool calls and returns result messages.
 
-  Supports parallel execution via `Task.async_stream` -
+  Supports parallel execution via `Task.Supervisor.async_stream` -
   multiple tool calls in a single assistant response are
-  executed concurrently.
+  executed concurrently under `Alloy.TaskSupervisor`.
   """
 
   alias Alloy.Agent.State
@@ -36,8 +36,9 @@ defmodule Alloy.Tool.Executor do
 
       {:ok, tagged} ->
         {results, meta} =
-          tagged
-          |> Task.async_stream(
+          Task.Supervisor.async_stream(
+            Alloy.TaskSupervisor,
+            tagged,
             &run_tagged(&1, tool_fns, context, on_event, seq_ref, corr_id, turn),
             timeout: tool_timeout,
             ordered: true,
@@ -224,8 +225,7 @@ defmodule Alloy.Tool.Executor do
 
   defp build_context(%State{} = state) do
     Map.merge(state.config.context, %{
-      working_directory: state.config.working_directory,
-      config: state.config
+      working_directory: state.config.working_directory
     })
   end
 end

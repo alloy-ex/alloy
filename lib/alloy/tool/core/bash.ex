@@ -88,7 +88,7 @@ defmodule Alloy.Tool.Core.Bash do
     shell_flag = if restricted?, do: "-rc", else: "-c"
 
     task =
-      Task.async(fn ->
+      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
         System.cmd("bash", [shell_flag, command], opts)
       end)
 
@@ -106,7 +106,10 @@ defmodule Alloy.Tool.Core.Bash do
   end
 
   defp run_custom_executor(executor, command, working_dir, timeout) do
-    task = Task.async(fn -> executor.(command, working_dir) end)
+    task =
+      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
+        executor.(command, working_dir)
+      end)
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
       {:ok, {output, exit_code}} ->
