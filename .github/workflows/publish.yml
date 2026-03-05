@@ -68,3 +68,20 @@ jobs:
         run: mix hex.publish --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Trigger landing-site version sync
+        if: ${{ secrets.ALLOY_WEBSITE_SYNC_TOKEN != '' }}
+        env:
+          ALLOY_WEBSITE_SYNC_TOKEN: ${{ secrets.ALLOY_WEBSITE_SYNC_TOKEN }}
+        run: |
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${ALLOY_WEBSITE_SYNC_TOKEN}" \
+            https://api.github.com/repos/alloy-ex/alloy-ex.github.io/dispatches \
+            -d "{\"event_type\":\"hex_release_published\",\"client_payload\":{\"tag\":\"${GITHUB_REF_NAME}\"}}"
+
+      - name: Skip landing-site sync dispatch (missing token)
+        if: ${{ secrets.ALLOY_WEBSITE_SYNC_TOKEN == '' }}
+        run: |
+          echo "::warning::ALLOY_WEBSITE_SYNC_TOKEN is not configured; landing-site sync was not triggered."
