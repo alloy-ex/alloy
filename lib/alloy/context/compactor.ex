@@ -68,11 +68,19 @@ defmodule Alloy.Context.Compactor do
     callback.(middle, state)
   rescue
     e ->
-      Logger.warning("on_compaction callback crashed: #{Exception.message(e)}")
+      Logger.warning(
+        "on_compaction callback crashed: #{Exception.message(e)}\n" <>
+          "Stacktrace: #{Exception.format_stacktrace(__STACKTRACE__)}"
+      )
+
       :ok
   catch
     kind, payload ->
-      Logger.warning("on_compaction callback error (#{kind}): #{inspect(payload)}")
+      Logger.warning(
+        "on_compaction callback error (#{kind}): #{inspect(payload)}\n" <>
+          "Stacktrace: #{Exception.format_stacktrace(__STACKTRACE__)}"
+      )
+
       :ok
   end
 

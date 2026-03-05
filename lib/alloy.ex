@@ -83,15 +83,7 @@ defmodule Alloy do
     try do
       final_state = Turn.run_loop(state)
 
-      result = %Result{
-        text: State.last_assistant_text(final_state),
-        messages: State.messages(final_state),
-        usage: final_state.usage,
-        tool_calls: final_state.tool_calls,
-        status: final_state.status,
-        turns: final_state.turn,
-        error: final_state.error
-      }
+      result = Result.from_state(final_state)
 
       case final_state.status do
         :completed -> {:ok, result}

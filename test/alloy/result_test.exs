@@ -1,7 +1,8 @@
 defmodule Alloy.ResultTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Result
+  alias Alloy.Agent.{Config, State}
+  alias Alloy.{Message, Result, Usage}
 
   describe "struct defaults" do
     test "creates with sensible defaults" do
@@ -73,6 +74,34 @@ defmodule Alloy.ResultTest do
 
       assert old == 10
       assert updated.turns == 11
+    end
+  end
+
+  describe "from_state/1" do
+    test "builds Result from a State struct" do
+      config = %Config{
+        provider: Alloy.Provider.Test,
+        provider_config: %{}
+      }
+
+      state =
+        State.init(config, [Message.user("hello")])
+        |> State.append_messages([Message.assistant("hi there")])
+
+      state = %{state | status: :completed, turn: 2, error: nil, tool_calls: [%{name: "echo"}]}
+      state = %{state | usage: %Usage{input_tokens: 10, output_tokens: 5}}
+
+      result = Result.from_state(state)
+
+      assert %Result{} = result
+      assert result.text == "hi there"
+      assert result.status == :completed
+      assert result.turns == 2
+      assert result.error == nil
+      assert result.tool_calls == [%{name: "echo"}]
+      assert result.usage.input_tokens == 10
+      assert result.request_id == nil
+      assert length(result.messages) == 2
     end
   end
 
