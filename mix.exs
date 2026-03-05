@@ -62,6 +62,7 @@ defmodule Alloy.MixProject do
         Core: [
           Alloy,
           Alloy.Agent.Config,
+          Alloy.Agent.Events,
           Alloy.Agent.Server,
           Alloy.Agent.State,
           Alloy.Agent.Turn,
@@ -75,6 +76,7 @@ defmodule Alloy.MixProject do
           Alloy.Provider.Anthropic,
           Alloy.Provider.OpenAI,
           Alloy.Provider.OpenAICompat,
+          Alloy.Provider.Retry,
           Alloy.Provider.Test
         ],
         Tools: [

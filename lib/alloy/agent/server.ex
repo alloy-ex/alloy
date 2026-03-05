@@ -296,7 +296,8 @@ defmodule Alloy.Agent.Server do
       catch
         kind, reason ->
           Logger.warning(
-            "[Alloy] on_shutdown callback threw #{inspect(kind)}: #{inspect(reason)}"
+            "[Alloy] on_shutdown callback threw #{inspect(kind)}: #{inspect(reason)}\n" <>
+              "Stacktrace: #{Exception.format_stacktrace(__STACKTRACE__)}"
           )
       end
     end
@@ -686,17 +687,7 @@ defmodule Alloy.Agent.Server do
     %{state | turn: 0, status: :idle, error: nil, tool_calls: []}
   end
 
-  defp build_result(%State{} = state) do
-    %Result{
-      text: State.last_assistant_text(state),
-      messages: State.messages(state),
-      usage: state.usage,
-      tool_calls: state.tool_calls,
-      status: state.status,
-      turns: state.turn,
-      error: state.error
-    }
-  end
+  defp build_result(%State{} = state), do: Result.from_state(state)
 
   # Returns the canonical "effective session ID" used consistently for both
   # PubSub broadcast topics and the exported Session.id.

@@ -153,6 +153,72 @@ defmodule Alloy.Context.CompactorTest do
       compacted = Compactor.maybe_compact(state)
       assert %State{} = compacted
     end
+
+    test "logs stacktrace when on_compaction raises" do
+      callback = fn _middle, _state ->
+        raise "Boom! Callback crashed!"
+      end
+
+      big_text = String.duplicate("x", 1200)
+
+      messages = [
+        Message.user("original"),
+        Message.assistant(big_text),
+        Message.user("middle"),
+        Message.assistant("recent"),
+        Message.user("latest")
+      ]
+
+      config = %Config{
+        provider: Alloy.Provider.Test,
+        provider_config: %{},
+        max_tokens: 250,
+        on_compaction: callback
+      }
+
+      state = %State{config: config, messages: messages, messages_new: []}
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          Compactor.maybe_compact(state)
+        end)
+
+      assert log =~ "on_compaction callback crashed"
+      assert log =~ "Stacktrace"
+    end
+
+    test "logs stacktrace when on_compaction throws" do
+      callback = fn _middle, _state ->
+        throw(:kaboom)
+      end
+
+      big_text = String.duplicate("x", 1200)
+
+      messages = [
+        Message.user("original"),
+        Message.assistant(big_text),
+        Message.user("middle"),
+        Message.assistant("recent"),
+        Message.user("latest")
+      ]
+
+      config = %Config{
+        provider: Alloy.Provider.Test,
+        provider_config: %{},
+        max_tokens: 250,
+        on_compaction: callback
+      }
+
+      state = %State{config: config, messages: messages, messages_new: []}
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          Compactor.maybe_compact(state)
+        end)
+
+      assert log =~ "on_compaction callback error"
+      assert log =~ "Stacktrace"
+    end
   end
 
   describe "Config parses on_compaction" do

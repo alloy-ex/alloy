@@ -114,4 +114,29 @@ defmodule Alloy.Agent.OTPLifecycleTest do
       assert session.metadata.status == :idle
     end
   end
+
+  # ── on_shutdown catch stacktrace ──────────────────────────────────────────
+
+  describe "on_shutdown catch block logs stacktrace" do
+    test "logs stacktrace when on_shutdown throws" do
+      {:ok, provider_pid} = TestProvider.start_link([TestProvider.text_response("Done")])
+
+      {:ok, agent} =
+        Server.start_link(
+          provider: {TestProvider, agent_pid: provider_pid},
+          on_shutdown: fn _session -> throw(:kaboom) end
+        )
+
+      {:ok, _} = Server.chat(agent, "Hello")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          Server.stop(agent)
+          Process.sleep(50)
+        end)
+
+      assert log =~ "on_shutdown callback threw"
+      assert log =~ "Stacktrace"
+    end
+  end
 end

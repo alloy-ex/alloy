@@ -44,6 +44,26 @@ defmodule Alloy.Result do
     turns: 0
   ]
 
+  @doc """
+  Build a `Result` from a final `State`.
+
+  Extracts text, messages, usage, tool calls, status, turns, and error
+  from the state. The `request_id` is left as `nil` — async callers
+  overlay it via `%{result | request_id: id}`.
+  """
+  @spec from_state(State.t()) :: t()
+  def from_state(%State{} = state) do
+    %__MODULE__{
+      text: State.last_assistant_text(state),
+      messages: State.messages(state),
+      usage: state.usage,
+      tool_calls: state.tool_calls,
+      status: state.status,
+      turns: state.turn,
+      error: state.error
+    }
+  end
+
   # ── Access callbacks ─────────────────────────────────────────────────────
 
   @impl Access
