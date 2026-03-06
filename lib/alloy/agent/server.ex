@@ -111,7 +111,7 @@ defmodule Alloy.Agent.Server do
 
   ## Examples
 
-      Server.set_model(pid, provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-haiku-4-5-20251001"})
+      Server.set_model(pid, provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-haiku-4-5"})
       Server.set_model(pid, provider: Alloy.Provider.OpenAI)
 
   Returns `{:error, :busy}` if an async Turn is currently running via `send_message/3`.

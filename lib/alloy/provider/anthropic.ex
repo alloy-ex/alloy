@@ -9,14 +9,15 @@ defmodule Alloy.Provider.Anthropic do
 
   Required:
   - `:api_key` - Anthropic API key
-  - `:model` - Model name (e.g., "claude-opus-4-6", "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001")
+  - `:model` - Model name (e.g., "claude-opus-4-6",
+    "claude-sonnet-4-6", "claude-haiku-4-5")
 
   Optional:
   - `:max_tokens` - Max output tokens (default: 4096)
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.anthropic.com")
   - `:api_version` - API version header (default: "2023-06-01")
+  - `:extra_headers` - Additional headers as `[{name, value}]`
   - `:req_options` - Additional options passed to Req (useful for testing)
   - `:extended_thinking` - Enable extended thinking. Pass a keyword list with
     `:budget_tokens` (e.g., `[budget_tokens: 5000]`). Thinking blocks are
@@ -50,6 +51,8 @@ defmodule Alloy.Provider.Anthropic do
   @default_api_version "2023-06-01"
   @default_max_tokens 4096
   @default_provider_timeout 15_000
+  @code_execution_tool_type "code_execution_20250825"
+  @code_execution_beta "code-execution-2025-08-25"
 
   @impl true
   def complete(messages, tool_defs, config) do
@@ -60,11 +63,7 @@ defmodule Alloy.Provider.Anthropic do
       ([
          url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
          method: :post,
-         headers: [
-           {"x-api-key", config.api_key},
-           {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
-           {"content-type", "application/json"}
-         ],
+         headers: build_headers(config),
          body: Jason.encode!(body),
          receive_timeout: timeout
        ] ++ Map.get(config, :req_options, []))
@@ -118,11 +117,7 @@ defmodule Alloy.Provider.Anthropic do
       ([
          url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
          method: :post,
-         headers: [
-           {"x-api-key", config.api_key},
-           {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
-           {"content-type", "application/json"}
-         ],
+         headers: build_headers(config),
          body: Jason.encode!(body),
          into: stream_handler
        ] ++ Map.get(config, :req_options, []))
@@ -321,7 +316,7 @@ defmodule Alloy.Provider.Anthropic do
   defp maybe_add_code_execution(body, config) do
     if Map.get(config, :code_execution, false) do
       code_exec_tool = %{
-        "type" => "code_execution_20250522",
+        "type" => @code_execution_tool_type,
         "name" => "code_execution"
       }
 
@@ -330,6 +325,46 @@ defmodule Alloy.Provider.Anthropic do
     else
       body
     end
+  end
+
+  defp build_headers(config) do
+    extra_headers = Map.get(config, :extra_headers, [])
+    {beta_values, other_headers} = split_anthropic_beta_headers(extra_headers)
+
+    beta_values =
+      if Map.get(config, :code_execution, false) do
+        [@code_execution_beta | beta_values]
+      else
+        beta_values
+      end
+
+    [
+      {"x-api-key", config.api_key},
+      {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
+      {"content-type", "application/json"}
+    ] ++ build_beta_headers(beta_values) ++ other_headers
+  end
+
+  defp split_anthropic_beta_headers(headers) do
+    Enum.reduce(headers, {[], []}, fn
+      {"anthropic-beta", value}, {betas, others} -> {[value | betas], others}
+      {name, value}, {betas, others} -> {betas, [{name, value} | others]}
+    end)
+  end
+
+  defp build_beta_headers([]), do: []
+
+  defp build_beta_headers(beta_values) do
+    merged_value =
+      beta_values
+      |> Enum.reverse()
+      |> Enum.flat_map(&String.split(&1, ",", trim: true))
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+      |> Enum.join(",")
+
+    [{"anthropic-beta", merged_value}]
   end
 
   defp format_message(%Message{role: role, content: content}) when is_binary(content) do

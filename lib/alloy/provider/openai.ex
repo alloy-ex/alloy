@@ -9,12 +9,13 @@ defmodule Alloy.Provider.OpenAI do
 
   Required:
   - `:api_key` - OpenAI API key
-  - `:model` - Model name (e.g., "gpt-5.2", "gpt-5.1", "o3-pro")
+  - `:model` - Model name (e.g., "gpt-5.4", "gpt-5.1", "o3-pro")
 
   Optional:
   - `:max_tokens` - Max output tokens (default: 4096)
   - `:system_prompt` - System prompt string
-  - `:api_url` - Base URL (default: "https://api.openai.com")
+  - `:api_url` - Base URL (default: "https://api.openai.com"). Can point to
+    compatible Responses APIs such as xAI's "https://api.x.ai"
   - `:req_options` - Additional options passed to Req
 
   ## Example
@@ -22,7 +23,15 @@ defmodule Alloy.Provider.OpenAI do
       Alloy.run("Summarize this code.",
         provider: {Alloy.Provider.OpenAI,
           api_key: System.get_env("OPENAI_API_KEY"),
-          model: "gpt-5.2"
+          model: "gpt-5.4"
+        }
+      )
+
+      Alloy.run("Review this repo",
+        provider: {Alloy.Provider.OpenAI,
+          api_key: System.get_env("XAI_API_KEY"),
+          api_url: "https://api.x.ai",
+          model: "grok-4"
         }
       )
   """

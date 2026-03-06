@@ -13,20 +13,37 @@ defmodule Alloy.Context.TokenCounter do
   alias Alloy.Message
 
   @model_limits %{
-    # Anthropic (200k context)
-    "claude-opus-4-6" => 200_000,
-    "claude-sonnet-4-6" => 200_000,
-    "claude-sonnet-4-6-20250514" => 200_000,
-    "claude-haiku-4-5-20251001" => 200_000,
-    # OpenAI
-    "gpt-5.2" => 1_047_576,
-    "gpt-5.1" => 1_047_576,
     "o3-pro" => 200_000,
-    # Google Gemini
-    "gemini-2.5-flash" => 1_000_000,
-    "gemini-2.5-pro" => 1_000_000,
-    "gemini-3-flash-preview" => 1_000_000
+    "gemini-flash-latest" => 1_048_576
   }
+
+  @anthropic_model_limits [
+    {~r/^claude-opus-4-6(?:-\d{8})?$/, 200_000},
+    {~r/^claude-sonnet-4-6(?:-\d{8})?$/, 200_000},
+    {~r/^claude-haiku-4-5(?:-\d{8})?$/, 200_000}
+  ]
+
+  @openai_model_limits [
+    {~r/^gpt-5(?:-\d{4}-\d{2}-\d{2})?$/, 400_000},
+    {~r/^gpt-5\.1(?:-\d{4}-\d{2}-\d{2})?$/, 400_000},
+    {~r/^gpt-5\.2(?:-\d{4}-\d{2}-\d{2})?$/, 400_000},
+    {~r/^gpt-5\.4(?:-\d{4}-\d{2}-\d{2})?$/, 1_050_000}
+  ]
+
+  @gemini_model_limits [
+    {~r/^gemini-2\.5-(?:flash|pro|flash-lite)(?:-preview(?:-\d{2}-\d{4})?)?$/, 1_048_576},
+    {~r/^gemini-3-(?:flash|pro)-preview(?:-\d{2}-\d{4})?$/, 1_048_576}
+  ]
+
+  @xai_model_limits [
+    {~r/^grok-4$/, 256_000},
+    {~r/^grok-4-fast-(?:reasoning|non-reasoning)$/, 2_000_000},
+    {~r/^grok-4-1-fast-reasoning$/, 2_000_000},
+    {~r/^grok-4-1-fast-non-reasoning$/, 2_000_000},
+    {~r/^grok-code-fast-1$/, 256_000},
+    {~r/^grok-3(?:-fast)?$/, 131_072},
+    {~r/^grok-3-mini(?:-fast)?$/, 131_072}
+  ]
 
   @default_limit 200_000
   @default_budget_ratio 0.9
@@ -118,7 +135,18 @@ defmodule Alloy.Context.TokenCounter do
   """
   @spec model_limit(String.t()) :: pos_integer()
   def model_limit(model_name) do
-    Map.get(@model_limits, model_name, @default_limit)
+    Map.get(@model_limits, model_name) ||
+      pattern_model_limit(@anthropic_model_limits, model_name) ||
+      pattern_model_limit(@openai_model_limits, model_name) ||
+      pattern_model_limit(@gemini_model_limits, model_name) ||
+      pattern_model_limit(@xai_model_limits, model_name) ||
+      @default_limit
+  end
+
+  defp pattern_model_limit(limits, model_name) do
+    Enum.find_value(limits, fn {pattern, limit} ->
+      if Regex.match?(pattern, model_name), do: limit
+    end)
   end
 
   @doc """

@@ -11,11 +11,11 @@ Alloy is the completion-tool-call loop and nothing else. Send messages to any LL
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and tell me the version",
-  provider: {Alloy.Provider.OpenAI, api_key: System.get_env("OPENAI_API_KEY"), model: "gpt-5.2"},
+  provider: {Alloy.Provider.OpenAI, api_key: System.get_env("OPENAI_API_KEY"), model: "gpt-5.4"},
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.7.0"
+result.text #=> "The version is 0.7.2"
 ```
 
 ## Why Alloy?
@@ -63,11 +63,15 @@ result.text #=> "4"
   provider: {Alloy.Provider.OpenAICompat,
     api_url: "https://generativelanguage.googleapis.com",
     chat_path: "/v1beta/openai/chat/completions",
-    api_key: "...", model: "gemini-2.5-flash"},
+    api_key: "...", model: "gemini-2.5-flash-lite"},
   tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Bash],
   max_turns: 10
 )
 ```
+
+Gemini model IDs Alloy now budgets for include `gemini-2.5-pro`,
+`gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-pro-preview`, and
+`gemini-3-flash-preview`.
 
 ### Swap providers in one line
 
@@ -79,7 +83,10 @@ opts = [tools: [Alloy.Tool.Core.Read], max_turns: 10]
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"}} | opts])
 
 # OpenAI
-Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.2"}} | opts])
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"}} | opts])
+
+# xAI via Responses-compatible API
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", api_url: "https://api.x.ai", model: "grok-4"}} | opts])
 
 # Any OpenAI-compatible API (Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, etc.)
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAICompat, api_url: "http://localhost:11434", model: "llama4"}} | opts])
@@ -91,7 +98,7 @@ Stream tokens as they arrive — works with every provider:
 
 ```elixir
 {:ok, agent} = Alloy.Agent.Server.start_link(
-  provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.2"},
+  provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"},
   tools: [Alloy.Tool.Core.Read]
 )
 
@@ -137,11 +144,16 @@ end
 
 ## Providers
 
-| Provider | Module | Example |
-|----------|--------|---------|
-| Anthropic | `Alloy.Provider.Anthropic` | `model: "claude-sonnet-4-6"` |
-| OpenAI | `Alloy.Provider.OpenAI` | `model: "gpt-5.2"` |
-| Any OpenAI-compatible | `Alloy.Provider.OpenAICompat` | Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, Together |
+| Vendor | Recommended Module | Example Models |
+|--------|---------------------|----------------|
+| Anthropic | `Alloy.Provider.Anthropic` | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
+| OpenAI | `Alloy.Provider.OpenAI` | `gpt-5.4` |
+| xAI | `Alloy.Provider.OpenAI` with `api_url: "https://api.x.ai"` | `grok-4`, `grok-4-fast-reasoning`, `grok-code-fast-1` |
+| Gemini | `Alloy.Provider.OpenAICompat` | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-pro-preview` |
+| Other OpenAI-compatible APIs | `Alloy.Provider.OpenAICompat` | Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together |
+
+Use `Alloy.Provider.OpenAI` for native Responses APIs like OpenAI and xAI.
+Use `Alloy.Provider.OpenAICompat` for chat-completions compatible APIs and local runtimes.
 
 `OpenAICompat` works with any API that implements the OpenAI chat completions format.
 Just set `api_url`, `model`, and optionally `api_key` and `chat_path`.
@@ -214,3 +226,8 @@ for a reference Phoenix application built on Alloy.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Releases
+
+Hex.pm publishing is handled by GitHub Actions on `v*` tags.
+Successful publishes also dispatch the landing-site version sync workflow.

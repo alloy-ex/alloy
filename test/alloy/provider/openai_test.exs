@@ -183,6 +183,16 @@ defmodule Alloy.Provider.OpenAITest do
       assert function_output["call_id"] == "call_abc"
       assert function_output["output"] == "file contents here"
     end
+
+    test "uses custom api_url for Responses-compatible providers such as xAI" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:api_url, "https://api.x.ai")
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_info, %{host: "api.x.ai", request_path: "/v1/responses"}}
+    end
   end
 
   describe "complete/3 multimodal formatting" do
@@ -527,6 +537,7 @@ defmodule Alloy.Provider.OpenAITest do
       Req.Test.stub(__MODULE__, fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         send(test_pid, {:request_body, body})
+        send(test_pid, {:request_info, %{host: conn.host, request_path: conn.request_path}})
 
         Plug.Conn.send_resp(
           conn,

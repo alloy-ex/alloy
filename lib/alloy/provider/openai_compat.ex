@@ -9,7 +9,7 @@ defmodule Alloy.Provider.OpenAICompat do
 
   Required:
   - `:api_url` - Base URL (e.g., "https://api.deepseek.com",
-    "https://api.mistral.ai", "http://localhost:11434")
+    "https://api.mistral.ai", "https://api.x.ai", "http://localhost:11434")
   - `:model` - Model name
 
   Optional:
@@ -39,13 +39,12 @@ defmodule Alloy.Provider.OpenAICompat do
         }
       )
 
-      # OpenRouter
+      # xAI chat completions compatibility
       Alloy.run("Hello",
         provider: {Alloy.Provider.OpenAICompat,
-          api_key: System.get_env("OPENROUTER_API_KEY"),
-          api_url: "https://openrouter.ai",
-          chat_path: "/api/v1/chat/completions",
-          model: "anthropic/claude-sonnet-4-6"
+          api_key: System.get_env("XAI_API_KEY"),
+          api_url: "https://api.x.ai",
+          model: "grok-code-fast-1"
         }
       )
   """

@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-03-06
+
+### Added
+
+- **xAI Responses path documented and tested** — `Alloy.Provider.OpenAI` now explicitly documents `api_url: "https://api.x.ai"` usage, and tests verify custom Responses API routing.
+- **Current xAI model budgeting** — `TokenCounter` now recognizes current public xAI API model names including `grok-4`, `grok-4-fast-reasoning`, `grok-4-fast-non-reasoning`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning`, and `grok-code-fast-1`.
+
+### Changed
+
+- **Provider/model docs refreshed** — README and provider moduledocs now point to current Anthropic 4.6, OpenAI GPT-5.4, Gemini 2.5/3 preview, and xAI model setups.
+- **Anthropic code execution integration updated** — provider now uses `code_execution_20250825` and automatically merges required `anthropic-beta` headers with caller-supplied beta flags.
+- **Publish workflow aligned with CI strictness** — release pipeline now runs `mix credo --strict` before publishing to Hex.pm.
+
+### Fixed
+
+- **OpenAI token budgets corrected** — `gpt-5`, `gpt-5.1`, and `gpt-5.2` context limits were updated to current published limits, preventing stale compaction thresholds.
+- **xAI token budgets corrected** — `grok-4` now uses the documented 256k window, while Grok 4 fast and Grok 4.1 fast variants use the documented 2M window.
+- **Anthropic model drift removed** — stale Anthropic alias examples were replaced with current `claude-opus-4-6`, `claude-sonnet-4-6`, and `claude-haiku-4-5` references.
+
 ## [0.7.1] - 2026-03-04
 
 ### Added
@@ -236,6 +255,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.7.2]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.2
 [0.7.1]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.1
 [0.7.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.0
 [0.6.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.6.0

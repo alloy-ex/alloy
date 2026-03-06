@@ -74,9 +74,35 @@ defmodule Alloy.Context.TokenCounterTest do
 
   describe "model_limit/1" do
     test "returns known model limits" do
+      assert TokenCounter.model_limit("claude-opus-4-6") == 200_000
       assert TokenCounter.model_limit("claude-sonnet-4-6") == 200_000
-      assert TokenCounter.model_limit("gpt-5.2") == 1_047_576
-      assert TokenCounter.model_limit("gemini-2.5-flash") == 1_000_000
+      assert TokenCounter.model_limit("claude-haiku-4-5") == 200_000
+      assert TokenCounter.model_limit("gpt-5") == 400_000
+      assert TokenCounter.model_limit("gpt-5.1") == 400_000
+      assert TokenCounter.model_limit("gpt-5.2") == 400_000
+      assert TokenCounter.model_limit("gpt-5.4") == 1_050_000
+      assert TokenCounter.model_limit("gemini-2.5-flash") == 1_048_576
+      assert TokenCounter.model_limit("gemini-2.5-flash-lite") == 1_048_576
+      assert TokenCounter.model_limit("gemini-3-flash-preview") == 1_048_576
+      assert TokenCounter.model_limit("grok-4") == 256_000
+      assert TokenCounter.model_limit("grok-4-fast-reasoning") == 2_000_000
+      assert TokenCounter.model_limit("grok-4-fast-non-reasoning") == 2_000_000
+      assert TokenCounter.model_limit("grok-4-1-fast-reasoning") == 2_000_000
+      assert TokenCounter.model_limit("grok-4-1-fast-non-reasoning") == 2_000_000
+      assert TokenCounter.model_limit("grok-code-fast-1") == 256_000
+    end
+
+    test "returns known limits for dated or aliased models" do
+      assert TokenCounter.model_limit("claude-opus-4-6-20251015") == 200_000
+      assert TokenCounter.model_limit("claude-sonnet-4-6-20251010") == 200_000
+      assert TokenCounter.model_limit("claude-haiku-4-5-20251015") == 200_000
+      assert TokenCounter.model_limit("gpt-5-2025-08-07") == 400_000
+      assert TokenCounter.model_limit("gpt-5.1-2025-11-13") == 400_000
+      assert TokenCounter.model_limit("gpt-5.2-2025-12-11") == 400_000
+      assert TokenCounter.model_limit("gpt-5.4-2026-03-05") == 1_050_000
+      assert TokenCounter.model_limit("gemini-3-pro-preview-11-2025") == 1_048_576
+      assert TokenCounter.model_limit("gemini-flash-latest") == 1_048_576
+      assert TokenCounter.model_limit("grok-3-mini") == 131_072
     end
 
     test "returns default for unknown model" do

@@ -226,9 +226,35 @@ defmodule Alloy.Provider.AnthropicTest do
       tools = decoded["tools"]
       assert length(tools) == 2
 
-      code_exec_tool = Enum.find(tools, &(&1["type"] == "code_execution_20250522"))
+      code_exec_tool = Enum.find(tools, &(&1["type"] == "code_execution_20250825"))
       assert code_exec_tool != nil
       assert code_exec_tool["name"] == "code_execution"
+    end
+
+    test "adds anthropic-beta header for code_execution and merges extra beta headers" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:code_execution, true)
+        |> Map.put(:extra_headers, [{"anthropic-beta", "context-1m-2025-08-07"}])
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_headers, headers}
+
+      anthropic_beta_values =
+        headers
+        |> Enum.filter(fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
+        |> Enum.map(fn {_name, value} -> value end)
+
+      assert [merged_beta_header] = anthropic_beta_values
+
+      merged_beta_values =
+        merged_beta_header
+        |> String.split(",", trim: true)
+        |> Enum.map(&String.trim/1)
+        |> Enum.sort()
+
+      assert merged_beta_values == ["code-execution-2025-08-25", "context-1m-2025-08-07"]
     end
 
     test "does not include code_execution tool when code_execution is false" do
@@ -249,7 +275,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
       tools = decoded["tools"]
       assert length(tools) == 1
-      refute Enum.any?(tools, &(&1["type"] == "code_execution_20250522"))
+      refute Enum.any?(tools, &(&1["type"] == "code_execution_20250825"))
     end
 
     test "parses server_tool_use response blocks" do
@@ -964,7 +990,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
       config = %{
         api_key: "sk-ant-test-key",
-        model: "claude-sonnet-4-6-20250514",
+        model: "claude-sonnet-4-6",
         max_tokens: 4096,
         req_options: [plug: {Req.Test, __MODULE__}]
       }
@@ -985,7 +1011,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
       config = %{
         api_key: "sk-ant-test-key",
-        model: "claude-sonnet-4-6-20250514",
+        model: "claude-sonnet-4-6",
         max_tokens: 4096,
         req_options: [
           plug: {Req.Test, __MODULE__},
@@ -1008,7 +1034,7 @@ defmodule Alloy.Provider.AnthropicTest do
   defp config_with_response(response) do
     %{
       api_key: "sk-ant-test-key",
-      model: "claude-sonnet-4-6-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 4096,
       req_options: [
         plug: {Req.Test, __MODULE__},
@@ -1032,7 +1058,7 @@ defmodule Alloy.Provider.AnthropicTest do
   defp config_with_sse_stream(chunks) do
     %{
       api_key: "sk-ant-test-key",
-      model: "claude-sonnet-4-6-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 4096,
       req_options: [plug: {Req.Test, __MODULE__}, retry: false]
     }
@@ -1053,7 +1079,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
     %{
       api_key: "sk-ant-test-key",
-      model: "claude-sonnet-4-6-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 4096,
       req_options: [plug: {Req.Test, __MODULE__}, retry: false]
     }
@@ -1074,7 +1100,7 @@ defmodule Alloy.Provider.AnthropicTest do
   defp config_with_sse_error_stream(status, body) do
     %{
       api_key: "sk-ant-test-key",
-      model: "claude-sonnet-4-6-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 4096,
       req_options: [plug: {Req.Test, __MODULE__}, retry: false]
     }
@@ -1092,7 +1118,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
     %{
       api_key: "sk-ant-test-key",
-      model: "claude-sonnet-4-6-20250514",
+      model: "claude-sonnet-4-6",
       max_tokens: 4096,
       req_options: [
         plug: {Req.Test, __MODULE__},
@@ -1103,6 +1129,7 @@ defmodule Alloy.Provider.AnthropicTest do
       Req.Test.stub(__MODULE__, fn conn ->
         {:ok, body, conn} = Plug.Conn.read_body(conn)
         send(test_pid, {:request_body, body})
+        send(test_pid, {:request_headers, conn.req_headers})
 
         Plug.Conn.send_resp(
           conn,
