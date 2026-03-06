@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-03-06
+
+### Fixed
+
+- **Hex publish workflow validation** — the release workflow no longer references `secrets.*` directly in step `if:` guards, so tag-triggered publish jobs can run again and dispatch the landing-site sync correctly.
+
+### Changed
+
+- **Release version bump** — republishes the provider/model refresh from `0.7.2` as a valid Hex release candidate after fixing the GitHub Actions publish workflow.
+
 ## [0.7.2] - 2026-03-06
 
 ### Added
@@ -255,6 +265,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.7.3]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.3
 [0.7.2]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.2
 [0.7.1]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.1
 [0.7.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.0

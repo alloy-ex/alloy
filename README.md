@@ -15,7 +15,7 @@ Alloy is the completion-tool-call loop and nothing else. Send messages to any LL
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.7.2"
+result.text #=> "The version is 0.7.3"
 ```
 
 ## Why Alloy?

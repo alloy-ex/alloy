@@ -43,6 +43,8 @@ jobs:
     name: Publish to Hex.pm
     needs: test
     runs-on: ubuntu-latest
+    env:
+      ALLOY_WEBSITE_SYNC_TOKEN: ${{ secrets.ALLOY_WEBSITE_SYNC_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
@@ -70,9 +72,7 @@ jobs:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
       - name: Trigger landing-site version sync
-        if: ${{ secrets.ALLOY_WEBSITE_SYNC_TOKEN != '' }}
-        env:
-          ALLOY_WEBSITE_SYNC_TOKEN: ${{ secrets.ALLOY_WEBSITE_SYNC_TOKEN }}
+        if: ${{ env.ALLOY_WEBSITE_SYNC_TOKEN != '' }}
         run: |
           curl --fail --silent --show-error \
             -X POST \
@@ -82,6 +82,6 @@ jobs:
             -d "{\"event_type\":\"hex_release_published\",\"client_payload\":{\"tag\":\"${GITHUB_REF_NAME}\"}}"
 
       - name: Skip landing-site sync dispatch (missing token)
-        if: ${{ secrets.ALLOY_WEBSITE_SYNC_TOKEN == '' }}
+        if: ${{ env.ALLOY_WEBSITE_SYNC_TOKEN == '' }}
         run: |
           echo "::warning::ALLOY_WEBSITE_SYNC_TOKEN is not configured; landing-site sync was not triggered."
