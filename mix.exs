@@ -64,6 +64,7 @@ defmodule Alloy.MixProject do
           Alloy.Agent.Config,
           Alloy.Agent.Events,
           Alloy.Agent.Server,
+          Alloy.ModelMetadata,
           Alloy.Agent.State,
           Alloy.Agent.Turn,
           Alloy.Message,
