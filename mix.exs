@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.7.3"
+  @version "0.7.4"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do

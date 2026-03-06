@@ -15,7 +15,7 @@ Alloy is the completion-tool-call loop and nothing else. Send messages to any LL
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.7.3"
+result.text #=> "The version is 0.7.4"
 ```
 
 ## Why Alloy?
@@ -109,6 +109,26 @@ end)
 
 All providers support streaming. If a custom provider doesn't implement
 `stream/4`, the turn loop falls back to `complete/3` automatically.
+
+### Overriding model metadata
+
+Alloy derives the compaction budget from the configured provider model when it
+knows that model's context window. If you need to support a just-released model
+before Alloy ships a catalog update, override it in config:
+
+```elixir
+{:ok, result} = Alloy.run("Summarise this repository",
+  provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4-2026-03-05"},
+  model_metadata_overrides: %{
+    "gpt-5.4" => 900_000,
+    "acme-reasoner" => %{limit: 640_000, suffix_patterns: ["", ~r/^-\d{4}\.\d{2}$/]}
+  }
+)
+```
+
+Set `max_tokens` explicitly when you want a fixed compaction budget. Otherwise
+Alloy derives it from the current model, including after
+`Alloy.Agent.Server.set_model/2` switches to a different provider model.
 
 ### Supervised GenServer agent
 
