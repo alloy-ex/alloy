@@ -36,11 +36,12 @@ defmodule Alloy do
   - `:system_prompt` - system prompt string (default: `nil`)
   - `:messages` - existing conversation history (default: `[]`)
   - `:max_turns` - maximum agent loop iterations (default: `25`)
-  - `:max_tokens` - context window budget for compaction (default: `200_000`)
+  - `:max_tokens` - context window budget for compaction (default: provider model window when known, otherwise `200_000`)
   - `:middleware` - list of `Alloy.Middleware` modules (default: `[]`)
   - `:working_directory` - base path for file tools (default: `"."`)
   - `:context` - arbitrary map passed to tools and middleware (default: `%{}`)
   - `:max_pending` - max queued async `send_message/3` requests while one is running (default: `0`)
+  - `:model_metadata_overrides` - overrides for model context windows used to derive `:max_tokens` when not set explicitly (default: `%{}`)
   """
 
   alias Alloy.Agent.{Config, Server, State, Turn}

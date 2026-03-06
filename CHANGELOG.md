@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Config-level model metadata overrides** — `Alloy.run/2` now accepts `:model_metadata_overrides`, allowing applications to override or extend model context windows used to derive compaction budgets without waiting for a library release.
+
+### Changed
+
+- **`max_tokens` defaults now follow provider models** — `Alloy.Agent.Config` derives the compaction budget from the configured provider `:model` when the catalog knows that model, re-derives it when models change via `Server.set_model/2`, and falls back to `200_000` only when no model metadata is available or when no model is configured.
+
 ## [0.7.3] - 2026-03-06
 
 ### Fixed

@@ -13,6 +13,13 @@ defmodule Alloy.ModelMetadata do
           suffix_patterns: [String.t() | Regex.t()]
         }
 
+  @type override_entry ::
+          pos_integer()
+          | %{
+              required(:limit) => pos_integer(),
+              optional(:suffix_patterns) => [String.t() | Regex.t()]
+            }
+
   @default_limit 200_000
 
   @model_entries [
@@ -59,11 +66,25 @@ defmodule Alloy.ModelMetadata do
   @doc """
   Returns the known context window limit for a model name.
 
-  Returns `nil` when the model is not in the current catalog.
+  `overrides` may provide exact-model or family overrides as either:
+
+  - `%{"model-name" => 1_000_000}`
+  - `%{"model-name" => %{limit: 1_000_000, suffix_patterns: ["", ~r/^-\d+$/]}}`
+
+  For overrides that only provide a limit, existing catalog suffix patterns are
+  reused when available; unknown models default to exact-match only.
+
+  Returns `nil` when the model is not in the current catalog or overrides.
   """
-  @spec context_window(String.t()) :: pos_integer() | nil
-  def context_window(model_name) when is_binary(model_name) do
-    Enum.find_value(@model_entries, fn entry ->
+  @spec context_window(
+          String.t(),
+          %{optional(String.t()) => override_entry()} | [{String.t(), override_entry()}]
+        ) ::
+          pos_integer() | nil
+  def context_window(model_name, overrides \\ %{}) when is_binary(model_name) do
+    entries = override_entries(overrides) ++ @model_entries
+
+    Enum.find_value(entries, fn entry ->
       if match_entry?(entry, model_name), do: entry.limit
     end)
   end
@@ -79,6 +100,48 @@ defmodule Alloy.ModelMetadata do
   """
   @spec catalog() :: [model_entry()]
   def catalog, do: @model_entries
+
+  defp override_entries(overrides) when is_map(overrides) do
+    overrides
+    |> Enum.map(&build_override_entry/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp override_entries(overrides) when is_list(overrides) do
+    overrides
+    |> Enum.map(&build_override_entry/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp override_entries(_), do: []
+
+  defp build_override_entry({name, limit})
+       when is_binary(name) and is_integer(limit) and limit > 0 do
+    %{name: name, limit: limit, suffix_patterns: override_suffix_patterns(name, nil)}
+  end
+
+  defp build_override_entry({name, %{limit: limit} = override})
+       when is_binary(name) and is_integer(limit) and limit > 0 do
+    %{name: name, limit: limit, suffix_patterns: override_suffix_patterns(name, override)}
+  end
+
+  defp build_override_entry({name, override}) when is_binary(name) and is_list(override) do
+    build_override_entry({name, Map.new(override)})
+  end
+
+  defp build_override_entry(_), do: nil
+
+  defp override_suffix_patterns(_name, %{suffix_patterns: suffix_patterns})
+       when is_list(suffix_patterns) do
+    suffix_patterns
+  end
+
+  defp override_suffix_patterns(name, _override) do
+    case Enum.find(@model_entries, &(&1.name == name)) do
+      %{suffix_patterns: suffix_patterns} -> suffix_patterns
+      nil -> [""]
+    end
+  end
 
   defp match_entry?(%{name: name, suffix_patterns: suffix_patterns}, model_name) do
     case String.trim_leading(model_name, name) do

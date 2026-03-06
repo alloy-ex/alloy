@@ -396,13 +396,7 @@ defmodule Alloy.Agent.Server do
 
   @impl GenServer
   def handle_call({:set_model, provider_opts}, _from, state) do
-    {provider_mod, provider_config} =
-      case provider_opts[:provider] do
-        {mod, config} when is_atom(mod) and is_list(config) -> {mod, Map.new(config)}
-        mod when is_atom(mod) -> {mod, %{}}
-      end
-
-    updated_config = %{state.config | provider: provider_mod, provider_config: provider_config}
+    updated_config = Config.with_provider(state.config, provider_opts[:provider])
     {:reply, :ok, %{state | config: updated_config}}
   end
 
