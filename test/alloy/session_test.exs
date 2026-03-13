@@ -99,5 +99,26 @@ defmodule Alloy.SessionTest do
 
       assert updated.metadata == %{agent: "researcher"}
     end
+
+    test "merges result metadata into session metadata" do
+      session = Session.new(metadata: %{agent: "researcher"})
+
+      result = %{
+        messages: [Message.user("test")],
+        usage: %Usage{input_tokens: 5},
+        metadata: %{
+          provider_state: %{response_id: "resp_789"},
+          provider_response: %{citations: [%{"url" => "https://docs.x.ai/overview"}]}
+        }
+      }
+
+      updated = Session.update_from_result(session, result)
+
+      assert updated.metadata == %{
+               agent: "researcher",
+               provider_state: %{response_id: "resp_789"},
+               provider_response: %{citations: [%{"url" => "https://docs.x.ai/overview"}]}
+             }
+    end
   end
 end

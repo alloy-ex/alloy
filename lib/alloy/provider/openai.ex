@@ -16,6 +16,18 @@ defmodule Alloy.Provider.OpenAI do
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.openai.com"). Can point to
     compatible Responses APIs such as xAI's "https://api.x.ai"
+  - `:provider_state` - opaque provider-owned state carried across turns.
+    For Responses APIs Alloy uses `%{response_id: "..."}`
+  - `:store` - Persist the response server-side when supported
+  - `:include` - Additional response fields to include
+  - `:tool_choice` - Provider-native tool selection mode
+  - `:parallel_tool_calls` - Whether the provider may issue tool calls in parallel
+  - `:previous_response_id` - Explicit Responses continuation ID. Overrides
+    `provider_state.response_id` when both are present
+  - `:built_in_tools` - provider-native tool definitions to append to custom
+    function tools
+  - `:web_search` - `true` or a config map to append a `web_search` tool
+  - `:x_search` - `true` or a config map to append an `x_search` tool
   - `:req_options` - Additional options passed to Req
 
   ## Example
@@ -125,16 +137,75 @@ defmodule Alloy.Provider.OpenAI do
   defp build_request_body(messages, tool_defs, config) do
     input_items = build_input_items(messages, config)
 
-    body = %{
-      "model" => config.model,
-      "max_output_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
-      "input" => input_items
-    }
+    body =
+      %{
+        "model" => config.model,
+        "max_output_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
+        "input" => input_items
+      }
+      |> maybe_put_previous_response_id(config)
+      |> maybe_put_optional_request_field("store", Map.get(config, :store))
+      |> maybe_put_optional_request_field("include", Map.get(config, :include))
+      |> maybe_put_optional_request_field("tool_choice", Map.get(config, :tool_choice))
+      |> maybe_put_optional_request_field(
+        "parallel_tool_calls",
+        Map.get(config, :parallel_tool_calls)
+      )
 
-    case tool_defs do
+    tools =
+      Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
+
+    case tools do
       [] -> body
-      defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
+      defs -> Map.put(body, "tools", defs)
     end
+  end
+
+  defp maybe_put_previous_response_id(body, config) do
+    previous_response_id =
+      Map.get(config, :previous_response_id) ||
+        get_in(config, [:provider_state, :response_id])
+
+    maybe_put_optional_request_field(body, "previous_response_id", previous_response_id)
+  end
+
+  defp maybe_put_optional_request_field(body, _key, nil), do: body
+  defp maybe_put_optional_request_field(body, _key, value) when value == [], do: body
+  defp maybe_put_optional_request_field(body, key, value), do: Map.put(body, key, value)
+
+  defp built_in_tools(config) do
+    []
+    |> maybe_append_built_in_tool("web_search", Map.get(config, :web_search))
+    |> maybe_append_built_in_tool("x_search", Map.get(config, :x_search))
+    |> Kernel.++(normalize_built_in_tools(Map.get(config, :built_in_tools, [])))
+  end
+
+  defp maybe_append_built_in_tool(tools, _type, nil), do: tools
+  defp maybe_append_built_in_tool(tools, _type, false), do: tools
+  defp maybe_append_built_in_tool(tools, type, true), do: tools ++ [%{"type" => type}]
+
+  defp maybe_append_built_in_tool(tools, "web_search", config) when is_map(config) do
+    tools ++ [normalize_web_search_tool(config)]
+  end
+
+  defp maybe_append_built_in_tool(tools, type, config) when is_map(config) do
+    tools ++ [Map.put(Alloy.Provider.stringify_keys(config), "type", type)]
+  end
+
+  defp normalize_built_in_tools(tools) when is_list(tools) do
+    Enum.map(tools, &normalize_built_in_tool/1)
+  end
+
+  defp normalize_built_in_tools(_), do: []
+
+  defp normalize_built_in_tool(%{"type" => _type} = tool), do: Alloy.Provider.stringify_keys(tool)
+
+  defp normalize_built_in_tool(%{type: _type} = tool), do: Alloy.Provider.stringify_keys(tool)
+
+  defp normalize_web_search_tool(config) do
+    config
+    |> Alloy.Provider.stringify_keys()
+    |> Map.put("type", "web_search")
   end
 
   defp build_input_items(messages, config) do
@@ -329,6 +400,7 @@ defmodule Alloy.Provider.OpenAI do
 
   defp parse_response(%{"output" => output} = resp) when is_list(output) do
     usage = resp["usage"] || %{}
+    provider_state = provider_state_from_response(resp)
 
     case parse_output_to_blocks(output) do
       {:ok, content_blocks} ->
@@ -346,7 +418,9 @@ defmodule Alloy.Provider.OpenAI do
            usage: %{
              input_tokens: Map.get(usage, "input_tokens", 0),
              output_tokens: Map.get(usage, "output_tokens", 0)
-           }
+           },
+           provider_state: provider_state,
+           response_metadata: response_metadata_from_response(resp)
          }}
 
       {:error, _} = err ->
@@ -356,6 +430,7 @@ defmodule Alloy.Provider.OpenAI do
 
   defp parse_response(%{"output_text" => text} = resp) when is_binary(text) do
     usage = resp["usage"] || %{}
+    provider_state = provider_state_from_response(resp)
 
     content_blocks =
       case text do
@@ -370,7 +445,9 @@ defmodule Alloy.Provider.OpenAI do
        usage: %{
          input_tokens: Map.get(usage, "input_tokens", 0),
          output_tokens: Map.get(usage, "output_tokens", 0)
-       }
+       },
+       provider_state: provider_state,
+       response_metadata: response_metadata_from_response(resp)
      }}
   end
 
@@ -428,8 +505,8 @@ defmodule Alloy.Provider.OpenAI do
   defp parse_assistant_content(content) when is_list(content) do
     content
     |> Enum.flat_map(fn
-      %{"type" => "output_text", "text" => text} when is_binary(text) and text != "" ->
-        [%{type: "text", text: text}]
+      %{"type" => "output_text", "text" => text} = item when is_binary(text) and text != "" ->
+        [%{type: "text", text: text} |> maybe_put_annotations(item["annotations"])]
 
       %{"type" => "refusal", "refusal" => text} when is_binary(text) and text != "" ->
         [%{type: "text", text: text}]
@@ -493,4 +570,30 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp format_error_payload(error), do: inspect(error)
+
+  defp provider_state_from_response(%{"id" => id}) when is_binary(id) and id != "" do
+    %{response_id: id}
+  end
+
+  defp provider_state_from_response(_resp), do: %{}
+
+  defp response_metadata_from_response(resp) do
+    %{}
+    |> maybe_put_response_metadata(:citations, Map.get(resp, "citations"))
+    |> maybe_put_response_metadata(
+      :server_side_tool_usage,
+      Map.get(resp, "server_side_tool_usage")
+    )
+  end
+
+  defp maybe_put_response_metadata(metadata, _key, nil), do: metadata
+  defp maybe_put_response_metadata(metadata, _key, value) when value == [], do: metadata
+  defp maybe_put_response_metadata(metadata, key, value), do: Map.put(metadata, key, value)
+
+  defp maybe_put_annotations(block, annotations)
+       when is_list(annotations) and annotations != [] do
+    Map.put(block, :annotations, annotations)
+  end
+
+  defp maybe_put_annotations(block, _annotations), do: block
 end

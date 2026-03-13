@@ -12,15 +12,21 @@ defmodule Alloy.Provider do
   - `:stop_reason` - `:tool_use` (continue looping) or `:end_turn` (done)
   - `:messages` - list of `Alloy.Message` structs from the response
   - `:usage` - map with `:input_tokens` and `:output_tokens`
+  - `:provider_state` - optional opaque map Alloy feeds back to the same provider
+    on subsequent turns (for example, stored response IDs)
+  - `:response_metadata` - optional provider response metadata exposed to the app
+    layer (for example, citations or server-side tool usage)
   """
 
   @type stop_reason :: :tool_use | :end_turn
   @type tool_def :: %{name: String.t(), description: String.t(), input_schema: map()}
 
   @type completion_response :: %{
-          stop_reason: stop_reason(),
-          messages: [Alloy.Message.t()],
-          usage: map()
+          required(:stop_reason) => stop_reason(),
+          required(:messages) => [Alloy.Message.t()],
+          required(:usage) => map(),
+          optional(:provider_state) => map(),
+          optional(:response_metadata) => map()
         }
 
   @doc """
@@ -66,8 +72,14 @@ defmodule Alloy.Provider do
   @spec stringify_keys(term()) :: term()
   def stringify_keys(map) when is_map(map) do
     Map.new(map, fn
-      {k, v} when is_atom(k) -> {Atom.to_string(k), stringify_keys(v)}
-      {k, v} -> {k, stringify_keys(v)}
+      {k, v} when is_atom(k) ->
+        {Atom.to_string(k), stringify_keys(v)}
+
+      {k, v} when is_binary(k) ->
+        {k, stringify_keys(v)}
+
+      {k, _v} ->
+        raise ArgumentError, "stringify_keys expects atom or string keys, got: #{inspect(k)}"
     end)
   end
 

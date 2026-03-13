@@ -12,6 +12,7 @@ defmodule Alloy.ResultTest do
       assert result.messages == []
       assert result.usage == %Alloy.Usage{}
       assert result.tool_calls == []
+      assert result.metadata == %{}
       assert result.status == :completed
       assert result.turns == 0
       assert result.error == nil
@@ -24,6 +25,10 @@ defmodule Alloy.ResultTest do
         messages: [:msg],
         usage: %Alloy.Usage{input_tokens: 42},
         tool_calls: [%{name: "read"}],
+        metadata: %{
+          provider_state: %{response_id: "resp_123"},
+          provider_response: %{citations: [%{"url" => "https://docs.x.ai/overview"}]}
+        },
         status: :error,
         turns: 3,
         error: :timeout,
@@ -34,6 +39,12 @@ defmodule Alloy.ResultTest do
       assert result.messages == [:msg]
       assert result.usage.input_tokens == 42
       assert result.tool_calls == [%{name: "read"}]
+
+      assert result.metadata == %{
+               provider_state: %{response_id: "resp_123"},
+               provider_response: %{citations: [%{"url" => "https://docs.x.ai/overview"}]}
+             }
+
       assert result.status == :error
       assert result.turns == 3
       assert result.error == :timeout
@@ -90,6 +101,12 @@ defmodule Alloy.ResultTest do
 
       state = %{state | status: :completed, turn: 2, error: nil, tool_calls: [%{name: "echo"}]}
       state = %{state | usage: %Usage{input_tokens: 10, output_tokens: 5}}
+      state = %{state | provider_state: %{response_id: "resp_456"}}
+
+      state = %{
+        state
+        | provider_response_metadata: %{citations: [%{"url" => "https://docs.x.ai/overview"}]}
+      }
 
       result = Result.from_state(state)
 
@@ -99,6 +116,12 @@ defmodule Alloy.ResultTest do
       assert result.turns == 2
       assert result.error == nil
       assert result.tool_calls == [%{name: "echo"}]
+
+      assert result.metadata == %{
+               provider_state: %{response_id: "resp_456"},
+               provider_response: %{citations: [%{"url" => "https://docs.x.ai/overview"}]}
+             }
+
       assert result.usage.input_tokens == 10
       assert result.request_id == nil
       assert length(result.messages) == 2

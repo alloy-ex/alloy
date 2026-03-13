@@ -15,7 +15,7 @@ Alloy is the completion-tool-call loop and nothing else. Send messages to any LL
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.7.4"
+result.text #=> "The version is 0.7.5"
 ```
 
 ## Why Alloy?
@@ -31,6 +31,30 @@ Most agent frameworks try to be everything — sessions, memory, RAG, multi-agen
 - **Context compaction** — automatic summarization when approaching token limits
 - **OTP-native** — supervision trees, hot code reloading, real parallel tool execution
 - **~5,000 lines** — small enough to read, understand, and extend
+
+## Design Boundary
+
+Alloy stays minimal by owning protocol and loop concerns, not application
+workflows.
+
+What belongs in Alloy:
+- Provider wire-format translation
+- Tool-call / completion loop mechanics
+- Normalized message blocks
+- Opaque provider-owned state such as stored response IDs
+- Provider response metadata such as citations or server-side tool telemetry
+
+What does not belong in Alloy:
+- Sessions and persistence policy
+- File storage, indexing, or retrieval workflows
+- UI rendering for citations, search, or artifacts
+- Scheduling, background job orchestration, or dashboards
+- Tenant plans, quotas, billing, or hosted infrastructure policy
+
+Rule of thumb: if the feature is required to speak a provider API correctly,
+and could help any Alloy consumer, it likely belongs here. If it needs a
+database table, product defaults, UI decisions, or tenancy logic, it belongs in
+your application layer.
 
 ## Installation
 
@@ -109,6 +133,68 @@ end)
 
 All providers support streaming. If a custom provider doesn't implement
 `stream/4`, the turn loop falls back to `complete/3` automatically.
+
+### Provider-owned state
+
+Some provider APIs expose server-side state such as stored response IDs.
+That transport concern lives in Alloy; your app decides whether and how to
+persist it.
+
+Results expose provider-owned state in `result.metadata.provider_state`:
+
+```elixir
+{:ok, result} =
+  Alloy.run("Read the repo",
+    provider: {Alloy.Provider.OpenAI,
+      api_key: System.get_env("XAI_API_KEY"),
+      api_url: "https://api.x.ai",
+      model: "grok-4",
+      store: true
+    }
+  )
+
+provider_state = result.metadata.provider_state
+```
+
+Pass that state back to the same provider on the next turn to continue a
+provider-native conversation:
+
+```elixir
+{:ok, next_result} =
+  Alloy.run("Keep going",
+    messages: result.messages,
+    provider: {Alloy.Provider.OpenAI,
+      api_key: System.get_env("XAI_API_KEY"),
+      api_url: "https://api.x.ai",
+      model: "grok-4",
+      provider_state: provider_state
+    }
+  )
+```
+
+### Provider-native tools and citations
+
+Responses-compatible providers can expose built-in server-side tools without
+leaking those wire details into your app layer.
+
+For xAI search tools:
+
+```elixir
+{:ok, result} =
+  Alloy.run("Summarise the latest xAI docs updates",
+    provider: {Alloy.Provider.OpenAI,
+      api_key: System.get_env("XAI_API_KEY"),
+      api_url: "https://api.x.ai",
+      model: "grok-4",
+      web_search: %{allowed_domains: ["docs.x.ai"]},
+      include: ["inline_citations"]
+    }
+  )
+```
+
+Citation metadata is exposed in two places:
+- `result.metadata.provider_response.citations` for provider-level citation data
+- assistant text blocks may include `:annotations` for inline citation spans
 
 ### Overriding model metadata
 
