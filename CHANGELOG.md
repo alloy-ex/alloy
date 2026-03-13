@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] - 2026-03-13
+
+### Fixed
+
+- **EchoTool test crashes (7 warnings)** — `EchoTool.execute/2` now accepts both string and atom key maps, fixing pattern-match failures when the test provider sends atom-keyed tool inputs.
+- **Anthropic double-timeout** — removed the `Task.Supervisor` wrapper from `Anthropic.complete/3`. Req's `receive_timeout` (injected by `Retry.inject_receive_timeout`) already enforces the deadline — the Task added a redundant `yield + 5s` buffer. `complete/3` now calls `Req.request` directly, matching the OpenAI and OpenAICompat providers.
+- **6 Dialyzer warnings resolved** — changed `pending_requests` typespec from `:queue.queue()` (opaque in OTP 28) to `term()` in `State`, replaced `when value == %{}` guard with `map_size/1` in `Result`, and removed unreachable `nil` clause in `maybe_put_metadata/3`.
+- **`stringify_keys/1` safety** — added explicit `is_binary(k)` clause and `raise ArgumentError` for unexpected (non-atom, non-string) map keys instead of silent pass-through.
+
 ## [0.7.4] - 2026-03-06
 
 ### Added
@@ -275,6 +284,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.7.5]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.5
+[0.7.4]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.4
 [0.7.3]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.3
 [0.7.2]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.2
 [0.7.1]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.1

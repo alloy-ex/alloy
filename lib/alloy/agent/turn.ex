@@ -91,21 +91,29 @@ defmodule Alloy.Agent.Turn do
           )
 
         case result do
-          {:ok, %{stop_reason: :tool_use, messages: new_msgs, usage: usage}} ->
+          {:ok, %{stop_reason: :tool_use, messages: new_msgs, usage: usage} = provider_response} ->
             state =
               state
               |> State.append_messages(new_msgs)
               |> State.increment_turn()
               |> State.merge_usage(usage)
+              |> State.merge_provider_state(Map.get(provider_response, :provider_state))
+              |> State.put_provider_response_metadata(
+                Map.get(provider_response, :response_metadata)
+              )
 
             handle_tool_use(state, new_msgs, opts, deadline)
 
-          {:ok, %{stop_reason: :end_turn, messages: new_msgs, usage: usage}} ->
+          {:ok, %{stop_reason: :end_turn, messages: new_msgs, usage: usage} = provider_response} ->
             state =
               state
               |> State.append_messages(new_msgs)
               |> State.increment_turn()
               |> State.merge_usage(usage)
+              |> State.merge_provider_state(Map.get(provider_response, :provider_state))
+              |> State.put_provider_response_metadata(
+                Map.get(provider_response, :response_metadata)
+              )
 
             case Middleware.run(:after_completion, state) do
               {:halted, reason} ->
@@ -170,8 +178,10 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  defp build_provider_config(%State{config: config}) do
-    Map.put(config.provider_config, :system_prompt, config.system_prompt)
+  defp build_provider_config(%State{config: config, provider_state: provider_state}) do
+    config.provider_config
+    |> Map.put(:system_prompt, config.system_prompt)
+    |> Map.put(:provider_state, provider_state)
   end
 
   defp extract_tool_calls(messages) do

@@ -105,6 +105,55 @@ defmodule Alloy.Agent.TurnTest do
       assert end_event_seq > start_event_seq
     end
 
+    test "carries provider_state across turns and exposes it in final state" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "world"}}
+          ]),
+          TestProvider.text_response("Tool said: Echo: world", %{response_id: "resp_123"})
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool]
+      }
+
+      state = State.init(config, [Message.user("Echo world")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert result.provider_state == %{response_id: "resp_123"}
+    end
+
+    test "stores latest provider response metadata in final state" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [Message.assistant("Hello there!")],
+             usage: %{input_tokens: 10, output_tokens: 5},
+             response_metadata: %{citations: [%{"url" => "https://docs.x.ai/overview"}]}
+           }}
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid}
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+
+      assert result.provider_response_metadata == %{
+               citations: [%{"url" => "https://docs.x.ai/overview"}]
+             }
+    end
+
     test "handles multiple tool calls in one turn" do
       {:ok, pid} =
         TestProvider.start_link([

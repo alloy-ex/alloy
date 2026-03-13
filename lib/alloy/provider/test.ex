@@ -122,6 +122,20 @@ defmodule Alloy.Provider.Test do
   end
 
   @doc """
+  Builds a scripted `{:ok, completion_response}` with text and provider state.
+  """
+  @spec text_response(String.t(), map()) :: {:ok, Alloy.Provider.completion_response()}
+  def text_response(text, provider_state) when is_binary(text) and is_map(provider_state) do
+    {:ok,
+     %{
+       stop_reason: :end_turn,
+       messages: [Alloy.Message.assistant(text)],
+       usage: %{input_tokens: 10, output_tokens: 5},
+       provider_state: provider_state
+     }}
+  end
+
+  @doc """
   Builds a scripted `{:ok, completion_response}` with tool_use blocks.
   """
   @spec tool_use_response([Alloy.Message.content_block()]) ::

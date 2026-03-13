@@ -11,6 +11,7 @@ defmodule Alloy.Result do
     * `:messages` — full conversation history
     * `:usage` — accumulated `%Alloy.Usage{}` token counts
     * `:tool_calls` — list of tool execution metadata maps
+    * `:metadata` — auxiliary result metadata such as provider-owned state
     * `:status` — final run status (`:completed`, `:max_turns`, `:error`, `:halted`)
     * `:turns` — number of agent loop iterations
     * `:error` — error term (or `nil` on success)
@@ -27,6 +28,7 @@ defmodule Alloy.Result do
           messages: [Message.t()],
           usage: Usage.t(),
           tool_calls: [map()],
+          metadata: map(),
           status: State.status(),
           turns: non_neg_integer(),
           error: term() | nil,
@@ -40,6 +42,7 @@ defmodule Alloy.Result do
     messages: [],
     usage: %Usage{},
     tool_calls: [],
+    metadata: %{},
     status: :completed,
     turns: 0
   ]
@@ -58,6 +61,7 @@ defmodule Alloy.Result do
       messages: State.messages(state),
       usage: state.usage,
       tool_calls: state.tool_calls,
+      metadata: build_metadata(state),
       status: state.status,
       turns: state.turn,
       error: state.error
@@ -77,4 +81,15 @@ defmodule Alloy.Result do
     value = Map.get(result, key)
     {value, Map.put(result, key, nil)}
   end
+
+  defp build_metadata(%State{} = state) do
+    %{}
+    |> maybe_put_metadata(:provider_state, state.provider_state)
+    |> maybe_put_metadata(:provider_response, state.provider_response_metadata)
+  end
+
+  defp maybe_put_metadata(metadata, _key, value) when is_map(value) and map_size(value) == 0,
+    do: metadata
+
+  defp maybe_put_metadata(metadata, key, value), do: Map.put(metadata, key, value)
 end

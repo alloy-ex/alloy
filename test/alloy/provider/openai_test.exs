@@ -28,6 +28,7 @@ defmodule Alloy.Provider.OpenAITest do
       assert Message.text(hd(result.messages)) == "Hello!"
       assert result.usage.input_tokens == 10
       assert result.usage.output_tokens == 5
+      assert result.provider_state == %{response_id: "resp_test"}
     end
   end
 
@@ -193,6 +194,88 @@ defmodule Alloy.Provider.OpenAITest do
 
       assert_received {:request_info, %{host: "api.x.ai", request_path: "/v1/responses"}}
     end
+
+    test "includes native Responses API controls in the request body" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{response_id: "resp_prev"})
+        |> Map.put(:store, true)
+        |> Map.put(:include, ["inline_citations"])
+        |> Map.put(:tool_choice, "required")
+        |> Map.put(:parallel_tool_calls, false)
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert decoded["previous_response_id"] == "resp_prev"
+      assert decoded["store"] == true
+      assert decoded["include"] == ["inline_citations"]
+      assert decoded["tool_choice"] == "required"
+      assert decoded["parallel_tool_calls"] == false
+    end
+
+    test "explicit previous_response_id overrides provider_state response_id" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{response_id: "resp_prev"})
+        |> Map.put(:previous_response_id, "resp_explicit")
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert decoded["previous_response_id"] == "resp_explicit"
+    end
+
+    test "includes provider-native built-in search tools" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:web_search, %{allowed_domains: ["docs.x.ai"]})
+        |> Map.put(:x_search, %{max_search_results: 5})
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [
+               %{
+                 "type" => "web_search",
+                 "allowed_domains" => ["docs.x.ai"]
+               },
+               %{
+                 "type" => "x_search",
+                 "max_search_results" => 5
+               }
+             ] = decoded["tools"]
+    end
+
+    test "appends raw built_in_tools after custom function tools" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:built_in_tools, [%{type: "web_search_preview"}])
+
+      tool_defs = [
+        %{
+          name: "read",
+          description: "Read a file",
+          input_schema: %{type: "object", properties: %{}}
+        }
+      ]
+
+      OpenAI.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [
+               %{"type" => "function", "name" => "read"},
+               %{"type" => "web_search_preview"}
+             ] = decoded["tools"]
+    end
   end
 
   describe "complete/3 multimodal formatting" do
@@ -318,6 +401,76 @@ defmodule Alloy.Provider.OpenAITest do
       assert result.stop_reason == :end_turn
       assert result.usage.input_tokens == 0
       assert result.usage.output_tokens == 0
+    end
+  end
+
+  describe "complete/3 response metadata" do
+    test "captures citations and output text annotations" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "resp_test",
+              "object" => "response",
+              "status" => "completed",
+              "citations" => [
+                %{
+                  "type" => "url_citation",
+                  "url" => "https://docs.x.ai/overview",
+                  "title" => "Overview"
+                }
+              ],
+              "output" => [
+                %{
+                  "id" => "msg_test",
+                  "type" => "message",
+                  "role" => "assistant",
+                  "content" => [
+                    %{
+                      "type" => "output_text",
+                      "text" => "xAI says hi [1]",
+                      "annotations" => [
+                        %{
+                          "type" => "url_citation",
+                          "url" => "https://docs.x.ai/overview",
+                          "title" => "Overview",
+                          "start_index" => 12,
+                          "end_index" => 15
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "usage" => %{"input_tokens" => 10, "output_tokens" => 5}
+            })
+        })
+
+      assert {:ok, result} = OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert result.response_metadata == %{
+               citations: [
+                 %{
+                   "type" => "url_citation",
+                   "url" => "https://docs.x.ai/overview",
+                   "title" => "Overview"
+                 }
+               ]
+             }
+
+      [%Message{content: [%{type: "text", text: "xAI says hi [1]", annotations: annotations}]}] =
+        result.messages
+
+      assert annotations == [
+               %{
+                 "type" => "url_citation",
+                 "url" => "https://docs.x.ai/overview",
+                 "title" => "Overview",
+                 "start_index" => 12,
+                 "end_index" => 15
+               }
+             ]
     end
   end
 

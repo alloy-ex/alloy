@@ -50,7 +50,13 @@ defmodule Alloy.Session do
   """
   @spec update_from_result(t(), map()) :: t()
   def update_from_result(%__MODULE__{} = session, result) do
-    %{session | messages: result.messages, usage: result.usage, updated_at: DateTime.utc_now()}
+    %{
+      session
+      | messages: result.messages,
+        usage: result.usage,
+        metadata: Map.merge(session.metadata, Map.get(result, :metadata, %{})),
+        updated_at: DateTime.utc_now()
+    }
   end
 
   defp generate_id do

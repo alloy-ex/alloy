@@ -14,7 +14,6 @@ defmodule Alloy.Test.EchoTool do
   end
 
   @impl true
-  def execute(%{"text" => text}, _context) do
-    {:ok, "Echo: #{text}"}
-  end
+  def execute(%{"text" => text}, _context), do: {:ok, "Echo: #{text}"}
+  def execute(%{text: text}, _context), do: {:ok, "Echo: #{text}"}
 end

@@ -22,10 +22,12 @@ defmodule Alloy.Agent.State do
           tool_calls: [map()],
           tool_defs: [map()],
           tool_fns: %{String.t() => module()},
+          provider_state: map(),
+          provider_response_metadata: map(),
           started_at: integer() | nil,
           agent_id: String.t(),
           current_task: {reference(), pid(), binary()} | nil,
-          pending_requests: :queue.queue({String.t(), binary()})
+          pending_requests: term()
         }
 
   @enforce_keys [:config]
@@ -40,6 +42,8 @@ defmodule Alloy.Agent.State do
     status: :idle,
     tool_defs: [],
     tool_fns: %{},
+    provider_state: %{},
+    provider_response_metadata: %{},
     started_at: nil,
     agent_id: "",
     current_task: nil,
@@ -61,6 +65,7 @@ defmodule Alloy.Agent.State do
       messages: messages,
       tool_defs: tool_defs,
       tool_fns: tool_fns,
+      provider_state: Map.get(config.provider_config, :provider_state, %{}),
       started_at: System.monotonic_time(:millisecond),
       agent_id: agent_id
     }
@@ -89,6 +94,26 @@ defmodule Alloy.Agent.State do
   @spec append_tool_calls(t(), [map()]) :: t()
   def append_tool_calls(%__MODULE__{} = state, tool_calls) when is_list(tool_calls) do
     %{state | tool_calls: state.tool_calls ++ tool_calls}
+  end
+
+  @doc """
+  Merge provider-owned state returned by the model backend.
+  """
+  @spec merge_provider_state(t(), map() | nil) :: t()
+  def merge_provider_state(%__MODULE__{} = state, nil), do: state
+
+  def merge_provider_state(%__MODULE__{} = state, provider_state) when is_map(provider_state) do
+    %{state | provider_state: Map.merge(state.provider_state, provider_state)}
+  end
+
+  @doc """
+  Replace the latest provider response metadata for this run.
+  """
+  @spec put_provider_response_metadata(t(), map() | nil) :: t()
+  def put_provider_response_metadata(%__MODULE__{} = state, nil), do: state
+
+  def put_provider_response_metadata(%__MODULE__{} = state, metadata) when is_map(metadata) do
+    %{state | provider_response_metadata: metadata}
   end
 
   @doc """

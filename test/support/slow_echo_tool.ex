@@ -26,4 +26,10 @@ defmodule Alloy.Test.SlowEchoTool do
     if sleep_ms > 0, do: Process.sleep(sleep_ms)
     {:ok, "Echo: #{text}"}
   end
+
+  def execute(%{text: text} = input, _context) do
+    sleep_ms = Map.get(input, :sleep_ms, 0)
+    if sleep_ms > 0, do: Process.sleep(sleep_ms)
+    {:ok, "Echo: #{text}"}
+  end
 end
