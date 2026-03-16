@@ -118,7 +118,18 @@ Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAICompat, api_url: "h
 
 ### Streaming
 
-Stream tokens as they arrive — works with every provider:
+For a one-shot run, use `Alloy.stream/3`:
+
+```elixir
+{:ok, result} =
+  Alloy.stream("Explain OTP", fn chunk ->
+    IO.write(chunk)
+  end,
+    provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"}
+  )
+```
+
+For a persistent agent process with conversation state, use `Alloy.Agent.Server.stream_chat/4`:
 
 ```elixir
 {:ok, agent} = Alloy.Agent.Server.start_link(
@@ -133,6 +144,9 @@ end)
 
 All providers support streaming. If a custom provider doesn't implement
 `stream/4`, the turn loop falls back to `complete/3` automatically.
+
+`Alloy.run/2` remains the buffered convenience API. Use `Alloy.stream/3`
+when you want the same one-shot flow with token streaming.
 
 ### Provider-owned state
 
