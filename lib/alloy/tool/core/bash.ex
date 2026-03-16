@@ -68,7 +68,7 @@ defmodule Alloy.Tool.Core.Bash do
   @impl true
   def execute(input, context) do
     command = input["command"]
-    timeout = min(input["timeout"] || @default_timeout, @default_timeout)
+    timeout = normalize_timeout(input["timeout"])
     working_dir = Map.get(context, :working_directory)
     executor = Map.get(context, :bash_executor)
 
@@ -125,6 +125,9 @@ defmodule Alloy.Tool.Core.Bash do
 
   defp maybe_add_cd(opts, nil), do: opts
   defp maybe_add_cd(opts, dir), do: Keyword.put(opts, :cd, dir)
+
+  defp normalize_timeout(timeout) when is_integer(timeout) and timeout > 0, do: timeout
+  defp normalize_timeout(_timeout), do: @default_timeout
 
   defp truncate(output) when byte_size(output) > @max_output do
     String.slice(output, 0, @max_output) <> "\n... (output truncated)"
