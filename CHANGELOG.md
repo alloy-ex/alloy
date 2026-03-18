@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] - 2026-03-19
+
+### Added
+
+- **Grouped compaction settings** — `Alloy.run/2` now accepts `compaction: [...]` with `reserve_tokens`, `keep_recent_tokens`, and `fallback`, making context compaction behavior configurable without replacing `max_tokens`.
+
+### Changed
+
+- **Summary-first context compaction** — `Alloy.Context.Compactor` now preserves the first message, keeps a recent token-budgeted verbatim window, and replaces older context with a single structured handoff summary generated through the configured provider.
+- **Reserve-based compaction trigger** — compaction now starts when the conversation exceeds `max_tokens - reserve_tokens` instead of relying on the previous fixed 90% threshold.
+- **Repeated compactions reuse the handoff summary** — Alloy updates the existing synthetic summary message on later compactions instead of stacking multiple summaries, while still falling back to deterministic truncation if summary generation fails.
+
 ## [0.7.5] - 2026-03-13
 
 ### Fixed
