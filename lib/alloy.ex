@@ -45,6 +45,7 @@ defmodule Alloy do
   - `:messages` - existing conversation history (default: `[]`)
   - `:max_turns` - maximum agent loop iterations (default: `25`)
   - `:max_tokens` - context window budget for compaction (default: provider model window when known, otherwise `200_000`)
+  - `:compaction` - grouped compaction settings like `reserve_tokens`, `keep_recent_tokens`, and `fallback` (default: derived from `:max_tokens`)
   - `:middleware` - list of `Alloy.Middleware` modules (default: `[]`)
   - `:working_directory` - base path for file tools (default: `"."`)
   - `:context` - arbitrary map passed to tools and middleware (default: `%{}`)

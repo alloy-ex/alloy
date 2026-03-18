@@ -67,4 +67,49 @@ defmodule Alloy.Agent.ConfigTest do
       assert config.code_execution == false
     end
   end
+
+  describe "compaction option" do
+    test "derives reserve and keep_recent token defaults from max_tokens" do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          max_tokens: 80
+        )
+
+      assert config.compaction == %{
+               reserve_tokens: 8,
+               keep_recent_tokens: 10,
+               fallback: :truncate
+             }
+    end
+
+    test "accepts explicit compaction overrides" do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          max_tokens: 100,
+          compaction: [reserve_tokens: 12, keep_recent_tokens: 34, fallback: :truncate]
+        )
+
+      assert config.compaction == %{
+               reserve_tokens: 12,
+               keep_recent_tokens: 34,
+               fallback: :truncate
+             }
+    end
+
+    test "scales defaults safely for very small max_tokens" do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          max_tokens: 5
+        )
+
+      assert config.compaction == %{
+               reserve_tokens: 1,
+               keep_recent_tokens: 1,
+               fallback: :truncate
+             }
+    end
+  end
 end

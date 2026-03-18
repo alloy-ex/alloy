@@ -8,6 +8,12 @@ defmodule Alloy.Agent.Config do
 
   alias Alloy.ModelMetadata
 
+  @type compaction :: %{
+          reserve_tokens: pos_integer(),
+          keep_recent_tokens: pos_integer(),
+          fallback: :truncate
+        }
+
   @type t :: %__MODULE__{
           provider: module(),
           provider_config: map(),
@@ -21,6 +27,11 @@ defmodule Alloy.Agent.Config do
           timeout_ms: pos_integer(),
           tool_timeout: pos_integer(),
           middleware: [module()],
+          compaction: compaction(),
+          compaction_explicit: %{
+            reserve_tokens: boolean(),
+            keep_recent_tokens: boolean()
+          },
           working_directory: String.t(),
           context: map(),
           on_shutdown: (Alloy.Session.t() -> any()) | nil,
@@ -47,6 +58,8 @@ defmodule Alloy.Agent.Config do
     timeout_ms: 120_000,
     tool_timeout: 120_000,
     middleware: [],
+    compaction: %{reserve_tokens: 16_384, keep_recent_tokens: 20_000, fallback: :truncate},
+    compaction_explicit: %{reserve_tokens: false, keep_recent_tokens: false},
     working_directory: ".",
     context: %{},
     on_shutdown: nil,
@@ -69,25 +82,31 @@ defmodule Alloy.Agent.Config do
     model_metadata_overrides = normalize_model_metadata_overrides(opts[:model_metadata_overrides])
     max_tokens_explicit? = Keyword.has_key?(opts, :max_tokens)
 
+    max_tokens =
+      resolve_max_tokens(
+        opts,
+        provider_config,
+        model_metadata_overrides,
+        max_tokens_explicit?
+      )
+
+    {compaction, compaction_explicit} = resolve_compaction(opts[:compaction], max_tokens)
+
     %__MODULE__{
       provider: provider_mod,
       provider_config: provider_config,
       tools: Keyword.get(opts, :tools, []),
       system_prompt: Keyword.get(opts, :system_prompt),
       max_turns: Keyword.get(opts, :max_turns, 25),
-      max_tokens:
-        resolve_max_tokens(
-          opts,
-          provider_config,
-          model_metadata_overrides,
-          max_tokens_explicit?
-        ),
+      max_tokens: max_tokens,
       max_tokens_explicit?: max_tokens_explicit?,
       max_retries: Keyword.get(opts, :max_retries, 3),
       retry_backoff_ms: Keyword.get(opts, :retry_backoff_ms, 1_000),
       timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
       tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
       middleware: Keyword.get(opts, :middleware, []),
+      compaction: compaction,
+      compaction_explicit: compaction_explicit,
       working_directory: Keyword.get(opts, :working_directory, "."),
       context: Keyword.get(opts, :context, %{}),
       on_shutdown: Keyword.get(opts, :on_shutdown, nil),
@@ -122,7 +141,30 @@ defmodule Alloy.Agent.Config do
         default_max_tokens(model_name(provider_config), config.model_metadata_overrides)
       end
 
-    %{config | provider: provider_mod, provider_config: provider_config, max_tokens: max_tokens}
+    compaction =
+      %{
+        reserve_tokens:
+          resolve_compaction_field(
+            config.compaction.reserve_tokens,
+            config.compaction_explicit.reserve_tokens,
+            default_reserve_tokens(max_tokens)
+          ),
+        keep_recent_tokens:
+          resolve_compaction_field(
+            config.compaction.keep_recent_tokens,
+            config.compaction_explicit.keep_recent_tokens,
+            default_keep_recent_tokens(max_tokens)
+          ),
+        fallback: config.compaction.fallback
+      }
+
+    %{
+      config
+      | provider: provider_mod,
+        provider_config: provider_config,
+        max_tokens: max_tokens,
+        compaction: compaction
+    }
   end
 
   defp parse_provider({module, config})
@@ -175,5 +217,98 @@ defmodule Alloy.Agent.Config do
 
   defp default_max_tokens(_model_name, _model_metadata_overrides) do
     ModelMetadata.default_context_window()
+  end
+
+  defp resolve_compaction(raw_compaction, max_tokens) do
+    compaction = normalize_compaction(raw_compaction)
+
+    explicit = %{
+      reserve_tokens: Map.has_key?(compaction, :reserve_tokens),
+      keep_recent_tokens: Map.has_key?(compaction, :keep_recent_tokens)
+    }
+
+    fallback =
+      compaction
+      |> Map.get(:fallback, :truncate)
+      |> validate_compaction_fallback()
+
+    resolved = %{
+      reserve_tokens:
+        if(explicit.reserve_tokens,
+          do: validate_compaction_tokens!(compaction.reserve_tokens, :reserve_tokens),
+          else: default_reserve_tokens(max_tokens)
+        ),
+      keep_recent_tokens:
+        if(explicit.keep_recent_tokens,
+          do: validate_compaction_tokens!(compaction.keep_recent_tokens, :keep_recent_tokens),
+          else: default_keep_recent_tokens(max_tokens)
+        ),
+      fallback: fallback
+    }
+
+    {resolved, explicit}
+  end
+
+  defp normalize_compaction(nil), do: %{}
+
+  defp normalize_compaction(compaction) when is_map(compaction),
+    do: normalize_compaction_map(compaction)
+
+  defp normalize_compaction(compaction) when is_list(compaction),
+    do: normalize_compaction_map(Map.new(compaction))
+
+  defp normalize_compaction(other) do
+    raise ArgumentError,
+          "compaction must be a keyword list or map, got: #{inspect(other)}"
+  end
+
+  defp normalize_compaction_map(map) do
+    Enum.reduce(map, %{}, fn
+      {:reserve_tokens, value}, acc ->
+        Map.put(acc, :reserve_tokens, value)
+
+      {"reserve_tokens", value}, acc ->
+        Map.put(acc, :reserve_tokens, value)
+
+      {:keep_recent_tokens, value}, acc ->
+        Map.put(acc, :keep_recent_tokens, value)
+
+      {"keep_recent_tokens", value}, acc ->
+        Map.put(acc, :keep_recent_tokens, value)
+
+      {:fallback, value}, acc ->
+        Map.put(acc, :fallback, value)
+
+      {"fallback", value}, acc ->
+        Map.put(acc, :fallback, value)
+
+      {key, _value}, _acc ->
+        raise ArgumentError, "unsupported compaction option: #{inspect(key)}"
+    end)
+  end
+
+  defp resolve_compaction_field(current_value, true, _default_value), do: current_value
+  defp resolve_compaction_field(_current_value, false, default_value), do: default_value
+
+  defp validate_compaction_tokens!(value, _field) when is_integer(value) and value > 0, do: value
+
+  defp validate_compaction_tokens!(value, field) do
+    raise ArgumentError,
+          "#{field} must be a positive integer, got: #{inspect(value)}"
+  end
+
+  defp validate_compaction_fallback(:truncate), do: :truncate
+
+  defp validate_compaction_fallback(other) do
+    raise ArgumentError,
+          "compaction fallback must be :truncate, got: #{inspect(other)}"
+  end
+
+  defp default_reserve_tokens(max_tokens) do
+    min(16_384, max(1, div(max_tokens, 10)))
+  end
+
+  defp default_keep_recent_tokens(max_tokens) do
+    min(20_000, max(1, div(max_tokens, 8)))
   end
 end

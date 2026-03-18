@@ -219,4 +219,16 @@ defmodule Alloy.Context.TokenCounterTest do
       refute TokenCounter.within_budget?(messages, 1000)
     end
   end
+
+  describe "within_reserve?/3" do
+    test "returns true when the reserve still leaves enough room" do
+      messages = [Message.user(String.duplicate("a", 200))]
+      assert TokenCounter.within_reserve?(messages, 100, 40)
+    end
+
+    test "returns false when the reserve threshold is exceeded" do
+      messages = [Message.user(String.duplicate("a", 260))]
+      refute TokenCounter.within_reserve?(messages, 100, 40)
+    end
+  end
 end
