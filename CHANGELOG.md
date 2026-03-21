@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-03-21
+
+### Added
+
+- **Cost guard** — `Alloy.run/2` now accepts `max_budget_cents: N` to cap agent spend. The loop halts with `:budget_exceeded` status when cumulative `estimated_cost_cents` exceeds the threshold. Default is `nil` (no limit).
+- **One-shot streaming helper** — `Alloy.stream/3` provides a simpler API for streaming agent responses without managing a GenServer.
+
+### Changed
+
+- **Summary-first context compaction** — `Alloy.Context.Compactor` now preserves the first message, keeps a recent token-budgeted verbatim window, and replaces older context with a single structured handoff summary generated through the configured provider. Falls back to deterministic truncation if summary generation fails.
+- **Grouped compaction settings** — `compaction: [reserve_tokens: N, keep_recent_tokens: N, fallback: :truncate]` makes context compaction behavior configurable.
+- **Reserve-based compaction trigger** — compaction now starts when the conversation exceeds `max_tokens - reserve_tokens` instead of the previous fixed 90% threshold.
+
+### Fixed
+
+- **Bash tool timeout** — fixed timeout override not being respected when passed via tool input.
+
 ## [0.7.6] - 2026-03-19
 
 ### Added
@@ -296,6 +313,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.8.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.8.0
+[0.7.6]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.6
 [0.7.5]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.5
 [0.7.4]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.4
 [0.7.3]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.3

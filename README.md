@@ -15,7 +15,7 @@ Alloy is the completion-tool-call loop and nothing else. Send messages to any LL
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.7.5"
+result.text #=> "The version is 0.8.0"
 ```
 
 ## Why Alloy?
@@ -28,7 +28,8 @@ Most agent frameworks try to be everything — sessions, memory, RAG, multi-agen
 - **Streaming** — token-by-token from any provider, unified interface
 - **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
 - **Middleware** — custom hooks, tool blocking
-- **Context compaction** — automatic summarization when approaching token limits
+- **Context compaction** — summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
+- **Cost guard** — `max_budget_cents` halts the loop before overspending
 - **OTP-native** — supervision trees, hot code reloading, real parallel tool execution
 - **~5,000 lines** — small enough to read, understand, and extend
 
@@ -63,7 +64,7 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.7"}
+    {:alloy, "~> 0.8"}
   ]
 end
 ```
@@ -243,6 +244,25 @@ summarizes older context:
   ]
 )
 ```
+
+### Cost guard
+
+Cap how much an agent run can spend:
+
+```elixir
+{:ok, result} = Alloy.run("Research this codebase thoroughly",
+  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"},
+  tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Bash],
+  max_budget_cents: 50
+)
+
+case result.status do
+  :completed -> IO.puts(result.text)
+  :budget_exceeded -> IO.puts("Stopped: spent #{result.usage.estimated_cost_cents}¢")
+end
+```
+
+Set `max_budget_cents: nil` (default) for no limit.
 
 ### Supervised GenServer agent
 
