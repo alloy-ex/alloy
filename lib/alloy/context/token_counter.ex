@@ -113,4 +113,14 @@ defmodule Alloy.Context.TokenCounter do
   def within_budget?(messages, max_tokens, ratio \\ @default_budget_ratio) do
     estimate_tokens(messages) < max_tokens * ratio
   end
+
+  @doc """
+  Returns true if the estimated token count stays within `max_tokens`
+  after reserving `reserve_tokens` for future work like compaction summaries
+  or model responses.
+  """
+  @spec within_reserve?([Message.t()], pos_integer(), non_neg_integer()) :: boolean()
+  def within_reserve?(messages, max_tokens, reserve_tokens) do
+    estimate_tokens(messages) <= max(max_tokens - reserve_tokens, 0)
+  end
 end

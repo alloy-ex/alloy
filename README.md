@@ -230,6 +230,20 @@ Set `max_tokens` explicitly when you want a fixed compaction budget. Otherwise
 Alloy derives it from the current model, including after
 `Alloy.Agent.Server.set_model/2` switches to a different provider model.
 
+Use `compaction:` when you want to tune how much room Alloy reserves before it
+summarizes older context:
+
+```elixir
+{:ok, result} = Alloy.run("Summarise this repository",
+  provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"},
+  compaction: [
+    reserve_tokens: 12_000,
+    keep_recent_tokens: 8_000,
+    fallback: :truncate
+  ]
+)
+```
+
 ### Supervised GenServer agent
 
 ```elixir
