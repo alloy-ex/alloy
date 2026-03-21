@@ -79,6 +79,16 @@ defmodule Alloy.Tool.Core.BashTest do
       assert msg =~ ~r/server|loop|input/i
     end
 
+    test "honors explicit timeouts above the default", %{tmp_dir: tmp_dir} do
+      assert {:ok, result} =
+               Bash.execute(
+                 %{"command" => "sleep 11", "timeout" => 12_000},
+                 %{working_directory: tmp_dir}
+               )
+
+      assert result =~ "exit code: 0"
+    end
+
     test "executes in bash not sh", %{tmp_dir: tmp_dir} do
       # $0 reports the name of the invoking shell: "bash" when called as bash, "sh" when called as sh
       assert {:ok, result} =
