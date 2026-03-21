@@ -9,7 +9,7 @@ defmodule Alloy.Agent.State do
   alias Alloy.Agent.Config
   alias Alloy.{Message, Usage}
 
-  @type status :: :idle | :running | :completed | :error | :max_turns | :halted
+  @type status :: :idle | :running | :completed | :error | :max_turns | :budget_exceeded | :halted
 
   @type t :: %__MODULE__{
           config: Config.t(),
