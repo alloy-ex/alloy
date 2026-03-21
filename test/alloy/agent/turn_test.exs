@@ -1835,4 +1835,74 @@ defmodule Alloy.Agent.TurnTest do
       assert result.status == :error
     end
   end
+
+  describe "run_loop/1 with max_budget_cents" do
+    test "halts when cost exceeds budget" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          # Turn 1: tool call — costs 50 cents
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "hello"}}
+          ]),
+          # Turn 2: would respond, but budget should be exceeded
+          TestProvider.text_response("Done!")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        max_budget_cents: 50
+      }
+
+      # Pre-seed usage so first turn pushes us over budget
+      state = State.init(config, [Message.user("Hi")])
+      state = %{state | usage: %Alloy.Usage{estimated_cost_cents: 51}}
+
+      result = Turn.run_loop(state)
+
+      assert result.status == :budget_exceeded
+      # Should stop before making any provider calls
+      assert result.turn == 0
+    end
+
+    test "allows run when under budget" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Hello!")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_budget_cents: 100
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+    end
+
+    test "nil max_budget_cents means no limit" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Hello!")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_budget_cents: nil
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      state = %{state | usage: %Alloy.Usage{estimated_cost_cents: 999_999}}
+
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+    end
+  end
 end

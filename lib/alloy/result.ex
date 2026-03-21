@@ -12,7 +12,7 @@ defmodule Alloy.Result do
     * `:usage` — accumulated `%Alloy.Usage{}` token counts
     * `:tool_calls` — list of tool execution metadata maps
     * `:metadata` — auxiliary result metadata such as provider-owned state
-    * `:status` — final run status (`:completed`, `:max_turns`, `:error`, `:halted`)
+    * `:status` — final run status (`:completed`, `:max_turns`, `:budget_exceeded`, `:error`, `:halted`)
     * `:turns` — number of agent loop iterations
     * `:error` — error term (or `nil` on success)
     * `:request_id` — correlation ID for async requests (or `nil` for sync)

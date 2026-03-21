@@ -41,7 +41,8 @@ defmodule Alloy.Agent.Config do
           max_pending: non_neg_integer(),
           fallback_providers: [{module(), map()}],
           code_execution: boolean(),
-          model_metadata_overrides: map()
+          model_metadata_overrides: map(),
+          max_budget_cents: number() | nil
         }
 
   @enforce_keys [:provider, :provider_config]
@@ -69,7 +70,8 @@ defmodule Alloy.Agent.Config do
     max_pending: 0,
     fallback_providers: [],
     code_execution: false,
-    model_metadata_overrides: %{}
+    model_metadata_overrides: %{},
+    max_budget_cents: nil
   ]
 
   @doc """
@@ -119,7 +121,8 @@ defmodule Alloy.Agent.Config do
         |> Keyword.get(:fallback_providers, [])
         |> Enum.map(&parse_fallback_provider/1),
       code_execution: Keyword.get(opts, :code_execution, false),
-      model_metadata_overrides: model_metadata_overrides
+      model_metadata_overrides: model_metadata_overrides,
+      max_budget_cents: Keyword.get(opts, :max_budget_cents)
     }
   end
 
