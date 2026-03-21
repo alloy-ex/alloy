@@ -53,6 +53,14 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp do_turn(%State{} = state, opts, deadline) do
+    if budget_exceeded?(state) do
+      %{state | status: :budget_exceeded}
+    else
+      do_turn_inner(state, opts, deadline)
+    end
+  end
+
+  defp do_turn_inner(%State{} = state, opts, deadline) do
     state = Compactor.maybe_compact(state)
 
     case Middleware.run(:before_completion, state) do
@@ -186,5 +194,11 @@ defmodule Alloy.Agent.Turn do
 
   defp extract_tool_calls(messages) do
     Enum.flat_map(messages, &Message.tool_calls/1)
+  end
+
+  defp budget_exceeded?(%State{config: %{max_budget_cents: nil}}), do: false
+
+  defp budget_exceeded?(%State{config: %{max_budget_cents: max}, usage: usage}) do
+    usage.estimated_cost_cents >= max
   end
 end
