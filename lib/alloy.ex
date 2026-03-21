@@ -29,6 +29,14 @@ defmodule Alloy do
         messages: previous_result.messages
       )
 
+  ## One-Shot Streaming
+
+      {:ok, result} = Alloy.stream("Explain OTP", fn chunk ->
+        IO.write(chunk)
+      end,
+        provider: {Alloy.Provider.OpenAI, api_key: "sk-...", model: "gpt-5.4"}
+      )
+
   ## Options
 
   - `:provider` - `{module, config_keyword_list}` or just `module` (required)
@@ -77,12 +85,43 @@ defmodule Alloy do
   """
   @spec run(String.t() | nil, keyword()) :: {:ok, result()} | {:error, result()}
   def run(message \\ nil, opts) do
+    do_run(message, opts, [])
+  end
+
+  @doc """
+  Run the agent loop and stream text deltas as they arrive.
+
+  This is a one-shot convenience API for callers who do not need a persistent
+  `Alloy.Agent.Server` process. It returns the same result shape as `run/2`.
+
+  The first argument can be a string (converted to a user message)
+  or `nil` if the `:messages` option provides conversation history.
+
+  ## Options
+
+  Accepts the same options as `run/2`, plus:
+
+  - `:on_event` - function called with normalized event envelopes during the run
+  """
+  @spec stream(String.t() | nil, (String.t() -> any), keyword()) ::
+          {:ok, result()} | {:error, result()}
+  def stream(message, on_chunk, opts \\ []) when is_function(on_chunk, 1) do
+    on_event = validate_on_event(Keyword.get(opts, :on_event))
+
+    turn_opts =
+      [streaming: true, on_chunk: on_chunk]
+      |> maybe_put(:on_event, on_event)
+
+    do_run(message, opts, turn_opts)
+  end
+
+  defp do_run(message, opts, turn_opts) do
     config = Config.from_opts(opts)
     messages = build_messages(message, opts)
     state = %{State.init(config, messages) | status: :running}
 
     try do
-      final_state = Turn.run_loop(state)
+      final_state = Turn.run_loop(state, turn_opts)
 
       result = Result.from_state(final_state)
 
@@ -104,4 +143,14 @@ defmodule Alloy do
     existing = Keyword.get(opts, :messages, [])
     existing ++ [Message.user(text)]
   end
+
+  defp validate_on_event(nil), do: nil
+  defp validate_on_event(on_event) when is_function(on_event, 1), do: on_event
+
+  defp validate_on_event(bad) do
+    raise ArgumentError, "on_event must be a 1-arity function, got: #{inspect(bad)}"
+  end
+
+  defp maybe_put(opts, _key, nil), do: opts
+  defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
 end

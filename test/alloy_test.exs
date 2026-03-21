@@ -57,6 +57,69 @@ defmodule AlloyTest do
     end
   end
 
+  describe "Alloy.stream/3" do
+    test "streams text for a one-shot conversation" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Streaming works")
+        ])
+
+      test_pid = self()
+
+      assert {:ok, result} =
+               Alloy.stream(
+                 "Explain OTP",
+                 fn chunk -> send(test_pid, {:chunk, chunk}) end,
+                 provider: {TestProvider, agent_pid: pid}
+               )
+
+      assert result.text == "Streaming works"
+      assert result.status == :completed
+
+      assert_received {:chunk, "S"}
+      assert_received {:chunk, "t"}
+      assert_received {:chunk, "r"}
+    end
+
+    test "forwards on_event callbacks" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("OK")
+        ])
+
+      test_pid = self()
+
+      assert {:ok, result} =
+               Alloy.stream(
+                 "Hi",
+                 fn _chunk -> :ok end,
+                 provider: {TestProvider, agent_pid: pid},
+                 on_event: fn event -> send(test_pid, {:event, event}) end
+               )
+
+      assert result.status == :completed
+
+      assert_received {:event, %{event: :text_delta, payload: "O"}}
+      assert_received {:event, %{event: :text_delta, payload: "K"}}
+    end
+
+    test "raises when on_event is not a function" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Nope")
+        ])
+
+      assert_raise ArgumentError, ~r/on_event must be a 1-arity function/, fn ->
+        Alloy.stream(
+          "Hi",
+          fn _chunk -> :ok end,
+          provider: {TestProvider, agent_pid: pid},
+          on_event: :invalid
+        )
+      end
+    end
+  end
+
   describe "Alloy.run/2 with tools" do
     test "executes tools and returns final response" do
       {:ok, pid} =
