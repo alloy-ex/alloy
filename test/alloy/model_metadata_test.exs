@@ -8,6 +8,11 @@ defmodule Alloy.ModelMetadataTest do
       assert ModelMetadata.context_window("claude-opus-4-6") == 200_000
       assert ModelMetadata.context_window("gpt-5.4") == 1_050_000
       assert ModelMetadata.context_window("grok-4-fast-reasoning") == 2_000_000
+      # grok-4 is 2M (not 256K) per xAI docs
+      assert ModelMetadata.context_window("grok-4") == 2_000_000
+      # grok-4.1-fast models (dot notation)
+      assert ModelMetadata.context_window("grok-4.1-fast") == 2_000_000
+      assert ModelMetadata.context_window("grok-4.1-fast-reasoning") == 2_000_000
     end
 
     test "returns dated snapshot matches" do

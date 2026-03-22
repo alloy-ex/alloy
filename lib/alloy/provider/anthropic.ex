@@ -271,16 +271,35 @@ defmodule Alloy.Provider.Anthropic do
       "messages" => Enum.map(messages, &format_message/1)
     }
 
+    cache? = Map.get(config, :cache, false)
+
     body =
       case Map.get(config, :system_prompt) do
-        nil -> body
-        prompt -> Map.put(body, "system", prompt)
+        nil ->
+          body
+
+        prompt when cache? ->
+          Map.put(body, "system", [
+            %{
+              "type" => "text",
+              "text" => prompt,
+              "cache_control" => %{"type" => "ephemeral"}
+            }
+          ])
+
+        prompt ->
+          Map.put(body, "system", prompt)
       end
 
     body =
       case tool_defs do
-        [] -> body
-        defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
+        [] ->
+          body
+
+        defs ->
+          tools = Enum.map(defs, &format_tool_def/1)
+          tools = maybe_add_cache_to_last_tool(tools, cache?)
+          Map.put(body, "tools", tools)
       end
 
     body = maybe_add_code_execution(body, config)
@@ -430,6 +449,14 @@ defmodule Alloy.Provider.Anthropic do
   defp format_content_block(block) when is_map(block) do
     # Pass through any other block types as-is, converting atom keys to strings
     Map.new(block, fn {k, v} -> {to_string(k), v} end)
+  end
+
+  defp maybe_add_cache_to_last_tool([], _cache?), do: []
+  defp maybe_add_cache_to_last_tool(tools, false), do: tools
+
+  defp maybe_add_cache_to_last_tool(tools, true) do
+    {init, [last]} = Enum.split(tools, -1)
+    init ++ [Map.put(last, "cache_control", %{"type" => "ephemeral"})]
   end
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do

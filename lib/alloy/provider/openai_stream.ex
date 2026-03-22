@@ -42,6 +42,7 @@ defmodule Alloy.Provider.OpenAIStream do
     initial_acc = %{
       buffer: "",
       content: "",
+      reasoning_content: "",
       tool_calls: %{},
       finish_reason: nil,
       usage: %{},
@@ -104,6 +105,16 @@ defmodule Alloy.Provider.OpenAIStream do
         %{"content" => text} when is_binary(text) and text != "" ->
           acc.on_chunk.(text)
           %{acc | content: acc.content <> text}
+
+        _ ->
+          acc
+      end
+
+    # Accumulate reasoning_content from DeepSeek/xAI reasoning models
+    acc =
+      case delta do
+        %{"reasoning_content" => text} when is_binary(text) and text != "" ->
+          %{acc | reasoning_content: acc.reasoning_content <> text}
 
         _ ->
           acc
@@ -174,6 +185,11 @@ defmodule Alloy.Provider.OpenAIStream do
   # ── Response Building ────────────────────────────────────────────────
 
   defp build_response(acc) do
+    reasoning_blocks =
+      if acc.reasoning_content != "",
+        do: [%{type: "thinking", thinking: acc.reasoning_content}],
+        else: []
+
     text_blocks = if acc.content != "", do: [%{type: "text", text: acc.content}], else: []
 
     tool_blocks_result =
@@ -203,7 +219,7 @@ defmodule Alloy.Provider.OpenAIStream do
         {:error, reason}
 
       tool_blocks ->
-        content_blocks = text_blocks ++ Enum.reverse(tool_blocks)
+        content_blocks = reasoning_blocks ++ text_blocks ++ Enum.reverse(tool_blocks)
         stop_reason = parse_finish_reason(acc.finish_reason)
         message = %Message{role: :assistant, content: content_blocks}
 

@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.8.0"
+  @version "0.9.0"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -90,8 +90,7 @@ defmodule Alloy.MixProject do
           Alloy.Tool.Registry
         ],
         Context: [
-          Alloy.Context.Compactor,
-          Alloy.Context.TokenCounter
+          Alloy.Context.Compactor
         ],
         Middleware: [
           Alloy.Middleware

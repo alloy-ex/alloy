@@ -36,15 +36,35 @@ defmodule Alloy.Agent.Turn do
   @spec run_loop(State.t(), keyword()) :: State.t()
   def run_loop(%State{} = state, opts \\ []) do
     opts = Events.normalize_opts(state, opts)
+    run_start = System.monotonic_time(:millisecond)
+
+    :telemetry.execute(
+      [:alloy, :run, :start],
+      %{system_time: System.system_time()},
+      %{model: state.config.provider_config[:model]}
+    )
 
     # Compute a hard deadline ONCE for the entire loop, leaving headroom
     # so the retry logic never overshoots the caller-side timeout.
     deadline =
       System.monotonic_time(:millisecond) + state.config.timeout_ms - @deadline_headroom_ms
 
-    state
-    |> do_turn(opts, deadline)
-    |> State.materialize()
+    result =
+      state
+      |> do_turn(opts, deadline)
+      |> State.materialize()
+
+    :telemetry.execute(
+      [:alloy, :run, :stop],
+      %{duration_ms: System.monotonic_time(:millisecond) - run_start},
+      %{
+        status: result.status,
+        turns: result.turn,
+        model: state.config.provider_config[:model]
+      }
+    )
+
+    result
   end
 
   defp do_turn(%State{turn: turn, config: config} = state, _opts, _deadline)
@@ -61,8 +81,55 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp do_turn_inner(%State{} = state, opts, deadline) do
-    state = Compactor.maybe_compact(state)
+    turn_number = state.turn + 1
 
+    :telemetry.execute(
+      [:alloy, :turn, :start],
+      %{system_time: System.system_time()},
+      %{turn: turn_number}
+    )
+
+    messages_before = length(State.messages(state))
+    {compaction_status, state} = Compactor.maybe_compact(state)
+
+    state =
+      case compaction_status do
+        :compacted ->
+          :telemetry.execute(
+            [:alloy, :compaction, :done],
+            %{messages_before: messages_before, messages_after: length(State.messages(state))},
+            %{turn: turn_number}
+          )
+
+          case Middleware.run(:after_compaction, state) do
+            {:halted, reason} ->
+              %{state | status: :halted, error: "Halted by middleware: #{reason}"}
+
+            %State{} = state ->
+              state
+          end
+
+        :unchanged ->
+          state
+      end
+
+    if state.status == :halted do
+      :telemetry.execute([:alloy, :turn, :stop], %{}, %{turn: turn_number, status: :halted})
+      state
+    else
+      result = do_turn_after_compaction(state, opts, deadline)
+
+      :telemetry.execute(
+        [:alloy, :turn, :stop],
+        %{},
+        %{turn: turn_number, status: result.status}
+      )
+
+      result
+    end
+  end
+
+  defp do_turn_after_compaction(%State{} = state, opts, deadline) do
     case Middleware.run(:before_completion, state) do
       {:halted, reason} ->
         %{state | status: :halted, error: "Halted by middleware: #{reason}"}

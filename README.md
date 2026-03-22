@@ -15,7 +15,7 @@ Alloy is the completion-tool-call loop and nothing else. Send messages to any LL
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.8.0"
+result.text #=> "The version is 0.9.0"
 ```
 
 ## Why Alloy?
@@ -29,6 +29,10 @@ Most agent frameworks try to be everything — sessions, memory, RAG, multi-agen
 - **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
 - **Middleware** — custom hooks, tool blocking
 - **Context compaction** — summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
+- **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
+- **Reasoning blocks** — DeepSeek/xAI `reasoning_content` parsed as first-class thinking blocks
+- **Provider passthrough** — `extra_body` injects arbitrary provider-specific params (response_format, temperature, reasoning_effort)
+- **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
 - **Cost guard** — `max_budget_cents` halts the loop before overspending
 - **OTP-native** — supervision trees, hot code reloading, real parallel tool execution
 - **~5,000 lines** — small enough to read, understand, and extend
@@ -64,7 +68,7 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.8"}
+    {:alloy, "~> 0.9"}
   ]
 end
 ```
@@ -113,7 +117,10 @@ Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", m
 # xAI via Responses-compatible API
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", api_url: "https://api.x.ai", model: "grok-4"}} | opts])
 
-# Any OpenAI-compatible API (Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, etc.)
+# xAI via chat completions (reasoning models, extra_body)
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAICompat, api_key: "...", api_url: "https://api.x.ai", model: "grok-4.1-fast-reasoning"}} | opts])
+
+# Any OpenAI-compatible API (Ollama, OpenRouter, DeepSeek, Mistral, Groq, etc.)
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAICompat, api_url: "http://localhost:11434", model: "llama4"}} | opts])
 ```
 
@@ -264,6 +271,98 @@ end
 
 Set `max_budget_cents: nil` (default) for no limit.
 
+### Anthropic prompt caching
+
+Enable prompt caching to save 60-90% on input tokens. Alloy automatically adds
+`cache_control` breakpoints to the system prompt and last tool definition:
+
+```elixir
+{:ok, result} = Alloy.run("Explain this codebase",
+  provider: {Alloy.Provider.Anthropic,
+    api_key: "...", model: "claude-sonnet-4-6",
+    cache: true
+  },
+  tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Bash],
+  system_prompt: "You are a senior Elixir developer."
+)
+
+# Cache usage is reported in result.usage
+result.usage.cache_creation_input_tokens  #=> 1500
+result.usage.cache_read_input_tokens      #=> 1500  (on subsequent calls)
+```
+
+### Reasoning model support (DeepSeek, xAI)
+
+OpenAI-compatible reasoning models that return `reasoning_content` (DeepSeek-R1,
+xAI Grok reasoning variants) are automatically parsed into thinking blocks:
+
+```elixir
+{:ok, result} = Alloy.run("Solve this step by step",
+  provider: {Alloy.Provider.OpenAICompat,
+    api_url: "https://api.x.ai",
+    api_key: "...", model: "grok-4.1-fast-reasoning"
+  }
+)
+
+# Thinking blocks are preserved in message content
+[thinking, text] = hd(result.messages).content
+thinking.type     #=> "thinking"
+thinking.thinking #=> "Step 1: Let me consider..."
+text.type         #=> "text"
+text.text         #=> "The answer is 42."
+```
+
+### Provider-specific parameters (extra_body)
+
+Pass arbitrary provider-specific parameters via `extra_body`. It merges last,
+so it can override any default field:
+
+```elixir
+{:ok, result} = Alloy.run("Return JSON",
+  provider: {Alloy.Provider.OpenAICompat,
+    api_url: "https://api.deepseek.com",
+    api_key: "...", model: "deepseek-chat",
+    extra_body: %{
+      "response_format" => %{"type" => "json_object"},
+      "temperature" => 0.3
+    }
+  }
+)
+```
+
+Works for any provider param: `reasoning_effort`, `max_completion_tokens`,
+`presence_penalty`, etc.
+
+### Telemetry
+
+Alloy emits telemetry events for observability. Attach handlers for OTEL,
+logging, or custom metrics:
+
+```elixir
+:telemetry.attach_many("my-handler", [
+  [:alloy, :run, :start],
+  [:alloy, :run, :stop],
+  [:alloy, :turn, :start],
+  [:alloy, :turn, :stop],
+  [:alloy, :provider, :request],
+  [:alloy, :compaction, :done],
+  [:alloy, :tool, :start],
+  [:alloy, :tool, :stop],
+  [:alloy, :event]
+], &MyApp.Telemetry.handle_event/4, nil)
+```
+
+| Event | Measurements | Metadata |
+|-------|-------------|----------|
+| `[:alloy, :run, :start]` | `system_time` | `model` |
+| `[:alloy, :run, :stop]` | `duration_ms` | `status`, `turns`, `model` |
+| `[:alloy, :turn, :start]` | `system_time` | `turn` |
+| `[:alloy, :turn, :stop]` | — | `turn`, `status` |
+| `[:alloy, :provider, :request]` | `duration_ms` | `provider`, `model`, `streaming`, `attempt`, `result` |
+| `[:alloy, :compaction, :done]` | `messages_before`, `messages_after` | `turn` |
+| `[:alloy, :tool, :start]` | — | tool identity, correlation |
+| `[:alloy, :tool, :stop]` | `duration_ms` | tool identity, result |
+
 ### Supervised GenServer agent
 
 ```elixir
@@ -302,7 +401,7 @@ end
 |--------|---------------------|----------------|
 | Anthropic | `Alloy.Provider.Anthropic` | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
 | OpenAI | `Alloy.Provider.OpenAI` | `gpt-5.4` |
-| xAI | `Alloy.Provider.OpenAI` with `api_url: "https://api.x.ai"` | `grok-4`, `grok-4-fast-reasoning`, `grok-code-fast-1` |
+| xAI | `Alloy.Provider.OpenAI` with `api_url: "https://api.x.ai"` | `grok-4`, `grok-4.1-fast`, `grok-4-fast-reasoning`, `grok-code-fast-1` |
 | Gemini | `Alloy.Provider.OpenAICompat` | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-pro-preview` |
 | Other OpenAI-compatible APIs | `Alloy.Provider.OpenAICompat` | Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together |
 
