@@ -11,7 +11,6 @@ defmodule Alloy.Context.Compactor do
   require Logger
 
   alias Alloy.Agent.State
-  alias Alloy.Context.TokenCounter
   alias Alloy.Message
 
   @default_keep_recent 10
@@ -82,17 +81,19 @@ defmodule Alloy.Context.Compactor do
 
   @doc """
   Compacts state messages when they exceed `max_tokens - reserve_tokens`.
-  Returns state unchanged when within budget.
+
+  Returns `{:compacted, state}` when compaction occurred, or
+  `{:unchanged, state}` when already within budget.
   """
-  @spec maybe_compact(State.t()) :: State.t()
+  @spec maybe_compact(State.t()) :: {:compacted | :unchanged, State.t()}
   def maybe_compact(%State{} = state) do
     messages = State.messages(state)
     reserve_tokens = state.config.compaction.reserve_tokens
 
-    if TokenCounter.within_reserve?(messages, state.config.max_tokens, reserve_tokens) do
-      state
+    if within_reserve?(messages, state.config.max_tokens, reserve_tokens) do
+      {:unchanged, state}
     else
-      compact_messages_in_state(state, messages)
+      {:compacted, compact_messages_in_state(state, messages)}
     end
   end
 
@@ -280,7 +281,7 @@ defmodule Alloy.Context.Compactor do
     Enum.reduce_while(max_index..0//-1, {0, 0}, fn index,
                                                    {_threshold_index, accumulated_tokens} ->
       accumulated_tokens =
-        accumulated_tokens + TokenCounter.estimate_message_tokens(Enum.at(messages, index))
+        accumulated_tokens + estimate_message_tokens(Enum.at(messages, index))
 
       if accumulated_tokens >= keep_recent_tokens do
         {:halt, {index, accumulated_tokens}}
@@ -442,4 +443,78 @@ defmodule Alloy.Context.Compactor do
   end
 
   defp compact_message(msg), do: msg
+
+  # --- Token estimation (inlined from TokenCounter) ---
+  # Chars/4 heuristic — good enough for budget decisions, not billing.
+
+  # Fixed heuristics for media types. Intentionally conservative rough estimates.
+  @image_tokens 1_000
+  @audio_tokens 500
+  @video_tokens 2_000
+  @document_tokens 3_000
+
+  defp estimate_tokens(text) when is_binary(text), do: div(String.length(text), 4)
+
+  defp estimate_tokens(messages) when is_list(messages) do
+    Enum.reduce(messages, 0, fn msg, acc -> acc + estimate_message_tokens(msg) end)
+  end
+
+  defp estimate_message_tokens(%Message{content: content}) when is_binary(content) do
+    estimate_tokens(content)
+  end
+
+  defp estimate_message_tokens(%Message{content: blocks}) when is_list(blocks) do
+    Enum.reduce(blocks, 0, fn block, acc -> acc + estimate_block_tokens(block) end)
+  end
+
+  defp estimate_block_tokens(%{type: "text", text: text}) when is_binary(text) do
+    estimate_tokens(text)
+  end
+
+  defp estimate_block_tokens(%{type: "tool_use", name: name, input: input}) do
+    name_tokens = estimate_tokens(to_string(name))
+
+    input_str =
+      case Jason.encode(input) do
+        {:ok, json} -> json
+        {:error, _} -> inspect(input)
+      end
+
+    name_tokens + estimate_tokens(input_str)
+  end
+
+  defp estimate_block_tokens(%{type: "tool_result", content: content}) when is_binary(content) do
+    estimate_tokens(content)
+  end
+
+  defp estimate_block_tokens(%{type: "thinking", thinking: text}) when is_binary(text) do
+    estimate_tokens(text)
+  end
+
+  defp estimate_block_tokens(%{type: "server_tool_use", name: name, input: input}) do
+    name_tokens = estimate_tokens(to_string(name))
+
+    input_str =
+      case Jason.encode(input) do
+        {:ok, json} -> json
+        {:error, _} -> inspect(input)
+      end
+
+    name_tokens + estimate_tokens(input_str)
+  end
+
+  defp estimate_block_tokens(%{type: "server_tool_result", content: content})
+       when is_binary(content) do
+    estimate_tokens(content)
+  end
+
+  defp estimate_block_tokens(%{type: "image"}), do: @image_tokens
+  defp estimate_block_tokens(%{type: "audio"}), do: @audio_tokens
+  defp estimate_block_tokens(%{type: "video"}), do: @video_tokens
+  defp estimate_block_tokens(%{type: "document"}), do: @document_tokens
+  defp estimate_block_tokens(_block), do: 0
+
+  defp within_reserve?(messages, max_tokens, reserve_tokens) do
+    estimate_tokens(messages) <= max(max_tokens - reserve_tokens, 0)
+  end
 end

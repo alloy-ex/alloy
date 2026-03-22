@@ -61,8 +61,31 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp do_turn_inner(%State{} = state, opts, deadline) do
-    state = Compactor.maybe_compact(state)
+    {compaction_status, state} = Compactor.maybe_compact(state)
 
+    state =
+      case compaction_status do
+        :compacted ->
+          case Middleware.run(:after_compaction, state) do
+            {:halted, reason} ->
+              %{state | status: :halted, error: "Halted by middleware: #{reason}"}
+
+            %State{} = state ->
+              state
+          end
+
+        :unchanged ->
+          state
+      end
+
+    if state.status == :halted do
+      state
+    else
+      do_turn_after_compaction(state, opts, deadline)
+    end
+  end
+
+  defp do_turn_after_compaction(%State{} = state, opts, deadline) do
     case Middleware.run(:before_completion, state) do
       {:halted, reason} ->
         %{state | status: :halted, error: "Halted by middleware: #{reason}"}

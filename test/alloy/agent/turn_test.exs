@@ -995,6 +995,117 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  describe "run_loop/1 with :after_compaction hook" do
+    test "fires :after_compaction when compaction occurs" do
+      test_pid = self()
+
+      defmodule AfterCompactionTrackingMiddleware do
+        @behaviour Alloy.Middleware
+
+        def call(:after_compaction, state) do
+          send(state.config.context[:test_pid], :after_compaction_fired)
+          state
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        middleware: [AfterCompactionTrackingMiddleware],
+        context: %{test_pid: test_pid},
+        # Tiny budget to force compaction
+        max_tokens: 50,
+        compaction: %{fallback: :truncate, reserve_tokens: 10, keep_recent_tokens: 5}
+      }
+
+      state =
+        State.init(config, [
+          Message.user("original"),
+          Message.assistant(String.duplicate("a", 400)),
+          Message.user("latest")
+        ])
+
+      Turn.run_loop(state)
+
+      assert_received :after_compaction_fired
+    end
+
+    test "does NOT fire :after_compaction when within budget" do
+      test_pid = self()
+
+      defmodule AfterCompactionNoFireMiddleware do
+        @behaviour Alloy.Middleware
+
+        def call(:after_compaction, state) do
+          send(state.config.context[:test_pid], :after_compaction_should_not_fire)
+          state
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        middleware: [AfterCompactionNoFireMiddleware],
+        context: %{test_pid: test_pid}
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      Turn.run_loop(state)
+
+      refute_received :after_compaction_should_not_fire
+    end
+
+    test "halting in :after_compaction stops the turn" do
+      defmodule AfterCompactionHaltMiddleware do
+        @behaviour Alloy.Middleware
+
+        def call(:after_compaction, _state), do: {:halt, "compaction policy violation"}
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Should not reach")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        middleware: [AfterCompactionHaltMiddleware],
+        max_tokens: 50,
+        compaction: %{fallback: :truncate, reserve_tokens: 10, keep_recent_tokens: 5},
+        max_retries: 0,
+        retry_backoff_ms: 1
+      }
+
+      state =
+        State.init(config, [
+          Message.user("original"),
+          Message.assistant(String.duplicate("a", 400)),
+          Message.user("latest")
+        ])
+
+      result = Turn.run_loop(state)
+
+      assert result.status == :halted
+      assert result.error =~ "compaction policy violation"
+    end
+  end
+
   describe "run_loop/1 with before_tool_call halting middleware" do
     test "middleware halting before_tool_call stops the agent with status :halted" do
       defmodule BeforeToolCallHaltingMiddleware do

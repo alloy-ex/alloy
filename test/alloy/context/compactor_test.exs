@@ -139,7 +139,7 @@ defmodule Alloy.Context.CompactorTest do
           provider_config: %{summary_response: {:ok, summary_text("unused")}, test_pid: self()}
         )
 
-      assert Compactor.maybe_compact(state) == state
+      assert {:unchanged, ^state} = Compactor.maybe_compact(state)
       refute_received {:summary_request, _, _, _}
     end
 
@@ -161,7 +161,7 @@ defmodule Alloy.Context.CompactorTest do
           provider_state: %{response_id: "should-not-leak"}
         )
 
-      compacted = Compactor.maybe_compact(state)
+      {:compacted, compacted} = Compactor.maybe_compact(state)
 
       assert_received {:summary_request, [%Message{role: :user, content: prompt}], [], config}
       assert prompt =~ "<conversation>"
@@ -194,7 +194,7 @@ defmodule Alloy.Context.CompactorTest do
           provider_config: %{summary_response: {:ok, summary_text("Recent")}, test_pid: self()}
         )
 
-      compacted = Compactor.maybe_compact(state)
+      {:compacted, compacted} = Compactor.maybe_compact(state)
 
       assert Enum.take(compacted.messages, -5) == Enum.take(messages, -5)
     end
@@ -220,7 +220,7 @@ defmodule Alloy.Context.CompactorTest do
           provider_config: %{agent_pid: provider_pid}
         )
 
-      first_compaction = Compactor.maybe_compact(state)
+      {:compacted, first_compaction} = Compactor.maybe_compact(state)
 
       second_state = %{
         first_compaction
@@ -230,7 +230,7 @@ defmodule Alloy.Context.CompactorTest do
           messages_new: []
       }
 
-      second_compaction = Compactor.maybe_compact(second_state)
+      {:compacted, second_compaction} = Compactor.maybe_compact(second_state)
 
       summary_messages = Enum.filter(second_compaction.messages, &summary_message?/1)
 
@@ -263,7 +263,7 @@ defmodule Alloy.Context.CompactorTest do
           provider_config: %{summary_response: {:ok, summary_text("Tool")}, test_pid: self()}
         )
 
-      compacted = Compactor.maybe_compact(state)
+      {:compacted, compacted} = Compactor.maybe_compact(state)
 
       assert tool_pairs_intact?(Enum.drop(compacted.messages, 2))
       refute tool_result_message?(Enum.at(compacted.messages, 2))
@@ -286,7 +286,7 @@ defmodule Alloy.Context.CompactorTest do
           provider_config: %{summary_response: {:ok, summary_text("Split")}, test_pid: self()}
         )
 
-      compacted = Compactor.maybe_compact(state)
+      {:compacted, compacted} = Compactor.maybe_compact(state)
 
       assert summary_message?(Enum.at(compacted.messages, 1))
       assert Enum.at(compacted.messages, 2) == Enum.at(messages, 3)
@@ -313,7 +313,7 @@ defmodule Alloy.Context.CompactorTest do
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          compacted = Compactor.maybe_compact(state)
+          {:compacted, compacted} = Compactor.maybe_compact(state)
           compacted_msg = Enum.at(compacted.messages, 1)
           assert String.length(compacted_msg.content) <= 203
           refute Enum.any?(compacted.messages, &summary_message?/1)
@@ -350,7 +350,7 @@ defmodule Alloy.Context.CompactorTest do
           on_compaction: callback
         )
 
-      _compacted = Compactor.maybe_compact(state)
+      {:compacted, _compacted} = Compactor.maybe_compact(state)
 
       assert_received {:compaction_fired, middle_messages, received_state}
       assert middle_messages != []
@@ -376,7 +376,7 @@ defmodule Alloy.Context.CompactorTest do
           on_compaction: callback
         )
 
-      _result = Compactor.maybe_compact(state)
+      {:unchanged, _result} = Compactor.maybe_compact(state)
 
       refute_received :should_not_fire
     end
@@ -398,7 +398,7 @@ defmodule Alloy.Context.CompactorTest do
           provider_config: %{summary_response: {:ok, summary_text("Nil")}, test_pid: self()}
         )
 
-      compacted = Compactor.maybe_compact(state)
+      {:compacted, compacted} = Compactor.maybe_compact(state)
       assert %State{} = compacted
       assert Enum.any?(compacted.messages, &summary_message?/1)
     end
@@ -425,7 +425,7 @@ defmodule Alloy.Context.CompactorTest do
           on_compaction: callback
         )
 
-      compacted = Compactor.maybe_compact(state)
+      {:compacted, compacted} = Compactor.maybe_compact(state)
       assert %State{} = compacted
       assert Enum.any?(compacted.messages, &summary_message?/1)
     end
@@ -454,7 +454,7 @@ defmodule Alloy.Context.CompactorTest do
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          Compactor.maybe_compact(state)
+          {:compacted, _} = Compactor.maybe_compact(state)
         end)
 
       assert log =~ "on_compaction callback crashed"
@@ -485,7 +485,7 @@ defmodule Alloy.Context.CompactorTest do
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          Compactor.maybe_compact(state)
+          {:compacted, _} = Compactor.maybe_compact(state)
         end)
 
       assert log =~ "on_compaction callback error"

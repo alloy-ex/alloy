@@ -90,8 +90,7 @@ defmodule Alloy.MixProject do
           Alloy.Tool.Registry
         ],
         Context: [
-          Alloy.Context.Compactor,
-          Alloy.Context.TokenCounter
+          Alloy.Context.Compactor
         ],
         Middleware: [
           Alloy.Middleware

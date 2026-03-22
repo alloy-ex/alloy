@@ -2,7 +2,7 @@ defmodule Alloy.ModelMetadata do
   @moduledoc """
   Provider model metadata used for context budgeting.
 
-  The primary consumer today is `Alloy.Context.TokenCounter`, but this module
+  The primary consumer today is `Alloy.Context.Compactor`, but this module
   keeps model-window knowledge in one place so provider updates do not require
   editing token estimation logic directly.
   """
