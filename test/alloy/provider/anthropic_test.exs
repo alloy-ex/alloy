@@ -389,7 +389,91 @@ defmodule Alloy.Provider.AnthropicTest do
     end
   end
 
-  describe "complete/3 with cache control" do
+  describe "complete/3 with cache: true" do
+    test "system prompt is sent as content block with cache_control when cache: true" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:system_prompt, "You are helpful.")
+        |> Map.put(:cache, true)
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      # System should be a list of content blocks, not a bare string
+      assert is_list(decoded["system"])
+      [system_block] = decoded["system"]
+      assert system_block["type"] == "text"
+      assert system_block["text"] == "You are helpful."
+      assert system_block["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "system prompt is bare string when cache is not set" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:system_prompt, "You are helpful.")
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      # Default: bare string, no cache_control
+      assert decoded["system"] == "You are helpful."
+    end
+
+    test "last tool definition gets cache_control when cache: true" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:cache, true)
+
+      tool_defs = [
+        %{
+          name: "read",
+          description: "Read a file",
+          input_schema: %{type: "object", properties: %{}}
+        },
+        %{
+          name: "write",
+          description: "Write a file",
+          input_schema: %{type: "object", properties: %{}}
+        }
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      tools = decoded["tools"]
+      assert length(tools) == 2
+
+      # Only the LAST tool should have cache_control
+      refute Map.has_key?(hd(tools), "cache_control")
+      assert List.last(tools)["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "tools have no cache_control when cache is not set" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{
+          name: "read",
+          description: "Read a file",
+          input_schema: %{type: "object", properties: %{}}
+        }
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      [tool] = decoded["tools"]
+      refute Map.has_key?(tool, "cache_control")
+    end
+
     test "includes cache usage in response" do
       config =
         config_with_response(%{

@@ -2016,4 +2016,99 @@ defmodule Alloy.Agent.TurnTest do
       assert result.status == :completed
     end
   end
+
+  describe "telemetry events" do
+    test "emits [:alloy, :run, :start] and [:alloy, :run, :stop] for run lifecycle" do
+      ref_start = :telemetry_test.attach_event_handlers(self(), [[:alloy, :run, :start]])
+      ref_stop = :telemetry_test.attach_event_handlers(self(), [[:alloy, :run, :stop]])
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Hello!")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid}
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+
+      assert_received {[:alloy, :run, :start], ^ref_start, _measurements, _metadata}
+
+      assert_received {[:alloy, :run, :stop], ^ref_stop, measurements, metadata}
+      assert is_integer(measurements.duration_ms)
+      assert measurements.duration_ms >= 0
+      assert metadata.status == :completed
+      assert metadata.turns == 1
+    end
+
+    test "emits [:alloy, :turn, :start] and [:alloy, :turn, :stop] per turn" do
+      ref_start = :telemetry_test.attach_event_handlers(self(), [[:alloy, :turn, :start]])
+      ref_stop = :telemetry_test.attach_event_handlers(self(), [[:alloy, :turn, :stop]])
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "hi"}}
+          ]),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool]
+      }
+
+      state = State.init(config, [Message.user("Echo hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert result.turn == 2
+
+      # Should have received 2 turn:start and 2 turn:stop events
+      assert_received {[:alloy, :turn, :start], ^ref_start, _m, %{turn: 1}}
+      assert_received {[:alloy, :turn, :start], ^ref_start, _m, %{turn: 2}}
+      assert_received {[:alloy, :turn, :stop], ^ref_stop, _m, %{turn: 1}}
+      assert_received {[:alloy, :turn, :stop], ^ref_stop, _m, %{turn: 2}}
+    end
+
+    test "emits [:alloy, :compaction, :done] when compaction fires" do
+      ref = :telemetry_test.attach_event_handlers(self(), [[:alloy, :compaction, :done]])
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("ok")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_tokens: 100,
+        compaction: %{reserve_tokens: 5, keep_recent_tokens: 50, fallback: :truncate}
+      }
+
+      # Fill messages to trigger compaction
+      big_msg = String.duplicate("word ", 200)
+
+      state =
+        State.init(config, [
+          Message.user("Start"),
+          Message.assistant(big_msg),
+          Message.user("Continue"),
+          Message.assistant(big_msg),
+          Message.user("More")
+        ])
+
+      _result = Turn.run_loop(state)
+
+      assert_received {[:alloy, :compaction, :done], ^ref, measurements, _metadata}
+      assert is_integer(measurements.messages_before)
+      assert is_integer(measurements.messages_after)
+    end
+  end
 end

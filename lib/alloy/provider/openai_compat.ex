@@ -120,10 +120,14 @@ defmodule Alloy.Provider.OpenAICompat do
       "messages" => openai_messages
     }
 
-    case tool_defs do
-      [] -> body
-      defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
-    end
+    body =
+      case tool_defs do
+        [] -> body
+        defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
+      end
+
+    # Merge extra_body LAST so caller can override any field
+    Map.merge(body, Map.get(config, :extra_body, %{}))
   end
 
   defp build_messages(messages, config) do
@@ -250,6 +254,13 @@ defmodule Alloy.Provider.OpenAICompat do
   end
 
   defp parse_message_to_blocks(message) do
+    reasoning_blocks =
+      case message["reasoning_content"] do
+        nil -> []
+        "" -> []
+        text -> [%{type: "thinking", thinking: text}]
+      end
+
     text_blocks =
       case message["content"] do
         nil -> []
@@ -273,7 +284,7 @@ defmodule Alloy.Provider.OpenAICompat do
 
     case tool_blocks do
       {:error, _} = err -> err
-      blocks -> {:ok, text_blocks ++ blocks}
+      blocks -> {:ok, reasoning_blocks ++ text_blocks ++ blocks}
     end
   end
 
@@ -290,7 +301,8 @@ defmodule Alloy.Provider.OpenAICompat do
 
   defp parse_error(status, body) when is_map(body) do
     case body do
-      %{"error" => error} -> "#{error["type"]}: #{error["message"]}"
+      %{"error" => error} when is_map(error) -> "#{error["type"]}: #{error["message"]}"
+      %{"error" => error} when is_binary(error) -> "HTTP #{status}: #{error}"
       _ -> "HTTP #{status}: #{inspect(body)}"
     end
   end

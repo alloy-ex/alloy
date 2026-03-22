@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-03-22
+
+### Breaking
+
+- **`Compactor.maybe_compact/1` return type** — now returns `{:compacted | :unchanged, State.t()}` instead of a bare `State.t()`.
+- **`Alloy.Context.TokenCounter` removed** — token estimation logic inlined into `Compactor`. Users who called `TokenCounter` directly should use `Compactor` functions instead.
+
+### Added
+
+- **`:after_compaction` middleware hook** — fires after context compaction occurs, allowing middleware to inspect or modify state post-compaction.
+- **Reasoning/thinking block parsing in OpenAICompat** — DeepSeek and xAI reasoning models that return `reasoning_content` now produce `%{type: "thinking", thinking: text}` blocks instead of silently dropping the reasoning data. Works in both `complete/3` and streaming.
+- **`extra_body` config for OpenAICompat** — pass `extra_body: %{"response_format" => ..., "temperature" => 0.7}` to inject arbitrary provider-specific parameters into the request. Merges last so it can override defaults.
+- **Anthropic prompt caching** — pass `cache: true` in Anthropic provider config to automatically add `cache_control` breakpoints to the system prompt and last tool definition. Enables 60-90% input token cost savings. Default: `false` (no behavior change).
+- **6 new telemetry events** — `[:alloy, :run, :start]`, `[:alloy, :run, :stop]`, `[:alloy, :turn, :start]`, `[:alloy, :turn, :stop]`, `[:alloy, :provider, :request]`, `[:alloy, :compaction, :done]` provide full lifecycle observability for OTEL, logging, or custom metrics.
+- **xAI grok-4.1-fast model family** — dot-notation models (`grok-4.1-fast`, `grok-4.1-fast-reasoning`, `grok-4.1-fast-non-reasoning`) added to the model catalog.
+
+### Fixed
+
+- **grok-4 context window** — corrected from 256K to 2M tokens per xAI documentation.
+
 ## [0.8.0] - 2026-03-21
 
 ### Added
@@ -313,6 +333,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.9.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.9.0
 [0.8.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.8.0
 [0.7.6]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.6
 [0.7.5]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.5

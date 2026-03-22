@@ -152,8 +152,22 @@ defmodule Alloy.Provider.Retry do
     # All providers read :req_options from config, so this flows through automatically.
     provider_config = inject_receive_timeout(provider_config, deadline)
 
+    provider_start = System.monotonic_time(:millisecond)
+
     {result, chunks_emitted?} =
       call_provider(provider, state, provider_config, streaming?, on_chunk)
+
+    :telemetry.execute(
+      [:alloy, :provider, :request],
+      %{duration_ms: System.monotonic_time(:millisecond) - provider_start},
+      %{
+        provider: provider,
+        model: Map.get(provider_config, :model),
+        streaming: streaming?,
+        attempt: state.config.max_retries - retries_left + 1,
+        result: if(match?({:ok, _}, result), do: :ok, else: :error)
+      }
+    )
 
     case result do
       {:ok, _} = success ->

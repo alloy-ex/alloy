@@ -53,11 +53,18 @@ defmodule Alloy.ModelMetadata do
       suffix_patterns: ["", ~r/^-\d{2}-\d{4}$/]
     },
     %{name: "gemini-3-pro-preview", limit: 1_048_576, suffix_patterns: ["", ~r/^-\d{2}-\d{4}$/]},
-    %{name: "grok-4", limit: 256_000, suffix_patterns: [""]},
+    %{name: "grok-4", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-fast-reasoning", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-fast-non-reasoning", limit: 2_000_000, suffix_patterns: [""]},
+    # Dash notation (grok-4-1-fast-*) for backward compat
     %{name: "grok-4-1-fast-reasoning", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-1-fast-non-reasoning", limit: 2_000_000, suffix_patterns: [""]},
+    # Dot notation (grok-4.1-fast*) matching actual xAI API model IDs
+    %{
+      name: "grok-4.1-fast",
+      limit: 2_000_000,
+      suffix_patterns: ["", "-reasoning", "-non-reasoning"]
+    },
     %{name: "grok-code-fast-1", limit: 256_000, suffix_patterns: [""]},
     %{name: "grok-3", limit: 131_072, suffix_patterns: ["", "-fast"]},
     %{name: "grok-3-mini", limit: 131_072, suffix_patterns: ["", "-fast"]}

@@ -303,6 +303,41 @@ defmodule Alloy.Provider.OpenAIStreamTest do
     end
   end
 
+  describe "stream/5 reasoning_content" do
+    test "accumulates reasoning_content deltas and produces thinking block" do
+      reasoning_delta = fn text ->
+        %{
+          "id" => "chatcmpl-test",
+          "choices" => [
+            %{"index" => 0, "delta" => %{"reasoning_content" => text}, "finish_reason" => nil}
+          ]
+        }
+      end
+
+      chunks = [
+        sse_chunk(reasoning_delta.("Step 1. ")),
+        sse_chunk(reasoning_delta.("Step 2.")),
+        sse_chunk(text_delta("The answer.")),
+        sse_chunk(finish_chunk("stop")),
+        sse_done()
+      ]
+
+      {collected, result} = collect_stream(chunks, test_name: :reasoning_stream)
+
+      # Text chunks are emitted via on_chunk
+      assert collected == ["The answer."]
+
+      assert {:ok, response} = result
+      [%Message{role: :assistant, content: blocks}] = response.messages
+
+      thinking = Enum.find(blocks, &(&1.type == "thinking"))
+      assert thinking.thinking == "Step 1. Step 2."
+
+      text = Enum.find(blocks, &(&1.type == "text"))
+      assert text.text == "The answer."
+    end
+  end
+
   describe "stream/5 error handling" do
     test "returns error on non-200 status" do
       Req.Test.stub(:stream_error, fn conn ->
