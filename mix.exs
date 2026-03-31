@@ -75,6 +75,7 @@ defmodule Alloy.MixProject do
         Providers: [
           Alloy.Provider,
           Alloy.Provider.Anthropic,
+          Alloy.Provider.Gemini,
           Alloy.Provider.OpenAI,
           Alloy.Provider.OpenAICompat,
           Alloy.Provider.Retry,
