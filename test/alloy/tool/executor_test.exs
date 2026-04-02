@@ -602,4 +602,127 @@ defmodule Alloy.Tool.ExecutorTest do
 
     State.init(config)
   end
+
+  # --- Test Tools for max_result_chars ---
+
+  defmodule VerboseTool do
+    @behaviour Alloy.Tool
+    def name, do: "verbose"
+    def description, do: "Returns lots of text"
+    def input_schema, do: %{type: "object", properties: %{}}
+    def max_result_chars, do: 100
+    def execute(_input, _ctx), do: {:ok, String.duplicate("x", 500)}
+  end
+
+  defmodule UnlimitedTool do
+    @behaviour Alloy.Tool
+    def name, do: "unlimited"
+    def description, do: "Returns text with unlimited result"
+    def input_schema, do: %{type: "object", properties: %{}}
+    def max_result_chars, do: :unlimited
+    def execute(_input, _ctx), do: {:ok, String.duplicate("y", 500)}
+  end
+
+  # --- Test Tools for concurrent? ---
+
+  defmodule SequentialTool do
+    @behaviour Alloy.Tool
+    def name, do: "sequential"
+    def description, do: "Not concurrency safe"
+    def input_schema, do: %{type: "object", properties: %{}}
+    def concurrent?, do: false
+
+    def execute(_input, _ctx) do
+      ts = System.monotonic_time(:millisecond)
+      Process.sleep(30)
+      {:ok, "seq:#{ts}"}
+    end
+  end
+
+  defmodule ParallelTool do
+    @behaviour Alloy.Tool
+    def name, do: "parallel"
+    def description, do: "Concurrency safe (default)"
+    def input_schema, do: %{type: "object", properties: %{}}
+
+    def execute(_input, _ctx) do
+      ts = System.monotonic_time(:millisecond)
+      Process.sleep(30)
+      {:ok, "par:#{ts}"}
+    end
+  end
+
+  describe "execute_all — max_result_chars truncation" do
+    test "truncates results exceeding max_result_chars" do
+      state = build_state([VerboseTool])
+      call = %{id: "c_verbose", name: "verbose", type: "tool_use", input: %{}}
+
+      result = Executor.execute_all([call], state.tool_fns, state)
+
+      assert %Message{role: :user, content: [block]} = result
+      assert String.length(block.content) < 200
+      assert block.content =~ "[truncated"
+    end
+
+    test "tools without max_result_chars return full content" do
+      state = build_state([SuccessTool])
+      call = %{id: "c_full", name: "success", type: "tool_use", input: %{}}
+
+      result = Executor.execute_all([call], state.tool_fns, state)
+
+      assert %Message{role: :user, content: [block]} = result
+      assert block.content == "it worked"
+    end
+
+    test "tools with max_result_chars :unlimited return full content" do
+      state = build_state([UnlimitedTool])
+      call = %{id: "c_unlim", name: "unlimited", type: "tool_use", input: %{}}
+
+      result = Executor.execute_all([call], state.tool_fns, state)
+
+      assert %Message{role: :user, content: [block]} = result
+      assert String.length(block.content) == 500
+    end
+  end
+
+  describe "execute_all — concurrency safety partitioning" do
+    test "sequential tools complete before parallel tools start" do
+      state = build_state([SequentialTool, ParallelTool])
+
+      calls = [
+        %{id: "c_seq", name: "sequential", type: "tool_use", input: %{}},
+        %{id: "c_par", name: "parallel", type: "tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{role: :user, content: blocks}, _meta} =
+               Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
+
+      seq_block = Enum.find(blocks, &(&1.tool_use_id == "c_seq"))
+      par_block = Enum.find(blocks, &(&1.tool_use_id == "c_par"))
+
+      assert seq_block.content =~ "seq:"
+      assert par_block.content =~ "par:"
+
+      "seq:" <> seq_ts = seq_block.content
+      "par:" <> par_ts = par_block.content
+
+      assert String.to_integer(seq_ts) <= String.to_integer(par_ts)
+    end
+
+    test "result order matches original call order" do
+      state = build_state([ParallelTool, SequentialTool])
+
+      calls = [
+        %{id: "c1", name: "parallel", type: "tool_use", input: %{}},
+        %{id: "c2", name: "sequential", type: "tool_use", input: %{}},
+        %{id: "c3", name: "parallel", type: "tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{role: :user, content: blocks}, _meta} =
+               Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
+
+      ids = Enum.map(blocks, & &1.tool_use_id)
+      assert ids == ["c1", "c2", "c3"]
+    end
+  end
 end

@@ -22,6 +22,8 @@ defmodule Alloy.Tool.Core.Edit do
   def name, do: "edit"
 
   @impl true
+  def concurrent?, do: false
+  @impl true
   def description, do: "Search and replace text in a file."
 
   @impl true

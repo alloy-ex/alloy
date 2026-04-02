@@ -2111,4 +2111,54 @@ defmodule Alloy.Agent.TurnTest do
       assert is_integer(measurements.messages_after)
     end
   end
+
+  describe "prompt too long recovery" do
+    test "recovers from prompt-too-long by compacting and retrying" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response(
+            "invalid_request_error: prompt is too long: 204301 tokens > 200000 maximum"
+          ),
+          TestProvider.text_response("Recovered after compaction")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_tokens: 200_000,
+        compaction: %{reserve_tokens: 1_000, keep_recent_tokens: 5_000, fallback: :truncate}
+      }
+
+      state = State.init(config, [Message.user("Hello")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert result.run_metadata == %{prompt_too_long_recovery: true}
+    end
+
+    test "does not retry prompt-too-long more than once" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response(
+            "invalid_request_error: prompt is too long: 204301 tokens > 200000 maximum"
+          ),
+          TestProvider.error_response(
+            "invalid_request_error: prompt is too long: 150000 tokens > 100000 maximum"
+          )
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_tokens: 200_000,
+        compaction: %{reserve_tokens: 1_000, keep_recent_tokens: 5_000, fallback: :truncate}
+      }
+
+      state = State.init(config, [Message.user("Hello")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :error
+      assert result.error =~ "prompt is too long"
+    end
+  end
 end
