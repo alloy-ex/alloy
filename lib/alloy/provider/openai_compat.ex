@@ -154,7 +154,7 @@ defmodule Alloy.Provider.OpenAICompat do
       blocks
       |> Enum.filter(&(&1[:type] == "tool_use"))
       |> Enum.map(fn call ->
-        %{
+        tc = %{
           "id" => call.id,
           "type" => "function",
           "function" => %{
@@ -162,6 +162,12 @@ defmodule Alloy.Provider.OpenAICompat do
             "arguments" => Jason.encode!(call.input)
           }
         }
+
+        # Echo Gemini 3.x thought signatures back for multi-turn tool calls
+        case Map.get(call, :thought_signature) do
+          nil -> tc
+          sig -> Map.put(tc, "extra_content", %{"google" => %{"thought_signature" => sig}})
+        end
       end)
 
     text_parts =
@@ -273,9 +279,16 @@ defmodule Alloy.Provider.OpenAICompat do
       |> Enum.reduce_while([], fn tc, acc ->
         case Jason.decode(tc["function"]["arguments"]) do
           {:ok, input} ->
-            {:cont,
-             acc ++
-               [%{type: "tool_use", id: tc["id"], name: tc["function"]["name"], input: input}]}
+            block = %{type: "tool_use", id: tc["id"], name: tc["function"]["name"], input: input}
+
+            # Preserve Gemini 3.x thought signatures for multi-turn tool calls
+            block =
+              case get_in(tc, ["extra_content", "google", "thought_signature"]) do
+                nil -> block
+                sig -> Map.put(block, :thought_signature, sig)
+              end
+
+            {:cont, acc ++ [block]}
 
           {:error, _} ->
             {:halt, {:error, "Invalid JSON in tool call arguments for #{tc["function"]["name"]}"}}
@@ -292,6 +305,9 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_finish_reason("tool_calls"), do: :tool_use
   defp parse_finish_reason(_), do: :end_turn
 
+  # Gemini 3.x wraps errors in a list
+  defp parse_error(status, [item | _]) when is_map(item), do: parse_error(status, item)
+
   defp parse_error(status, body) when is_binary(body) do
     case Jason.decode(body) do
       {:ok, %{"error" => error}} -> "#{error["type"]}: #{error["message"]}"
@@ -306,4 +322,6 @@ defmodule Alloy.Provider.OpenAICompat do
       _ -> "HTTP #{status}: #{inspect(body)}"
     end
   end
+
+  defp parse_error(_status, body), do: "API error: #{inspect(body)}"
 end
