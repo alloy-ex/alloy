@@ -22,7 +22,7 @@ result.text #=> "The version is 0.9.0"
 
 Most agent frameworks try to be everything — sessions, memory, RAG, multi-agent orchestration, scheduling, UI. Alloy does one thing well: the agent loop. Inspired by [Pi Agent](https://github.com/badlogic/pi-mono)'s minimalism, Alloy brings the same philosophy to the BEAM with OTP's natural advantages: supervision, fault isolation, parallel tool execution, and real concurrency.
 
-- **3 providers** — Anthropic, OpenAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, Together, etc.)
+- **4 providers** — Anthropic, Codex, OpenAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, Together, etc.)
 - **4 built-in tools** — read, write, edit, bash
 - **GenServer agents** — supervised, stateful, message-passing
 - **Streaming** — token-by-token from any provider, unified interface
@@ -113,6 +113,9 @@ Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Anthropic, api_key: "..."
 
 # OpenAI
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"}} | opts])
+
+# Codex via local ChatGPT login
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Codex, model: "gpt-5.4"}} | opts])
 
 # xAI via Responses-compatible API
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", api_url: "https://api.x.ai", model: "grok-4"}} | opts])
@@ -400,11 +403,13 @@ end
 | Vendor | Recommended Module | Example Models |
 |--------|---------------------|----------------|
 | Anthropic | `Alloy.Provider.Anthropic` | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
+| Codex | `Alloy.Provider.Codex` | `gpt-5.4` via local `codex login` |
 | OpenAI | `Alloy.Provider.OpenAI` | `gpt-5.4` |
 | xAI | `Alloy.Provider.OpenAI` with `api_url: "https://api.x.ai"` | `grok-4`, `grok-4.1-fast`, `grok-4-fast-reasoning`, `grok-code-fast-1` |
 | Gemini | `Alloy.Provider.OpenAICompat` | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-pro-preview` |
 | Other OpenAI-compatible APIs | `Alloy.Provider.OpenAICompat` | Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together |
 
+Use `Alloy.Provider.Codex` to drive a locally installed Codex CLI with ChatGPT-plan auth.
 Use `Alloy.Provider.OpenAI` for native Responses APIs like OpenAI and xAI.
 Use `Alloy.Provider.OpenAICompat` for chat-completions compatible APIs and local runtimes.
 
