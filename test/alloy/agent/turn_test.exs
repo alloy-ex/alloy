@@ -1365,4 +1365,99 @@ defmodule Alloy.Agent.TurnTest do
       assert receive_timeout <= 4_000
     end
   end
+
+  describe "run_loop/2 halt_on_tool" do
+    test "halts after matching tool name without giving LLM another turn" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "done"}}
+          ]),
+          # This response should NEVER be reached — halt_on_tool fires first
+          TestProvider.text_response("This narration should not appear")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        halt_on_tool: "echo"
+      }
+
+      state = State.init(config, [Message.user("Echo done")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :halted
+      assert result.error =~ "halt_on_tool"
+      # Only 1 provider turn fired (tool_use), not 2
+      assert result.turn == 1
+    end
+
+    test "halts after matching tool name and action tuple" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"action" => "close", "text" => "bye"}}
+          ]),
+          TestProvider.text_response("Should not reach here")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        halt_on_tool: {"echo", "close"}
+      }
+
+      state = State.init(config, [Message.user("Close")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :halted
+      assert result.error =~ "halt_on_tool"
+    end
+
+    test "does not halt when tool name matches but action does not" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"action" => "create", "text" => "hi"}}
+          ]),
+          TestProvider.text_response("Completed normally")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        halt_on_tool: {"echo", "close"}
+      }
+
+      state = State.init(config, [Message.user("Create")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+    end
+
+    test "does not halt when halt_on_tool is nil" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "hello"}}
+          ]),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        halt_on_tool: nil
+      }
+
+      state = State.init(config, [Message.user("Go")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+    end
+  end
 end

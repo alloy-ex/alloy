@@ -135,15 +135,32 @@ defmodule Alloy.Agent.Turn do
           result_msg ->
             state = State.append_messages(state, result_msg)
 
-            case Middleware.run(:after_tool_execution, state) do
-              {:halted, reason} ->
-                %{state | status: :halted, error: "Halted by middleware: #{reason}"}
+            if halt_on_tool_match?(tool_calls, state.config.halt_on_tool) do
+              %{state | status: :halted, error: "halt_on_tool: loop halted after matching tool"}
+            else
+              case Middleware.run(:after_tool_execution, state) do
+                {:halted, reason} ->
+                  %{state | status: :halted, error: "Halted by middleware: #{reason}"}
 
-              %State{} = state ->
-                do_turn(state, opts, deadline)
+                %State{} = state ->
+                  do_turn(state, opts, deadline)
+              end
             end
         end
     end
+  end
+
+  defp halt_on_tool_match?(_tool_calls, nil), do: false
+
+  defp halt_on_tool_match?(tool_calls, {tool_name, action})
+       when is_binary(tool_name) and is_binary(action) do
+    Enum.any?(tool_calls, fn tc ->
+      tc[:name] == tool_name and (tc[:input] || %{})["action"] == action
+    end)
+  end
+
+  defp halt_on_tool_match?(tool_calls, tool_name) when is_binary(tool_name) do
+    Enum.any?(tool_calls, fn tc -> tc[:name] == tool_name end)
   end
 
   defp call_provider_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline) do

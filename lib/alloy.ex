@@ -73,6 +73,23 @@ defmodule Alloy do
   or ignored if `:messages` option provides conversation history.
 
   Returns `{:ok, result}` on completion or `{:error, result}` on failure.
+
+  ## Options
+
+    - `:halt_on_tool` — `tool_name` string or `{tool_name, action}` tuple. When
+      any executed tool matches, the loop halts immediately after that tool's result
+      without giving the LLM another turn. Default: `nil`.
+
+      ```elixir
+      # Halt after any call to the "beads" tool
+      Alloy.run(prompt, halt_on_tool: "beads", ...)
+
+      # Halt only after beads tool with action="transition"
+      Alloy.run(prompt, halt_on_tool: {"beads", "transition"}, ...)
+      ```
+
+      This prevents agents from producing a final narration turn after a completion
+      signal. The result has `status: :halted` and `error: "halt_on_tool: ..."`.
   """
   @spec run(String.t() | nil, keyword()) :: {:ok, result()} | {:error, result()}
   def run(message \\ nil, opts) do
