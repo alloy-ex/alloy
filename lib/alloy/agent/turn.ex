@@ -242,15 +242,36 @@ defmodule Alloy.Agent.Turn do
               |> State.append_messages(result_msg)
               |> State.append_tool_calls(tool_call_meta)
 
-            case Middleware.run(:after_tool_execution, state) do
-              {:halted, reason} ->
-                %{state | status: :halted, error: "Halted by middleware: #{reason}"}
-
-              %State{} = state ->
-                do_turn(state, opts, deadline)
-            end
+            after_tools(state, tool_calls, opts, deadline)
         end
     end
+  end
+
+  defp after_tools(%State{} = state, tool_calls, opts, deadline) do
+    if halt_on_tool_match?(tool_calls, state.config.halt_on_tool) do
+      %{state | status: :halted, error: "halt_on_tool: loop halted after matching tool"}
+    else
+      case Middleware.run(:after_tool_execution, state) do
+        {:halted, reason} ->
+          %{state | status: :halted, error: "Halted by middleware: #{reason}"}
+
+        %State{} = state ->
+          do_turn(state, opts, deadline)
+      end
+    end
+  end
+
+  defp halt_on_tool_match?(_tool_calls, nil), do: false
+
+  defp halt_on_tool_match?(tool_calls, {tool_name, action})
+       when is_binary(tool_name) and is_binary(action) do
+    Enum.any?(tool_calls, fn tc ->
+      tc[:name] == tool_name and (tc[:input] || %{})["action"] == action
+    end)
+  end
+
+  defp halt_on_tool_match?(tool_calls, tool_name) when is_binary(tool_name) do
+    Enum.any?(tool_calls, fn tc -> tc[:name] == tool_name end)
   end
 
   defp build_provider_config(%State{config: config, provider_state: provider_state}) do

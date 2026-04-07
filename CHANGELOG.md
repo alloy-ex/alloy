@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`halt_on_tool:` option for `Alloy.run/2`** — pass `halt_on_tool: "tool_name"` or
+  `halt_on_tool: {"tool_name", "action"}` to stop the agent loop immediately after a
+  matching tool executes, before the LLM gets another turn. This prevents agents from
+  producing a final narration turn after a completion signal (e.g. transitioning a bead
+  or calling a "done" tool). Equivalent to writing a one-liner `:after_tool_execution`
+  middleware, but built in. Default: `nil` (no early halt).
+
 ## [0.9.0] - 2026-03-22
 
 ### Breaking

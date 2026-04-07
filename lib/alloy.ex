@@ -51,6 +51,8 @@ defmodule Alloy do
   - `:context` - arbitrary map passed to tools and middleware (default: `%{}`)
   - `:max_pending` - max queued async `send_message/3` requests while one is running (default: `0`)
   - `:model_metadata_overrides` - overrides for model context windows used to derive `:max_tokens` when not set explicitly (default: `%{}`)
+  - `:halt_on_tool` - `tool_name` string or `{tool_name, action}` tuple; halts the loop
+    immediately after a matching tool executes, without an extra LLM turn (default: `nil`)
   """
 
   alias Alloy.Agent.{Config, Server, State, Turn}
