@@ -86,7 +86,9 @@ defmodule Alloy do
   """
   @spec run(String.t() | nil, keyword()) :: {:ok, result()} | {:error, result()}
   def run(message \\ nil, opts) do
-    do_run(message, opts, [])
+    on_event = validate_on_event(Keyword.get(opts, :on_event))
+    turn_opts = maybe_put([], :on_event, on_event)
+    do_run(message, opts, turn_opts)
   end
 
   @doc """
