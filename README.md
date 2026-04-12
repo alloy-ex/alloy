@@ -22,7 +22,7 @@ result.text #=> "The version is 0.10.0"
 
 Most agent frameworks try to be everything — sessions, memory, RAG, multi-agent orchestration, scheduling, UI. Alloy does one thing well: the agent loop. Inspired by [Pi Agent](https://github.com/badlogic/pi-mono)'s minimalism, Alloy brings the same philosophy to the BEAM with OTP's natural advantages: supervision, fault isolation, parallel tool execution, and real concurrency.
 
-- **5 providers** — Anthropic, Gemini, OpenAI, Codex, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, Together, etc.)
+- **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
 - **4 built-in tools** — read, write, edit, bash
 - **GenServer agents** — supervised, stateful, message-passing
 - **Streaming** — token-by-token from any provider, unified interface

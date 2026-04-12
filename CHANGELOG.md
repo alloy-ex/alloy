@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Gemini provider** — `Alloy.Provider.Gemini` adds native Google Gemini support via the GenerateContent API, including streaming and tool calling.
+- **xAI provider** — `Alloy.Provider.XAI` wraps the OpenAI Responses API with xAI defaults. Use `{Alloy.Provider.XAI, api_key: key, model: "grok-4"}` instead of manually setting `api_url`. Supports `web_search: true` and `x_search: true` for Grok's native search tools.
 - **Codex provider** — `Alloy.Provider.Codex` adds OpenAI Codex support with ChatGPT authentication and session management.
 - **Tool concurrency control** — tools can implement `concurrent?/0` to declare whether they are safe to run in parallel. The executor runs non-concurrent tools sequentially first, then concurrent tools in parallel. Default: `true`.
 - **Tool result truncation** — tools can implement `max_result_chars/0` to cap output length. The executor truncates results that exceed the limit, keeping head and tail. Default: `:unlimited`.

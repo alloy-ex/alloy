@@ -80,7 +80,8 @@ defmodule Alloy.MixProject do
           Alloy.Provider.OpenAI,
           Alloy.Provider.OpenAICompat,
           Alloy.Provider.Retry,
-          Alloy.Provider.Test
+          Alloy.Provider.Test,
+          Alloy.Provider.XAI
         ],
         Tools: [
           Alloy.Tool,
