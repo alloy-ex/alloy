@@ -192,13 +192,7 @@ defmodule Alloy.Agent.Turn do
                 Map.get(provider_response, :response_metadata)
               )
 
-            case Middleware.run(:after_completion, state) do
-              {:halted, reason} ->
-                %{state | status: :halted, error: "Halted by middleware: #{reason}"}
-
-              %State{} = state ->
-                %{state | status: :completed}
-            end
+            maybe_complete_or_continue(state, opts, deadline)
 
           {:error, reason} ->
             handle_provider_error(reason, state, opts, deadline, prompt_retried?)
@@ -290,13 +284,33 @@ defmodule Alloy.Agent.Turn do
       String.contains?(reason, "maximum context length")
   end
 
-  defp prompt_too_long?(reason) when is_binary(reason) do
-    String.contains?(reason, "prompt is too long") or
-      String.contains?(reason, "context_length_exceeded") or
-      String.contains?(reason, "maximum context length")
+  defp prompt_too_long?(_), do: false
+
+  defp maybe_complete_or_continue(state, opts, deadline) do
+    if until_tool_pending?(state) do
+      state
+      |> State.append_messages([
+        Message.user(
+          "Continue. You must call the #{state.config.until_tool} tool before finishing."
+        )
+      ])
+      |> do_turn(opts, deadline)
+    else
+      case Middleware.run(:after_completion, state) do
+        {:halted, reason} ->
+          %{state | status: :halted, error: "Halted by middleware: #{reason}"}
+
+        %State{} = state ->
+          %{state | status: :completed}
+      end
+    end
   end
 
-  defp prompt_too_long?(_), do: false
+  defp until_tool_pending?(%State{config: %{until_tool: nil}}), do: false
+
+  defp until_tool_pending?(%State{config: %{until_tool: name}, tool_calls: calls}) do
+    not Enum.any?(calls, fn call -> call[:name] == name end)
+  end
 
   defp budget_exceeded?(%State{config: %{max_budget_cents: nil}}), do: false
 

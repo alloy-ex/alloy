@@ -86,6 +86,7 @@ defmodule Alloy.Result do
     %{}
     |> maybe_put_metadata(:provider_state, state.provider_state)
     |> maybe_put_metadata(:provider_response, state.provider_response_metadata)
+    |> maybe_put_metadata(:run, state.run_metadata)
   end
 
   defp maybe_put_metadata(metadata, _key, value) when is_map(value) and map_size(value) == 0,

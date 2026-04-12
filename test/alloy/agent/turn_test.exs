@@ -2161,4 +2161,97 @@ defmodule Alloy.Agent.TurnTest do
       assert result.error =~ "prompt is too long"
     end
   end
+
+  describe "run_loop/1 with until_tool" do
+    test "continues loop when model ends turn without calling the target tool" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          # Turn 1: model tries to end without calling submit
+          TestProvider.text_response("I'm done!"),
+          # Turn 2: after continuation prompt, model calls the tool
+          TestProvider.tool_use_response([
+            %{id: "tc_1", name: "submit", input: %{"answer" => "42"}}
+          ]),
+          # Turn 3: model ends after tool result
+          TestProvider.text_response("Submitted.")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        until_tool: "submit"
+      }
+
+      state = State.init(config, [Message.user("What is the answer?")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert result.turn == 3
+    end
+
+    test "completes immediately when target tool is called on first pass" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tc_1", name: "submit", input: %{"answer" => "42"}}
+          ]),
+          TestProvider.text_response("Done.")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        until_tool: "submit"
+      }
+
+      state = State.init(config, [Message.user("Answer please")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert result.turn == 2
+    end
+
+    test "max_turns still wins over until_tool" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("Not calling it."),
+          TestProvider.text_response("Still not."),
+          TestProvider.text_response("Nope.")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        until_tool: "submit",
+        max_turns: 3
+      }
+
+      state = State.init(config, [Message.user("Call submit")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :max_turns
+    end
+
+    test "nil until_tool does not affect normal completion" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("All done!")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        until_tool: nil
+      }
+
+      state = State.init(config, [Message.user("Hi")])
+      result = Turn.run_loop(state)
+
+      assert result.status == :completed
+      assert result.turn == 1
+    end
+  end
 end

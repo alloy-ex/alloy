@@ -15,27 +15,29 @@ Alloy is the completion-tool-call loop and nothing else. Send messages to any LL
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.9.0"
+result.text #=> "The version is 0.10.0"
 ```
 
 ## Why Alloy?
 
 Most agent frameworks try to be everything — sessions, memory, RAG, multi-agent orchestration, scheduling, UI. Alloy does one thing well: the agent loop. Inspired by [Pi Agent](https://github.com/badlogic/pi-mono)'s minimalism, Alloy brings the same philosophy to the BEAM with OTP's natural advantages: supervision, fault isolation, parallel tool execution, and real concurrency.
 
-- **4 providers** — Anthropic, Gemini, OpenAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, Together, etc.)
+- **5 providers** — Anthropic, Gemini, OpenAI, Codex, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, xAI, DeepSeek, Mistral, Groq, Together, etc.)
 - **4 built-in tools** — read, write, edit, bash
 - **GenServer agents** — supervised, stateful, message-passing
 - **Streaming** — token-by-token from any provider, unified interface
 - **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
-- **Middleware** — custom hooks, tool blocking
+- **Middleware** — custom hooks, tool blocking, argument editing
 - **Context compaction** — summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
 - **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
 - **Reasoning blocks** — DeepSeek/xAI `reasoning_content` parsed as first-class thinking blocks
+- **Tool safety** — `concurrent?/0` controls parallel execution, `max_result_chars/0` caps output, prompt-too-long auto-recovery
+- **Structured output** — `until_tool` forces the loop to continue until a specific tool is called
 - **Provider passthrough** — `extra_body` injects arbitrary provider-specific params (response_format, temperature, reasoning_effort)
 - **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
 - **Cost guard** — `max_budget_cents` halts the loop before overspending
 - **OTP-native** — supervision trees, hot code reloading, real parallel tool execution
-- **~5,000 lines** — small enough to read, understand, and extend
+- **~7,500 lines** — small enough to read, understand, and extend
 
 ## Design Boundary
 
@@ -68,7 +70,7 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.9"}
+    {:alloy, "~> 0.10"}
   ]
 end
 ```
@@ -363,6 +365,56 @@ logging, or custom metrics:
 | `[:alloy, :compaction, :done]` | `messages_before`, `messages_after` | `turn` |
 | `[:alloy, :tool, :start]` | — | tool identity, correlation |
 | `[:alloy, :tool, :stop]` | `duration_ms` | tool identity, result |
+
+### Structured output with `until_tool`
+
+Force the model to call a specific tool before the loop completes. This is more
+reliable than response format instructions because the tool schema is validated
+at the API level:
+
+```elixir
+defmodule SubmitAnswer do
+  @behaviour Alloy.Tool
+  def name, do: "submit_answer"
+  def description, do: "Submit your final answer as structured data."
+  def input_schema do
+    %{type: "object", properties: %{
+      answer: %{type: "string"},
+      confidence: %{type: "number", minimum: 0, maximum: 1}
+    }, required: ["answer", "confidence"]}
+  end
+  def execute(input, _ctx), do: {:ok, "Received: #{input["answer"]}"}
+end
+
+{:ok, result} = Alloy.run("What is the capital of France?",
+  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"},
+  tools: [SubmitAnswer],
+  until_tool: "submit_answer"
+)
+```
+
+### Middleware: editing tool arguments
+
+Middleware can return `{:edit, modified_call}` from `:before_tool_call` to rewrite
+tool arguments before execution (e.g., policy enforcement, input sanitization):
+
+```elixir
+defmodule SanitizeBash do
+  @behaviour Alloy.Middleware
+
+  def call(:before_tool_call, state) do
+    call = state.config.context[:current_tool_call]
+
+    if call[:name] == "bash" && String.contains?(call[:input]["command"], "rm ") do
+      {:edit, %{call | input: %{"command" => "echo 'rm commands are blocked'"}}}
+    else
+      state
+    end
+  end
+
+  def call(_hook, state), do: state
+end
+```
 
 ### Supervised GenServer agent
 

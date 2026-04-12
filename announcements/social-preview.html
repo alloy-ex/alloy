@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 1280px;
+    height: 640px;
+    background: #0a0a0f;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* Animated-look gradient mesh background */
+  .bg-orb-1 {
+    position: absolute;
+    width: 600px;
+    height: 600px;
+    top: -150px;
+    right: -100px;
+    background: radial-gradient(circle, rgba(99, 102, 241, 0.2) 0%, transparent 65%);
+    border-radius: 50%;
+  }
+  .bg-orb-2 {
+    position: absolute;
+    width: 500px;
+    height: 500px;
+    bottom: -200px;
+    left: -100px;
+    background: radial-gradient(circle, rgba(139, 92, 246, 0.12) 0%, transparent 65%);
+    border-radius: 50%;
+  }
+  .bg-orb-3 {
+    position: absolute;
+    width: 300px;
+    height: 300px;
+    top: 50%;
+    left: 45%;
+    transform: translate(-50%, -50%);
+    background: radial-gradient(circle, rgba(168, 85, 247, 0.08) 0%, transparent 70%);
+    border-radius: 50%;
+  }
+
+  /* Subtle noise texture */
+  body::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+    opacity: 0.5;
+    pointer-events: none;
+  }
+
+  .container {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    height: 100%;
+    text-align: center;
+    padding: 0 100px;
+  }
+
+  .logo-row {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    margin-bottom: 32px;
+  }
+
+  .logo-mark {
+    width: 68px;
+    height: 68px;
+    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 40%, #a78bfa 100%);
+    border-radius: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 38px;
+    font-weight: 800;
+    color: white;
+    letter-spacing: -1px;
+    box-shadow:
+      0 0 40px rgba(99, 102, 241, 0.3),
+      0 0 80px rgba(99, 102, 241, 0.1);
+  }
+
+  .name {
+    font-size: 64px;
+    font-weight: 800;
+    color: #f0f6fc;
+    letter-spacing: -2.5px;
+  }
+
+  .tagline {
+    font-size: 26px;
+    font-weight: 400;
+    color: #7d8590;
+    line-height: 1.5;
+    max-width: 700px;
+    margin-bottom: 48px;
+  }
+  .tagline strong {
+    color: #c9d1d9;
+    font-weight: 600;
+  }
+
+  .providers {
+    display: flex;
+    gap: 28px;
+    align-items: center;
+  }
+  .provider {
+    font-size: 15px;
+    font-weight: 600;
+    color: #484f58;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+  }
+  .provider-sep {
+    width: 4px;
+    height: 4px;
+    background: #30363d;
+    border-radius: 50%;
+  }
+
+  .bottom {
+    position: absolute;
+    bottom: 44px;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    align-items: center;
+  }
+  .bottom .elixir-dot {
+    width: 10px;
+    height: 10px;
+    background: #6e4a7e;
+    border-radius: 50%;
+  }
+  .bottom span {
+    font-size: 14px;
+    color: #484f58;
+    font-weight: 500;
+    letter-spacing: 0.5px;
+  }
+</style>
+</head>
+<body>
+  <div class="bg-orb-1"></div>
+  <div class="bg-orb-2"></div>
+  <div class="bg-orb-3"></div>
+
+  <div class="container">
+    <div class="logo-row">
+      <div class="logo-mark">A</div>
+      <div class="name">Alloy</div>
+    </div>
+    <div class="tagline">
+      <strong>Any model. Any provider.</strong><br>
+      The agent engine for Elixir.
+    </div>
+    <div class="providers">
+      <div class="provider">Anthropic</div>
+      <div class="provider-sep"></div>
+      <div class="provider">OpenAI</div>
+      <div class="provider-sep"></div>
+      <div class="provider">xAI</div>
+      <div class="provider-sep"></div>
+      <div class="provider">Gemini</div>
+      <div class="provider-sep"></div>
+      <div class="provider">DeepSeek</div>
+      <div class="provider-sep"></div>
+      <div class="provider">Ollama</div>
+    </div>
+  </div>
+
+  <div class="bottom">
+    <div class="elixir-dot"></div>
+    <span>Elixir / OTP</span>
+  </div>
+</body>
+</html>

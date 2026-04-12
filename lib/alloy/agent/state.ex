@@ -24,6 +24,7 @@ defmodule Alloy.Agent.State do
           tool_fns: %{String.t() => module()},
           provider_state: map(),
           provider_response_metadata: map(),
+          run_metadata: map(),
           started_at: integer() | nil,
           agent_id: String.t(),
           current_task: {reference(), pid(), binary()} | nil,
@@ -44,6 +45,7 @@ defmodule Alloy.Agent.State do
     tool_fns: %{},
     provider_state: %{},
     provider_response_metadata: %{},
+    run_metadata: %{},
     started_at: nil,
     agent_id: "",
     current_task: nil,
@@ -114,6 +116,16 @@ defmodule Alloy.Agent.State do
 
   def put_provider_response_metadata(%__MODULE__{} = state, metadata) when is_map(metadata) do
     %{state | provider_response_metadata: metadata}
+  end
+
+  @doc """
+  Merge agent-loop runtime metadata for the current run.
+  """
+  @spec merge_run_metadata(t(), map() | nil) :: t()
+  def merge_run_metadata(%__MODULE__{} = state, nil), do: state
+
+  def merge_run_metadata(%__MODULE__{} = state, metadata) when is_map(metadata) do
+    %{state | run_metadata: Map.merge(state.run_metadata, metadata)}
   end
 
   @doc """
