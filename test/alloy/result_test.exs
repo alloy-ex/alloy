@@ -105,7 +105,8 @@ defmodule Alloy.ResultTest do
 
       state = %{
         state
-        | provider_response_metadata: %{citations: [%{"url" => "https://docs.x.ai/overview"}]}
+        | provider_response_metadata: %{citations: [%{"url" => "https://docs.x.ai/overview"}]},
+          run_metadata: %{prompt_too_long_recovery: true}
       }
 
       result = Result.from_state(state)
@@ -119,7 +120,8 @@ defmodule Alloy.ResultTest do
 
       assert result.metadata == %{
                provider_state: %{response_id: "resp_456"},
-               provider_response: %{citations: [%{"url" => "https://docs.x.ai/overview"}]}
+               provider_response: %{citations: [%{"url" => "https://docs.x.ai/overview"}]},
+               run: %{prompt_too_long_recovery: true}
              }
 
       assert result.usage.input_tokens == 10

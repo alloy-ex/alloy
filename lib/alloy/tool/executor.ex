@@ -37,24 +37,40 @@ defmodule Alloy.Tool.Executor do
         h
 
       {:ok, tagged} ->
-        {results, meta} =
-          Task.Supervisor.async_stream(
-            Alloy.TaskSupervisor,
-            tagged,
-            &run_tagged(&1, tool_fns, context, on_event, seq_ref, corr_id, turn),
-            timeout: tool_timeout,
-            ordered: true,
-            on_timeout: :kill_task
-          )
-          |> Enum.zip(tagged)
-          |> Enum.map(fn
-            {{:ok, pair}, _} ->
-              pair
+        {sequential, concurrent} = partition_by_concurrency(tagged, tool_fns)
 
-            {{:exit, reason}, tag} ->
-              crashed(call_from(tag), reason, on_event, seq_ref, corr_id, turn)
+        # Phase 1: Non-concurrent tools run sequentially
+        seq_results =
+          Enum.map(sequential, fn tag ->
+            run_tagged(tag, tool_fns, context, on_event, seq_ref, corr_id, turn)
           end)
-          |> Enum.unzip()
+
+        # Phase 2: Concurrent tools run in parallel
+        par_results =
+          if concurrent == [] do
+            []
+          else
+            Task.Supervisor.async_stream(
+              Alloy.TaskSupervisor,
+              concurrent,
+              &run_tagged(&1, tool_fns, context, on_event, seq_ref, corr_id, turn),
+              timeout: tool_timeout,
+              ordered: true,
+              on_timeout: :kill_task
+            )
+            |> Enum.zip(concurrent)
+            |> Enum.map(fn
+              {{:ok, pair}, _} ->
+                pair
+
+              {{:exit, reason}, tag} ->
+                crashed(call_from(tag), reason, on_event, seq_ref, corr_id, turn)
+            end)
+          end
+
+        # Reassemble in original call order
+        all = reassemble_ordered(tagged, sequential, seq_results, concurrent, par_results)
+        {results, meta} = Enum.unzip(all)
 
         {:ok, Message.tool_results(results), meta}
     end
@@ -65,6 +81,7 @@ defmodule Alloy.Tool.Executor do
       Enum.reduce_while(calls, {:ok, []}, fn call, {:ok, acc} ->
         case Middleware.run_before_tool_call(state, call) do
           :ok -> {:cont, {:ok, [{:execute, call} | acc]}}
+          {:edit, modified_call} -> {:cont, {:ok, [{:execute, modified_call} | acc]}}
           {:block, reason} -> {:cont, {:ok, [{:blocked, call, reason} | acc]}}
           {:halted, reason} -> {:halt, {:halted, reason}}
         end
@@ -87,10 +104,10 @@ defmodule Alloy.Tool.Executor do
           try do
             case mod.execute(call[:input] || %{}, ctx) do
               {:ok, text, data} when is_map(data) ->
-                {block_fn.(call[:id], text, false), nil, data}
+                {block_fn.(call[:id], maybe_truncate(text, mod), false), nil, data}
 
               {:ok, r} ->
-                {block_fn.(call[:id], r, false), nil, nil}
+                {block_fn.(call[:id], maybe_truncate(r, mod), false), nil, nil}
 
               {:error, r} ->
                 {block_fn.(call[:id], r, true), r, nil}
@@ -230,6 +247,56 @@ defmodule Alloy.Tool.Executor do
   defp maybe_put_structured_data(meta, data), do: Map.put(meta, :structured_data, data)
 
   defp random_id, do: "run_" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+
+  defp maybe_truncate(text, mod) when is_binary(text) do
+    if function_exported?(mod, :max_result_chars, 0) do
+      case mod.max_result_chars() do
+        :unlimited ->
+          text
+
+        max when is_integer(max) and byte_size(text) > max ->
+          head = div(max * 4, 5)
+          tail = max - head
+
+          String.slice(text, 0, head) <>
+            "\n\n[truncated " <>
+            Integer.to_string(String.length(text)) <>
+            " -> " <>
+            Integer.to_string(max) <>
+            " chars]\n\n" <>
+            String.slice(text, -tail, tail)
+
+        _ ->
+          text
+      end
+    else
+      text
+    end
+  end
+
+  defp maybe_truncate(text, _mod), do: text
+
+  defp partition_by_concurrency(tagged, tool_fns) do
+    Enum.split_with(tagged, fn
+      {:execute, call} ->
+        case Map.fetch(tool_fns, call[:name]) do
+          {:ok, mod} ->
+            function_exported?(mod, :concurrent?, 0) and mod.concurrent?() == false
+
+          :error ->
+            false
+        end
+
+      {:blocked, _, _} ->
+        false
+    end)
+  end
+
+  defp reassemble_ordered(tagged, seq_tags, seq_results, par_tags, par_results) do
+    seq_map = Map.new(Enum.zip(seq_tags, seq_results))
+    par_map = Map.new(Enum.zip(par_tags, par_results))
+    Enum.map(tagged, fn tag -> Map.get(seq_map, tag) || Map.get(par_map, tag) end)
+  end
 
   defp build_context(%State{} = state) do
     Map.merge(state.config.context, %{

@@ -23,6 +23,8 @@ defmodule Alloy.Tool.Core.Read do
   def name, do: "read"
 
   @impl true
+  def max_result_chars, do: 50_000
+  @impl true
   def description, do: "Read a file from the filesystem. Returns contents with line numbers."
 
   @impl true

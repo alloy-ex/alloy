@@ -27,7 +27,7 @@ defmodule Alloy.Middleware do
           | :session_start
           | :session_end
 
-  @type call_result :: State.t() | {:block, String.t()} | {:halt, String.t()}
+  @type call_result :: State.t() | {:block, String.t()} | {:halt, String.t()} | {:edit, map()}
 
   @doc """
   Called at the specified hook point. Returns modified state,
@@ -66,22 +66,44 @@ defmodule Alloy.Middleware do
   Runs `:before_tool_call` middleware for a single tool call.
 
   Injects the tool call into `state.config.context[:current_tool_call]`
-  before running middleware. Returns `:ok` or `{:block, reason}`.
+  before running middleware. Returns `:ok`, `{:block, reason}`,
+  `{:edit, modified_call}`, or `{:halted, reason}`.
+
+  The `{:edit, modified_call}` return lets middleware rewrite tool arguments
+  before execution. The modified call must keep the same `:id` and `:name`.
   """
   @spec run_before_tool_call(State.t(), map()) ::
-          :ok | {:block, String.t()} | {:halted, String.t()}
+          :ok | {:block, String.t()} | {:edit, map()} | {:halted, String.t()}
   def run_before_tool_call(%State{} = state, tool_call) do
-    # Inject the tool call into context so middleware can inspect it
     updated_context = Map.put(state.config.context, :current_tool_call, tool_call)
     updated_config = %{state.config | context: updated_context}
     updated_state = %{state | config: updated_config}
 
     Enum.reduce_while(updated_state.config.middleware, :ok, fn middleware, _acc ->
       case middleware.call(:before_tool_call, updated_state) do
-        {:block, reason} -> {:halt, {:block, reason}}
-        {:halt, reason} -> {:halt, {:halted, reason}}
-        %State{} -> {:cont, :ok}
+        {:block, reason} ->
+          {:halt, {:block, reason}}
+
+        {:halt, reason} ->
+          {:halt, {:halted, reason}}
+
+        {:edit, modified_call} ->
+          validate_edit!(tool_call, modified_call)
+          {:halt, {:edit, modified_call}}
+
+        %State{} ->
+          {:cont, :ok}
       end
     end)
+  end
+
+  defp validate_edit!(original, modified) do
+    unless Map.get(modified, :id) == Map.get(original, :id) and
+             Map.get(modified, :name) == Map.get(original, :name) do
+      raise ArgumentError,
+            "Middleware :edit must preserve the tool call :id and :name. " <>
+              "Original: #{inspect(Map.take(original, [:id, :name]))}, " <>
+              "Modified: #{inspect(Map.take(modified, [:id, :name]))}"
+    end
   end
 end

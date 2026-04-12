@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.9.0"
+  @version "0.10.0"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -75,10 +75,13 @@ defmodule Alloy.MixProject do
         Providers: [
           Alloy.Provider,
           Alloy.Provider.Anthropic,
+          Alloy.Provider.Codex,
+          Alloy.Provider.Gemini,
           Alloy.Provider.OpenAI,
           Alloy.Provider.OpenAICompat,
           Alloy.Provider.Retry,
-          Alloy.Provider.Test
+          Alloy.Provider.Test,
+          Alloy.Provider.XAI
         ],
         Tools: [
           Alloy.Tool,

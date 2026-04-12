@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-04-12
+
+### Added
+
+- **Gemini provider** — `Alloy.Provider.Gemini` adds native Google Gemini support via the GenerateContent API, including streaming and tool calling.
+- **xAI provider** — `Alloy.Provider.XAI` wraps the OpenAI Responses API with xAI defaults. Use `{Alloy.Provider.XAI, api_key: key, model: "grok-4"}` instead of manually setting `api_url`. Supports `web_search: true` and `x_search: true` for Grok's native search tools.
+- **Codex provider** — `Alloy.Provider.Codex` adds OpenAI Codex support with ChatGPT authentication and session management.
+- **Tool concurrency control** — tools can implement `concurrent?/0` to declare whether they are safe to run in parallel. The executor runs non-concurrent tools sequentially first, then concurrent tools in parallel. Default: `true`.
+- **Tool result truncation** — tools can implement `max_result_chars/0` to cap output length. The executor truncates results that exceed the limit, keeping head and tail. Default: `:unlimited`.
+- **Prompt-too-long recovery** — when a provider returns a "prompt is too long" error, Alloy forces context compaction and retries the turn once before failing.
+- **`until_tool` option** — `Alloy.run("question", until_tool: "submit")` forces the loop to continue until the model calls the named tool. If the model signals `:end_turn` without calling it, the loop injects a continuation prompt and keeps going. Useful for structured output enforcement via tool schemas.
+- **HITL `:edit` variant** — middleware can return `{:edit, modified_call}` from `:before_tool_call` to rewrite tool arguments before execution. The modified call must preserve the original `:id` and `:name`. This enables human-in-the-loop argument correction, policy-based input rewriting, and tool-call sanitization.
+
+### Fixed
+
+- **Duplicate `prompt_too_long?/1` clause** — removed dead code (identical function clause).
+
 ## [0.9.0] - 2026-03-22
 
 ### Breaking

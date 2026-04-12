@@ -80,6 +80,15 @@ defmodule Alloy.Context.Compactor do
   def summary_prefix, do: @summary_prefix
 
   @doc """
+  Forces compaction regardless of reserve budget.
+  Used when the provider rejects the prompt as too long.
+  """
+  @spec force_compact(State.t()) :: State.t()
+  def force_compact(%State{} = state) do
+    compact_messages_in_state(state, State.messages(state))
+  end
+
+  @doc """
   Compacts state messages when they exceed `max_tokens - reserve_tokens`.
 
   Returns `{:compacted, state}` when compaction occurred, or

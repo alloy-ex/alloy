@@ -47,6 +47,11 @@ defmodule Alloy.Tool.Core.Bash do
   def name, do: "bash"
 
   @impl true
+  def concurrent?, do: false
+
+  @impl true
+  def max_result_chars, do: 30_000
+  @impl true
   def description, do: "Execute a shell command and return its output."
 
   @impl true

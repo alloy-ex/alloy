@@ -115,7 +115,21 @@ defmodule Alloy.Tool do
   """
   @callback result_type() :: :text | :structured
 
-  @optional_callbacks [allowed_callers: 0, result_type: 0]
+  @doc """
+  Maximum characters in the tool result before truncation.
+  The executor truncates results exceeding this, keeping head + tail.
+  Defaults to `:unlimited` when not implemented.
+  """
+  @callback max_result_chars() :: pos_integer() | :unlimited
+
+  @doc """
+  Whether this tool is safe to run concurrently with other tools.
+  State-mutating tools (file write, bash) should return false.
+  Defaults to `true` when not implemented.
+  """
+  @callback concurrent?() :: boolean()
+
+  @optional_callbacks [allowed_callers: 0, result_type: 0, max_result_chars: 0, concurrent?: 0]
 
   @doc """
   Resolve a file path against the working directory from context.

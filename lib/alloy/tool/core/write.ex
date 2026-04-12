@@ -21,6 +21,8 @@ defmodule Alloy.Tool.Core.Write do
   def name, do: "write"
 
   @impl true
+  def concurrent?, do: false
+  @impl true
   def description, do: "Write content to a file. Creates parent directories if needed."
 
   @impl true

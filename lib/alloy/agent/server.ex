@@ -578,7 +578,8 @@ defmodule Alloy.Agent.Server do
   # ── Private ───────────────────────────────────────────────────────────────
 
   defp broadcast(pubsub, topic, message) do
-    case Phoenix.PubSub.broadcast(pubsub, topic, message) do
+    # credo:disable-for-next-line Credo.Check.Refactor.Apply
+    case apply(pubsub_module(), :broadcast, [pubsub, topic, message]) do
       :ok ->
         :ok
 
@@ -594,14 +595,15 @@ defmodule Alloy.Agent.Server do
   defp maybe_subscribe_pubsub(%State{config: %{pubsub: nil}}), do: :ok
 
   defp maybe_subscribe_pubsub(%State{config: config}) do
-    unless Code.ensure_loaded?(Phoenix.PubSub) do
+    unless Code.ensure_loaded?(pubsub_module()) do
       raise ArgumentError,
             "Alloy: pubsub: is configured but :phoenix_pubsub is not available. " <>
               "Add {:phoenix_pubsub, \"~> 2.1\"} to your mix.exs dependencies."
     end
 
     for topic <- config.subscribe do
-      case Phoenix.PubSub.subscribe(config.pubsub, topic) do
+      # credo:disable-for-next-line Credo.Check.Refactor.Apply
+      case apply(pubsub_module(), :subscribe, [config.pubsub, topic]) do
         :ok ->
           :ok
 
@@ -611,6 +613,10 @@ defmodule Alloy.Agent.Server do
           )
       end
     end
+  end
+
+  defp pubsub_module do
+    Module.concat(Phoenix, PubSub)
   end
 
   defp set_running(state) do
@@ -678,7 +684,7 @@ defmodule Alloy.Agent.Server do
   end
 
   defp reset_for_new_run(state) do
-    %{state | turn: 0, status: :idle, error: nil, tool_calls: []}
+    %{state | turn: 0, status: :idle, error: nil, tool_calls: [], run_metadata: %{}}
   end
 
   defp build_result(%State{} = state), do: Result.from_state(state)

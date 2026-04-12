@@ -180,6 +180,81 @@ defmodule Alloy.MiddlewareTest do
     end
   end
 
+  describe "run_before_tool_call/2 with edit" do
+    defmodule EditArgsMiddleware do
+      @behaviour Alloy.Middleware
+
+      def call(:before_tool_call, %State{} = state) do
+        tool_call = state.config.context[:current_tool_call]
+
+        if tool_call[:name] == "bash" do
+          {:edit, %{tool_call | input: %{"command" => "echo safe"}}}
+        else
+          state
+        end
+      end
+
+      def call(_hook, %State{} = state), do: state
+    end
+
+    test "returns {:edit, modified_call} with rewritten input" do
+      state = build_state(middleware: [EditArgsMiddleware])
+      tool_call = %{id: "tc_1", name: "bash", input: %{"command" => "rm -rf /"}}
+
+      assert {:edit, edited} = Middleware.run_before_tool_call(state, tool_call)
+      assert edited.id == "tc_1"
+      assert edited.name == "bash"
+      assert edited.input == %{"command" => "echo safe"}
+    end
+
+    test "allows non-targeted tools through unchanged" do
+      state = build_state(middleware: [EditArgsMiddleware])
+      tool_call = %{id: "tc_2", name: "read", input: %{"file_path" => "mix.exs"}}
+
+      assert :ok = Middleware.run_before_tool_call(state, tool_call)
+    end
+
+    test "raises ArgumentError if :edit changes the tool name" do
+      defmodule BadEditMiddleware do
+        @behaviour Alloy.Middleware
+
+        def call(:before_tool_call, %State{} = state) do
+          tool_call = state.config.context[:current_tool_call]
+          {:edit, %{tool_call | name: "different_tool"}}
+        end
+
+        def call(_hook, %State{} = state), do: state
+      end
+
+      state = build_state(middleware: [BadEditMiddleware])
+      tool_call = %{id: "tc_1", name: "bash", input: %{"command" => "echo hi"}}
+
+      assert_raise ArgumentError, ~r/preserve the tool call :id and :name/, fn ->
+        Middleware.run_before_tool_call(state, tool_call)
+      end
+    end
+
+    test "raises ArgumentError if :edit changes the tool id" do
+      defmodule BadEditIdMiddleware do
+        @behaviour Alloy.Middleware
+
+        def call(:before_tool_call, %State{} = state) do
+          tool_call = state.config.context[:current_tool_call]
+          {:edit, %{tool_call | id: "different_id"}}
+        end
+
+        def call(_hook, %State{} = state), do: state
+      end
+
+      state = build_state(middleware: [BadEditIdMiddleware])
+      tool_call = %{id: "tc_1", name: "bash", input: %{"command" => "echo hi"}}
+
+      assert_raise ArgumentError, ~r/preserve the tool call :id and :name/, fn ->
+        Middleware.run_before_tool_call(state, tool_call)
+      end
+    end
+  end
+
   describe "run_before_tool_call/2 with halt" do
     test "middleware returning {:halt, reason} on :before_tool_call returns {:halted, reason}" do
       defmodule HaltOnToolCallMiddleware do

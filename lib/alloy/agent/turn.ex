@@ -14,6 +14,8 @@ defmodule Alloy.Agent.Turn do
   alias Alloy.Provider.Retry
   alias Alloy.Tool.Executor
 
+  require Logger
+
   # Buffer subtracted from timeout_ms when computing the retry deadline.
   # Ensures the retry loop finishes before the caller-side timeout fires.
   # Note: timeout_ms values <= this constant effectively disable retries.
@@ -129,7 +131,7 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  defp do_turn_after_compaction(%State{} = state, opts, deadline) do
+  defp do_turn_after_compaction(%State{} = state, opts, deadline, prompt_retried? \\ false) do
     case Middleware.run(:before_completion, state) do
       {:halted, reason} ->
         %{state | status: :halted, error: "Halted by middleware: #{reason}"}
@@ -190,25 +192,38 @@ defmodule Alloy.Agent.Turn do
                 Map.get(provider_response, :response_metadata)
               )
 
-            case Middleware.run(:after_completion, state) do
-              {:halted, reason} ->
-                %{state | status: :halted, error: "Halted by middleware: #{reason}"}
-
-              %State{} = state ->
-                %{state | status: :completed}
-            end
+            maybe_complete_or_continue(state, opts, deadline)
 
           {:error, reason} ->
-            state = %{state | status: :error, error: reason}
-
-            case Middleware.run(:on_error, state) do
-              {:halted, halted_reason} ->
-                %{state | status: :halted, error: "Halted by middleware: #{halted_reason}"}
-
-              %State{} = state ->
-                state
-            end
+            handle_provider_error(reason, state, opts, deadline, prompt_retried?)
         end
+    end
+  end
+
+  defp handle_provider_error(reason, state, opts, deadline, prompt_retried?) do
+    if not prompt_retried? and prompt_too_long?(reason) do
+      Logger.info("[Turn] Prompt too long — forcing compaction and retrying")
+
+      :telemetry.execute(
+        [:alloy, :turn, :prompt_too_long_recovery],
+        %{},
+        %{turn: state.turn + 1}
+      )
+
+      state
+      |> Compactor.force_compact()
+      |> do_turn_after_compaction(opts, deadline, true)
+      |> State.merge_run_metadata(%{prompt_too_long_recovery: true})
+    else
+      state = %{state | status: :error, error: reason}
+
+      case Middleware.run(:on_error, state) do
+        {:halted, halted_reason} ->
+          %{state | status: :halted, error: "Halted by middleware: #{halted_reason}"}
+
+        %State{} = state ->
+          state
+      end
     end
   end
 
@@ -261,6 +276,40 @@ defmodule Alloy.Agent.Turn do
 
   defp extract_tool_calls(messages) do
     Enum.flat_map(messages, &Message.tool_calls/1)
+  end
+
+  defp prompt_too_long?(reason) when is_binary(reason) do
+    String.contains?(reason, "prompt is too long") or
+      String.contains?(reason, "context_length_exceeded") or
+      String.contains?(reason, "maximum context length")
+  end
+
+  defp prompt_too_long?(_), do: false
+
+  defp maybe_complete_or_continue(state, opts, deadline) do
+    if until_tool_pending?(state) do
+      state
+      |> State.append_messages([
+        Message.user(
+          "Continue. You must call the #{state.config.until_tool} tool before finishing."
+        )
+      ])
+      |> do_turn(opts, deadline)
+    else
+      case Middleware.run(:after_completion, state) do
+        {:halted, reason} ->
+          %{state | status: :halted, error: "Halted by middleware: #{reason}"}
+
+        %State{} = state ->
+          %{state | status: :completed}
+      end
+    end
+  end
+
+  defp until_tool_pending?(%State{config: %{until_tool: nil}}), do: false
+
+  defp until_tool_pending?(%State{config: %{until_tool: name}, tool_calls: calls}) do
+    not Enum.any?(calls, fn call -> call[:name] == name end)
   end
 
   defp budget_exceeded?(%State{config: %{max_budget_cents: nil}}), do: false
