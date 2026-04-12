@@ -268,8 +268,6 @@ defmodule Alloy.Agent.Server do
       Task.Supervisor.terminate_child(Alloy.TaskSupervisor, task_pid)
     end
 
-    State.cleanup(state)
-
     state =
       case Middleware.run(:session_end, state) do
         {:halted, reason} ->
@@ -301,6 +299,9 @@ defmodule Alloy.Agent.Server do
           )
       end
     end
+
+    # Cleanup last — after all consumers (middleware, callbacks) are done.
+    State.cleanup(state)
 
     :ok
   end

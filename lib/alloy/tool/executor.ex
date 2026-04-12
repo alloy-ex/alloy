@@ -254,17 +254,23 @@ defmodule Alloy.Tool.Executor do
         :unlimited ->
           text
 
-        max when is_integer(max) and byte_size(text) > max ->
-          head = div(max * 4, 5)
-          tail = max - head
+        max when is_integer(max) ->
+          len = String.length(text)
 
-          String.slice(text, 0, head) <>
-            "\n\n[truncated " <>
-            Integer.to_string(String.length(text)) <>
-            " -> " <>
-            Integer.to_string(max) <>
-            " chars]\n\n" <>
-            String.slice(text, -tail, tail)
+          if len > max do
+            head = div(max * 4, 5)
+            tail = max - head
+
+            String.slice(text, 0, head) <>
+              "\n\n[truncated " <>
+              Integer.to_string(len) <>
+              " -> " <>
+              Integer.to_string(max) <>
+              " chars]\n\n" <>
+              String.slice(text, -tail, tail)
+          else
+            text
+          end
 
         _ ->
           text

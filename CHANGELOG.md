@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-04-13
+
+### Fixed
+
+- **Tool result truncation** — `max_result_chars` guard now uses character count (`String.length`) instead of byte count (`byte_size`). Multi-byte UTF-8 content (CJK, emoji) was triggering truncation earlier than intended.
+- **Codex provider timeout** — `run_codex` now wraps `System.cmd` in a `Task` with a configurable timeout (default 120s). Previously a hung `codex exec` process could block the turn loop indefinitely.
+- **Symlink path traversal** — `allowed_paths` validation now resolves symlinks recursively via `resolve_real_path`, preventing symlink-based escapes from allowed directories.
+- **OpenAICompat nil guard** — added pattern match on `tc["function"]` before accessing arguments. Malformed tool call responses now return a graceful error instead of crashing the turn loop.
+- **Testing helper** — `assert_tool_called` no longer raises `ArgumentError` when matching string keys against atom-keyed input maps. Uses `safe_atom_get` with rescue fallback.
+- **Gemini streaming performance** — `parse_stream_parts` uses prepend+reverse instead of `++` accumulation, eliminating O(n²) behavior on large streaming responses.
+- **Terminate ordering** — `State.cleanup` now runs after `on_shutdown` callback and `:session_end` middleware, ensuring consumers can access state before resources are freed.
+- **Middleware docs** — documented that `{:edit, ...}`, `{:block, ...}`, and `{:halt, ...}` all stop the middleware chain immediately (first responder wins).
+
 ## [0.10.0] - 2026-04-12
 
 ### Added

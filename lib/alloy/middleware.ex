@@ -71,6 +71,10 @@ defmodule Alloy.Middleware do
 
   The `{:edit, modified_call}` return lets middleware rewrite tool arguments
   before execution. The modified call must keep the same `:id` and `:name`.
+
+  Note: `{:edit, ...}`, `{:block, ...}`, and `{:halt, ...}` all stop the
+  middleware chain immediately. The first middleware that returns one of
+  these wins — subsequent middleware modules will not see the tool call.
   """
   @spec run_before_tool_call(State.t(), map()) ::
           :ok | {:block, String.t()} | {:edit, map()} | {:halted, String.t()}
