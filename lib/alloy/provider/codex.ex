@@ -138,9 +138,19 @@ defmodule Alloy.Provider.Codex do
     {command, command_args, command_opts} =
       runner_command(runner, executable, args, paths, config)
 
-    case runner.(command, command_args, command_opts) do
-      {output, status} when is_integer(status) ->
+    timeout = Map.get(config, :timeout_ms, 120_000)
+
+    task = Task.async(fn -> runner.(command, command_args, command_opts) end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, status}} when is_integer(status) ->
         {:ok, %{output: output, status: status}}
+
+      {:ok, other} ->
+        {:error, "codex exec returned unexpected result: #{inspect(other)}"}
+
+      nil ->
+        {:error, "codex exec timed out after #{timeout}ms"}
     end
   rescue
     error in ErlangError ->

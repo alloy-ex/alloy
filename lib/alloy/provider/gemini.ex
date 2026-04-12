@@ -430,17 +430,20 @@ defmodule Alloy.Provider.Gemini do
   defp handle_stream_chunk(acc, _other), do: acc
 
   defp parse_stream_parts(parts) do
-    Enum.reduce(parts, {[], []}, fn part, {blocks, deltas} ->
-      block = parse_content_part(part)
+    {blocks, deltas} =
+      Enum.reduce(parts, {[], []}, fn part, {blocks, deltas} ->
+        block = parse_content_part(part)
 
-      deltas =
-        case block do
-          %{type: "text", text: text} -> deltas ++ [text]
-          _ -> deltas
-        end
+        deltas =
+          case block do
+            %{type: "text", text: text} -> [text | deltas]
+            _ -> deltas
+          end
 
-      {blocks ++ [block], deltas}
-    end)
+        {[block | blocks], deltas}
+      end)
+
+    {Enum.reverse(blocks), Enum.reverse(deltas)}
   end
 
   defp merge_usage(existing, new) do

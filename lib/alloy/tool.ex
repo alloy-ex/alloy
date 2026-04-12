@@ -158,10 +158,36 @@ defmodule Alloy.Tool do
         {:ok, resolved}
 
       paths when is_list(paths) ->
-        if Enum.any?(paths, fn allowed -> String.starts_with?(resolved, Path.expand(allowed)) end) do
+        # Resolve symlinks to prevent escaping allowed directories via symlink traversal.
+        # Falls back to the expanded path for non-existent targets.
+        real = resolve_real_path(resolved)
+
+        if Enum.any?(paths, fn allowed ->
+             String.starts_with?(real, resolve_real_path(Path.expand(allowed)))
+           end) do
           {:ok, resolved}
         else
           {:error, "Path #{resolved} is outside allowed directories"}
+        end
+    end
+  end
+
+  defp resolve_real_path(path) do
+    case :file.read_link_all(String.to_charlist(path)) do
+      {:ok, target} ->
+        target
+        |> List.to_string()
+        |> Path.expand(Path.dirname(path))
+        |> resolve_real_path()
+
+      {:error, _} ->
+        # Not a symlink — check if a parent component is
+        parent = Path.dirname(path)
+
+        if parent == path do
+          path
+        else
+          Path.join(resolve_real_path(parent), Path.basename(path))
         end
     end
   end

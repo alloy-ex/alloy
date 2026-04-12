@@ -180,9 +180,9 @@ defmodule Alloy.Testing do
         Enum.filter(calls, fn call ->
           call.name == name &&
             Enum.all?(expected, fn {k, v} ->
-              # Match both atom and string keys
+              # Match both atom and string keys — rescue if atom doesn't exist
               Map.get(call.input, k) == v || Map.get(call.input, to_string(k)) == v ||
-                (is_binary(k) && Map.get(call.input, String.to_existing_atom(k)) == v)
+                (is_binary(k) && safe_atom_get(call.input, k) == v)
             end)
         end)
 
@@ -203,5 +203,13 @@ defmodule Alloy.Testing do
       refute unquote(tool_name) in names,
              "Expected tool #{inspect(unquote(tool_name))} NOT to be called, but it was"
     end
+  end
+
+  @doc false
+  def safe_atom_get(map, string_key) when is_binary(string_key) do
+    String.to_existing_atom(string_key)
+    |> then(&Map.get(map, &1))
+  rescue
+    ArgumentError -> nil
   end
 end

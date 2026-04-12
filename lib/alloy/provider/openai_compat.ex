@@ -271,14 +271,18 @@ defmodule Alloy.Provider.OpenAICompat do
     tool_blocks =
       (message["tool_calls"] || [])
       |> Enum.reduce_while([], fn tc, acc ->
-        case Jason.decode(tc["function"]["arguments"]) do
-          {:ok, input} ->
-            {:cont,
-             acc ++
-               [%{type: "tool_use", id: tc["id"], name: tc["function"]["name"], input: input}]}
+        case tc["function"] do
+          %{"arguments" => args, "name" => name} ->
+            case Jason.decode(args) do
+              {:ok, input} ->
+                {:cont, acc ++ [%{type: "tool_use", id: tc["id"], name: name, input: input}]}
 
-          {:error, _} ->
-            {:halt, {:error, "Invalid JSON in tool call arguments for #{tc["function"]["name"]}"}}
+              {:error, _} ->
+                {:halt, {:error, "Invalid JSON in tool call arguments for #{name}"}}
+            end
+
+          _ ->
+            {:halt, {:error, "Malformed tool call: missing function definition"}}
         end
       end)
 
