@@ -17,6 +17,12 @@ defmodule Alloy.Provider.Codex do
   - `:workdir` - Directory passed to `codex exec` (defaults to a temp dir)
   - `:profile` - Optional Codex config profile
   - `:codex_home` - Override `CODEX_HOME` instead of creating an isolated temp home
+  - `:auth_path` - Override source `auth.json` copied into the isolated home
+    (default: `~/.codex/auth.json`)
+  - `:tmp_dir` - Parent for the provider's temp working directory
+    (default: `System.tmp_dir!/0`)
+  - `:timeout_ms` - Timeout for a single `codex exec` invocation
+    (default: `120_000`)
   - `:command_runner` - Test hook matching `System.cmd/3`
   - `:system_prompt` - System prompt string
 
@@ -35,7 +41,56 @@ defmodule Alloy.Provider.Codex do
 
   alias Alloy.Message
 
+  @default_timeout_ms 120_000
+  @default_codex_bin "codex"
+  @output_truncation 4_000
+  @error_truncation 2_000
+  @zero_usage %{input_tokens: 0, output_tokens: 0}
+  @valid_json_escape_chars ~r{\\(?!["\\/bfnrtu])}
+
+  @response_schema %{
+    type: "object",
+    additionalProperties: false,
+    properties: %{
+      stop_reason: %{type: "string", enum: ["end_turn", "tool_use"]},
+      text: %{type: "string"},
+      tool_calls: %{
+        type: "array",
+        items: %{
+          type: "object",
+          additionalProperties: false,
+          properties: %{
+            call_id: %{type: "string"},
+            name: %{type: "string"},
+            arguments_json: %{type: "string"}
+          },
+          required: ["call_id", "name", "arguments_json"]
+        }
+      }
+    },
+    required: ["stop_reason", "text", "tool_calls"]
+  }
+
+  @typedoc """
+  Configuration for the Codex provider. See the module doc for field semantics.
+  """
+  @type config :: %{
+          required(:model) => String.t(),
+          optional(:codex_bin) => String.t(),
+          optional(:workdir) => Path.t(),
+          optional(:profile) => String.t(),
+          optional(:codex_home) => Path.t(),
+          optional(:auth_path) => Path.t(),
+          optional(:tmp_dir) => Path.t(),
+          optional(:timeout_ms) => pos_integer(),
+          optional(:system_prompt) => String.t(),
+          optional(:command_runner) => (String.t(), [String.t()], keyword() ->
+                                          {String.t(), integer()})
+        }
+
   @impl true
+  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     case prepare_paths(config) do
       {:ok, paths} ->
@@ -57,6 +112,8 @@ defmodule Alloy.Provider.Codex do
   end
 
   @impl true
+  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     with {:ok, result} <- complete(messages, tool_defs, config),
          :ok <- emit_chunks(result, on_chunk) do
@@ -93,7 +150,7 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp cleanup_paths(%{base_dir: base_dir}) do
-    File.rm_rf(base_dir)
+    _ = File.rm_rf(base_dir)
     :ok
   end
 
@@ -117,7 +174,7 @@ defmodule Alloy.Provider.Codex do
 
   defp run_codex(prompt, paths, config) do
     runner = Map.get(config, :command_runner, &System.cmd/3)
-    executable = Map.get(config, :codex_bin, "codex")
+    executable = Map.get(config, :codex_bin, @default_codex_bin)
 
     args =
       [
@@ -138,7 +195,7 @@ defmodule Alloy.Provider.Codex do
     {command, command_args, command_opts} =
       runner_command(runner, executable, args, paths, config)
 
-    timeout = Map.get(config, :timeout_ms, 120_000)
+    timeout = Map.get(config, :timeout_ms, @default_timeout_ms)
 
     task = Task.async(fn -> runner.(command, command_args, command_opts) end)
 
@@ -196,7 +253,7 @@ defmodule Alloy.Provider.Codex do
     message =
       output
       |> String.trim()
-      |> truncate(2000)
+      |> truncate(@error_truncation)
 
     "codex exec failed with status #{status}: #{message}"
   end
@@ -268,35 +325,36 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp parse_tool_blocks(text, tool_calls) do
-    blocks =
-      tool_calls
-      |> Enum.with_index(1)
-      |> Enum.map(fn {tool_call, index} ->
-        with {:ok, call_id} <- tool_call_id(tool_call, index),
-             {:ok, name} <- fetch_string(tool_call, "name"),
-             {:ok, arguments} <- fetch_arguments(tool_call) do
-          {:ok, %{type: "tool_use", id: call_id, name: name, input: arguments}}
-        end
-      end)
+    tool_calls
+    |> Enum.with_index(1)
+    |> Enum.reduce_while([], fn {tool_call, index}, acc ->
+      case build_tool_block(tool_call, index) do
+        {:ok, block} -> {:cont, [block | acc]}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      {:error, _} = err -> err
+      blocks -> finalize_tool_blocks(text, Enum.reverse(blocks))
+    end
+  end
 
-    case Enum.find(blocks, &match?({:error, _}, &1)) do
-      {:error, reason} ->
-        {:error, reason}
+  defp build_tool_block(tool_call, index) do
+    with {:ok, call_id} <- tool_call_id(tool_call, index),
+         {:ok, name} <- fetch_string(tool_call, "name"),
+         {:ok, arguments} <- fetch_arguments(tool_call) do
+      {:ok, %{type: "tool_use", id: call_id, name: name, input: arguments}}
+    end
+  end
 
-      nil ->
-        tool_blocks = Enum.map(blocks, fn {:ok, block} -> block end)
+  defp finalize_tool_blocks(_text, []) do
+    {:error, "Codex returned tool_use without any tool calls"}
+  end
 
-        full_blocks =
-          case String.trim(text) do
-            "" -> tool_blocks
-            trimmed -> [%{type: "text", text: trimmed} | tool_blocks]
-          end
-
-        if full_blocks == [] do
-          {:error, "Codex returned tool_use without any tool calls"}
-        else
-          {:ok, full_blocks}
-        end
+  defp finalize_tool_blocks(text, tool_blocks) do
+    case String.trim(text) do
+      "" -> {:ok, tool_blocks}
+      trimmed -> {:ok, [%{type: "text", text: trimmed} | tool_blocks]}
     end
   end
 
@@ -317,19 +375,38 @@ defmodule Alloy.Provider.Codex do
 
   defp fetch_arguments(map) do
     with {:ok, json} <- fetch_string(map, "arguments_json"),
-         {:ok, decoded} <- Jason.decode(json),
-         true <- is_map(decoded) do
+         {:ok, decoded} when is_map(decoded) <- decode_arguments_json(json) do
       {:ok, decoded}
     else
-      false ->
-        {:error, "Codex tool call arguments must decode to a JSON object"}
-
-      {:error, %Jason.DecodeError{} = error} ->
-        {:error, "invalid Codex arguments_json: #{Exception.message(error)}"}
-
-      {:error, reason} ->
-        {:error, reason}
+      {:ok, _non_map} -> {:error, "Codex tool call arguments must decode to a JSON object"}
+      {:error, _reason} = err -> err
     end
+  end
+
+  # Attempt to parse arguments_json, falling back to a repair pass for the
+  # common case where Codex omits double-escaping backslashes inside strings
+  # (e.g. `\n` in Elixir code becomes a literal `\n` in JSON instead of `\\n`).
+  defp decode_arguments_json(json) do
+    case Jason.decode(json) do
+      {:ok, _} = ok ->
+        ok
+
+      {:error, %Jason.DecodeError{}} ->
+        case json |> repair_backslash_escapes() |> Jason.decode() do
+          {:ok, _} = ok ->
+            ok
+
+          {:error, %Jason.DecodeError{} = error} ->
+            {:error, "invalid Codex arguments_json: #{Exception.message(error)}"}
+        end
+    end
+  end
+
+  # Replace bare backslash sequences that are not valid JSON escapes.
+  # Valid JSON single-character escapes after \: " \ / b f n r t u
+  # Any other `\X` is invalid JSON — double the backslash to `\\X`.
+  defp repair_backslash_escapes(json) do
+    Regex.replace(@valid_json_escape_chars, json, fn match -> "\\" <> match end)
   end
 
   defp emit_chunks(%{messages: [%Message{content: text}]}, on_chunk) when is_binary(text) do
@@ -350,11 +427,11 @@ defmodule Alloy.Provider.Codex do
       backend: "codex_exec",
       model: Map.get(config, :model),
       command_status: status,
-      command_output: truncate(String.trim(output), 4000)
+      command_output: truncate(String.trim(output), @output_truncation)
     }
   end
 
-  defp zero_usage, do: %{input_tokens: 0, output_tokens: 0}
+  defp zero_usage, do: @zero_usage
 
   defp build_prompt(messages, tool_defs, config) do
     payload = %{
@@ -422,30 +499,7 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
-  defp response_schema do
-    %{
-      type: "object",
-      additionalProperties: false,
-      properties: %{
-        stop_reason: %{type: "string", enum: ["end_turn", "tool_use"]},
-        text: %{type: "string"},
-        tool_calls: %{
-          type: "array",
-          items: %{
-            type: "object",
-            additionalProperties: false,
-            properties: %{
-              call_id: %{type: "string"},
-              name: %{type: "string"},
-              arguments_json: %{type: "string"}
-            },
-            required: ["call_id", "name", "arguments_json"]
-          }
-        }
-      },
-      required: ["stop_reason", "text", "tool_calls"]
-    }
-  end
+  defp response_schema, do: @response_schema
 
   defp maybe_append_profile(args, config) do
     case Map.get(config, :profile) do
