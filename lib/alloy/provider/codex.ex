@@ -46,7 +46,10 @@ defmodule Alloy.Provider.Codex do
   @output_truncation 4_000
   @error_truncation 2_000
   @zero_usage %{input_tokens: 0, output_tokens: 0}
-  @valid_json_escape_chars ~r{\\(?!["\\/bfnrtu])}
+
+  # Matches any `\X` where X is NOT a valid JSON single-character escape
+  # (valid set: " \ / b f n r t u). Used by the decode repair pass.
+  @invalid_json_escape_re ~r{\\(?!["\\/bfnrtu])}
 
   @response_schema %{
     type: "object",
@@ -71,17 +74,21 @@ defmodule Alloy.Provider.Codex do
     required: ["stop_reason", "text", "tool_calls"]
   }
 
+  # Pre-encoded at compile time — the schema is static, no need to
+  # re-encode it on every `complete/3` call.
+  @response_schema_json Jason.encode!(@response_schema)
+
   @typedoc """
   Configuration for the Codex provider. See the module doc for field semantics.
   """
   @type config :: %{
           required(:model) => String.t(),
           optional(:codex_bin) => String.t(),
-          optional(:workdir) => Path.t(),
+          optional(:workdir) => String.t(),
           optional(:profile) => String.t(),
-          optional(:codex_home) => Path.t(),
-          optional(:auth_path) => Path.t(),
-          optional(:tmp_dir) => Path.t(),
+          optional(:codex_home) => String.t(),
+          optional(:auth_path) => String.t(),
+          optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:command_runner) => (String.t(), [String.t()], keyword() ->
@@ -95,7 +102,7 @@ defmodule Alloy.Provider.Codex do
     case prepare_paths(config) do
       {:ok, paths} ->
         try do
-          with :ok <- File.write(paths.schema_path, Jason.encode!(response_schema())),
+          with :ok <- File.write(paths.schema_path, @response_schema_json),
                prompt = build_prompt(messages, tool_defs, config),
                :ok <- File.write(paths.prompt_path, prompt),
                {:ok, command_result} <- run_codex(prompt, paths, config),
@@ -374,7 +381,7 @@ defmodule Alloy.Provider.Codex do
        %{
          stop_reason: :end_turn,
          messages: [Message.assistant(text)],
-         usage: zero_usage(),
+         usage: @zero_usage,
          response_metadata: response_metadata(config, command_result)
        }}
     else
@@ -393,7 +400,7 @@ defmodule Alloy.Provider.Codex do
        %{
          stop_reason: :tool_use,
          messages: [Message.assistant_blocks(blocks)],
-         usage: zero_usage(),
+         usage: @zero_usage,
          response_metadata: response_metadata(config, command_result)
        }}
     end
@@ -487,11 +494,11 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  # Replace bare backslash sequences that are not valid JSON escapes.
-  # Valid JSON single-character escapes after \: " \ / b f n r t u
-  # Any other `\X` is invalid JSON — double the backslash to `\\X`.
+  # Replace bare backslash sequences that are not valid JSON escapes by
+  # doubling the backslash, converting `\X` (invalid) into `\\X` (valid —
+  # literal backslash followed by X).
   defp repair_backslash_escapes(json) do
-    Regex.replace(@valid_json_escape_chars, json, fn match -> "\\" <> match end)
+    Regex.replace(@invalid_json_escape_re, json, fn match -> "\\" <> match end)
   end
 
   defp emit_chunks(%{messages: [%Message{content: text}]}, on_chunk) when is_binary(text) do
@@ -507,6 +514,9 @@ defmodule Alloy.Provider.Codex do
     :ok
   end
 
+  # Unknown shape — skip silently rather than crash the stream caller.
+  defp emit_chunks(_result, _on_chunk), do: :ok
+
   defp response_metadata(config, %{output: output, status: status}) do
     %{
       backend: "codex_exec",
@@ -515,8 +525,6 @@ defmodule Alloy.Provider.Codex do
       command_output: truncate(String.trim(output), @output_truncation)
     }
   end
-
-  defp zero_usage, do: @zero_usage
 
   defp build_prompt(messages, tool_defs, config) do
     payload = %{
@@ -574,6 +582,10 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
+  # Defensive fallback for unknown block shapes — keeps serialization
+  # total even if Alloy adds a new block type the Codex provider hasn't
+  # learned yet. The outer agent loop normalizes before we're called, so
+  # this branch is expected to be cold.
   defp serialize_block(block), do: Alloy.Provider.stringify_keys(block)
 
   defp serialize_tool_def(%{name: name, description: description, input_schema: input_schema}) do
@@ -583,8 +595,6 @@ defmodule Alloy.Provider.Codex do
       input_schema: input_schema
     }
   end
-
-  defp response_schema, do: @response_schema
 
   defp maybe_append_profile(args, config) do
     case Map.get(config, :profile) do
@@ -640,9 +650,15 @@ defmodule Alloy.Provider.Codex do
     Path.join(System.user_home!(), ".codex/config.toml")
   end
 
-  defp truncate(text, limit) when is_binary(text) and byte_size(text) > limit do
-    binary_part(text, 0, limit) <> "..."
+  # `limit` is a character budget, not a byte budget — `String.slice/3`
+  # respects grapheme boundaries so we never split a multibyte codepoint
+  # mid-sequence and produce invalid UTF-8 in user-facing fields like
+  # `response_metadata.command_output`.
+  defp truncate(text, limit) when is_binary(text) do
+    if String.length(text) > limit do
+      String.slice(text, 0, limit) <> "..."
+    else
+      text
+    end
   end
-
-  defp truncate(text, _limit), do: text
 end
