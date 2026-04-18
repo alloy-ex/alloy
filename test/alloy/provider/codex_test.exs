@@ -250,6 +250,51 @@ defmodule Alloy.Provider.CodexTest do
       assert {:ok, result} = Codex.complete([Message.user("Need a decision")], [], config)
       assert result.messages == [Message.assistant("stdin ok")]
     end
+
+    test "returns a timeout error instead of hanging when the real shell-backed run exceeds timeout_ms" do
+      temp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "alloy-codex-provider-timeout-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(temp_dir)
+      on_exit(fn -> File.rm_rf(temp_dir) end)
+
+      auth_path = Path.join(temp_dir, "auth.json")
+      File.write!(auth_path, "{}")
+
+      script_path = Path.join(temp_dir, "slow-codex.sh")
+
+      File.write!(script_path, """
+      #!/bin/sh
+      # Drain stdin so the shell redirect completes, then hang.
+      cat > /dev/null
+      sleep 30
+      """)
+
+      File.chmod!(script_path, 0o755)
+
+      config = %{
+        model: "gpt-5.4",
+        codex_bin: script_path,
+        auth_path: auth_path,
+        timeout_ms: 200
+      }
+
+      # If the Port-based timeout path is broken, this call hangs for 30s
+      # and ExUnit's own timeout would catch it — the assertion below
+      # verifies the graceful error path fires instead.
+      started_at = System.monotonic_time(:millisecond)
+      result = Codex.complete([Message.user("hang")], [], config)
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert {:error, reason} = result
+      assert reason =~ "timed out"
+      # Generous slack for TERM/KILL grace window and CI noise.
+      assert elapsed < 5_000,
+             "expected timeout to fire within ~200ms + grace, took #{elapsed}ms"
+    end
   end
 
   describe "stream/4" do

@@ -183,8 +183,8 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp run_codex(prompt, paths, config) do
-    runner = Map.get(config, :command_runner, &System.cmd/3)
     executable = Map.get(config, :codex_bin, @default_codex_bin)
+    timeout = Map.get(config, :timeout_ms, @default_timeout_ms)
 
     args =
       [
@@ -202,48 +202,116 @@ defmodule Alloy.Provider.Codex do
       |> maybe_append_model(config)
       |> append_prompt_arg(prompt, config)
 
-    {command, command_args, command_opts} =
-      runner_command(executable, args, paths, config)
+    if injected_runner?(config) do
+      run_injected(config, executable, args, paths)
+    else
+      run_port(executable, args, paths, timeout)
+    end
+  end
 
-    timeout = Map.get(config, :timeout_ms, @default_timeout_ms)
+  # Test path: the caller supplies a synchronous function matching
+  # `System.cmd/3`. No timeout enforcement — tests should be fast enough
+  # to rely on ExUnit's own timeout.
+  defp run_injected(config, executable, args, paths) do
+    runner = Map.fetch!(config, :command_runner)
+    opts = [cd: paths.workdir, stderr_to_stdout: true]
 
-    task = Task.async(fn -> runner.(command, command_args, command_opts) end)
-
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {output, status}} when is_integer(status) ->
+    case runner.(executable, args, opts) do
+      {output, status} when is_binary(output) and is_integer(status) ->
         {:ok, %{output: output, status: status}}
 
-      {:ok, other} ->
+      other ->
         {:error, "codex exec returned unexpected result: #{inspect(other)}"}
-
-      nil ->
-        {:error, "codex exec timed out after #{timeout}ms"}
     end
   rescue
     error in ErlangError ->
       {:error, "codex exec failed to start: #{Exception.message(error)}"}
   end
 
-  defp runner_command(executable, args, paths, config) do
-    opts = [cd: paths.workdir, stderr_to_stdout: true]
+  # Real path: spawn via Port so we capture the OS pid and can kill the
+  # subprocess on timeout. `exec env ... codex ...` makes the shell process
+  # replace itself with env, which replaces itself with codex — so
+  # `Port.info(:os_pid)` returns codex's own pid rather than a shell pid
+  # whose children we'd otherwise orphan.
+  defp run_port(executable, args, paths, timeout) do
+    shell_command = build_port_command(executable, args, paths)
 
-    if injected_runner?(config) do
-      {executable, args, opts}
-    else
-      env_args =
-        [{"OTEL_SDK_DISABLED", "true"}, {"CODEX_HOME", paths.codex_home}]
-        |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-        |> Enum.map_join(" ", fn {key, value} -> shell_escape("#{key}=#{value}") end)
+    port =
+      Port.open(
+        {:spawn_executable, "/bin/sh"},
+        [
+          {:args, ["-lc", shell_command]},
+          {:cd, paths.workdir},
+          :binary,
+          :exit_status,
+          :use_stdio,
+          :stderr_to_stdout
+        ]
+      )
 
-      shell_command =
-        "env " <>
-          env_args <>
-          " " <>
-          Enum.map_join([executable | args], " ", &shell_escape/1) <>
-          " < " <>
-          shell_escape(paths.prompt_path)
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, [])
+      nil -> {:error, "codex exec port closed before os_pid was available"}
+    end
+  rescue
+    error in ErlangError ->
+      {:error, "codex exec failed to start: #{Exception.message(error)}"}
+  end
 
-      {"/bin/sh", ["-lc", shell_command], opts}
+  defp build_port_command(executable, args, paths) do
+    env_args =
+      [{"OTEL_SDK_DISABLED", "true"}, {"CODEX_HOME", paths.codex_home}]
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Enum.map_join(" ", fn {key, value} -> shell_escape("#{key}=#{value}") end)
+
+    "exec env " <>
+      env_args <>
+      " " <>
+      Enum.map_join([executable | args], " ", &shell_escape/1) <>
+      " < " <>
+      shell_escape(paths.prompt_path)
+  end
+
+  defp collect_port(port, os_pid, timeout, acc) do
+    receive do
+      {^port, {:data, data}} when is_binary(data) ->
+        collect_port(port, os_pid, timeout, [acc, data])
+
+      {^port, {:exit_status, status}} ->
+        {:ok, %{output: IO.iodata_to_binary(acc), status: status}}
+    after
+      timeout ->
+        _ = kill_os_process(os_pid)
+        _ = close_and_drain(port)
+        {:error, "codex exec timed out after #{timeout}ms"}
+    end
+  end
+
+  # SIGTERM with a 100ms grace window, then SIGKILL. Best-effort — if
+  # codex has already exited, the second kill is a no-op.
+  defp kill_os_process(os_pid) do
+    _ = System.cmd("/bin/kill", ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    Process.sleep(100)
+    _ = System.cmd("/bin/kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    :ok
+  end
+
+  defp close_and_drain(port) do
+    _ =
+      try do
+        Port.close(port)
+      rescue
+        ArgumentError -> :ok
+      end
+
+    drain_port_messages(port)
+  end
+
+  defp drain_port_messages(port) do
+    receive do
+      {^port, _} -> drain_port_messages(port)
+    after
+      0 -> :ok
     end
   end
 
