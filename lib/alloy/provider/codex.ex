@@ -17,6 +17,12 @@ defmodule Alloy.Provider.Codex do
   - `:workdir` - Directory passed to `codex exec` (defaults to a temp dir)
   - `:profile` - Optional Codex config profile
   - `:codex_home` - Override `CODEX_HOME` instead of creating an isolated temp home
+  - `:auth_path` - Override source `auth.json` copied into the isolated home
+    (default: `~/.codex/auth.json`)
+  - `:tmp_dir` - Parent for the provider's temp working directory
+    (default: `System.tmp_dir!/0`)
+  - `:timeout_ms` - Timeout for a single `codex exec` invocation
+    (default: `120_000`)
   - `:command_runner` - Test hook matching `System.cmd/3`
   - `:system_prompt` - System prompt string
 
@@ -35,12 +41,68 @@ defmodule Alloy.Provider.Codex do
 
   alias Alloy.Message
 
+  @default_timeout_ms 120_000
+  @default_codex_bin "codex"
+  @output_truncation 4_000
+  @error_truncation 2_000
+  @zero_usage %{input_tokens: 0, output_tokens: 0}
+
+  # Matches any `\X` where X is NOT a valid JSON single-character escape
+  # (valid set: " \ / b f n r t u). Used by the decode repair pass.
+  @invalid_json_escape_re ~r{\\(?!["\\/bfnrtu])}
+
+  @response_schema %{
+    type: "object",
+    additionalProperties: false,
+    properties: %{
+      stop_reason: %{type: "string", enum: ["end_turn", "tool_use"]},
+      text: %{type: "string"},
+      tool_calls: %{
+        type: "array",
+        items: %{
+          type: "object",
+          additionalProperties: false,
+          properties: %{
+            call_id: %{type: "string"},
+            name: %{type: "string"},
+            arguments_json: %{type: "string"}
+          },
+          required: ["call_id", "name", "arguments_json"]
+        }
+      }
+    },
+    required: ["stop_reason", "text", "tool_calls"]
+  }
+
+  # Pre-encoded at compile time — the schema is static, no need to
+  # re-encode it on every `complete/3` call.
+  @response_schema_json Jason.encode!(@response_schema)
+
+  @typedoc """
+  Configuration for the Codex provider. See the module doc for field semantics.
+  """
+  @type config :: %{
+          required(:model) => String.t(),
+          optional(:codex_bin) => String.t(),
+          optional(:workdir) => String.t(),
+          optional(:profile) => String.t(),
+          optional(:codex_home) => String.t(),
+          optional(:auth_path) => String.t(),
+          optional(:tmp_dir) => String.t(),
+          optional(:timeout_ms) => pos_integer(),
+          optional(:system_prompt) => String.t(),
+          optional(:command_runner) => (String.t(), [String.t()], keyword() ->
+                                          {String.t(), integer()})
+        }
+
   @impl true
+  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     case prepare_paths(config) do
       {:ok, paths} ->
         try do
-          with :ok <- File.write(paths.schema_path, Jason.encode!(response_schema())),
+          with :ok <- File.write(paths.schema_path, @response_schema_json),
                prompt = build_prompt(messages, tool_defs, config),
                :ok <- File.write(paths.prompt_path, prompt),
                {:ok, command_result} <- run_codex(prompt, paths, config),
@@ -57,6 +119,8 @@ defmodule Alloy.Provider.Codex do
   end
 
   @impl true
+  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     with {:ok, result} <- complete(messages, tool_defs, config),
          :ok <- emit_chunks(result, on_chunk) do
@@ -65,35 +129,45 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp prepare_paths(config) do
-    base_dir =
-      config
-      |> Map.get(:tmp_dir)
-      |> case do
-        nil -> Path.join(System.tmp_dir!(), "alloy-codex-#{System.unique_integer([:positive])}")
-        dir -> Path.join(dir, "alloy-codex-#{System.unique_integer([:positive])}")
-      end
+    base_dir = build_base_dir(config)
 
-    case File.mkdir_p(base_dir) do
-      :ok ->
-        with {:ok, codex_home} <- prepare_codex_home(base_dir, config) do
-          {:ok,
-           %{
-             base_dir: base_dir,
-             codex_home: codex_home,
-             prompt_path: Path.join(base_dir, "prompt.txt"),
-             schema_path: Path.join(base_dir, "response_schema.json"),
-             last_message_path: Path.join(base_dir, "last_message.json"),
-             workdir: Map.get(config, :workdir, base_dir)
-           }}
-        end
-
+    with :ok <- mkdir_base(base_dir),
+         {:ok, codex_home} <- prepare_codex_home(base_dir, config) do
+      {:ok, build_paths(base_dir, codex_home, config)}
+    else
       {:error, reason} ->
-        {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
+        # `File.rm_rf/1` is a no-op if the directory was never created,
+        # so this is safe to run on both mkdir and prepare_codex_home failures.
+        _ = File.rm_rf(base_dir)
+        {:error, reason}
     end
   end
 
+  defp build_base_dir(config) do
+    parent = Map.get(config, :tmp_dir) || System.tmp_dir!()
+    Path.join(parent, "alloy-codex-#{System.unique_integer([:positive])}")
+  end
+
+  defp mkdir_base(base_dir) do
+    case File.mkdir_p(base_dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
+    end
+  end
+
+  defp build_paths(base_dir, codex_home, config) do
+    %{
+      base_dir: base_dir,
+      codex_home: codex_home,
+      prompt_path: Path.join(base_dir, "prompt.txt"),
+      schema_path: Path.join(base_dir, "response_schema.json"),
+      last_message_path: Path.join(base_dir, "last_message.json"),
+      workdir: Map.get(config, :workdir, base_dir)
+    }
+  end
+
   defp cleanup_paths(%{base_dir: base_dir}) do
-    File.rm_rf(base_dir)
+    _ = File.rm_rf(base_dir)
     :ok
   end
 
@@ -116,8 +190,8 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp run_codex(prompt, paths, config) do
-    runner = Map.get(config, :command_runner, &System.cmd/3)
-    executable = Map.get(config, :codex_bin, "codex")
+    executable = Map.get(config, :codex_bin, @default_codex_bin)
+    timeout = Map.get(config, :timeout_ms, @default_timeout_ms)
 
     args =
       [
@@ -133,70 +207,139 @@ defmodule Alloy.Provider.Codex do
       ]
       |> maybe_append_profile(config)
       |> maybe_append_model(config)
-      |> append_prompt_arg(prompt, runner, config)
+      |> append_prompt_arg(prompt, config)
 
-    {command, command_args, command_opts} =
-      runner_command(runner, executable, args, paths, config)
+    if injected_runner?(config) do
+      run_injected(config, executable, args, paths)
+    else
+      run_port(executable, args, paths, timeout)
+    end
+  end
 
-    timeout = Map.get(config, :timeout_ms, 120_000)
+  # Test path: the caller supplies a synchronous function matching
+  # `System.cmd/3`. No timeout enforcement — tests should be fast enough
+  # to rely on ExUnit's own timeout.
+  defp run_injected(config, executable, args, paths) do
+    runner = Map.fetch!(config, :command_runner)
+    opts = [cd: paths.workdir, stderr_to_stdout: true]
 
-    task = Task.async(fn -> runner.(command, command_args, command_opts) end)
-
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {output, status}} when is_integer(status) ->
+    case runner.(executable, args, opts) do
+      {output, status} when is_binary(output) and is_integer(status) ->
         {:ok, %{output: output, status: status}}
 
-      {:ok, other} ->
+      other ->
         {:error, "codex exec returned unexpected result: #{inspect(other)}"}
-
-      nil ->
-        {:error, "codex exec timed out after #{timeout}ms"}
     end
   rescue
     error in ErlangError ->
       {:error, "codex exec failed to start: #{Exception.message(error)}"}
   end
 
-  defp runner_command(runner, executable, args, paths, config) do
-    opts = [cd: paths.workdir, stderr_to_stdout: true]
+  # Real path: spawn via Port so we capture the OS pid and can kill the
+  # subprocess on timeout. `exec env ... codex ...` makes the shell process
+  # replace itself with env, which replaces itself with codex — so
+  # `Port.info(:os_pid)` returns codex's own pid rather than a shell pid
+  # whose children we'd otherwise orphan.
+  defp run_port(executable, args, paths, timeout) do
+    shell_command = build_port_command(executable, args, paths)
 
-    if injected_runner?(runner, config) do
-      {executable, args, opts}
-    else
-      env_args =
-        [{"OTEL_SDK_DISABLED", "true"}, {"CODEX_HOME", paths.codex_home}]
-        |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-        |> Enum.map_join(" ", fn {key, value} -> shell_escape("#{key}=#{value}") end)
+    port =
+      Port.open(
+        {:spawn_executable, "/bin/sh"},
+        [
+          {:args, ["-lc", shell_command]},
+          {:cd, paths.workdir},
+          :binary,
+          :exit_status,
+          :use_stdio,
+          :stderr_to_stdout
+        ]
+      )
 
-      shell_command =
-        "env " <>
-          env_args <>
-          " " <>
-          Enum.map_join([executable | args], " ", &shell_escape/1) <>
-          " < " <>
-          shell_escape(paths.prompt_path)
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, [])
+      nil -> {:error, "codex exec port closed before os_pid was available"}
+    end
+  rescue
+    error in ErlangError ->
+      {:error, "codex exec failed to start: #{Exception.message(error)}"}
+  end
 
-      {"/bin/sh", ["-lc", shell_command], opts}
+  defp build_port_command(executable, args, paths) do
+    env_args =
+      [{"OTEL_SDK_DISABLED", "true"}, {"CODEX_HOME", paths.codex_home}]
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Enum.map_join(" ", fn {key, value} -> shell_escape("#{key}=#{value}") end)
+
+    "exec env " <>
+      env_args <>
+      " " <>
+      Enum.map_join([executable | args], " ", &shell_escape/1) <>
+      " < " <>
+      shell_escape(paths.prompt_path)
+  end
+
+  defp collect_port(port, os_pid, timeout, acc) do
+    receive do
+      {^port, {:data, data}} when is_binary(data) ->
+        collect_port(port, os_pid, timeout, [acc, data])
+
+      {^port, {:exit_status, status}} ->
+        {:ok, %{output: IO.iodata_to_binary(acc), status: status}}
+    after
+      timeout ->
+        _ = kill_os_process(os_pid)
+        _ = close_and_drain(port)
+        {:error, "codex exec timed out after #{timeout}ms"}
     end
   end
 
-  defp append_prompt_arg(args, prompt, runner, config) do
-    if injected_runner?(runner, config) do
+  # SIGTERM with a 100ms grace window, then SIGKILL. Best-effort — if
+  # codex has already exited, the second kill is a no-op.
+  defp kill_os_process(os_pid) do
+    _ = System.cmd("/bin/kill", ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    Process.sleep(100)
+    _ = System.cmd("/bin/kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    :ok
+  end
+
+  defp close_and_drain(port) do
+    _ =
+      try do
+        Port.close(port)
+      rescue
+        ArgumentError -> :ok
+      end
+
+    drain_port_messages(port)
+  end
+
+  defp drain_port_messages(port) do
+    receive do
+      {^port, _} -> drain_port_messages(port)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp append_prompt_arg(args, prompt, config) do
+    if injected_runner?(config) do
       args ++ [prompt]
     else
       args ++ ["-"]
     end
   end
 
-  defp injected_runner?(runner, config) do
-    Map.has_key?(config, :command_runner) and runner != (&System.cmd/3)
-  end
+  # An explicit `:command_runner` in config means the caller is driving
+  # process execution themselves (almost always a test). Real usage goes
+  # through the shell wrapper so we can inject env and stdin-feed the prompt.
+  defp injected_runner?(config), do: Map.has_key?(config, :command_runner)
 
   defp codex_error(status, output) do
     message =
       output
       |> String.trim()
-      |> truncate(2000)
+      |> truncate(@error_truncation)
 
     "codex exec failed with status #{status}: #{message}"
   end
@@ -238,7 +381,7 @@ defmodule Alloy.Provider.Codex do
        %{
          stop_reason: :end_turn,
          messages: [Message.assistant(text)],
-         usage: zero_usage(),
+         usage: @zero_usage,
          response_metadata: response_metadata(config, command_result)
        }}
     else
@@ -257,7 +400,7 @@ defmodule Alloy.Provider.Codex do
        %{
          stop_reason: :tool_use,
          messages: [Message.assistant_blocks(blocks)],
-         usage: zero_usage(),
+         usage: @zero_usage,
          response_metadata: response_metadata(config, command_result)
        }}
     end
@@ -268,35 +411,36 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp parse_tool_blocks(text, tool_calls) do
-    blocks =
-      tool_calls
-      |> Enum.with_index(1)
-      |> Enum.map(fn {tool_call, index} ->
-        with {:ok, call_id} <- tool_call_id(tool_call, index),
-             {:ok, name} <- fetch_string(tool_call, "name"),
-             {:ok, arguments} <- fetch_arguments(tool_call) do
-          {:ok, %{type: "tool_use", id: call_id, name: name, input: arguments}}
-        end
-      end)
+    tool_calls
+    |> Enum.with_index(1)
+    |> Enum.reduce_while([], fn {tool_call, index}, acc ->
+      case build_tool_block(tool_call, index) do
+        {:ok, block} -> {:cont, [block | acc]}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      {:error, _} = err -> err
+      blocks -> finalize_tool_blocks(text, Enum.reverse(blocks))
+    end
+  end
 
-    case Enum.find(blocks, &match?({:error, _}, &1)) do
-      {:error, reason} ->
-        {:error, reason}
+  defp build_tool_block(tool_call, index) do
+    with {:ok, call_id} <- tool_call_id(tool_call, index),
+         {:ok, name} <- fetch_string(tool_call, "name"),
+         {:ok, arguments} <- fetch_arguments(tool_call) do
+      {:ok, %{type: "tool_use", id: call_id, name: name, input: arguments}}
+    end
+  end
 
-      nil ->
-        tool_blocks = Enum.map(blocks, fn {:ok, block} -> block end)
+  defp finalize_tool_blocks(_text, []) do
+    {:error, "Codex returned tool_use without any tool calls"}
+  end
 
-        full_blocks =
-          case String.trim(text) do
-            "" -> tool_blocks
-            trimmed -> [%{type: "text", text: trimmed} | tool_blocks]
-          end
-
-        if full_blocks == [] do
-          {:error, "Codex returned tool_use without any tool calls"}
-        else
-          {:ok, full_blocks}
-        end
+  defp finalize_tool_blocks(text, tool_blocks) do
+    case String.trim(text) do
+      "" -> {:ok, tool_blocks}
+      trimmed -> {:ok, [%{type: "text", text: trimmed} | tool_blocks]}
     end
   end
 
@@ -317,19 +461,44 @@ defmodule Alloy.Provider.Codex do
 
   defp fetch_arguments(map) do
     with {:ok, json} <- fetch_string(map, "arguments_json"),
-         {:ok, decoded} <- Jason.decode(json),
-         true <- is_map(decoded) do
+         {:ok, decoded} when is_map(decoded) <- decode_arguments_json(json) do
       {:ok, decoded}
     else
-      false ->
-        {:error, "Codex tool call arguments must decode to a JSON object"}
-
-      {:error, %Jason.DecodeError{} = error} ->
-        {:error, "invalid Codex arguments_json: #{Exception.message(error)}"}
-
-      {:error, reason} ->
-        {:error, reason}
+      {:ok, _non_map} -> {:error, "Codex tool call arguments must decode to a JSON object"}
+      {:error, _reason} = err -> err
     end
+  end
+
+  # Codex occasionally emits strings containing invalid JSON escape sequences
+  # — most often `\d`, `\s`, `\p`, `\A` from regex source inside code payloads.
+  # Valid single-character JSON escapes after `\` are: " \ / b f n r t u.
+  # If the first decode fails, we double any other `\X` and retry.
+  #
+  # This does NOT help cases where Codex *under-escapes* an otherwise valid
+  # sequence (e.g. emits `\n` when the intent was a literal backslash-n):
+  # Jason decodes that successfully and silently produces wrong data. Fixing
+  # that class of error needs a prompt-level constraint, not a post-hoc patch.
+  defp decode_arguments_json(json) do
+    case Jason.decode(json) do
+      {:ok, _} = ok ->
+        ok
+
+      {:error, %Jason.DecodeError{}} ->
+        case json |> repair_backslash_escapes() |> Jason.decode() do
+          {:ok, _} = ok ->
+            ok
+
+          {:error, %Jason.DecodeError{} = error} ->
+            {:error, "invalid Codex arguments_json: #{Exception.message(error)}"}
+        end
+    end
+  end
+
+  # Replace bare backslash sequences that are not valid JSON escapes by
+  # doubling the backslash, converting `\X` (invalid) into `\\X` (valid —
+  # literal backslash followed by X).
+  defp repair_backslash_escapes(json) do
+    Regex.replace(@invalid_json_escape_re, json, fn match -> "\\" <> match end)
   end
 
   defp emit_chunks(%{messages: [%Message{content: text}]}, on_chunk) when is_binary(text) do
@@ -345,16 +514,17 @@ defmodule Alloy.Provider.Codex do
     :ok
   end
 
+  # Unknown shape — skip silently rather than crash the stream caller.
+  defp emit_chunks(_result, _on_chunk), do: :ok
+
   defp response_metadata(config, %{output: output, status: status}) do
     %{
       backend: "codex_exec",
       model: Map.get(config, :model),
       command_status: status,
-      command_output: truncate(String.trim(output), 4000)
+      command_output: truncate(String.trim(output), @output_truncation)
     }
   end
-
-  defp zero_usage, do: %{input_tokens: 0, output_tokens: 0}
 
   defp build_prompt(messages, tool_defs, config) do
     payload = %{
@@ -412,6 +582,10 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
+  # Defensive fallback for unknown block shapes — keeps serialization
+  # total even if Alloy adds a new block type the Codex provider hasn't
+  # learned yet. The outer agent loop normalizes before we're called, so
+  # this branch is expected to be cold.
   defp serialize_block(block), do: Alloy.Provider.stringify_keys(block)
 
   defp serialize_tool_def(%{name: name, description: description, input_schema: input_schema}) do
@@ -419,31 +593,6 @@ defmodule Alloy.Provider.Codex do
       name: name,
       description: description,
       input_schema: input_schema
-    }
-  end
-
-  defp response_schema do
-    %{
-      type: "object",
-      additionalProperties: false,
-      properties: %{
-        stop_reason: %{type: "string", enum: ["end_turn", "tool_use"]},
-        text: %{type: "string"},
-        tool_calls: %{
-          type: "array",
-          items: %{
-            type: "object",
-            additionalProperties: false,
-            properties: %{
-              call_id: %{type: "string"},
-              name: %{type: "string"},
-              arguments_json: %{type: "string"}
-            },
-            required: ["call_id", "name", "arguments_json"]
-          }
-        }
-      },
-      required: ["stop_reason", "text", "tool_calls"]
     }
   end
 
@@ -501,9 +650,15 @@ defmodule Alloy.Provider.Codex do
     Path.join(System.user_home!(), ".codex/config.toml")
   end
 
-  defp truncate(text, limit) when is_binary(text) and byte_size(text) > limit do
-    binary_part(text, 0, limit) <> "..."
+  # `limit` is a character budget, not a byte budget — `String.slice/3`
+  # respects grapheme boundaries so we never split a multibyte codepoint
+  # mid-sequence and produce invalid UTF-8 in user-facing fields like
+  # `response_metadata.command_output`.
+  defp truncate(text, limit) when is_binary(text) do
+    if String.length(text) > limit do
+      String.slice(text, 0, limit) <> "..."
+    else
+      text
+    end
   end
-
-  defp truncate(text, _limit), do: text
 end

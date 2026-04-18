@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-04-18
+
+### Fixed
+
+- **Codex subprocess leak on timeout** — `Alloy.Provider.Codex` now spawns codex via `Port.open` and explicitly kills the OS process (SIGTERM → 100ms grace → SIGKILL) when `:timeout_ms` trips. Previously `Task.shutdown(:brutal_kill)` closed the BEAM task but left the `/bin/sh` + `codex` subprocess tree running, leaking one OS process per timeout.
+- **Codex temp-dir leak** — `prepare_paths/1` now cleans up `base_dir` when `prepare_codex_home/2` fails mid-setup. Previously the directory was orphaned on disk because the `try/after` cleanup in `complete/3` never ran.
+- **Codex `arguments_json` decode** — falls back to a backslash-escape repair pass for invalid JSON escapes (`\d`, `\s`, `\p`, `\A`) that Codex occasionally emits from regex-containing code payloads. Decodes that previously failed with `Jason.DecodeError` now retry cleanly.
+- **UTF-8-safe truncation** — `response_metadata.command_output` (and other truncated fields) no longer splits multi-byte codepoints mid-sequence. `truncate/2` now uses `String.slice/3` (character budget) rather than `binary_part/3` (byte budget).
+
+### Changed
+
+- **Codex provider typespecs** — added `@type config` and `@spec` to `complete/3` and `stream/4`; corrected invalid `Path.t()` references to `String.t()` (Elixir's `Path` module defines no `t/0` type).
+- **Codex provider internals** — module attribute constants replace scattered magic numbers; `Enum.reduce_while/3` replaces two-pass tool-block parsing; `with`-guards and pattern-matching replace awkward conditional chains; catchall `emit_chunks/2` clause prevents `stream/4` crashes on unknown result shapes. Observable behaviour unchanged.
+
 ## [0.10.1] - 2026-04-13
 
 ### Fixed
