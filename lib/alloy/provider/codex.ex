@@ -122,31 +122,41 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp prepare_paths(config) do
-    base_dir =
-      config
-      |> Map.get(:tmp_dir)
-      |> case do
-        nil -> Path.join(System.tmp_dir!(), "alloy-codex-#{System.unique_integer([:positive])}")
-        dir -> Path.join(dir, "alloy-codex-#{System.unique_integer([:positive])}")
-      end
+    base_dir = build_base_dir(config)
 
-    case File.mkdir_p(base_dir) do
-      :ok ->
-        with {:ok, codex_home} <- prepare_codex_home(base_dir, config) do
-          {:ok,
-           %{
-             base_dir: base_dir,
-             codex_home: codex_home,
-             prompt_path: Path.join(base_dir, "prompt.txt"),
-             schema_path: Path.join(base_dir, "response_schema.json"),
-             last_message_path: Path.join(base_dir, "last_message.json"),
-             workdir: Map.get(config, :workdir, base_dir)
-           }}
-        end
-
+    with :ok <- mkdir_base(base_dir),
+         {:ok, codex_home} <- prepare_codex_home(base_dir, config) do
+      {:ok, build_paths(base_dir, codex_home, config)}
+    else
       {:error, reason} ->
-        {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
+        # `File.rm_rf/1` is a no-op if the directory was never created,
+        # so this is safe to run on both mkdir and prepare_codex_home failures.
+        _ = File.rm_rf(base_dir)
+        {:error, reason}
     end
+  end
+
+  defp build_base_dir(config) do
+    parent = Map.get(config, :tmp_dir) || System.tmp_dir!()
+    Path.join(parent, "alloy-codex-#{System.unique_integer([:positive])}")
+  end
+
+  defp mkdir_base(base_dir) do
+    case File.mkdir_p(base_dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
+    end
+  end
+
+  defp build_paths(base_dir, codex_home, config) do
+    %{
+      base_dir: base_dir,
+      codex_home: codex_home,
+      prompt_path: Path.join(base_dir, "prompt.txt"),
+      schema_path: Path.join(base_dir, "response_schema.json"),
+      last_message_path: Path.join(base_dir, "last_message.json"),
+      workdir: Map.get(config, :workdir, base_dir)
+    }
   end
 
   defp cleanup_paths(%{base_dir: base_dir}) do
@@ -190,10 +200,10 @@ defmodule Alloy.Provider.Codex do
       ]
       |> maybe_append_profile(config)
       |> maybe_append_model(config)
-      |> append_prompt_arg(prompt, runner, config)
+      |> append_prompt_arg(prompt, config)
 
     {command, command_args, command_opts} =
-      runner_command(runner, executable, args, paths, config)
+      runner_command(executable, args, paths, config)
 
     timeout = Map.get(config, :timeout_ms, @default_timeout_ms)
 
@@ -214,10 +224,10 @@ defmodule Alloy.Provider.Codex do
       {:error, "codex exec failed to start: #{Exception.message(error)}"}
   end
 
-  defp runner_command(runner, executable, args, paths, config) do
+  defp runner_command(executable, args, paths, config) do
     opts = [cd: paths.workdir, stderr_to_stdout: true]
 
-    if injected_runner?(runner, config) do
+    if injected_runner?(config) do
       {executable, args, opts}
     else
       env_args =
@@ -237,17 +247,18 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp append_prompt_arg(args, prompt, runner, config) do
-    if injected_runner?(runner, config) do
+  defp append_prompt_arg(args, prompt, config) do
+    if injected_runner?(config) do
       args ++ [prompt]
     else
       args ++ ["-"]
     end
   end
 
-  defp injected_runner?(runner, config) do
-    Map.has_key?(config, :command_runner) and runner != (&System.cmd/3)
-  end
+  # An explicit `:command_runner` in config means the caller is driving
+  # process execution themselves (almost always a test). Real usage goes
+  # through the shell wrapper so we can inject env and stdin-feed the prompt.
+  defp injected_runner?(config), do: Map.has_key?(config, :command_runner)
 
   defp codex_error(status, output) do
     message =
@@ -383,9 +394,15 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  # Attempt to parse arguments_json, falling back to a repair pass for the
-  # common case where Codex omits double-escaping backslashes inside strings
-  # (e.g. `\n` in Elixir code becomes a literal `\n` in JSON instead of `\\n`).
+  # Codex occasionally emits strings containing invalid JSON escape sequences
+  # — most often `\d`, `\s`, `\p`, `\A` from regex source inside code payloads.
+  # Valid single-character JSON escapes after `\` are: " \ / b f n r t u.
+  # If the first decode fails, we double any other `\X` and retry.
+  #
+  # This does NOT help cases where Codex *under-escapes* an otherwise valid
+  # sequence (e.g. emits `\n` when the intent was a literal backslash-n):
+  # Jason decodes that successfully and silently produces wrong data. Fixing
+  # that class of error needs a prompt-level constraint, not a post-hoc patch.
   defp decode_arguments_json(json) do
     case Jason.decode(json) do
       {:ok, _} = ok ->
