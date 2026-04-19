@@ -56,6 +56,14 @@ defmodule Alloy.ModelMetadata do
     %{name: "grok-4", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-fast-reasoning", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-fast-non-reasoning", limit: 2_000_000, suffix_patterns: [""]},
+    # grok-4.20 family — current xAI frontier API models. The `-0309`
+    # suffix is a date stamp; regex patterns accept any 4-digit stamp so
+    # future snapshots on the same family won't need a code change.
+    %{
+      name: "grok-4.20",
+      limit: 2_000_000,
+      suffix_patterns: [~r/^-\d{4}-(reasoning|non-reasoning)$/, ~r/^-multi-agent-\d{4}$/]
+    },
     # Dash notation (grok-4-1-fast-*) for backward compat
     %{name: "grok-4-1-fast-reasoning", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-1-fast-non-reasoning", limit: 2_000_000, suffix_patterns: [""]},

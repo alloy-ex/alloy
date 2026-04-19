@@ -13,6 +13,10 @@ defmodule Alloy.ModelMetadataTest do
       # grok-4.1-fast models (dot notation)
       assert ModelMetadata.context_window("grok-4.1-fast") == 2_000_000
       assert ModelMetadata.context_window("grok-4.1-fast-reasoning") == 2_000_000
+      # grok-4.20 family — current xAI frontier API models
+      assert ModelMetadata.context_window("grok-4.20-0309-reasoning") == 2_000_000
+      assert ModelMetadata.context_window("grok-4.20-0309-non-reasoning") == 2_000_000
+      assert ModelMetadata.context_window("grok-4.20-multi-agent-0309") == 2_000_000
     end
 
     test "returns dated snapshot matches" do
