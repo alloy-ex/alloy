@@ -40,16 +40,28 @@ defmodule Alloy.Provider.XAI do
 
   @behaviour Alloy.Provider
 
+  alias Alloy.Message
   alias Alloy.Provider.OpenAI
 
   @xai_api_url "https://api.x.ai"
 
+  @typedoc """
+  Configuration for the xAI provider. Inherits the full `Alloy.Provider.OpenAI`
+  config surface plus `:web_search` and `:x_search` for Grok's native search
+  tools. `:api_url` defaults to `"https://api.x.ai"`.
+  """
+  @type config :: OpenAI.config()
+
   @impl true
+  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     OpenAI.complete(messages, tool_defs, with_defaults(config))
   end
 
   @impl true
+  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     OpenAI.stream(messages, tool_defs, with_defaults(config), on_chunk)
   end

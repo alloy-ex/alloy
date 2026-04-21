@@ -56,7 +56,31 @@ defmodule Alloy.Provider.OpenAI do
   @default_api_url "https://api.openai.com"
   @default_max_tokens 4096
 
+  @typedoc """
+  Configuration for the OpenAI provider. See the module doc for field
+  semantics.
+  """
+  @type config :: %{
+          required(:api_key) => String.t(),
+          required(:model) => String.t(),
+          optional(:max_tokens) => pos_integer(),
+          optional(:system_prompt) => String.t(),
+          optional(:api_url) => String.t(),
+          optional(:provider_state) => map(),
+          optional(:store) => boolean(),
+          optional(:include) => [String.t()],
+          optional(:tool_choice) => String.t() | map(),
+          optional(:parallel_tool_calls) => boolean(),
+          optional(:previous_response_id) => String.t(),
+          optional(:built_in_tools) => [map()],
+          optional(:web_search) => boolean() | map(),
+          optional(:x_search) => boolean() | map(),
+          optional(:req_options) => keyword()
+        }
+
   @impl true
+  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
@@ -85,6 +109,8 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   @impl true
+  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     body =
       messages

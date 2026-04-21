@@ -41,7 +41,27 @@ defmodule Alloy.Provider.Gemini do
   @default_api_version "v1beta"
   @default_max_tokens 4096
 
+  @typedoc """
+  Configuration for the Gemini provider. See the module doc for field
+  semantics.
+  """
+  @type config :: %{
+          required(:api_key) => String.t(),
+          required(:model) => String.t(),
+          optional(:max_tokens) => pos_integer(),
+          optional(:system_prompt) => String.t(),
+          optional(:api_url) => String.t(),
+          optional(:api_version) => String.t(),
+          optional(:generation_config) => map(),
+          optional(:tool_config) => map(),
+          optional(:safety_settings) => [map()],
+          optional(:extra_headers) => [{String.t(), String.t()}],
+          optional(:req_options) => keyword()
+        }
+
   @impl true
+  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
@@ -67,6 +87,8 @@ defmodule Alloy.Provider.Gemini do
   end
 
   @impl true
+  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     body = build_request_body(messages, tool_defs, config)
 

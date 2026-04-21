@@ -53,7 +53,27 @@ defmodule Alloy.Provider.Anthropic do
   @code_execution_tool_type "code_execution_20250825"
   @code_execution_beta "code-execution-2025-08-25"
 
+  @typedoc """
+  Configuration for the Anthropic provider. See the module doc for field
+  semantics.
+  """
+  @type config :: %{
+          required(:api_key) => String.t(),
+          required(:model) => String.t(),
+          optional(:max_tokens) => pos_integer(),
+          optional(:system_prompt) => String.t(),
+          optional(:api_url) => String.t(),
+          optional(:api_version) => String.t(),
+          optional(:extra_headers) => [{String.t(), String.t()}],
+          optional(:req_options) => keyword(),
+          optional(:extended_thinking) => keyword(),
+          optional(:on_event) => (term() -> :ok),
+          optional(:cache) => boolean()
+        }
+
   @impl true
+  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
@@ -86,6 +106,8 @@ defmodule Alloy.Provider.Anthropic do
   as `complete/3` once the stream finishes.
   """
   @impl true
+  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     body =
       build_request_body(messages, tool_defs, config)
