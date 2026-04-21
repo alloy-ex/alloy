@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-04-21
+
+### Added
+
+- **grok-4.20 family in the model catalog** — `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning`, and `grok-4.20-multi-agent-0309` now register their real 2M-token context window in `Alloy.ModelMetadata`. Users who explicitly pass one of these model IDs to `Alloy.Provider.XAI` no longer hit the generic 200K fallback in the Compactor. Suffix patterns use regex so future `-MMDD` snapshots on the same family don't need a catalog update.
+- **Provider typespec parity** — every provider that implements the `Alloy.Provider` behaviour now exposes a `@type config` and `@spec` on `complete/3` and `stream/4`. Users who run dialyzer get type-checking at call sites for all six providers (previously only `Codex`). No runtime change — this is purely a tooling-visibility improvement.
+
+### Changed
+
+- **`Alloy.Provider.XAI` docstring example** — now uses `grok-4.20-0309-reasoning` as the default-suggestion model (was `grok-4`) to reflect the current xAI API frontier.
+
 ## [0.10.2] - 2026-04-18
 
 ### Fixed

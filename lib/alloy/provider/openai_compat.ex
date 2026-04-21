@@ -57,7 +57,25 @@ defmodule Alloy.Provider.OpenAICompat do
   @default_max_tokens 4096
   @default_chat_path "/v1/chat/completions"
 
+  @typedoc """
+  Configuration for the OpenAI-compatible provider. `:api_key` is optional
+  (omit for local providers like Ollama). See the module doc for field
+  semantics.
+  """
+  @type config :: %{
+          required(:api_url) => String.t(),
+          required(:model) => String.t(),
+          optional(:api_key) => String.t(),
+          optional(:max_tokens) => pos_integer(),
+          optional(:system_prompt) => String.t(),
+          optional(:chat_path) => String.t(),
+          optional(:extra_headers) => [{String.t(), String.t()}],
+          optional(:req_options) => keyword()
+        }
+
   @impl true
+  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
     url = "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
@@ -84,6 +102,8 @@ defmodule Alloy.Provider.OpenAICompat do
   end
 
   @impl true
+  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     body = build_request_body(messages, tool_defs, config)
     url = "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"

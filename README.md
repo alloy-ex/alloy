@@ -15,7 +15,7 @@ Alloy is the completion-tool-call loop and nothing else. Send messages to any LL
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.10.0"
+result.text #=> "The version is 0.11.0"
 ```
 
 ## Why Alloy?
@@ -70,7 +70,7 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.10"}
+    {:alloy, "~> 0.11"}
   ]
 end
 ```
@@ -118,7 +118,7 @@ Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", m
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Gemini, api_key: "...", model: "gemini-2.5-flash"}} | opts])
 
 # xAI via Responses-compatible API
-Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", api_url: "https://api.x.ai", model: "grok-4"}} | opts])
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", api_url: "https://api.x.ai", model: "grok-4.20-0309-reasoning"}} | opts])
 
 # xAI via chat completions (reasoning models, extra_body)
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAICompat, api_key: "...", api_url: "https://api.x.ai", model: "grok-4.1-fast-reasoning"}} | opts])
@@ -173,7 +173,7 @@ Results expose provider-owned state in `result.metadata.provider_state`:
     provider: {Alloy.Provider.OpenAI,
       api_key: System.get_env("XAI_API_KEY"),
       api_url: "https://api.x.ai",
-      model: "grok-4",
+      model: "grok-4.20-0309-reasoning",
       store: true
     }
   )
@@ -191,7 +191,7 @@ provider-native conversation:
     provider: {Alloy.Provider.OpenAI,
       api_key: System.get_env("XAI_API_KEY"),
       api_url: "https://api.x.ai",
-      model: "grok-4",
+      model: "grok-4.20-0309-reasoning",
       provider_state: provider_state
     }
   )
@@ -210,7 +210,7 @@ For xAI search tools:
     provider: {Alloy.Provider.OpenAI,
       api_key: System.get_env("XAI_API_KEY"),
       api_url: "https://api.x.ai",
-      model: "grok-4",
+      model: "grok-4.20-0309-reasoning",
       web_search: %{allowed_domains: ["docs.x.ai"]},
       include: ["inline_citations"]
     }
@@ -455,7 +455,7 @@ end
 | Anthropic | `Alloy.Provider.Anthropic` | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
 | Gemini | `Alloy.Provider.Gemini` | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-pro-preview` |
 | OpenAI | `Alloy.Provider.OpenAI` | `gpt-5.4` |
-| xAI | `Alloy.Provider.OpenAI` with `api_url: "https://api.x.ai"` | `grok-4`, `grok-4.1-fast`, `grok-4-fast-reasoning`, `grok-code-fast-1` |
+| xAI | `Alloy.Provider.OpenAI` with `api_url: "https://api.x.ai"` | `grok-4.20-0309-reasoning`, `grok-4.20-multi-agent-0309`, `grok-4.1-fast-reasoning`, `grok-code-fast-1` |
 | Other OpenAI-compatible APIs | `Alloy.Provider.OpenAICompat` | Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together |
 
 Use `Alloy.Provider.OpenAI` for native Responses APIs like OpenAI and xAI.
