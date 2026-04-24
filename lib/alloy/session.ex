@@ -2,6 +2,14 @@ defmodule Alloy.Session do
   @moduledoc """
   Serializable session container.
 
+  > #### Moved to `alloy_agent` {: .warning}
+  >
+  > This struct has moved to `AlloyAgent.Session` in the
+  > [`alloy_agent`](https://hex.pm/packages/alloy_agent) package. This
+  > copy will be removed in Alloy 0.13.0. Migrate by replacing
+  > `%Alloy.Session{}` with `%AlloyAgent.Session{}` and
+  > `Alloy.Session.new/1` with `AlloyAgent.Session.new/1`.
+
   Wraps the conversation state in a format that can be serialized
   to JSON, stored in a database, or passed between processes.
   No database required — sessions are plain structs.

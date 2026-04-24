@@ -2,9 +2,16 @@ defmodule Alloy.Agent.Events do
   @moduledoc """
   Event envelope construction and runtime opts normalization.
 
+  > #### Moved to `alloy_agent` {: .warning}
+  >
+  > This module has moved to `AlloyAgent.Events` in the
+  > [`alloy_agent`](https://hex.pm/packages/alloy_agent) package. This
+  > copy will be removed in Alloy 0.13.0. The v1 envelope protocol is
+  > a runtime-layer concern; Alloy's loop still emits raw telemetry
+  > via `:telemetry.execute/3`.
+
   Builds v1 event envelopes, manages sequence counters, and derives
-  correlation IDs. Extracted from `Alloy.Agent.Turn` to separate
-  event plumbing from agent loop control flow.
+  correlation IDs.
   """
 
   alias Alloy.Agent.State
