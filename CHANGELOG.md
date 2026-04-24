@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-04-24
+
+### Deprecated
+
+- **`Alloy.Agent.Server`**, **`Alloy.Session`**, and **`Alloy.Agent.Events`** now emit compile-time deprecation warnings. These modules moved to the new [`alloy_agent`](https://hex.pm/packages/alloy_agent) package as `AlloyAgent.Server`, `AlloyAgent.Session`, and `AlloyAgent.Events`. The copies in Alloy will be **removed in 0.13.0**.
+
+### Why
+
+Alloy is refocusing as a protocol library: the loop, providers, tools, memory behaviour, message types. Runtime concerns (supervised processes, sessions, async dispatch, PubSub, backpressure, default memory stores) belong in the application layer, where OTP already gives you the primitives. `alloy_agent` is the opt-in runtime wrapper for users who want a supervised agent without wiring a GenServer themselves.
+
+Elixir's value proposition here is stronger than in Python or TypeScript: the BEAM already is the runtime. A protocol library that composes *with* OTP beats a runtime library that competes with it.
+
+### Migration
+
+Add `{:alloy_agent, "~> 0.1"}` to your deps, then:
+
+| Before (Alloy 0.12.0) | After (alloy_agent 0.1.0) |
+|---|---|
+| `alias Alloy.Agent.Server` | `alias AlloyAgent.Server` (or just `alias AlloyAgent`) |
+| `%Alloy.Session{}` | `%AlloyAgent.Session{}` |
+| `Alloy.Session.new/1` | `AlloyAgent.Session.new/1` |
+| `Alloy.send_message/3` | `AlloyAgent.send_message/3` |
+| `Alloy.cancel_request/2` | `AlloyAgent.cancel_request/2` |
+
+Code that uses only `Alloy.run/2`, `Alloy.stream/3`, tools, providers, messages, or the memory behaviour needs **no changes**.
+
+### Not changed
+
+- No runtime behaviour change in this release. The deprecated modules work exactly as they did in 0.12.0. This is a soft-migration patch — you have until Alloy 0.13.0 to move your imports.
+
 ## [0.12.0] - 2026-04-24
 
 ### Added

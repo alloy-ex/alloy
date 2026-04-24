@@ -2,6 +2,21 @@ defmodule Alloy.Agent.Server do
   @moduledoc """
   OTP-backed persistent agent process.
 
+  > #### Moved to `alloy_agent` {: .warning}
+  >
+  > This module has moved to `AlloyAgent.Server` in the
+  > [`alloy_agent`](https://hex.pm/packages/alloy_agent) package. This
+  > copy will be removed in Alloy 0.13.0. Migrate by adding
+  > `{:alloy_agent, "~> 0.1"}` to your deps and changing
+  > `alias Alloy.Agent.Server` to `alias AlloyAgent.Server` (or `alias AlloyAgent`).
+  >
+  > Why: Alloy is refocusing as a protocol library — the loop, providers,
+  > tools, memory behaviour, message types. Runtime concerns (supervised
+  > processes, sessions, async dispatch, PubSub, backpressure, default
+  > memory stores) belong in the app layer, where OTP already gives you
+  > the primitives. `alloy_agent` is the opt-in runtime for users who
+  > want a supervised agent without wiring a GenServer themselves.
+
   Wraps the stateless `Turn.run_loop/1` in a GenServer so the agent
   can hold conversation history across multiple calls, be supervised,
   and run concurrently with other agents.

@@ -71,7 +71,9 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.12"}
+    {:alloy, "~> 0.12"},
+    # Optional: supervised runtime wrapper (sessions, async dispatch, memory stores)
+    {:alloy_agent, "~> 0.1"}
   ]
 end
 ```
