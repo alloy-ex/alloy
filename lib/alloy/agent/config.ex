@@ -14,6 +14,17 @@ defmodule Alloy.Agent.Config do
           fallback: :truncate
         }
 
+  @typedoc """
+  Memory store binding — `{store_module, opaque_store_term}`. The store
+  module implements `Alloy.Memory`. The store term is whatever the
+  module needs (keyword list, map, pid, struct) — Alloy passes it
+  through verbatim.
+
+  As of 0.12.0, memory is Anthropic-only. `Alloy.run/2` raises if
+  `:memory` is set with any other provider.
+  """
+  @type memory :: {module(), term()} | nil
+
   @type t :: %__MODULE__{
           provider: module(),
           provider_config: map(),
@@ -43,7 +54,8 @@ defmodule Alloy.Agent.Config do
           code_execution: boolean(),
           model_metadata_overrides: map(),
           max_budget_cents: number() | nil,
-          until_tool: String.t() | nil
+          until_tool: String.t() | nil,
+          memory: memory()
         }
 
   @enforce_keys [:provider, :provider_config]
@@ -73,7 +85,8 @@ defmodule Alloy.Agent.Config do
     code_execution: false,
     model_metadata_overrides: %{},
     max_budget_cents: nil,
-    until_tool: nil
+    until_tool: nil,
+    memory: nil
   ]
 
   @doc """
@@ -125,8 +138,29 @@ defmodule Alloy.Agent.Config do
       code_execution: Keyword.get(opts, :code_execution, false),
       model_metadata_overrides: model_metadata_overrides,
       max_budget_cents: Keyword.get(opts, :max_budget_cents),
-      until_tool: Keyword.get(opts, :until_tool)
+      until_tool: Keyword.get(opts, :until_tool),
+      memory: validate_memory(Keyword.get(opts, :memory), provider_mod)
     }
+  end
+
+  defp validate_memory(nil, _provider), do: nil
+
+  defp validate_memory({module, _store} = memory, provider)
+       when is_atom(module) do
+    if provider == Alloy.Provider.Anthropic do
+      memory
+    else
+      raise ArgumentError,
+            "Alloy.Memory is Anthropic-only in 0.12.0. Got provider #{inspect(provider)} " <>
+              "with memory store module #{inspect(module)}. " <>
+              "Use Alloy.Provider.Anthropic or omit :memory."
+    end
+  end
+
+  defp validate_memory(bad, _provider) do
+    raise ArgumentError,
+          ":memory must be a {module, store_opts} tuple where module implements " <>
+            "Alloy.Memory. Got: #{inspect(bad)}"
   end
 
   @doc """

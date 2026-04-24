@@ -52,6 +52,8 @@ defmodule Alloy.Provider.Anthropic do
   @default_max_tokens 4096
   @code_execution_tool_type "code_execution_20250825"
   @code_execution_beta "code-execution-2025-08-25"
+  @memory_tool_type "memory_20250818"
+  @memory_beta "context-management-2025-06-27"
 
   @typedoc """
   Configuration for the Anthropic provider. See the module doc for field
@@ -68,7 +70,8 @@ defmodule Alloy.Provider.Anthropic do
           optional(:req_options) => keyword(),
           optional(:extended_thinking) => keyword(),
           optional(:on_event) => (term() -> :ok),
-          optional(:cache) => boolean()
+          optional(:cache) => boolean(),
+          optional(:memory) => {module(), term()}
         }
 
   @impl true
@@ -324,7 +327,10 @@ defmodule Alloy.Provider.Anthropic do
           Map.put(body, "tools", tools)
       end
 
-    body = maybe_add_code_execution(body, config)
+    body =
+      body
+      |> maybe_add_code_execution(config)
+      |> maybe_add_memory_tool(config)
 
     case Map.get(config, :extended_thinking) do
       nil ->
@@ -360,6 +366,18 @@ defmodule Alloy.Provider.Anthropic do
     end
   end
 
+  defp maybe_add_memory_tool(body, config) do
+    case Map.get(config, :memory) do
+      nil ->
+        body
+
+      {_module, _store} ->
+        memory_tool = %{"type" => @memory_tool_type, "name" => "memory"}
+        existing_tools = Map.get(body, "tools", [])
+        Map.put(body, "tools", existing_tools ++ [memory_tool])
+    end
+  end
+
   defp build_headers(config) do
     extra_headers = Map.get(config, :extra_headers, [])
     {beta_values, other_headers} = split_anthropic_beta_headers(extra_headers)
@@ -369,6 +387,12 @@ defmodule Alloy.Provider.Anthropic do
         [@code_execution_beta | beta_values]
       else
         beta_values
+      end
+
+    beta_values =
+      case Map.get(config, :memory) do
+        nil -> beta_values
+        {_module, _store} -> [@memory_beta | beta_values]
       end
 
     [

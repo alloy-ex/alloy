@@ -15,7 +15,7 @@ Alloy is the completion-tool-call loop and nothing else. Send messages to any LL
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.11.0"
+result.text #=> "The version is 0.12.0"
 ```
 
 ## Why Alloy?
@@ -29,6 +29,7 @@ Most agent frameworks try to be everything — sessions, memory, RAG, multi-agen
 - **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
 - **Middleware** — custom hooks, tool blocking, argument editing
 - **Context compaction** — summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
+- **Memory primitive** — `Alloy.Memory` behaviour for Anthropic's `memory_20250818` tool. Alloy owns the wire format and path validation; you own the store (in-memory, disk, Postgres — whatever fits)
 - **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
 - **Reasoning blocks** — DeepSeek/xAI `reasoning_content` parsed as first-class thinking blocks
 - **Tool safety** — `concurrent?/0` controls parallel execution, `max_result_chars/0` caps output, prompt-too-long auto-recovery
@@ -70,7 +71,7 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.11"}
+    {:alloy, "~> 0.12"}
   ]
 end
 ```
@@ -294,6 +295,52 @@ result.usage.cache_creation_input_tokens  #=> 1500
 result.usage.cache_read_input_tokens      #=> 1500  (on subsequent calls)
 ```
 
+### Memory (Anthropic `memory_20250818`)
+
+Alloy exposes memory as a behaviour — `Alloy.Memory` — matching the split
+Anthropic uses in their own Python SDK: Alloy owns the protocol (six
+commands on a `/memories/` tree, return-string formats, path validation);
+your code owns the backing store. No bytes touch Anthropic's servers.
+
+```elixir
+defmodule MyApp.Memory.Disk do
+  @behaviour Alloy.Memory
+
+  @impl true
+  def view(store, path), do: # read from disk
+  @impl true
+  def create(store, path, text), do: # write
+  @impl true
+  def str_replace(store, path, old, new), do: # ...
+  @impl true
+  def insert(store, path, line, text), do: # ...
+  @impl true
+  def delete(store, path), do: # ...
+  @impl true
+  def rename(store, old_path, new_path), do: # ...
+end
+
+{:ok, result} = Alloy.run("Remember the user prefers SI units",
+  provider: {Alloy.Provider.Anthropic, api_key: "sk-ant-...", model: "claude-sonnet-4-6"},
+  memory: {MyApp.Memory.Disk, root: "/var/agent/memories"}
+)
+```
+
+When `:memory` is set, Alloy injects the `memory_20250818` tool into the
+Anthropic request and adds the `context-management-2025-06-27` beta
+header. Memory tool calls are routed through `Alloy.Memory.Router`
+(not the general tool executor) so the typed-tool contract stays clean.
+
+The store term (second element of `{module, opts}`) is opaque — pass a
+keyword list, a map, a `pid()`, or a struct, whichever your store needs.
+Alloy does not bake session scoping into the contract; if you want
+per-session memory trees, thread `session_id: "..."` through your store
+opts and namespace inside your implementation.
+
+As of 0.12.0, memory is Anthropic-only — configuring `:memory` with any
+other provider raises at `Alloy.run/2` entry. Other providers will be
+wired as they ship their own memory primitives.
+
 ### Reasoning model support (DeepSeek, xAI)
 
 OpenAI-compatible reasoning models that return `reasoning_content` (DeepSeek-R1,
@@ -453,10 +500,10 @@ end
 | Vendor | Recommended Module | Example Models |
 |--------|---------------------|----------------|
 | Anthropic | `Alloy.Provider.Anthropic` | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
-| Gemini | `Alloy.Provider.Gemini` | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-pro-preview` |
+| Gemini | `Alloy.Provider.Gemini` | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-3-pro-preview`, `gemma-4-26b-a4b-it` (open-weight) |
 | OpenAI | `Alloy.Provider.OpenAI` | `gpt-5.4` |
 | xAI | `Alloy.Provider.OpenAI` with `api_url: "https://api.x.ai"` | `grok-4.20-0309-reasoning`, `grok-4.20-multi-agent-0309`, `grok-4.1-fast-reasoning`, `grok-code-fast-1` |
-| Other OpenAI-compatible APIs | `Alloy.Provider.OpenAICompat` | Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together |
+| Other OpenAI-compatible APIs | `Alloy.Provider.OpenAICompat` | `kimi-k2.6` (Moonshot), `qwen3-coder-plus` (1M ctx), `glm-4.6`, `mistral-large-2512`, plus Ollama, OpenRouter, DeepSeek, Groq, Together |
 
 Use `Alloy.Provider.OpenAI` for native Responses APIs like OpenAI and xAI.
 Use `Alloy.Provider.Gemini` for Gemini's native GenerateContent API.

@@ -17,6 +17,22 @@ defmodule Alloy.ModelMetadataTest do
       assert ModelMetadata.context_window("grok-4.20-0309-reasoning") == 2_000_000
       assert ModelMetadata.context_window("grok-4.20-0309-non-reasoning") == 2_000_000
       assert ModelMetadata.context_window("grok-4.20-multi-agent-0309") == 2_000_000
+      # Kimi (Moonshot AI)
+      assert ModelMetadata.context_window("kimi-k2.5") == 256_000
+      assert ModelMetadata.context_window("kimi-k2.6") == 256_000
+      # Gemma 4 variants
+      assert ModelMetadata.context_window("gemma-4-26b-a4b-it") == 256_000
+      assert ModelMetadata.context_window("gemma-4-31b-it") == 256_000
+      # GLM 4.6
+      assert ModelMetadata.context_window("glm-4.6") == 200_000
+      # Qwen 3 family — qwen3-coder-plus has a 1M window
+      assert ModelMetadata.context_window("qwen3-max") == 256_000
+      assert ModelMetadata.context_window("qwen3-max-preview") == 256_000
+      assert ModelMetadata.context_window("qwen3-coder-plus") == 1_000_000
+      assert ModelMetadata.context_window("qwen3.5-397b-a17b") == 1_000_000
+      # Mistral Large 3
+      assert ModelMetadata.context_window("mistral-large-2512") == 256_000
+      assert ModelMetadata.context_window("mistral-large-latest") == 256_000
     end
 
     test "returns dated snapshot matches" do
