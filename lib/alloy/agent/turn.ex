@@ -10,6 +10,7 @@ defmodule Alloy.Agent.Turn do
 
   alias Alloy.Agent.{Events, State}
   alias Alloy.Context.Compactor
+  alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.{Message, Middleware}
   alias Alloy.Provider.Retry
   alias Alloy.Tool.Executor
@@ -234,27 +235,46 @@ defmodule Alloy.Agent.Turn do
 
       %State{} = state ->
         tool_calls = extract_tool_calls(new_msgs)
+        {memory_calls, regular_calls} = Enum.split_with(tool_calls, &MemoryRouter.memory_call?/1)
         on_event = fn raw_event -> Events.emit(opts, state.turn, raw_event) end
         event_seq_ref = Keyword.get(opts, :event_seq_ref)
         event_correlation_id = Keyword.get(opts, :event_correlation_id)
         event_turn = state.turn
 
-        case Executor.execute_all(
-               tool_calls,
-               state.tool_fns,
-               state,
-               on_event: on_event,
-               event_seq_ref: event_seq_ref,
-               event_correlation_id: event_correlation_id,
-               event_turn: event_turn
-             ) do
+        memory_results =
+          case {memory_calls, state.config.memory} do
+            {[], _} -> []
+            {_calls, nil} -> []
+            {calls, memory} -> MemoryRouter.dispatch_all(calls, memory)
+          end
+
+        regular_result =
+          case regular_calls do
+            [] ->
+              {:ok, nil, []}
+
+            calls ->
+              Executor.execute_all(
+                calls,
+                state.tool_fns,
+                state,
+                on_event: on_event,
+                event_seq_ref: event_seq_ref,
+                event_correlation_id: event_correlation_id,
+                event_turn: event_turn
+              )
+          end
+
+        case regular_result do
           {:halted, reason} ->
             %{state | status: :halted, error: "Halted by middleware: #{reason}"}
 
-          {:ok, result_msg, tool_call_meta} ->
+          {:ok, regular_msg, tool_call_meta} ->
+            merged_msg = merge_tool_results(tool_calls, memory_results, regular_msg)
+
             state =
               state
-              |> State.append_messages(result_msg)
+              |> State.append_messages(merged_msg)
               |> State.append_tool_calls(tool_call_meta)
 
             case Middleware.run(:after_tool_execution, state) do
@@ -268,11 +288,35 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
+  # Reassemble tool_result blocks in the original tool_call order,
+  # regardless of whether each result came from the memory router or
+  # the generic tool executor. Tool-call IDs are unique per turn, so
+  # id-keyed lookup is safe.
+  defp merge_tool_results(tool_calls, memory_results, regular_msg) do
+    regular_blocks =
+      case regular_msg do
+        %Message{content: blocks} when is_list(blocks) -> blocks
+        nil -> []
+      end
+
+    by_id =
+      Enum.reduce(memory_results ++ regular_blocks, %{}, fn block, acc ->
+        Map.put(acc, block.tool_use_id, block)
+      end)
+
+    ordered = Enum.map(tool_calls, fn %{id: id} -> Map.fetch!(by_id, id) end)
+    Message.tool_results(ordered)
+  end
+
   defp build_provider_config(%State{config: config, provider_state: provider_state}) do
     config.provider_config
     |> Map.put(:system_prompt, config.system_prompt)
     |> Map.put(:provider_state, provider_state)
+    |> maybe_put_memory(config.memory)
   end
+
+  defp maybe_put_memory(provider_config, nil), do: provider_config
+  defp maybe_put_memory(provider_config, memory), do: Map.put(provider_config, :memory, memory)
 
   defp extract_tool_calls(messages) do
     Enum.flat_map(messages, &Message.tool_calls/1)

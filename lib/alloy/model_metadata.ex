@@ -75,7 +75,34 @@ defmodule Alloy.ModelMetadata do
     },
     %{name: "grok-code-fast-1", limit: 256_000, suffix_patterns: [""]},
     %{name: "grok-3", limit: 131_072, suffix_patterns: ["", "-fast"]},
-    %{name: "grok-3-mini", limit: 131_072, suffix_patterns: ["", "-fast"]}
+    %{name: "grok-3-mini", limit: 131_072, suffix_patterns: ["", "-fast"]},
+    # Kimi (Moonshot AI) — OpenAICompat via api.moonshot.ai
+    %{name: "kimi-k2.5", limit: 256_000, suffix_patterns: [""]},
+    %{name: "kimi-k2.6", limit: 256_000, suffix_patterns: [""]},
+    # Gemma 4 (Google open-weight via Gemini API)
+    %{
+      name: "gemma-4",
+      limit: 256_000,
+      suffix_patterns: ["", ~r/^-\d{1,3}b$/, ~r/^-\d{1,3}b-it$/, ~r/^-\d{1,3}b-a\d+b-it$/]
+    },
+    # GLM (Zhipu AI) — OpenAICompat via open.bigmodel.cn
+    %{name: "glm-4.6", limit: 200_000, suffix_patterns: [""]},
+    # Qwen 3 family (Alibaba) — OpenAICompat via dashscope
+    %{
+      name: "qwen3-max",
+      limit: 256_000,
+      suffix_patterns: ["", "-preview"]
+    },
+    %{name: "qwen3-coder-plus", limit: 1_000_000, suffix_patterns: [""]},
+    %{name: "qwen3-vl-plus", limit: 256_000, suffix_patterns: [""]},
+    %{name: "qwen3-omni-flash", limit: 256_000, suffix_patterns: [""]},
+    %{name: "qwen3.5-397b-a17b", limit: 1_000_000, suffix_patterns: [""]},
+    # Mistral Large 3 — OpenAICompat via api.mistral.ai
+    %{
+      name: "mistral-large",
+      limit: 256_000,
+      suffix_patterns: ["-2512", "-latest"]
+    }
   ]
 
   @doc """

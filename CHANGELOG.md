@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-04-24
+
+### Added
+
+- **`Alloy.Memory` behaviour** — first-class protocol for Anthropic's `memory_20250818` tool. Six callbacks (`view`, `create`, `str_replace`, `insert`, `delete`, `rename`) that any store can implement, matching the split used by Anthropic's own Python SDK (`BetaAbstractMemoryTool`). Memory is a protocol-level primitive with application-level storage — Alloy ships the behaviour, wire format, and path validation; user code (or future `alloy_agent`) ships the backing store.
+- **Anthropic provider memory wiring** — passing `memory: {StoreModule, store_opts}` to `Alloy.run/2` when using `Alloy.Provider.Anthropic` now injects the `memory_20250818` tool into the request and adds the `context-management-2025-06-27` beta header. Memory tool calls are routed through `Alloy.Memory.Router` rather than the generic tool executor, keeping the pipelines clean.
+- **`Alloy.run/2` `:memory` option** — validates at entry that memory requires `Alloy.Provider.Anthropic` (raises `ArgumentError` otherwise, with a clear migration path). Other providers will be wired as they ship their own memory primitives.
+- **Model catalog** — added context-window entries for:
+  - Kimi K2.5, K2.6 (Moonshot AI, 256K) — via `OpenAICompat` at `api.moonshot.ai`
+  - Gemma 4 (Google open-weight, 256K) — via `Gemini` provider
+  - GLM-4.6 (Zhipu AI, 200K) — via `OpenAICompat` at `open.bigmodel.cn`
+  - Qwen 3 family — `qwen3-max`/`qwen3-coder-plus` (up to 1M context), `qwen3-vl-plus`, `qwen3-omni-flash`, `qwen3.5-397b-a17b` — via `OpenAICompat` at DashScope
+  - Mistral Large 3 (`mistral-large-2512`, 256K) — via `OpenAICompat` at `api.mistral.ai`
+
+### Notes
+
+- Memory is non-breaking: existing callers who do not pass `:memory` see zero behavioural change.
+- The `context-management-2025-06-27` beta header is injected **only** when memory is configured. Accounts without beta access continue to see requests exactly as before.
+- The 1M-context Qwen 3 entries (`qwen3-coder-plus`, `qwen3.5-397b-a17b`) are notable — they offer a larger window than the current OpenAI/Anthropic ceilings and slot into Alloy through the generic `OpenAICompat` provider with no new code.
+
 ## [0.11.0] - 2026-04-21
 
 ### Added
