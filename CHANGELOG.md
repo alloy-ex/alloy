@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
-- **`Alloy.Agent.Server`**, **`Alloy.Session`**, and **`Alloy.Agent.Events`** now emit compile-time deprecation warnings. These modules moved to the new [`alloy_agent`](https://hex.pm/packages/alloy_agent) package as `AlloyAgent.Server`, `AlloyAgent.Session`, and `AlloyAgent.Events`. The copies in Alloy will be **removed in 0.13.0**.
+- **`Alloy.Agent.Server`**, **`Alloy.Session`**, and **`Alloy.Agent.Events`** are now documented as deprecated in HexDocs (warning admonitions on each `@moduledoc`). These modules moved to the new [`alloy_agent`](https://hex.pm/packages/alloy_agent) package as `AlloyAgent.Server`, `AlloyAgent.Session`, and `AlloyAgent.Events`. The copies in Alloy continue to work unchanged in 0.12.x and will be **removed in 0.13.0**.
+
+> **No `@deprecated` attribute / compile-time warnings yet.** The protocol loop (`Alloy.Agent.Turn`) still calls `Alloy.Agent.Events` internally, so adding `@deprecated` would break `mix compile --warnings-as-errors` for Alloy itself. The protocol/runtime split for events will be tightened in a follow-up patch ahead of 0.13.0; in the meantime, the HexDocs admonitions and the migration table below are the migration signal.
 
 ### Why
 
