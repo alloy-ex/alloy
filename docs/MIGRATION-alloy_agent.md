@@ -33,8 +33,11 @@ If your code touches any of these, yes:
 - `alias Alloy.Agent.Server`
 - `%Alloy.Session{}` as a struct
 - `Alloy.Session.new/1` or `Alloy.Session.update_from_result/2`
-- `Alloy.Agent.Events` (module rarely used directly)
 - `Alloy.send_message/3`, `Alloy.cancel_request/2` (delegates)
+
+If your code uses `Alloy.Agent.Events`, see the **0.12.2 correction**
+below — that module is now `Alloy.Events` (still in Alloy), not
+`AlloyAgent.Events`.
 
 If you only use `Alloy.run/2`, `Alloy.stream/3`, tools, providers,
 messages, results, or the memory behaviour — no changes needed.
@@ -72,11 +75,34 @@ Then `mix deps.get`.
 | `Alloy.Session.new/1` | `AlloyAgent.Session.new/1` |
 | `Alloy.Session.update_from_result/2` | `AlloyAgent.Session.update_from_result/2` |
 | `Alloy.Session.t()` (typespec) | `AlloyAgent.Session.t()` |
-| `alias Alloy.Agent.Events` (rare) | `alias AlloyAgent.Events` |
+| `alias Alloy.Agent.Events` (rare) | `alias Alloy.Events` *(corrected in 0.12.2 — see below)* |
 
 The `Alloy.Agent.{Config, State, Turn}` modules are **internal** loop
 mechanics and stay in Alloy — don't rename those. You're unlikely to
 import them directly anyway.
+
+#### Correction in Alloy 0.12.2: `Alloy.Agent.Events` stays in Alloy
+
+Alloy 0.12.1 listed `Alloy.Agent.Events` as moving to
+`AlloyAgent.Events`. **That guidance was wrong.** `Alloy.Agent.Turn`
+(the protocol loop) calls event envelope construction directly, so
+the v1 envelope format is part of Alloy's protocol surface — not a
+runtime concern. In Alloy 0.12.2 the canonical implementation lives
+at `Alloy.Events`; `Alloy.Agent.Events` is a `@deprecated` thin shim
+that delegates to it and will be removed in 0.13.0.
+
+If you migrated to `AlloyAgent.Events` based on the 0.12.1 guidance:
+switch back to `Alloy.Events`. The two implementations are
+byte-equivalent in 0.1.0 / 0.12.2, but only `Alloy.Events` will
+receive future protocol updates.
+
+```elixir
+# 0.12.1 said this — don't do this
+alias AlloyAgent.Events
+
+# 0.12.2 corrects to this
+alias Alloy.Events
+```
 
 ### 3. Default memory stores (new in alloy_agent 0.1.0)
 

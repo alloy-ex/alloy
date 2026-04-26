@@ -1,140 +1,33 @@
 defmodule Alloy.Agent.Events do
   @moduledoc """
-  Event envelope construction and runtime opts normalization.
+  Deprecated alias for `Alloy.Events`.
 
-  > #### Moved to `alloy_agent` {: .warning}
+  > #### Renamed to `Alloy.Events` {: .warning}
   >
-  > This module has moved to `AlloyAgent.Events` in the
-  > [`alloy_agent`](https://hex.pm/packages/alloy_agent) package. This
-  > copy will be removed in Alloy 0.13.0. The v1 envelope protocol is
-  > a runtime-layer concern; Alloy's loop still emits raw telemetry
-  > via `:telemetry.execute/3`.
-
-  Builds v1 event envelopes, manages sequence counters, and derives
-  correlation IDs.
+  > The v1 event envelope module has been promoted to the top-level
+  > namespace as `Alloy.Events`. It is part of Alloy's protocol surface
+  > — `Alloy.Agent.Turn` calls it directly, so it is **not** moving to
+  > the `alloy_agent` runtime package.
+  >
+  > This shim will be removed in Alloy 0.13.0. Update `alias` lines from
+  > `Alloy.Agent.Events` to `Alloy.Events`.
+  >
+  > Note: Alloy 0.12.1 incorrectly listed this module as moving to
+  > `AlloyAgent.Events`. That guidance was wrong and is retracted in
+  > 0.12.2 — see `docs/MIGRATION-alloy_agent.md` for the corrected table.
   """
 
   alias Alloy.Agent.State
 
-  @doc """
-  Normalize runtime opts for event emission.
-
-  Ensures `:on_event`, `:event_seq_ref`, and `:event_correlation_id`
-  are present in the opts keyword list.
-  """
+  @deprecated "Use Alloy.Events.normalize_opts/2 instead. Will be removed in Alloy 0.13.0."
   @spec normalize_opts(State.t(), keyword()) :: keyword()
-  def normalize_opts(%State{} = state, opts) do
-    on_event = Keyword.get(opts, :on_event) || fn _event -> :ok end
+  defdelegate normalize_opts(state, opts), to: Alloy.Events
 
-    opts
-    |> Keyword.put(:on_event, on_event)
-    |> put_new_lazy(:event_seq_ref, fn -> :atomics.new(1, signed: false) end)
-    |> put_new_lazy(:event_correlation_id, fn -> build_correlation_id(state) end)
-  end
-
-  @doc """
-  Derive a correlation ID from the agent state's context.
-
-  Precedence: `context[:request_id]` > `context[:correlation_id]` >
-  generated from `agent_id`.
-  """
+  @deprecated "Use Alloy.Events.build_correlation_id/1 instead. Will be removed in Alloy 0.13.0."
   @spec build_correlation_id(State.t()) :: binary()
-  def build_correlation_id(%State{} = state) do
-    context = state.config.context
+  defdelegate build_correlation_id(state), to: Alloy.Events
 
-    cond do
-      is_binary(Map.get(context, :request_id)) ->
-        Map.get(context, :request_id)
-
-      is_binary(Map.get(context, :correlation_id)) ->
-        Map.get(context, :correlation_id)
-
-      true ->
-        state.agent_id <> ":" <> Base.url_encode64(:crypto.strong_rand_bytes(8), padding: false)
-    end
-  end
-
-  @doc """
-  Emit an event envelope.
-
-  Builds a v1 envelope from the raw event, calls the `on_event` callback,
-  and fires a `:telemetry` event.
-  """
+  @deprecated "Use Alloy.Events.emit/3 instead. Will be removed in Alloy 0.13.0."
   @spec emit(keyword(), non_neg_integer(), term()) :: :ok
-  def emit(opts, turn, raw_event) do
-    on_event = Keyword.get(opts, :on_event) || fn _event -> :ok end
-    event_seq_ref = Keyword.get(opts, :event_seq_ref)
-    correlation_id = Keyword.get(opts, :event_correlation_id)
-
-    envelope = build_event_envelope(raw_event, event_seq_ref, correlation_id, turn)
-    on_event.(envelope)
-
-    :telemetry.execute(
-      [:alloy, :event],
-      %{seq: envelope.seq},
-      %{
-        v: envelope.v,
-        event: envelope.event,
-        correlation_id: envelope.correlation_id,
-        turn: envelope.turn
-      }
-    )
-  end
-
-  # ── Private ───────────────────────────────────────────────────────────────
-
-  defp build_event_envelope(%{v: 1} = envelope, _seq_ref, _correlation_id, _turn), do: envelope
-
-  defp build_event_envelope({event, payload}, seq_ref, correlation_id, turn)
-       when is_atom(event) do
-    {seq, effective_correlation_id, normalized_payload} =
-      normalize_event_fields(event, payload, seq_ref, correlation_id)
-
-    %{
-      v: 1,
-      seq: seq,
-      correlation_id: effective_correlation_id,
-      turn: turn,
-      ts_ms: System.system_time(:millisecond),
-      event: event,
-      payload: normalized_payload
-    }
-  end
-
-  defp build_event_envelope(raw_event, seq_ref, correlation_id, turn) do
-    %{
-      v: 1,
-      seq: next_event_seq(seq_ref),
-      correlation_id: correlation_id,
-      turn: turn,
-      ts_ms: System.system_time(:millisecond),
-      event: :runtime_event,
-      payload: raw_event
-    }
-  end
-
-  defp normalize_event_fields(event, payload, seq_ref, correlation_id)
-       when event in [:tool_start, :tool_end] and is_map(payload) do
-    seq = Map.get(payload, :event_seq) || next_event_seq(seq_ref)
-    effective_correlation_id = Map.get(payload, :correlation_id) || correlation_id
-    normalized_payload = Map.drop(payload, [:event_seq, :correlation_id])
-
-    {seq, effective_correlation_id, normalized_payload}
-  end
-
-  defp normalize_event_fields(_event, payload, seq_ref, correlation_id) do
-    {next_event_seq(seq_ref), correlation_id, payload}
-  end
-
-  defp next_event_seq(ref) do
-    :atomics.add_get(ref, 1, 1)
-  end
-
-  defp put_new_lazy(opts, key, producer) when is_list(opts) and is_function(producer, 0) do
-    if Keyword.has_key?(opts, key) do
-      opts
-    else
-      Keyword.put(opts, key, producer.())
-    end
-  end
+  defdelegate emit(opts, turn, raw_event), to: Alloy.Events
 end
