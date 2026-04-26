@@ -17,7 +17,7 @@ jobs:
       MIX_ENV: test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: erlef/setup-beam@v1
         with:
@@ -25,7 +25,7 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             deps
@@ -47,7 +47,7 @@ jobs:
       ALLOY_WEBSITE_SYNC_TOKEN: ${{ secrets.ALLOY_WEBSITE_SYNC_TOKEN }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: erlef/setup-beam@v1
         with:
@@ -55,7 +55,7 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             deps
