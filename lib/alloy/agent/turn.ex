@@ -8,8 +8,9 @@ defmodule Alloy.Agent.Turn do
   This is a pure function — no GenServer, no process overhead.
   """
 
-  alias Alloy.Agent.{Events, State}
+  alias Alloy.Agent.State
   alias Alloy.Context.Compactor
+  alias Alloy.Events
   alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.{Message, Middleware}
   alias Alloy.Provider.Retry

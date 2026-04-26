@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.2] - 2026-04-26
+
+### Changed
+
+- **`Alloy.Events`** is the new canonical module for v1 event envelope construction. The implementation moved from `Alloy.Agent.Events` to the top-level namespace because `Alloy.Agent.Turn` (the protocol loop) calls it directly — anything Turn calls is, by definition, part of Alloy's protocol surface, not a runtime concern.
+- **`Alloy.Agent.Events`** is now a `@deprecated` thin shim that delegates to `Alloy.Events`. External callers receive compile-time deprecation warnings and should switch their `alias` lines from `Alloy.Agent.Events` to `Alloy.Events`. The shim will be removed in Alloy 0.13.0.
+
+### Corrected
+
+- **Retracts the 0.12.1 guidance to migrate `Alloy.Agent.Events` → `AlloyAgent.Events`.** That guidance was wrong: `Alloy.Agent.Turn` depends on event envelope construction, so the v1 envelope format is protocol-layer (stays in Alloy), not runtime-layer (move to `alloy_agent`). The migration table in `docs/MIGRATION-alloy_agent.md` has been updated to point at `Alloy.Events` instead. Users who already migrated to `AlloyAgent.Events` based on 0.12.1 should switch back to `Alloy.Events`; the two implementations are byte-equivalent today, but only `Alloy.Events` will receive future protocol updates.
+- **`Alloy.Agent.Server`** and **`Alloy.Session`** deprecation guidance is unchanged — those modules still move to `alloy_agent` as `AlloyAgent.Server` and `AlloyAgent.Session` (they are runtime concerns Turn doesn't depend on).
+
 ## [0.12.1] - 2026-04-24
 
 ### Deprecated
