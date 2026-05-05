@@ -64,6 +64,8 @@ defmodule Alloy.ModelMetadata do
       limit: 2_000_000,
       suffix_patterns: [~r/^-\d{4}-(reasoning|non-reasoning)$/, ~r/^-multi-agent-\d{4}$/]
     },
+    # grok-4.3 — xAI frontier as of April 2026. Always-on reasoning (1M ctx).
+    %{name: "grok-4.3", limit: 1_000_000, suffix_patterns: [""]},
     # Dash notation (grok-4-1-fast-*) for backward compat
     %{name: "grok-4-1-fast-reasoning", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-1-fast-non-reasoning", limit: 2_000_000, suffix_patterns: [""]},

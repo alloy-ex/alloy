@@ -17,6 +17,8 @@ defmodule Alloy.ModelMetadataTest do
       assert ModelMetadata.context_window("grok-4.20-0309-reasoning") == 2_000_000
       assert ModelMetadata.context_window("grok-4.20-0309-non-reasoning") == 2_000_000
       assert ModelMetadata.context_window("grok-4.20-multi-agent-0309") == 2_000_000
+      # grok-4.3 — xAI frontier as of April 2026, 1M context window
+      assert ModelMetadata.context_window("grok-4.3") == 1_000_000
       # Kimi (Moonshot AI)
       assert ModelMetadata.context_window("kimi-k2.5") == 256_000
       assert ModelMetadata.context_window("kimi-k2.6") == 256_000
