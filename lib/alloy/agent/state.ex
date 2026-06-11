@@ -21,7 +21,7 @@ defmodule Alloy.Agent.State do
           error: term() | nil,
           tool_calls: [map()],
           tool_defs: [map()],
-          tool_fns: %{String.t() => module()},
+          tool_fns: %{String.t() => Alloy.Tool.Registry.tool()},
           provider_state: map(),
           provider_response_metadata: map(),
           run_metadata: map(),

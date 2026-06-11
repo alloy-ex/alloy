@@ -132,6 +132,48 @@ defmodule Alloy.Tool do
   @optional_callbacks [allowed_callers: 0, result_type: 0, max_result_chars: 0, concurrent?: 0]
 
   @doc """
+  Build an inline tool — a tool defined as data instead of a module.
+
+  Accepts the same information as the behaviour callbacks, as options.
+  The returned `Alloy.Tool.Inline` struct can be passed in `tools:`
+  alongside tool modules. Use this for tools discovered at runtime
+  (e.g., an MCP server's tool list) or one-off tools that don't warrant
+  a module:
+
+      lookup =
+        Alloy.Tool.inline(
+          name: "lookup_user",
+          description: "Look up a user by email",
+          input_schema: %{
+            type: "object",
+            properties: %{email: %{type: "string"}},
+            required: ["email"]
+          },
+          execute: fn %{"email" => email}, _context ->
+            case MyApp.Accounts.get_by_email(email) do
+              nil -> {:error, "No user with email " <> email}
+              user -> {:ok, "User: " <> user.name}
+            end
+          end
+        )
+
+  See `Alloy.Tool.Inline` for all options. Raises `ArgumentError` on
+  invalid definitions.
+  """
+  @spec inline(keyword() | map()) :: Alloy.Tool.Inline.t()
+  def inline(fields) when is_list(fields) or is_map(fields) do
+    alias Alloy.Tool.Inline
+
+    fields = Map.new(fields)
+    known = Inline.__struct__() |> Map.keys() |> List.delete(:__struct__)
+
+    case Enum.find(Map.keys(fields), &(&1 not in known)) do
+      nil -> Inline |> struct!(fields) |> Inline.validate!()
+      key -> raise ArgumentError, "unknown inline tool option: #{inspect(key)}"
+    end
+  end
+
+  @doc """
   Resolve a file path against the working directory from context.
 
   Absolute paths are returned as-is. Relative paths are joined with

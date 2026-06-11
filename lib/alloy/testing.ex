@@ -54,11 +54,12 @@ defmodule Alloy.Testing do
 
   ## Options
 
-  - `:tools` - list of tool modules (default: `[Alloy.Test.EchoTool]`)
+  - `:tools` - list of tool modules or inline tools (default: `[Alloy.Test.EchoTool]`)
   - `:system_prompt` - system prompt string
   - `:max_turns` - maximum turns (default: 10)
   - `:middleware` - list of middleware modules
   - `:working_directory` - working directory for tools
+  - `:context` - context map passed to tools and middleware (default: `%{}`)
   """
   @spec run_with_responses(String.t(), [term()], keyword()) :: State.t()
   def run_with_responses(prompt, responses, opts \\ []) do
@@ -71,7 +72,8 @@ defmodule Alloy.Testing do
       system_prompt: Keyword.get(opts, :system_prompt),
       max_turns: Keyword.get(opts, :max_turns, 10),
       middleware: Keyword.get(opts, :middleware, []),
-      working_directory: Keyword.get(opts, :working_directory, ".")
+      working_directory: Keyword.get(opts, :working_directory, "."),
+      context: Keyword.get(opts, :context, %{})
     }
 
     state = State.init(config, [Message.user(prompt)])

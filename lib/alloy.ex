@@ -40,7 +40,7 @@ defmodule Alloy do
   ## Options
 
   - `:provider` - `{module, config_keyword_list}` or just `module` (required)
-  - `:tools` - list of modules implementing `Alloy.Tool` (default: `[]`)
+  - `:tools` - list of modules implementing `Alloy.Tool` and/or `Alloy.Tool.Inline` structs built with `Alloy.Tool.inline/1` (default: `[]`)
   - `:system_prompt` - system prompt string (default: `nil`)
   - `:messages` - existing conversation history (default: `[]`)
   - `:max_turns` - maximum agent loop iterations (default: `25`)
@@ -51,6 +51,7 @@ defmodule Alloy do
   - `:context` - arbitrary map passed to tools and middleware (default: `%{}`)
   - `:max_pending` - max queued async `send_message/3` requests while one is running (default: `0`)
   - `:model_metadata_overrides` - overrides for model context windows used to derive `:max_tokens` when not set explicitly (default: `%{}`)
+  - `:model_catalog` - module implementing `Alloy.ModelCatalog`, consulted for model context windows after `:model_metadata_overrides` (default: `Alloy.ModelMetadata`)
   - `:until_tool` - tool name (string) that must be called before the loop completes. If the model signals `:end_turn` without calling this tool, the loop continues with a prompt to call it. Useful for structured output enforcement. (default: `nil`)
   """
 

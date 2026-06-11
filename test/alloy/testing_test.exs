@@ -34,6 +34,30 @@ defmodule Alloy.TestingTest do
 
       assert result.status == :completed
     end
+
+    test "passes :context through to tools" do
+      test_pid = self()
+
+      spy =
+        Alloy.Tool.inline(
+          name: "spy",
+          description: "Reports the context it receives",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, context ->
+            send(test_pid, {:ctx, context})
+            {:ok, "ok"}
+          end
+        )
+
+      result =
+        run_with_responses("Use spy", [tool_response("spy", %{}), text_response("Done")],
+          tools: [spy],
+          context: %{tenant: "acme"}
+        )
+
+      assert result.status == :completed
+      assert_received {:ctx, %{tenant: "acme"}}
+    end
   end
 
   describe "assert_tool_called/2" do

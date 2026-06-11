@@ -10,10 +10,12 @@ defmodule Alloy.Tool.Executor do
   alias Alloy.Agent.State
   alias Alloy.Message
   alias Alloy.Middleware
+  alias Alloy.Tool.Inline
+  alias Alloy.Tool.Registry
 
   require Logger
 
-  @spec execute_all([map()], %{String.t() => module()}, State.t()) ::
+  @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t()) ::
           Message.t() | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state) do
     case execute_all(tool_calls, tool_fns, state, []) do
@@ -22,7 +24,7 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
-  @spec execute_all([map()], %{String.t() => module()}, State.t(), keyword()) ::
+  @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t(), keyword()) ::
           {:ok, Message.t(), [map()]} | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
     context = build_context(state)
@@ -100,14 +102,14 @@ defmodule Alloy.Tool.Executor do
 
     {result, error, structured_data} =
       case Map.fetch(fns, call[:name]) do
-        {:ok, mod} ->
+        {:ok, tool} ->
           try do
-            case mod.execute(call[:input] || %{}, ctx) do
+            case tool_execute(tool, call[:input] || %{}, ctx) do
               {:ok, text, data} when is_map(data) ->
-                {block_fn.(call[:id], maybe_truncate(text, mod), false), nil, data}
+                {block_fn.(call[:id], maybe_truncate(text, tool), false), nil, data}
 
               {:ok, r} ->
-                {block_fn.(call[:id], maybe_truncate(r, mod), false), nil, nil}
+                {block_fn.(call[:id], maybe_truncate(r, tool), false), nil, nil}
 
               {:error, r} ->
                 {block_fn.(call[:id], r, true), r, nil}
@@ -248,49 +250,56 @@ defmodule Alloy.Tool.Executor do
 
   defp random_id, do: "run_" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
 
-  defp maybe_truncate(text, mod) when is_binary(text) do
-    if function_exported?(mod, :max_result_chars, 0) do
-      case mod.max_result_chars() do
-        :unlimited ->
+  # ── Tool dispatch (module or Alloy.Tool.Inline) ──────────────────────────
+
+  defp tool_execute(%Inline{execute: fun}, input, ctx), do: fun.(input, ctx)
+  defp tool_execute(mod, input, ctx), do: mod.execute(input, ctx)
+
+  defp tool_max_result_chars(%Inline{max_result_chars: max}), do: max
+
+  defp tool_max_result_chars(mod) do
+    if function_exported?(mod, :max_result_chars, 0), do: mod.max_result_chars()
+  end
+
+  defp tool_sequential?(%Inline{concurrent?: concurrent?}), do: concurrent? == false
+
+  defp tool_sequential?(mod) do
+    function_exported?(mod, :concurrent?, 0) and mod.concurrent?() == false
+  end
+
+  defp maybe_truncate(text, tool) when is_binary(text) do
+    case tool_max_result_chars(tool) do
+      max when is_integer(max) and max > 0 ->
+        len = String.length(text)
+
+        if len > max do
+          head = div(max * 4, 5)
+          tail = max - head
+
+          String.slice(text, 0, head) <>
+            "\n\n[truncated " <>
+            Integer.to_string(len) <>
+            " -> " <>
+            Integer.to_string(max) <>
+            " chars]\n\n" <>
+            String.slice(text, -tail, tail)
+        else
           text
+        end
 
-        max when is_integer(max) ->
-          len = String.length(text)
-
-          if len > max do
-            head = div(max * 4, 5)
-            tail = max - head
-
-            String.slice(text, 0, head) <>
-              "\n\n[truncated " <>
-              Integer.to_string(len) <>
-              " -> " <>
-              Integer.to_string(max) <>
-              " chars]\n\n" <>
-              String.slice(text, -tail, tail)
-          else
-            text
-          end
-
-        _ ->
-          text
-      end
-    else
-      text
+      _unlimited_or_nil ->
+        text
     end
   end
 
-  defp maybe_truncate(text, _mod), do: text
+  defp maybe_truncate(text, _tool), do: text
 
   defp partition_by_concurrency(tagged, tool_fns) do
     Enum.split_with(tagged, fn
       {:execute, call} ->
         case Map.fetch(tool_fns, call[:name]) do
-          {:ok, mod} ->
-            function_exported?(mod, :concurrent?, 0) and mod.concurrent?() == false
-
-          :error ->
-            false
+          {:ok, tool} -> tool_sequential?(tool)
+          :error -> false
         end
 
       {:blocked, _, _} ->
