@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.12.2"
+  @version "0.12.3"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -34,7 +34,10 @@ defmodule Alloy.MixProject do
 
   defp deps do
     [
-      {:req, "~> 0.5"},
+      # ~> 0.6 floor: req 0.6.0 fixes GHSA-px9f-whj3-246m (multipart header
+      # injection) and GHSA-655f-mp8p-96gv (decompression bomb) — relevant
+      # because Alloy can target user-configured OpenAI-compatible endpoints.
+      {:req, "~> 0.6"},
       {:jason, "~> 1.2"},
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
@@ -58,12 +61,23 @@ defmodule Alloy.MixProject do
       main: "Alloy",
       source_url: @source_url,
       source_ref: "v#{@version}",
+      extras: [
+        "docs/events.md",
+        "docs/recipes/sub-agents.md",
+        "docs/recipes/mcp-tools.md",
+        "livebooks/quickstart.livemd"
+      ],
+      groups_for_extras: [
+        Guides: ~r{docs/events\.md|livebooks/.*},
+        Recipes: ~r{docs/recipes/.*}
+      ],
       groups_for_modules: [
         Core: [
           Alloy,
           Alloy.Agent.Config,
           Alloy.Agent.Events,
           Alloy.Agent.Server,
+          Alloy.ModelCatalog,
           Alloy.ModelMetadata,
           Alloy.Agent.State,
           Alloy.Agent.Turn,
@@ -85,6 +99,7 @@ defmodule Alloy.MixProject do
         ],
         Tools: [
           Alloy.Tool,
+          Alloy.Tool.Inline,
           Alloy.Tool.Core.Bash,
           Alloy.Tool.Core.Read,
           Alloy.Tool.Core.Write,

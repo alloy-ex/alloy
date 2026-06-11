@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.3] - 2026-06-11
+
+### Added
+
+- **Model catalog refresh.** Added `claude-fable-5` and `claude-opus-4-8`
+  (1M-token context windows), `gpt-5.5`, and `gemini-3.5-flash` to the
+  built-in catalog.
+- **Docs:** v1 event envelope specification (`docs/events.md`) documenting
+  the `:on_event` contract; a runnable Livebook quickstart
+  (`livebooks/quickstart.livemd`); README repositioned around the
+  harness-not-framework premise with honest bash-sandboxing language.
+- **`alloy_agent` status clarified.** README and the migration doc now state
+  plainly that `alloy_agent` is not yet on Hex and that the 0.13 removals
+  will not happen before it ships.
+
+- **Inline tool definitions (`Alloy.Tool.inline/1`).** Tools can now be
+  defined as data — an `Alloy.Tool.Inline` struct with `name`, `description`,
+  `input_schema`, and a 2-arity `execute` function — and passed in `tools:`
+  alongside tool modules. This unlocks tools discovered at runtime (e.g.,
+  building one tool per MCP-server tool from its discovery response — see the
+  MCP recipe) and one-off tools that don't warrant a module. Optional fields
+  mirror the behaviour's optional callbacks (`concurrent?`,
+  `max_result_chars`, `allowed_callers`, `result_type`). The executor treats
+  both kinds identically: same crash isolation, truncation, events, and
+  parallel execution.
+- **`Alloy.Testing.run_with_responses/3` accepts `:context`**, so tools that
+  read from the agent context can be tested without dropping down to
+  `Alloy.run/2`.
+
+- **Recipes (hexdocs guides).** Two new documented, tested patterns instead of
+  new core features: *Sub-agents as tools* (delegation via a ~30-line tool
+  whose `execute/2` calls `Alloy.run/2`, verified verbatim in
+  `test/alloy/recipes/sub_agent_recipe_test.exs`) and *MCP servers as tools*
+  (a single gateway tool over `anubis_mcp`, keeping context cost to one tool
+  definition). Core stays loop-only by design.
+
+- **Pluggable model catalog (`Alloy.ModelCatalog`).** The built-in
+  `Alloy.ModelMetadata` is now just the default implementation of a new
+  behaviour. Pass any module implementing `context_window/1` (and optionally
+  `default_context_window/0`) via the new `:model_catalog` option to source
+  context windows from your own catalog — a static map, your own service, or
+  an adapter over `llm_db`. Resolution order: explicit `:max_tokens` →
+  `:model_metadata_overrides` → `:model_catalog` → default window.
+  `Alloy.ModelMetadata.override_window/2` is new public API supporting this
+  split. Fully backward compatible: the default catalog and override
+  semantics are unchanged.
+
+### Changed
+
+- **Elixir 1.20 / OTP 28 support.** Verified on Elixir 1.20.1 (gradual type
+  checker) with zero warnings; CI matrix now tests 1.20/OTP 28 and 1.19/OTP 27.
+  The `~> 1.17` requirement is unchanged.
+- **req `~> 0.6` (security).** req 0.6.0 fixes GHSA-px9f-whj3-246m (multipart
+  header injection) and GHSA-655f-mp8p-96gv (decompression bomb). The floor is
+  bumped because Alloy can target user-configured OpenAI-compatible endpoints,
+  which is the malicious-server vector the bomb fix addresses.
+- Dev/test deps updated: credo 1.7.19 (1.7.16 crashes under Elixir 1.20),
+  jason 1.4.5, telemetry 1.4.2, plug 1.19.2, ex_doc 0.40.3.
+
+### Fixed
+
+- Removed a dead `parse_assistant_content/1` fallback clause in
+  `Alloy.Provider.OpenAI` (flagged as unreachable by the Elixir 1.20 type
+  checker).
+- Internal tests no longer call the deprecated `Alloy.Agent.Events` shim;
+  the suite now exercises `Alloy.Events` directly
+  (`test/alloy/events_test.exs`).
+
 ## [0.12.2] - 2026-04-26
 
 ### Changed
