@@ -193,8 +193,8 @@ defmodule Alloy.StreamingTest do
         provider_config: %{}
       }
 
-      # Accessing a non-existent key on a struct raises KeyError
-      assert_raise KeyError, fn -> Map.fetch!(config, :streaming) end
+      # The struct must not define a :streaming key
+      refute Map.has_key?(Map.from_struct(config), :streaming)
     end
   end
 

@@ -545,8 +545,6 @@ defmodule Alloy.Provider.OpenAI do
     end)
   end
 
-  defp parse_assistant_content(_content), do: []
-
   defp parse_stop_reason(content_blocks) do
     if Enum.any?(content_blocks, &(&1.type == "tool_use")), do: :tool_use, else: :end_turn
   end

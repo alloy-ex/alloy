@@ -1,7 +1,8 @@
-defmodule Alloy.Agent.EventsTest do
+defmodule Alloy.EventsTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Agent.{Config, Events, State}
+  alias Alloy.Agent.{Config, State}
+  alias Alloy.Events
 
   defp build_state(context \\ %{}) do
     config = %Config{

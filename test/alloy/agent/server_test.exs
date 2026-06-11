@@ -585,7 +585,7 @@ defmodule Alloy.Agent.ServerTest do
     test "agent_event broadcasts to session-ID-based topic, not agent_id topic", %{pubsub: pubsub} do
       pid = start_provider([TestProvider.text_response("session id response")])
 
-      {:ok, agent} =
+      {:ok, _agent} =
         Server.start_link(
           opts(pid,
             pubsub: pubsub,
