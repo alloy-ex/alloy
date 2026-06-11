@@ -1,11 +1,19 @@
 defmodule Alloy.ModelMetadata do
   @moduledoc """
-  Provider model metadata used for context budgeting.
+  Built-in model metadata catalog used for context budgeting.
 
-  The primary consumer today is `Alloy.Context.Compactor`, but this module
-  keeps model-window knowledge in one place so provider updates do not require
-  editing token estimation logic directly.
+  This is the default implementation of the `Alloy.ModelCatalog` behaviour.
+  It ships a small, hand-curated set of entries so Alloy works out of the
+  box; it is not meant to track every model release. To use a richer or
+  self-maintained source (a static map, your own service, or an adapter over
+  [`llm_db`](https://hex.pm/packages/llm_db)), implement `Alloy.ModelCatalog`
+  and pass the module via the `:model_catalog` option.
+
+  Per-run tweaks that don't warrant a catalog module belong in
+  `:model_metadata_overrides` — overrides always win over any catalog.
   """
+
+  @behaviour Alloy.ModelCatalog
 
   @type model_entry :: %{
           name: String.t(),
@@ -25,6 +33,10 @@ defmodule Alloy.ModelMetadata do
   @model_entries [
     %{name: "o3-pro", limit: 200_000, suffix_patterns: [""]},
     %{name: "gemini-flash-latest", limit: 1_048_576, suffix_patterns: [""]},
+    # Fable 5 and Opus 4.8 ship with a 1M-token context window by default
+    # on the Claude API (June 2026).
+    %{name: "claude-fable-5", limit: 1_000_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
+    %{name: "claude-opus-4-8", limit: 1_000_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
     %{name: "claude-opus-4-6", limit: 200_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
     %{name: "claude-sonnet-4-6", limit: 200_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
     %{name: "claude-haiku-4-5", limit: 200_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
@@ -32,6 +44,9 @@ defmodule Alloy.ModelMetadata do
     %{name: "gpt-5.1", limit: 400_000, suffix_patterns: ["", ~r/^-\d{4}-\d{2}-\d{2}$/]},
     %{name: "gpt-5.2", limit: 400_000, suffix_patterns: ["", ~r/^-\d{4}-\d{2}-\d{2}$/]},
     %{name: "gpt-5.4", limit: 1_050_000, suffix_patterns: ["", ~r/^-\d{4}-\d{2}-\d{2}$/]},
+    # GPT-5.5 (API, Apr 2026). 400k window per current reporting; if OpenAI
+    # documents a larger window, prefer an override until this is updated.
+    %{name: "gpt-5.5", limit: 400_000, suffix_patterns: ["", ~r/^-\d{4}-\d{2}-\d{2}$/]},
     %{
       name: "gemini-2.5-flash",
       limit: 1_048_576,
@@ -53,6 +68,13 @@ defmodule Alloy.ModelMetadata do
       suffix_patterns: ["", ~r/^-\d{2}-\d{4}$/]
     },
     %{name: "gemini-3-pro-preview", limit: 1_048_576, suffix_patterns: ["", ~r/^-\d{2}-\d{4}$/]},
+    # Gemini 3.5 Flash is GA (June 2026); 3.5 Pro is still in limited preview
+    # and intentionally omitted until its GA model id is stable.
+    %{
+      name: "gemini-3.5-flash",
+      limit: 1_048_576,
+      suffix_patterns: ["", ~r/^-preview-\d{2}-\d{4}$/]
+    },
     %{name: "grok-4", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-fast-reasoning", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-fast-non-reasoning", limit: 2_000_000, suffix_patterns: [""]},
@@ -106,7 +128,20 @@ defmodule Alloy.ModelMetadata do
   ]
 
   @doc """
-  Returns the known context window limit for a model name.
+  Returns the known context window limit for a model name
+  (`Alloy.ModelCatalog` callback).
+
+  Returns `nil` when the model is not in the built-in catalog.
+  """
+  @impl Alloy.ModelCatalog
+  @spec context_window(String.t()) :: pos_integer() | nil
+  def context_window(model_name) when is_binary(model_name) do
+    context_window(model_name, %{})
+  end
+
+  @doc """
+  Returns the known context window limit for a model name, consulting
+  `overrides` ahead of the built-in catalog.
 
   `overrides` may provide exact-model or family overrides as either:
 
@@ -123,7 +158,7 @@ defmodule Alloy.ModelMetadata do
           %{optional(String.t()) => override_entry()} | [{String.t(), override_entry()}]
         ) ::
           pos_integer() | nil
-  def context_window(model_name, overrides \\ %{}) when is_binary(model_name) do
+  def context_window(model_name, overrides) when is_binary(model_name) do
     entries = override_entries(overrides) ++ @model_entries
 
     Enum.find_value(entries, fn entry ->
@@ -132,8 +167,28 @@ defmodule Alloy.ModelMetadata do
   end
 
   @doc """
+  Returns the context window for `model_name` from `overrides` alone,
+  ignoring the built-in catalog.
+
+  Used to apply `:model_metadata_overrides` ahead of any
+  `Alloy.ModelCatalog` implementation. Returns `nil` when no override
+  matches.
+  """
+  @spec override_window(
+          String.t(),
+          %{optional(String.t()) => override_entry()} | [{String.t(), override_entry()}]
+        ) ::
+          pos_integer() | nil
+  def override_window(model_name, overrides) when is_binary(model_name) do
+    Enum.find_value(override_entries(overrides), fn entry ->
+      if match_entry?(entry, model_name), do: entry.limit
+    end)
+  end
+
+  @doc """
   Returns the default fallback context window for unknown models.
   """
+  @impl Alloy.ModelCatalog
   @spec default_context_window() :: pos_integer()
   def default_context_window, do: @default_limit
 

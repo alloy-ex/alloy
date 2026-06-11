@@ -28,7 +28,7 @@ defmodule Alloy.Agent.Config do
   @type t :: %__MODULE__{
           provider: module(),
           provider_config: map(),
-          tools: [module()],
+          tools: [module() | Alloy.Tool.Inline.t()],
           system_prompt: String.t() | nil,
           max_turns: pos_integer(),
           max_tokens: pos_integer(),
@@ -53,6 +53,7 @@ defmodule Alloy.Agent.Config do
           fallback_providers: [{module(), map()}],
           code_execution: boolean(),
           model_metadata_overrides: map(),
+          model_catalog: module(),
           max_budget_cents: number() | nil,
           until_tool: String.t() | nil,
           memory: memory()
@@ -84,6 +85,7 @@ defmodule Alloy.Agent.Config do
     fallback_providers: [],
     code_execution: false,
     model_metadata_overrides: %{},
+    model_catalog: ModelMetadata,
     max_budget_cents: nil,
     until_tool: nil,
     memory: nil
@@ -97,6 +99,10 @@ defmodule Alloy.Agent.Config do
     {provider_mod, provider_config} = parse_provider(opts[:provider])
     provider_config = normalize_provider_config(provider_config)
     model_metadata_overrides = normalize_model_metadata_overrides(opts[:model_metadata_overrides])
+
+    model_catalog =
+      Alloy.ModelCatalog.validate!(Keyword.get(opts, :model_catalog, ModelMetadata))
+
     max_tokens_explicit? = Keyword.has_key?(opts, :max_tokens)
 
     max_tokens =
@@ -104,6 +110,7 @@ defmodule Alloy.Agent.Config do
         opts,
         provider_config,
         model_metadata_overrides,
+        model_catalog,
         max_tokens_explicit?
       )
 
@@ -137,6 +144,7 @@ defmodule Alloy.Agent.Config do
         |> Enum.map(&parse_fallback_provider/1),
       code_execution: Keyword.get(opts, :code_execution, false),
       model_metadata_overrides: model_metadata_overrides,
+      model_catalog: model_catalog,
       max_budget_cents: Keyword.get(opts, :max_budget_cents),
       until_tool: Keyword.get(opts, :until_tool),
       memory: validate_memory(Keyword.get(opts, :memory), provider_mod)
@@ -167,7 +175,7 @@ defmodule Alloy.Agent.Config do
   Returns an updated config with a new provider while preserving unrelated options.
 
   If `max_tokens` was not set explicitly, the budget is re-derived from the new
-  provider model and current `model_metadata_overrides`.
+  provider model, current `model_metadata_overrides`, and `model_catalog`.
   """
   @spec with_provider(t(), module() | {module(), keyword() | map()}) :: t()
   def with_provider(%__MODULE__{} = config, provider) do
@@ -178,7 +186,11 @@ defmodule Alloy.Agent.Config do
       if config.max_tokens_explicit? do
         config.max_tokens
       else
-        default_max_tokens(model_name(provider_config), config.model_metadata_overrides)
+        default_max_tokens(
+          model_name(provider_config),
+          config.model_metadata_overrides,
+          config.model_catalog
+        )
       end
 
     compaction =
@@ -236,13 +248,19 @@ defmodule Alloy.Agent.Config do
   defp normalize_model_metadata_overrides(nil), do: %{}
   defp normalize_model_metadata_overrides(_), do: %{}
 
-  defp resolve_max_tokens(opts, provider_config, model_metadata_overrides, max_tokens_explicit?) do
+  defp resolve_max_tokens(
+         opts,
+         provider_config,
+         model_metadata_overrides,
+         model_catalog,
+         max_tokens_explicit?
+       ) do
     if max_tokens_explicit? do
       Keyword.fetch!(opts, :max_tokens)
     else
       provider_config
       |> model_name()
-      |> default_max_tokens(model_metadata_overrides)
+      |> default_max_tokens(model_metadata_overrides, model_catalog)
     end
   end
 
@@ -250,13 +268,18 @@ defmodule Alloy.Agent.Config do
     Map.get(provider_config, :model) || Map.get(provider_config, "model")
   end
 
-  defp default_max_tokens(model_name, model_metadata_overrides) when is_binary(model_name) do
-    ModelMetadata.context_window(model_name, model_metadata_overrides) ||
-      ModelMetadata.default_context_window()
+  # Resolution order: :model_metadata_overrides beat any catalog; the
+  # catalog (built-in or user-supplied via :model_catalog) is consulted
+  # next; unknown models fall back to the catalog's default window.
+  defp default_max_tokens(model_name, model_metadata_overrides, model_catalog)
+       when is_binary(model_name) do
+    ModelMetadata.override_window(model_name, model_metadata_overrides) ||
+      model_catalog.context_window(model_name) ||
+      Alloy.ModelCatalog.default_window(model_catalog)
   end
 
-  defp default_max_tokens(_model_name, _model_metadata_overrides) do
-    ModelMetadata.default_context_window()
+  defp default_max_tokens(_model_name, _model_metadata_overrides, model_catalog) do
+    Alloy.ModelCatalog.default_window(model_catalog)
   end
 
   defp resolve_compaction(raw_compaction, max_tokens) do
