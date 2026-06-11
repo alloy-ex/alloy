@@ -1,0 +1,147 @@
+# Alloy Quickstart
+
+```elixir
+Mix.install([
+  {:alloy, "~> 0.12"},
+  {:kino, "~> 0.14"}
+])
+```
+
+## What this notebook covers
+
+Alloy is the completion–tool-call loop and nothing else. In ten minutes
+you'll run a one-shot agent, give it tools (including one defined inline in
+this notebook), stream tokens live, and test an agent without any HTTP.
+
+You need an API key for at least one provider. Set it as a Livebook secret
+named `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` / `GOOGLE_API_KEY` and adjust
+the provider tuples below).
+
+```elixir
+provider =
+  {Alloy.Provider.Anthropic,
+   api_key: System.fetch_env!("LB_ANTHROPIC_API_KEY"),
+   model: "claude-haiku-4-5"}
+```
+
+## 1. One-shot run
+
+`Alloy.run/2` is a pure function: messages in, result out. No processes to
+start, nothing to supervise.
+
+```elixir
+{:ok, result} = Alloy.run("In one sentence: why is the BEAM good at agents?",
+  provider: provider
+)
+
+result.text
+```
+
+The result also carries usage and per-call metadata:
+
+```elixir
+{result.usage, result.turns, result.status}
+```
+
+## 2. Give it a tool
+
+Built-in tools cover files and shell. `Alloy.Tool.Core.Read` is safe to try
+from a notebook:
+
+```elixir
+{:ok, result} = Alloy.run(
+  "Read mix.exs in this directory and tell me the Elixir version requirement",
+  provider: provider,
+  tools: [Alloy.Tool.Core.Read],
+  context: %{allowed_paths: [File.cwd!()]}
+)
+
+result.text
+```
+
+## 3. Define a tool inline
+
+Any function becomes a tool with `Alloy.Tool.inline/1` — no module needed.
+Here's a tool backed by plain Elixir:
+
+```elixir
+word_count =
+  Alloy.Tool.inline(
+    name: "word_count",
+    description: "Count the words in a piece of text",
+    input_schema: %{
+      type: "object",
+      properties: %{text: %{type: "string"}},
+      required: ["text"]
+    },
+    execute: fn %{"text" => text}, _context ->
+      {:ok, "#{length(String.split(text))} words"}
+    end
+  )
+
+{:ok, result} = Alloy.run(
+  "Use the word_count tool on this sentence: 'the BEAM runs the loop'",
+  provider: provider,
+  tools: [word_count]
+)
+
+result.text
+```
+
+## 4. Stream tokens live
+
+`Alloy.stream/3` calls your function with each text chunk. With Kino, that's
+a live-updating frame:
+
+```elixir
+frame = Kino.Frame.new()
+Kino.render(frame)
+
+buffer = :ets.new(:buf, [:public])
+:ets.insert(buffer, {:text, ""})
+
+{:ok, _result} = Alloy.stream(
+  "Write a haiku about supervision trees",
+  fn chunk ->
+    [{:text, acc}] = :ets.lookup(buffer, :text)
+    text = acc <> chunk
+    :ets.insert(buffer, {:text, text})
+    Kino.Frame.render(frame, Kino.Markdown.new(text))
+  end,
+  provider: provider
+)
+
+:done
+```
+
+For structured events (tool start/end, thinking deltas), pass `:on_event` —
+see the [event envelope spec](https://hexdocs.pm/alloy/events.html).
+
+## 5. Test without HTTP
+
+`Alloy.Testing` scripts provider responses so agent logic is testable in
+pure ExUnit — also handy in a notebook:
+
+```elixir
+import Alloy.Testing
+
+result =
+  run_with_responses("Count the words", [
+    tool_response("word_count", %{"text" => "one two three"}),
+    text_response("There are 3 words.")
+  ],
+    tools: [word_count]
+  )
+
+{result.status, last_text(result)}
+```
+
+## Where to go next
+
+* [Sub-agents as tools](https://hexdocs.pm/alloy/sub-agents.html) — delegation in ~30 lines
+* [MCP servers as tools](https://hexdocs.pm/alloy/mcp-tools.html) — mount external toolboxes
+* [Event envelope spec](https://hexdocs.pm/alloy/events.html) — build UIs on run events
+* `Alloy.Middleware` — block or edit tool calls (human-in-the-loop)
+```elixir
+:ok
+```

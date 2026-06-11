@@ -1,8 +1,14 @@
 # Migrating runtime concerns to `alloy_agent`
 
+> **Status (June 2026): `alloy_agent` is not yet published to Hex.** It is
+> in development as a sibling project. Until it ships there is nothing to
+> migrate *to* — keep using `Alloy.Agent.Server` and `Alloy.Session` from
+> this package. The 0.13.0 removals described below will not happen before
+> `alloy_agent` 0.1 is available on Hex. This doc describes the migration
+> you'll run when it is.
+
 Alloy 0.12.1 marks `Alloy.Agent.Server`, `Alloy.Session`, and
-`Alloy.Agent.Events` as moved to the new
-[`alloy_agent`](https://hex.pm/packages/alloy_agent) package. These
+`Alloy.Agent.Events` as moved to the new `alloy_agent` package. These
 modules continue to work in 0.12.x but will be **removed in Alloy 0.13.0**.
 
 This doc is the migration you want to run now — once, mechanically,

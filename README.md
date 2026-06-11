@@ -7,7 +7,9 @@
 
 **Minimal, OTP-native agent loop for Elixir.**
 
-Alloy is the completion-tool-call loop and nothing else. Send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. Run agents as supervised GenServers. No opinions on sessions, persistence, memory, scheduling, or UI — those belong in your application.
+Alloy is the completion-tool-call loop and nothing else. Send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. No opinions on sessions, persistence, memory, scheduling, or UI — those belong in your application, where OTP already gives you the runtime.
+
+Alloy is [Pi](https://github.com/badlogic/pi-mono)'s philosophy brought to the BEAM: a harness, not a framework. Three runtime dependencies, ~7,500 lines — small enough to read in an afternoon, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and tell me the version",
@@ -20,25 +22,7 @@ result.text #=> "The version is 0.12.0"
 
 ## Why Alloy?
 
-Most agent frameworks try to be everything — sessions, memory, RAG, multi-agent orchestration, scheduling, UI. Alloy does one thing well: the agent loop. Inspired by [Pi Agent](https://github.com/badlogic/pi-mono)'s minimalism, Alloy brings the same philosophy to the BEAM with OTP's natural advantages: supervision, fault isolation, parallel tool execution, and real concurrency.
-
-- **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
-- **4 built-in tools** — read, write, edit, bash
-- **GenServer agents** — supervised, stateful, message-passing
-- **Streaming** — token-by-token from any provider, unified interface
-- **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
-- **Middleware** — custom hooks, tool blocking, argument editing
-- **Context compaction** — summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
-- **Memory primitive** — `Alloy.Memory` behaviour for Anthropic's `memory_20250818` tool. Alloy owns the wire format and path validation; you own the store (in-memory, disk, Postgres — whatever fits)
-- **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
-- **Reasoning blocks** — DeepSeek/xAI `reasoning_content` parsed as first-class thinking blocks
-- **Tool safety** — `concurrent?/0` controls parallel execution, `max_result_chars/0` caps output, prompt-too-long auto-recovery
-- **Structured output** — `until_tool` forces the loop to continue until a specific tool is called
-- **Provider passthrough** — `extra_body` injects arbitrary provider-specific params (response_format, temperature, reasoning_effort)
-- **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
-- **Cost guard** — `max_budget_cents` halts the loop before overspending
-- **OTP-native** — supervision trees, hot code reloading, real parallel tool execution
-- **~7,500 lines** — small enough to read, understand, and extend
+Most agent frameworks try to be everything — sessions, memory, RAG, multi-agent orchestration, scheduling, UI. Alloy does one thing well: the agent loop. The BEAM makes the rest cheaper than a framework can: sub-agents are supervised function calls ([recipe](https://hexdocs.pm/alloy/sub-agents.html)), MCP servers mount as tools ([recipe](https://hexdocs.pm/alloy/mcp-tools.html)), parallel tool execution is `Task.Supervisor`, and crash isolation is just processes.
 
 ## Design Boundary
 
@@ -64,6 +48,26 @@ and could help any Alloy consumer, it likely belongs here. If it needs a
 database table, product defaults, UI decisions, or tenancy logic, it belongs in
 your application layer.
 
+## What's in the box
+
+- **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
+- **4 built-in tools** — read, write, edit, bash — plus inline tools defined as data with `Alloy.Tool.inline/1`
+- **GenServer agents** — supervised, stateful, message-passing (moving to the optional `alloy_agent` runtime package in 0.13)
+- **Streaming** — token-by-token from any provider, unified interface
+- **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
+- **Middleware** — custom hooks, tool blocking, argument editing
+- **Context compaction** — summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
+- **Memory primitive** — `Alloy.Memory` behaviour for Anthropic's `memory_20250818` tool. Alloy owns the wire format and path validation; you own the store (in-memory, disk, Postgres — whatever fits)
+- **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
+- **Reasoning blocks** — DeepSeek/xAI `reasoning_content` parsed as first-class thinking blocks
+- **Tool guardrails** — `concurrent?/0` controls parallel execution, `max_result_chars/0` caps output, prompt-too-long auto-recovery. Note: the bash tool's restricted mode is a guardrail, not a sandbox — see [Built-in tools](#built-in-tools)
+- **Structured output** — `until_tool` forces the loop to continue until a specific tool is called
+- **Provider passthrough** — `extra_body` injects arbitrary provider-specific params (response_format, temperature, reasoning_effort)
+- **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
+- **Cost guard** — `max_budget_cents` halts the loop before overspending
+- **Pluggable model catalog** — `Alloy.ModelCatalog` behaviour; bring your own context-window source (e.g., an `llm_db` adapter)
+- **~7,500 lines** — small enough to read, understand, and extend
+
 ## Installation
 
 Add `alloy` to your dependencies in `mix.exs`:
@@ -71,14 +75,20 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.12"},
-    # Optional: supervised runtime wrapper (sessions, async dispatch, memory stores)
-    {:alloy_agent, "~> 0.1"}
+    {:alloy, "~> 0.12"}
   ]
 end
 ```
 
+> **Note:** the optional `alloy_agent` runtime wrapper (sessions, async
+> dispatch, memory stores) referenced by the 0.12.x deprecation notices is
+> **not yet published** to Hex. Until it ships, keep using
+> `Alloy.Agent.Server` and `Alloy.Session` from this package — the 0.13
+> removals will not happen before `alloy_agent` is available.
+
 ## Quick Start
+
+Prefer a runnable version? [![Run in Livebook](https://livebook.dev/badge/v1/blue.svg)](https://livebook.dev/run?url=https%3A%2F%2Fraw.githubusercontent.com%2Falloy-ex%2Falloy%2Fmain%2Flivebooks%2Fquickstart.livemd)
 
 ### Simple completion
 
@@ -243,6 +253,38 @@ before Alloy ships a catalog update, override it in config:
 Set `max_tokens` explicitly when you want a fixed compaction budget. Otherwise
 Alloy derives it from the current model, including after
 `Alloy.Agent.Server.set_model/2` switches to a different provider model.
+
+### Pluggable model catalog
+
+The built-in catalog is deliberately small — Alloy is a harness, not a model
+database, and a hand-curated list will always lag the release treadmill. For a
+richer source of truth, implement the `Alloy.ModelCatalog` behaviour and pass
+it via `model_catalog:`. For example, backed by
+[`llm_db`](https://hex.pm/packages/llm_db) (45+ providers, maintained against
+models.dev):
+
+```elixir
+defmodule MyApp.LlmDbCatalog do
+  @behaviour Alloy.ModelCatalog
+
+  @impl true
+  def context_window(model) do
+    case LLMDb.model(model) do
+      %{context_window: limit} when is_integer(limit) -> limit
+      _ -> nil
+    end
+  end
+end
+
+{:ok, result} = Alloy.run("Summarise this repository",
+  provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"},
+  model_catalog: MyApp.LlmDbCatalog
+)
+```
+
+Resolution order: explicit `max_tokens` → `model_metadata_overrides` →
+`model_catalog` → default window. Returning `nil` for an unknown model is
+fine — Alloy falls back to the default.
 
 Use `compaction:` when you want to tune how much room Alloy reserves before it
 summarizes older context:
@@ -523,6 +565,14 @@ Just set `api_url`, `model`, and optionally `api_key` and `chat_path`.
 | **edit** | `Alloy.Tool.Core.Edit` | Search-and-replace editing |
 | **bash** | `Alloy.Tool.Core.Bash` | Execute shell commands (restricted shell by default) |
 
+> **Bash is a guardrail, not a sandbox.** Restricted mode (`bash -r`) blocks
+> `cd`, `PATH` changes, and redirection — but any interpreter on `PATH`
+> (`python3 -c`, `perl -e`) gives full capability, so treat it as a speed
+> bump against accidents, not an isolation boundary. For real isolation,
+> supply your own `:bash_executor` in context (container, jail, firejail, or
+> a remote runner) and restrict file tools with `:allowed_paths`. Treat the
+> agent's shell access as you would a contractor's laptop on your network.
+
 ### Custom tools
 
 ```elixir
@@ -551,6 +601,38 @@ defmodule MyApp.Tools.WebSearch do
   end
 end
 ```
+
+### Inline tools
+
+For one-off tools, or tools discovered at runtime (an MCP server's tool
+list, user-defined actions from a database), define a tool as data with
+`Alloy.Tool.inline/1` — no module needed. Inline tools and tool modules
+mix freely in `tools:`:
+
+```elixir
+weather =
+  Alloy.Tool.inline(
+    name: "get_weather",
+    description: "Get current weather for a location",
+    input_schema: %{
+      type: "object",
+      properties: %{location: %{type: "string"}},
+      required: ["location"]
+    },
+    execute: fn %{"location" => loc}, _context ->
+      {:ok, MyApp.Weather.current(loc)}
+    end
+  )
+
+{:ok, result} = Alloy.run("What's the weather in Sydney?",
+  provider: provider,
+  tools: [weather, Alloy.Tool.Core.Read]
+)
+```
+
+Optional fields mirror the behaviour's optional callbacks: `concurrent?:`,
+`max_result_chars:`, `allowed_callers:`, `result_type:`. See
+`Alloy.Tool.Inline` for details.
 
 ### Code execution (Anthropic)
 
