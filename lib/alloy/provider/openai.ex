@@ -181,11 +181,24 @@ defmodule Alloy.Provider.OpenAI do
     tools =
       Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
 
-    case tools do
-      [] -> body
-      defs -> Map.put(body, "tools", defs)
-    end
+    body =
+      case tools do
+        [] -> body
+        defs -> Map.put(body, "tools", defs)
+      end
+
+    # Merge extra_body LAST so caller can override any field (#18)
+    Map.merge(body, stringify_extra_body(Map.get(config, :extra_body, %{})))
   end
+
+  defp stringify_extra_body(extra_body) when is_map(extra_body) do
+    Map.new(extra_body, fn
+      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+      {key, value} -> {key, value}
+    end)
+  end
+
+  defp stringify_extra_body(_), do: %{}
 
   defp maybe_put_previous_response_id(body, config) do
     previous_response_id =

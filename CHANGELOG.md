@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.12.3] - 2026-06-11
 
+### Fixed
+
+- **Gemini 3.x thought signatures in `OpenAICompat`** (lands PR #24):
+  `thought_signature` from `extra_content.google` is preserved on tool_use
+  blocks and echoed back on subsequent turns — without it Gemini 3.x returns
+  HTTP 400 on multi-turn tool calls. Also handles Gemini's list-shaped error
+  bodies (previously a `FunctionClauseError`) and adds a `parse_error`
+  catch-all.
+- **`Config.on_shutdown` type broadened to `(struct() -> any())`** (#40) so
+  `alloy_agent`'s session struct satisfies dialyzer without a suppression.
+
 ### Added
+
+- **`extra_body` on the native OpenAI (Responses) provider** (#18), merged
+  last so callers can override any request field; atom keys are stringified.
+  Brings the Responses provider to parity with `OpenAICompat`.
+- **`grok-4.3` in the model catalog** (lands PR #41): xAI's current frontier
+  model, 1M context window; xAI provider docs updated to reference it.
+- **Mistral usage example** in the `OpenAICompat` moduledoc (#19).
 
 - **Model catalog refresh.** Added `claude-fable-5` and `claude-opus-4-8`
   (1M-token context windows), `gpt-5.5`, and `gemini-3.5-flash` to the

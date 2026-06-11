@@ -278,6 +278,56 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
+  describe "complete/3 extra_body merge" do
+    test "extra_body params appear in the request body" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:extra_body, %{
+          "reasoning" => %{"effort" => "high"},
+          "temperature" => 0.7
+        })
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert decoded["reasoning"] == %{"effort" => "high"}
+      assert decoded["temperature"] == 0.7
+    end
+
+    test "extra_body merges last and can override default fields" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:extra_body, %{"max_output_tokens" => 8192})
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["max_output_tokens"] == 8192
+    end
+
+    test "atom keys in extra_body are stringified before the merge" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:extra_body, %{max_output_tokens: 8192})
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["max_output_tokens"] == 8192
+    end
+
+    test "no extra_body leaves the request unchanged" do
+      config = config_that_captures_request()
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "temperature")
+    end
+  end
+
   describe "complete/3 multimodal formatting" do
     test "image block in user message formats to input_image data URL" do
       config = config_that_captures_request()

@@ -9,7 +9,7 @@ defmodule Alloy.Provider.XAI do
 
   Required:
   - `:api_key` - xAI API key
-  - `:model` - Model name (e.g., `"grok-4.20-0309-reasoning"`,
+  - `:model` - Model name (e.g., `"grok-4.3"`,
     `"grok-4.1-fast-reasoning"`, `"grok-code-fast-1"`)
 
   Optional:
@@ -22,7 +22,7 @@ defmodule Alloy.Provider.XAI do
       Alloy.run("What's happening on X today?",
         provider: {Alloy.Provider.XAI,
           api_key: System.get_env("XAI_API_KEY"),
-          model: "grok-4.20-0309-reasoning",
+          model: "grok-4.3",
           web_search: true
         }
       )

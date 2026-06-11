@@ -75,6 +75,9 @@ defmodule Alloy.ModelMetadata do
       limit: 1_048_576,
       suffix_patterns: ["", ~r/^-preview-\d{2}-\d{4}$/]
     },
+    # grok-4.3 — xAI's recommended frontier model (API launch 2026-04-30).
+    # Exact-match only; no date-stamped variants documented yet (PR #41).
+    %{name: "grok-4.3", limit: 1_000_000, suffix_patterns: [""]},
     %{name: "grok-4", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-fast-reasoning", limit: 2_000_000, suffix_patterns: [""]},
     %{name: "grok-4-fast-non-reasoning", limit: 2_000_000, suffix_patterns: [""]},

@@ -13,7 +13,9 @@ defmodule Alloy.ModelMetadataTest do
       # grok-4.1-fast models (dot notation)
       assert ModelMetadata.context_window("grok-4.1-fast") == 2_000_000
       assert ModelMetadata.context_window("grok-4.1-fast-reasoning") == 2_000_000
-      # grok-4.20 family — current xAI frontier API models
+      # grok-4.3 — xAI's recommended frontier model (1M window, PR #41)
+      assert ModelMetadata.context_window("grok-4.3") == 1_000_000
+      # grok-4.20 family
       assert ModelMetadata.context_window("grok-4.20-0309-reasoning") == 2_000_000
       assert ModelMetadata.context_window("grok-4.20-0309-non-reasoning") == 2_000_000
       assert ModelMetadata.context_window("grok-4.20-multi-agent-0309") == 2_000_000

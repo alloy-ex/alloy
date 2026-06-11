@@ -45,7 +45,9 @@ defmodule Alloy.Agent.Config do
           },
           working_directory: String.t(),
           context: map(),
-          on_shutdown: (Alloy.Session.t() -> any()) | nil,
+          # Accepts any session-shaped struct (%Alloy.Session{} or
+          # %AlloyAgent.Session{}) — see issue #40.
+          on_shutdown: (struct() -> any()) | nil,
           on_compaction: (list(), Alloy.Agent.State.t() -> any()) | nil,
           pubsub: module() | nil,
           subscribe: [String.t()],

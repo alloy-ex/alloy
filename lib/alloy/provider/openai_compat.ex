@@ -47,6 +47,16 @@ defmodule Alloy.Provider.OpenAICompat do
           model: "grok-code-fast-1"
         }
       )
+
+      # Mistral (mistral-large-latest and -2512 are in the built-in
+      # model catalog, so context budgeting works out of the box)
+      Alloy.run("Hello",
+        provider: {Alloy.Provider.OpenAICompat,
+          api_key: System.get_env("MISTRAL_API_KEY"),
+          api_url: "https://api.mistral.ai",
+          model: "mistral-large-latest"
+        }
+      )
   """
 
   @behaviour Alloy.Provider
@@ -174,7 +184,7 @@ defmodule Alloy.Provider.OpenAICompat do
       blocks
       |> Enum.filter(&(&1[:type] == "tool_use"))
       |> Enum.map(fn call ->
-        %{
+        tc = %{
           "id" => call.id,
           "type" => "function",
           "function" => %{
@@ -182,6 +192,13 @@ defmodule Alloy.Provider.OpenAICompat do
             "arguments" => Jason.encode!(call.input)
           }
         }
+
+        # Echo Gemini 3.x thought signatures back for multi-turn tool calls.
+        # Required or the API returns 400 (PR #24).
+        case Map.get(call, :thought_signature) do
+          nil -> tc
+          sig -> Map.put(tc, "extra_content", %{"google" => %{"thought_signature" => sig}})
+        end
       end)
 
     text_parts =
@@ -295,7 +312,11 @@ defmodule Alloy.Provider.OpenAICompat do
           %{"arguments" => args, "name" => name} ->
             case Jason.decode(args) do
               {:ok, input} ->
-                {:cont, acc ++ [%{type: "tool_use", id: tc["id"], name: name, input: input}]}
+                block =
+                  %{type: "tool_use", id: tc["id"], name: name, input: input}
+                  |> maybe_put_thought_signature(tc)
+
+                {:cont, acc ++ [block]}
 
               {:error, _} ->
                 {:halt, {:error, "Invalid JSON in tool call arguments for #{name}"}}
@@ -312,9 +333,20 @@ defmodule Alloy.Provider.OpenAICompat do
     end
   end
 
+  # Preserve Gemini 3.x thought signatures for multi-turn tool calls (PR #24).
+  defp maybe_put_thought_signature(block, tc) do
+    case get_in(tc, ["extra_content", "google", "thought_signature"]) do
+      nil -> block
+      sig -> Map.put(block, :thought_signature, sig)
+    end
+  end
+
   defp parse_finish_reason("stop"), do: :end_turn
   defp parse_finish_reason("tool_calls"), do: :tool_use
   defp parse_finish_reason(_), do: :end_turn
+
+  # Gemini 3.x wraps errors in a list (PR #24)
+  defp parse_error(status, [item | _]) when is_map(item), do: parse_error(status, item)
 
   defp parse_error(status, body) when is_binary(body) do
     case Jason.decode(body) do
@@ -330,4 +362,6 @@ defmodule Alloy.Provider.OpenAICompat do
       _ -> "HTTP #{status}: #{inspect(body)}"
     end
   end
+
+  defp parse_error(status, body), do: "HTTP #{status}: #{inspect(body)}"
 end

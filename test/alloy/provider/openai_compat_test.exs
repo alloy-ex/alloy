@@ -53,6 +53,116 @@ defmodule Alloy.Provider.OpenAICompatTest do
     end)
   end
 
+  # ── Gemini 3.x thought signatures (PR #24) ───────────────────────────
+
+  describe "Gemini 3.x thought signatures" do
+    test "thought_signature in a tool call response is preserved on the block" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "chatcmpl-test",
+              "choices" => [
+                %{
+                  "index" => 0,
+                  "message" => %{
+                    "role" => "assistant",
+                    "content" => nil,
+                    "tool_calls" => [
+                      %{
+                        "id" => "call_1",
+                        "type" => "function",
+                        "function" => %{"name" => "read", "arguments" => "{}"},
+                        "extra_content" => %{
+                          "google" => %{"thought_signature" => "sig-abc"}
+                        }
+                      }
+                    ]
+                  },
+                  "finish_reason" => "tool_calls"
+                }
+              ],
+              "usage" => %{"prompt_tokens" => 1, "completion_tokens" => 1}
+            })
+        })
+
+      {:ok, response} = OpenAICompat.complete([Message.user("Hi")], [], config)
+
+      [%Message{content: blocks}] = response.messages
+      tool_block = Enum.find(blocks, &(&1[:type] == "tool_use"))
+      assert tool_block.thought_signature == "sig-abc"
+    end
+
+    test "thought_signature on an assistant tool_use block is echoed back in the request" do
+      config = config_that_captures_request()
+
+      assistant_msg = %Message{
+        role: :assistant,
+        content: [
+          %{
+            type: "tool_use",
+            id: "call_1",
+            name: "read",
+            input: %{},
+            thought_signature: "sig-abc"
+          }
+        ]
+      }
+
+      tool_result_msg = %Message{
+        role: :user,
+        content: [%{type: "tool_result", tool_use_id: "call_1", content: "done"}]
+      }
+
+      OpenAICompat.complete([Message.user("Hi"), assistant_msg, tool_result_msg], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assistant = Enum.find(decoded["messages"], &(&1["role"] == "assistant"))
+      [tc] = assistant["tool_calls"]
+      assert tc["extra_content"] == %{"google" => %{"thought_signature" => "sig-abc"}}
+    end
+
+    test "tool calls without thought signatures are unchanged (no-op path)" do
+      config = config_that_captures_request()
+
+      assistant_msg = %Message{
+        role: :assistant,
+        content: [%{type: "tool_use", id: "call_1", name: "read", input: %{}}]
+      }
+
+      tool_result_msg = %Message{
+        role: :user,
+        content: [%{type: "tool_result", tool_use_id: "call_1", content: "done"}]
+      }
+
+      OpenAICompat.complete([Message.user("Hi"), assistant_msg, tool_result_msg], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assistant = Enum.find(decoded["messages"], &(&1["role"] == "assistant"))
+      [tc] = assistant["tool_calls"]
+      refute Map.has_key?(tc, "extra_content")
+    end
+
+    test "list-shaped error bodies do not crash parse_error" do
+      config =
+        config_with_response(%{
+          status: 400,
+          body:
+            Jason.encode!([
+              %{"error" => %{"message" => "missing thought_signature", "type" => "invalid"}}
+            ])
+        })
+
+      assert {:error, message} = OpenAICompat.complete([Message.user("Hi")], [], config)
+      assert message =~ "missing thought_signature"
+    end
+  end
+
   # ── Step 2: Reasoning Block Parsing ──────────────────────────────────
 
   describe "complete/3 reasoning_content parsing" do
