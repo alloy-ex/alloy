@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`:thinking` on `Alloy.Result`** (#36): a run result now surfaces the final
+  assistant reasoning text alongside `:text`, so callers no longer have to dig
+  it out of the last message's content blocks. Adds an `Alloy.Message.thinking/1`
+  helper for per-message extraction.
+
 ## [0.12.3] - 2026-06-11
 
 ### Fixed

@@ -80,6 +80,22 @@ defmodule Alloy.Message do
   end
 
   @doc """
+  Extracts thinking/reasoning text from a message, joining all thinking blocks.
+
+  Returns `nil` when the message carries no thinking content (plain-text
+  messages and messages without `"thinking"` blocks).
+  """
+  @spec thinking(t()) :: String.t() | nil
+  def thinking(%__MODULE__{content: content}) when is_binary(content), do: nil
+
+  def thinking(%__MODULE__{content: blocks}) when is_list(blocks) do
+    case Enum.filter(blocks, &(is_map(&1) && &1[:type] == "thinking")) do
+      [] -> nil
+      thinking_blocks -> Enum.map_join(thinking_blocks, "\n", & &1[:thinking])
+    end
+  end
+
+  @doc """
   Extracts tool_use blocks from an assistant message.
   """
   @spec tool_calls(t()) :: [content_block()]

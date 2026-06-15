@@ -183,6 +183,17 @@ defmodule Alloy.Agent.State do
   end
 
   @doc """
+  Extract the thinking/reasoning text from the most recent assistant message
+  that carries any. Returns `nil` when no assistant message has thinking.
+  """
+  @spec last_assistant_thinking(t()) :: String.t() | nil
+  def last_assistant_thinking(%__MODULE__{} = state) do
+    # Check the accumulator (newest messages) first, then fall back to base.
+    find_assistant_thinking(state.messages_new) ||
+      find_assistant_thinking_reversed(state.messages)
+  end
+
+  @doc """
   Clean up resources owned by this state. No-op currently; reserved
   for future resource management.
   """
@@ -203,6 +214,23 @@ defmodule Alloy.Agent.State do
     |> Enum.reverse()
     |> Enum.find_value(fn
       %Message{role: :assistant} = msg -> Message.text(msg)
+      _ -> nil
+    end)
+  end
+
+  # Thinking counterparts — same newest-first search, extracting thinking blocks.
+  defp find_assistant_thinking(messages_new) do
+    Enum.find_value(messages_new, fn
+      %Message{role: :assistant} = msg -> Message.thinking(msg)
+      _ -> nil
+    end)
+  end
+
+  defp find_assistant_thinking_reversed(messages) do
+    messages
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %Message{role: :assistant} = msg -> Message.thinking(msg)
       _ -> nil
     end)
   end
