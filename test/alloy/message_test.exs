@@ -136,4 +136,26 @@ defmodule Alloy.MessageTest do
       assert Message.text(msg) == ""
     end
   end
+
+  describe "thinking/1" do
+    test "extracts and joins thinking blocks, ignoring text/tool blocks" do
+      msg =
+        Message.assistant_blocks([
+          %{type: "thinking", thinking: "step one"},
+          %{type: "text", text: "the answer"},
+          %{type: "thinking", thinking: "step two"}
+        ])
+
+      assert Message.thinking(msg) == "step one\nstep two"
+    end
+
+    test "returns nil for a string-content message" do
+      assert Message.thinking(Message.assistant("hi")) == nil
+    end
+
+    test "returns nil when no thinking blocks are present" do
+      msg = Message.assistant_blocks([%{type: "text", text: "the answer"}])
+      assert Message.thinking(msg) == nil
+    end
+  end
 end

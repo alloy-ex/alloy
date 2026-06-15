@@ -9,6 +9,7 @@ defmodule Alloy.ResultTest do
       result = %Result{}
 
       assert result.text == nil
+      assert result.thinking == nil
       assert result.messages == []
       assert result.usage == %Alloy.Usage{}
       assert result.tool_calls == []
@@ -127,6 +128,37 @@ defmodule Alloy.ResultTest do
       assert result.usage.input_tokens == 10
       assert result.request_id == nil
       assert length(result.messages) == 2
+    end
+
+    test "surfaces the final assistant thinking text" do
+      config = %Config{provider: Alloy.Provider.Test, provider_config: %{}}
+
+      reasoning =
+        Message.assistant_blocks([
+          %{type: "thinking", thinking: "let me reason"},
+          %{type: "text", text: "the answer"}
+        ])
+
+      result =
+        config
+        |> State.init([Message.user("hello")])
+        |> State.append_messages([reasoning])
+        |> Result.from_state()
+
+      assert result.text == "the answer"
+      assert result.thinking == "let me reason"
+    end
+
+    test "thinking is nil when the model returned no thinking blocks" do
+      config = %Config{provider: Alloy.Provider.Test, provider_config: %{}}
+
+      result =
+        config
+        |> State.init([Message.user("hello")])
+        |> State.append_messages([Message.assistant("plain answer")])
+        |> Result.from_state()
+
+      assert result.thinking == nil
     end
   end
 

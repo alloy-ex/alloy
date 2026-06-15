@@ -8,6 +8,8 @@ defmodule Alloy.Result do
   ## Fields
 
     * `:text` — the final assistant text (or `nil` if the model returned no text)
+    * `:thinking` — the final assistant thinking/reasoning text (or `nil` if none),
+      so callers need not dig it out of the last message's content blocks
     * `:messages` — full conversation history
     * `:usage` — accumulated `%Alloy.Usage{}` token counts
     * `:tool_calls` — list of tool execution metadata maps
@@ -25,6 +27,7 @@ defmodule Alloy.Result do
 
   @type t :: %__MODULE__{
           text: String.t() | nil,
+          thinking: String.t() | nil,
           messages: [Message.t()],
           usage: Usage.t(),
           tool_calls: [map()],
@@ -37,6 +40,7 @@ defmodule Alloy.Result do
 
   defstruct [
     :text,
+    :thinking,
     :error,
     :request_id,
     messages: [],
@@ -58,6 +62,7 @@ defmodule Alloy.Result do
   def from_state(%State{} = state) do
     %__MODULE__{
       text: State.last_assistant_text(state),
+      thinking: State.last_assistant_thinking(state),
       messages: State.messages(state),
       usage: state.usage,
       tool_calls: state.tool_calls,
