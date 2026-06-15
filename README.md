@@ -9,7 +9,7 @@
 
 Alloy is the completion-tool-call loop and nothing else. Send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. No opinions on sessions, persistence, memory, scheduling, or UI — those belong in your application, where OTP already gives you the runtime.
 
-Alloy is [Pi](https://github.com/badlogic/pi-mono)'s philosophy brought to the BEAM: a harness, not a framework. Three runtime dependencies, ~7,500 lines — small enough to read in an afternoon, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
+Alloy is a harness, not a framework. Three runtime dependencies, ~7,500 lines — small enough to read in an afternoon, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and tell me the version",

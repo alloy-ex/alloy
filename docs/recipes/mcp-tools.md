@@ -1,7 +1,6 @@
 # Recipe: MCP servers as tools
 
-Alloy has no MCP support in core, on purpose. The
-[context-economy argument](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/)
+Alloy has no MCP support in core, on purpose. The context-economy argument
 is real: a typical MCP server dumps every tool definition into every request —
 Playwright's server costs ~13,700 tokens of tool schemas before the
 conversation starts. Most Elixir applications also don't need MCP to expose
@@ -191,7 +190,7 @@ end
 **Gateway vs. one-tool-per-MCP-tool.** The gateway costs one tool definition
 and a compact name/description list — the right default, and the reason this
 recipe exists. The per-tool variant gives the model full schemas (provider-
-side argument validation) but pays the context cost Pi warns about: every
+side argument validation) but pays the context cost the gateway avoids: every
 tool's complete schema rides along on every request. Measure before choosing
 it for servers with more than a handful of tools, and consider filtering the
 discovery list to the tools you actually want exposed.

@@ -8,9 +8,9 @@ a supervised task, crashes are isolated to the tool call, and when the model
 requests several delegations in one turn the executor fans them out in
 parallel (`concurrent?/0`).
 
-This is the same philosophy as [Pi](https://github.com/badlogic/pi-mono),
-which spawns itself via bash rather than shipping a sub-agent system. Alloy's
-translation: spawn yourself via function call.
+This mirrors how the leanest coding agents handle delegation: they spawn
+another copy of themselves via a shell command rather than shipping a
+sub-agent subsystem. Alloy's translation: spawn yourself via function call.
 
 > The module below is tested verbatim in
 > `test/alloy/recipes/sub_agent_recipe_test.exs`. If the API drifts, that
