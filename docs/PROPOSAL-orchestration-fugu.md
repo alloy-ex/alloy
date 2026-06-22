@@ -43,13 +43,52 @@ This mirrors the existing ecosystem shape: **Anvil** is the reference Phoenix
 *application* on Alloy; orchestration is likewise an application/library layer,
 not the harness.
 
+## Execution model: subscription-backed CLI by default, metered API opt-in
+
+A coordinator that fans a task out across a pool multiplies token spend by the
+number of members and turns. Billing that against metered provider **APIs** is
+the expensive way to run Fugu. The cheap way — and the **default** for this
+design — is to back pool members with **coding-agent CLIs running in
+programmatic / headless mode**, which execute against the operator's
+**subscription plan** (ChatGPT, Claude, Gemini) rather than per-token API
+billing.
+
+Alloy already proves the pattern: **`Alloy.Provider.Codex`** drives
+`codex exec` against a ChatGPT plan, treating the CLI as a structured
+completion backend while Alloy keeps the tool loop. The same shape extends to a
+**`claude` CLI** provider (`claude -p`, Claude plan) and a **Gemini CLI**
+provider — each is just *provider wire-format translation*, which by Alloy's
+own boundary belongs **in `alloy`**, not the orchestrator.
+
+**Principle:** pool members default to a subscription-backed CLI backend.
+A member only talks to a metered API when **explicitly flagged**
+(`api: true`, or by naming an API provider directly). This keeps fan-out cheap
+by default and makes every paid-API member a deliberate, visible choice.
+
+Consequences the design must carry:
+
+- **`backend: :cli` is the default** on `Orchestra.Member`; `backend: :api`
+  (or an explicit `api: true`) is opt-in per member.
+- **Rate limits replace dollar budgets for CLI members.** `codex exec` reports
+  zero structured token usage, so `max_budget_cents` is meaningless for CLI
+  backends — they're bounded by the subscription's request/rate limits, not
+  cents. The coordinator must treat concurrency limits and retry/backoff (not
+  cost caps) as the governing constraint for CLI members, and reserve
+  `max_budget_cents` accounting for the explicitly-flagged API members.
+- **Auth is local CLI login state**, not keys in config (Codex reads
+  `~/.codex/auth.json`; the others their own login state). The pool config
+  references a backend + model, not an `api_key`, unless a member is flagged
+  for API use.
+
 ## Capability → layer mapping
 
 | Fugu capability | Owning layer | Mechanism it reuses |
 |---|---|---|
-| Diverse provider/model pool, one-line swap | `alloy` (done) | 6 providers + `Alloy.Provider.OpenAICompat` |
-| Each pool member as a supervised, stateful agent w/ budget guard | `alloy_agent` | `AlloyAgent.Server` (one per member), `max_budget_cents` |
-| Parallel fan-out of members in a turn | `alloy` | `Task.Supervisor` + tool `concurrent?/0` |
+| Subscription-backed CLI member (default) | `alloy` | `Alloy.Provider.Codex` (`codex exec`); proposed `claude`/Gemini CLI providers |
+| Metered API member (opt-in, explicitly flagged) | `alloy` | API providers (`Anthropic`, `OpenAI`, `Gemini`, `xAI`, `OpenAICompat`) |
+| Diverse provider/model pool, one-line swap | `alloy` (done) | uniform `Alloy.Provider` behaviour across CLI + API backends |
+| Each pool member as a supervised, stateful agent | `alloy_agent` | `AlloyAgent.Server` (one per member); `max_budget_cents` for API members only |
+| Parallel fan-out of members in a turn | `alloy` | `Task.Supervisor` + tool `concurrent?/0` (bounded by CLI rate limits) |
 | Model selection / routing (Conductor) | **new** | `Orchestra.Router` behaviour |
 | Role assignment + multi-turn coordination (TRINITY) | **new** | `Orchestra.Coordinator` GenServer |
 | Shared scratch state between members | **new** | coordinator-owned blackboard |
@@ -73,16 +112,30 @@ effort and is explicitly **not** in scope here.
 
 ### Core abstractions
 
-1. **`Orchestra.Member`** — a named entry in the pool: a role, a provider/model
-   tuple (any Alloy provider), a system prompt, a toolset, and caps.
+1. **`Orchestra.Member`** — a named entry in the pool: a role, a backend
+   (CLI by default), a model, a system prompt, a toolset, and caps. The
+   `provider` it resolves to is a normal `Alloy.Provider` tuple either way —
+   the `backend` flag just selects CLI vs. API.
 
    ```elixir
+   # Default: subscription-backed CLI member (no api_key, login state is local)
    %Orchestra.Member{
      id: :verifier,
      role: :verifier,                  # :thinker | :worker | :verifier | custom
-     provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-opus-4-6"},
+     backend: :cli,                    # default — resolves to Alloy.Provider.Codex / claude CLI / etc.
+     model: "gpt-5.4",
      tools: [Alloy.Tool.Core.Read],
      system_prompt: "You verify candidate answers. ...",
+     caps: [max_turns: 6, timeout_ms: 60_000]   # rate-limited, not cost-capped
+   }
+
+   # Opt-in: explicitly-flagged metered API member
+   %Orchestra.Member{
+     id: :worker,
+     role: :worker,
+     backend: :api,                    # explicit flag — this member bills the API
+     provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-opus-4-6"},
+     tools: [Alloy.Tool.Core.Read],
      caps: [max_turns: 6, timeout_ms: 60_000, max_budget_cents: 25]
    }
    ```
@@ -118,7 +171,7 @@ effort and is explicitly **not** in scope here.
        pool: pool,
        router: Orchestra.Router.Heuristic,
        strategy: Orchestra.Strategy.ThinkWorkVerify,
-       max_budget_cents: 200       # whole-team budget, summed from members
+       max_budget_cents: 200       # applies only to explicitly-flagged API members
      )
 
    result.text          # final coordinated answer
@@ -135,13 +188,24 @@ processes, and `max_budget_cents`. The coordinator is mostly policy glue on top
 of those. It is close to an ideal showcase of Alloy's "harness, not framework"
 thesis.
 
-### Budget accounting note
+### Budget & rate-limit accounting note
 
-Per `docs/recipes/sub-agents.md`, a parent's `max_budget_cents` does **not**
-see tokens spent inside a child `Alloy.run/2`. The coordinator must therefore
-do **combined accounting itself**: cap each member individually and sum
-`result.usage` returned from each member to enforce the team budget. This is a
-first-class coordinator responsibility, not something inherited for free.
+Two regimes, because members run on two kinds of backend:
+
+- **CLI members (default)** bill against a subscription, not tokens. `codex
+  exec` reports zero structured usage, so `max_budget_cents` is meaningless
+  here — the binding constraint is the subscription's **rate/request limits**.
+  The coordinator governs CLI members with concurrency limits and
+  retry/backoff, not dollar caps.
+- **API members (opt-in)** are metered. Per `docs/recipes/sub-agents.md`, a
+  parent's `max_budget_cents` does **not** see tokens spent inside a child
+  `Alloy.run/2`, so the coordinator does **combined accounting itself**: cap
+  each API member individually and sum `result.usage` to enforce the team
+  budget. This is a first-class coordinator responsibility, not inherited for
+  free.
+
+Mixing the two in one pool is expected (e.g. cheap CLI thinkers + one flagged
+API verifier); the coordinator applies whichever regime each member declares.
 
 ## OpenAI-compatible endpoint (Phase 4)
 
@@ -158,12 +222,24 @@ observability) and stays in the new package — never in `alloy`.
   existing design boundaries. ✅ captured here. *Deliverable: this doc + draft PR.*
 
 - **Phase 1 — Core skeleton.** New `alloy_orchestra` package (umbrella sibling
-  or standalone repo). Define `Member`, `Assignment`, `Task`, `Result` structs;
-  `Router` and `Strategy` behaviours; `Router.Static`; `Strategy.BestOfN` (the
-  simplest fan-out-and-pick strategy). `Orchestra.run/2` executing members via
-  `Alloy.run/2` with `Task.Supervisor` fan-out. Team-budget summation.
-  *Acceptance: a 3-model best-of-N run returns a coordinated answer + summed
-  usage, all members capped, against live or mocked providers.*
+  or standalone repo). Define `Member` (`backend: :cli` default), `Assignment`,
+  `Task`, `Result` structs; `Router` and `Strategy` behaviours; `Router.Static`;
+  `Strategy.BestOfN` (the simplest fan-out-and-pick strategy). `Orchestra.run/2`
+  executing members via `Alloy.run/2` with `Task.Supervisor` fan-out, resolving
+  CLI members to `Alloy.Provider.Codex`. Per-regime accounting (rate limits for
+  CLI, summed budget for flagged API members).
+  *Acceptance: a 3-member best-of-N run on CLI backends returns a coordinated
+  answer; an API-flagged member enforces its `max_budget_cents`.*
+
+- **Phase 1b — CLI providers (lands in `alloy`, not the orchestrator).** The
+  default execution model needs more than the existing `Codex` provider. Add a
+  `claude` CLI provider (`claude -p`) and a Gemini CLI provider following the
+  `Alloy.Provider.Codex` shape — CLI as a structured completion backend, Alloy
+  keeps the loop. This is *provider wire-format translation*, which Alloy's
+  Design Boundary explicitly places **in `alloy`**. The orchestrator stays
+  provider-agnostic; it just selects among them. *Acceptance: each CLI provider
+  satisfies the `Alloy.Provider` behaviour and round-trips a tool call against
+  local login state.*
 
 - **Phase 2 — TRINITY-shaped strategy.** `Strategy.ThinkWorkVerify`: thinker
   drafts, worker executes (tools), verifier critiques, loop until verifier
@@ -204,7 +280,12 @@ observability) and stays in the new package — never in `alloy`.
    per member when a role needs continuity.
 3. **Endpoint framework** — bare Plug vs. Phoenix. (Lean: Plug; the endpoint is
    thin and Phoenix pulls in more than the serving layer needs.)
-4. **Naming** — `alloy_orchestra` vs. `alloy_ensemble` vs. `conductor`.
+4. **Which CLI providers to add to `alloy`** — `codex` exists; `claude -p` and
+   Gemini CLI are the obvious next two. Any others (e.g. open-weight runners)?
+5. **CLI rate-limit governance** — where the concurrency/backoff policy for
+   subscription backends lives: per-member caps in the orchestrator, or a shared
+   limiter. (Lean: a coordinator-level limiter keyed by backend identity.)
+6. **Naming** — `alloy_orchestra` vs. `alloy_ensemble` vs. `conductor`.
 
 ## Next step
 
