@@ -21,8 +21,16 @@ jobs:
         include:
           - elixir: "1.20"
             otp: "28"
+            lint: true
           - elixir: "1.19"
             otp: "27"
+            lint: true
+          # Floor leg: mix.exs promises ~> 1.17, so compile + test it.
+          # Lint/format/dialyzer stay on the modern legs — formatter output
+          # and warning sets differ across Elixir versions.
+          - elixir: "1.17"
+            otp: "26"
+            lint: false
 
     steps:
       - uses: actions/checkout@v5
@@ -50,7 +58,13 @@ jobs:
 
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
+        if: ${{ matrix.lint }}
+      - run: mix compile
+        if: ${{ !matrix.lint }}
       - run: mix test
       - run: mix format --check-formatted
+        if: ${{ matrix.lint }}
       - run: mix credo --strict
+        if: ${{ matrix.lint }}
       - run: mix dialyzer
+        if: ${{ matrix.lint }}

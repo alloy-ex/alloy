@@ -182,7 +182,7 @@ defmodule Alloy.Tool.ExecutorTest do
           refute block.content =~ "\n"
         end)
 
-        assert_receive {:tool_stop, %{error: error}}
+        assert_receive {:tool_stop, %{tool_name: "crasher", error: error}}
         assert error =~ "boom!"
         assert error =~ "lib/alloy/tool/executor.ex"
       after
