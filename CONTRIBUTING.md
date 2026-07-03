@@ -14,8 +14,14 @@ Rule of thumb: if it needs a database table, product defaults, or tenancy logic,
 git clone https://github.com/alloy-ex/alloy.git
 cd alloy
 mix deps.get
-mix test          # 533 tests, should all pass
+mix test          # 671 tests, should all pass
 ```
+
+The dev toolchain is pinned in `.tool-versions` (works with mise and asdf) to
+match CI's primary matrix leg — Elixir 1.20 brings the gradual type checker,
+so `mix compile --warnings-as-errors` locally catches what CI would. The
+library itself still supports `~> 1.17`; the pin is for contributors, not
+consumers.
 
 ## Development workflow
 
