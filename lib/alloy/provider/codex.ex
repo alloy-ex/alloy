@@ -271,9 +271,12 @@ defmodule Alloy.Provider.Codex do
         ]
       )
 
+    # Port.info/2 returns nil when the process already exited — its output
+    # and exit_status messages are still in the mailbox, so collect them;
+    # there is just no OS pid left to kill on timeout.
     case Port.info(port, :os_pid) do
       {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, [])
-      nil -> {:error, "codex exec port closed before os_pid was available"}
+      nil -> collect_port(port, nil, timeout, [])
     end
   rescue
     error in ErlangError ->
@@ -311,6 +314,8 @@ defmodule Alloy.Provider.Codex do
 
   # SIGTERM with a 100ms grace window, then SIGKILL. Best-effort — if
   # codex has already exited, the second kill is a no-op.
+  defp kill_os_process(nil), do: :ok
+
   defp kill_os_process(os_pid) do
     _ = System.cmd("/bin/kill", ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
     Process.sleep(100)
