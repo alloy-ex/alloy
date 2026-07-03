@@ -53,6 +53,34 @@ defmodule Alloy.Provider.OpenAICompatTest do
     end)
   end
 
+  describe "request formatting" do
+    test "includes strict true inside function tool definitions" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{
+          name: "search",
+          description: "Search",
+          strict: true,
+          input_schema: %{
+            type: "object",
+            properties: %{query: %{type: "string"}},
+            required: ["query"],
+            additionalProperties: false
+          }
+        }
+      ]
+
+      OpenAICompat.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [%{"type" => "function", "function" => function}] = decoded["tools"]
+      assert function["strict"] == true
+    end
+  end
+
   # ── Gemini 3.x thought signatures (PR #24) ───────────────────────────
 
   describe "Gemini 3.x thought signatures" do

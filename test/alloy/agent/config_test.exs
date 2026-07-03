@@ -2,6 +2,7 @@ defmodule Alloy.Agent.ConfigTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Agent.Config
+  alias Alloy.Context.Compactor
   alias Alloy.ModelMetadata
 
   describe "max_tokens" do
@@ -76,11 +77,23 @@ defmodule Alloy.Agent.ConfigTest do
           max_tokens: 80
         )
 
-      assert config.compaction == %{
+      assert Map.take(config.compaction, [
+               :reserve_tokens,
+               :keep_recent_tokens,
+               :fallback,
+               :clear_tool_results,
+               :keep_recent_tool_results
+             ]) == %{
                reserve_tokens: 8,
                keep_recent_tokens: 10,
-               fallback: :truncate
+               fallback: :truncate,
+               clear_tool_results: true,
+               keep_recent_tool_results: 3
              }
+
+      assert config.compaction.summary_system_prompt == Compactor.default_summary_system_prompt()
+
+      assert config.compaction.summary_prompt == Compactor.default_summary_prompt()
     end
 
     test "accepts explicit compaction overrides" do
@@ -91,10 +104,18 @@ defmodule Alloy.Agent.ConfigTest do
           compaction: [reserve_tokens: 12, keep_recent_tokens: 34, fallback: :truncate]
         )
 
-      assert config.compaction == %{
+      assert Map.take(config.compaction, [
+               :reserve_tokens,
+               :keep_recent_tokens,
+               :fallback,
+               :clear_tool_results,
+               :keep_recent_tool_results
+             ]) == %{
                reserve_tokens: 12,
                keep_recent_tokens: 34,
-               fallback: :truncate
+               fallback: :truncate,
+               clear_tool_results: true,
+               keep_recent_tool_results: 3
              }
     end
 
@@ -105,11 +126,69 @@ defmodule Alloy.Agent.ConfigTest do
           max_tokens: 5
         )
 
-      assert config.compaction == %{
+      assert Map.take(config.compaction, [
+               :reserve_tokens,
+               :keep_recent_tokens,
+               :fallback,
+               :clear_tool_results,
+               :keep_recent_tool_results
+             ]) == %{
                reserve_tokens: 1,
                keep_recent_tokens: 1,
-               fallback: :truncate
+               fallback: :truncate,
+               clear_tool_results: true,
+               keep_recent_tool_results: 3
              }
+    end
+
+    test "accepts tool-result clearing compaction options" do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          compaction: [clear_tool_results: false, keep_recent_tool_results: 0]
+        )
+
+      assert config.compaction.clear_tool_results == false
+      assert config.compaction.keep_recent_tool_results == 0
+    end
+
+    test "validates tool-result clearing compaction options" do
+      assert_raise ArgumentError, ~r/clear_tool_results must be a boolean/, fn ->
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          compaction: [clear_tool_results: "false"]
+        )
+      end
+
+      assert_raise ArgumentError,
+                   ~r/keep_recent_tool_results must be a non-negative integer/,
+                   fn ->
+                     Config.from_opts(
+                       provider: {Alloy.Provider.Test, []},
+                       compaction: [keep_recent_tool_results: -1]
+                     )
+                   end
+    end
+
+    test "accepts and validates custom compaction prompts" do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          compaction: [
+            summary_system_prompt: "Summarize like my app expects.",
+            summary_prompt: "Return a compact handoff."
+          ]
+        )
+
+      assert config.compaction.summary_system_prompt == "Summarize like my app expects."
+      assert config.compaction.summary_prompt == "Return a compact handoff."
+
+      assert_raise ArgumentError, ~r/summary_prompt must be a string/, fn ->
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          compaction: [summary_prompt: :bad]
+        )
+      end
     end
   end
 end

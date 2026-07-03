@@ -71,6 +71,22 @@ defmodule Alloy.Tool.InlineTest do
         weather_tool(timeout: 5_000)
       end
     end
+
+    test "validates strict option type" do
+      assert_raise ArgumentError, ~r/:strict must be a boolean/, fn ->
+        weather_tool(strict: "yes")
+      end
+    end
+
+    test "validates advanced-tool-use option types" do
+      assert_raise ArgumentError, ~r/:input_examples must be a list of maps/, fn ->
+        weather_tool(input_examples: ["bad"])
+      end
+
+      assert_raise ArgumentError, ~r/:defer_loading must be a boolean/, fn ->
+        weather_tool(defer_loading: "yes")
+      end
+    end
   end
 
   describe "Registry with inline tools" do
@@ -94,6 +110,43 @@ defmodule Alloy.Tool.InlineTest do
 
       assert def_with.allowed_callers == [:human]
       assert def_with.result_type == :structured
+    end
+
+    test "inline strict tools require additionalProperties false" do
+      assert_raise ArgumentError,
+                   ~r/strict tool "get_weather" input_schema must include additionalProperties: false/,
+                   fn ->
+                     Registry.build([weather_tool(strict: true)])
+                   end
+
+      {[def_with], _} =
+        Registry.build([
+          weather_tool(
+            strict: true,
+            input_schema: %{
+              type: "object",
+              properties: %{location: %{type: "string"}},
+              required: ["location"],
+              additionalProperties: false
+            }
+          )
+        ])
+
+      assert def_with.strict == true
+    end
+
+    test "inline advanced-tool-use fields appear in defs only when set" do
+      {[def_without], _} = Registry.build([weather_tool()])
+      refute Map.has_key?(def_without, :input_examples)
+      refute Map.has_key?(def_without, :defer_loading)
+
+      {[def_with], _} =
+        Registry.build([
+          weather_tool(input_examples: [%{location: "Sydney"}], defer_loading: true)
+        ])
+
+      assert def_with.input_examples == [%{location: "Sydney"}]
+      assert def_with.defer_loading == true
     end
 
     test "rejects things that are neither modules nor inline tools" do
@@ -140,7 +193,9 @@ defmodule Alloy.Tool.InlineTest do
           TestProvider.text_response("Tool crashed.")
         ])
 
-      assert [%{name: "get_weather", error: "Tool crashed: boom"}] = result.tool_calls
+      assert [%{name: "get_weather", error: error}] = result.tool_calls
+      assert error =~ "boom"
+      assert error =~ "lib/alloy/tool/executor.ex"
     end
 
     test "structured 3-tuple results carry structured data" do

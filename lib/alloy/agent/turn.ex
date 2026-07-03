@@ -94,7 +94,7 @@ defmodule Alloy.Agent.Turn do
     )
 
     messages_before = length(State.messages(state))
-    {compaction_status, state} = Compactor.maybe_compact(state)
+    {compaction_status, state} = Compactor.maybe_compact(state, turn: turn_number)
 
     state =
       case compaction_status do

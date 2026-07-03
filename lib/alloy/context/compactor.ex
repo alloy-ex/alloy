@@ -6,6 +6,16 @@ defmodule Alloy.Context.Compactor do
   preserves the first message, keeps a recent verbatim token window, and
   replaces older context with a structured handoff summary. If summary
   generation fails, Alloy falls back to deterministic truncation.
+
+  Compaction options live under `compaction:`:
+
+    * `:clear_tool_results` - clear old bulky tool-result content before
+      summary generation (default `true`)
+    * `:keep_recent_tool_results` - newest tool results to preserve verbatim
+      when clearing (default `3`)
+    * `:summary_system_prompt` - system prompt used for summary generation
+    * `:summary_prompt` - user prompt instructions appended after the
+      serialized conversation
   """
 
   require Logger
@@ -73,6 +83,14 @@ defmodule Alloy.Context.Compactor do
   - Keep the summary concise but decision-complete enough for the next model to continue without rereading the discarded messages.
   """
 
+  @doc false
+  @spec default_summary_system_prompt() :: String.t()
+  def default_summary_system_prompt, do: @summary_system_prompt
+
+  @doc false
+  @spec default_summary_prompt() :: String.t()
+  def default_summary_prompt, do: @summary_prompt
+
   @doc """
   Prefix used for synthetic handoff summary messages inserted by the compactor.
   """
@@ -94,15 +112,15 @@ defmodule Alloy.Context.Compactor do
   Returns `{:compacted, state}` when compaction occurred, or
   `{:unchanged, state}` when already within budget.
   """
-  @spec maybe_compact(State.t()) :: {:compacted | :unchanged, State.t()}
-  def maybe_compact(%State{} = state) do
+  @spec maybe_compact(State.t(), keyword()) :: {:compacted | :unchanged, State.t()}
+  def maybe_compact(%State{} = state, opts \\ []) do
     messages = State.messages(state)
     reserve_tokens = state.config.compaction.reserve_tokens
 
     if within_reserve?(messages, state.config.max_tokens, reserve_tokens) do
       {:unchanged, state}
     else
-      {:compacted, compact_messages_in_state(state, messages)}
+      {:compacted, compact_messages_in_state(state, messages, opts)}
     end
   end
 
@@ -116,7 +134,61 @@ defmodule Alloy.Context.Compactor do
     {first, middle, recent}
   end
 
-  defp compact_messages_in_state(%State{} = state, messages) do
+  defp compact_messages_in_state(%State{} = state, messages, opts \\ []) do
+    case maybe_clear_tool_results(messages, state, opts) do
+      {:done, cleared_messages} ->
+        %{state | messages: cleared_messages, messages_new: []}
+
+      {:continue, messages} ->
+        summarize_or_fallback(state, messages)
+    end
+  end
+
+  defp maybe_clear_tool_results(
+         messages,
+         %State{
+           turn: turn,
+           config: %{
+             max_tokens: max_tokens,
+             compaction:
+               %{
+                 clear_tool_results: true,
+                 keep_recent_tokens: keep_recent_tokens,
+                 reserve_tokens: reserve_tokens
+               } = compaction
+           }
+         },
+         opts
+       ) do
+    keep_recent_tool_results = Map.get(compaction, :keep_recent_tool_results, 3)
+    telemetry_turn = Keyword.get(opts, :turn, turn + 1)
+
+    {cleared_messages, cleared} =
+      clear_tool_results(messages,
+        keep_recent_tokens: keep_recent_tokens,
+        keep_recent_tool_results: keep_recent_tool_results
+      )
+
+    if cleared.results_cleared > 0 do
+      :telemetry.execute(
+        [:alloy, :compaction, :cleared],
+        cleared,
+        %{turn: telemetry_turn}
+      )
+
+      if within_reserve?(cleared_messages, max_tokens, reserve_tokens) do
+        {:done, cleared_messages}
+      else
+        {:continue, cleared_messages}
+      end
+    else
+      {:continue, messages}
+    end
+  end
+
+  defp maybe_clear_tool_results(messages, _state, _opts), do: {:continue, messages}
+
+  defp summarize_or_fallback(%State{} = state, messages) do
     keep_recent_tokens = state.config.compaction.keep_recent_tokens
 
     case prepare_summary_compaction(messages, keep_recent_tokens) do
@@ -140,6 +212,133 @@ defmodule Alloy.Context.Compactor do
         fallback_compact_state(state, messages)
     end
   end
+
+  defp clear_tool_results(messages, opts) do
+    keep_recent_tokens = Keyword.fetch!(opts, :keep_recent_tokens)
+    keep_recent_tool_results = Keyword.fetch!(opts, :keep_recent_tool_results)
+    old_indexes = MapSet.new(old_message_indexes(messages, keep_recent_tokens))
+
+    result_positions = tool_result_positions(messages)
+
+    keep_positions =
+      result_positions
+      |> Enum.take(-keep_recent_tool_results)
+      |> Enum.map(fn %{message_index: message_index, block_index: block_index} ->
+        {message_index, block_index}
+      end)
+      |> MapSet.new()
+
+    {cleared_messages, cleared} =
+      messages
+      |> Enum.with_index()
+      |> Enum.map_reduce(%{results_cleared: 0, bytes_cleared: 0}, fn {message, message_index},
+                                                                     acc ->
+        if MapSet.member?(old_indexes, message_index) do
+          clear_tool_results_in_message(message, message_index, keep_positions, acc)
+        else
+          {message, acc}
+        end
+      end)
+
+    {cleared_messages, cleared}
+  end
+
+  defp old_message_indexes([_first | rest] = _messages, keep_recent_tokens) do
+    {previous_summary, tail} =
+      case rest do
+        [%Message{} = message | rest_tail] ->
+          if summary_message?(message), do: {message, rest_tail}, else: {nil, rest}
+
+        [] ->
+          {nil, []}
+      end
+
+    offset = if previous_summary, do: 2, else: 1
+
+    if tail == [] do
+      []
+    else
+      cut_index = find_cut_point(tail, keep_recent_tokens)
+
+      if cut_index > 0 do
+        offset..(offset + cut_index - 1)//1 |> Enum.to_list()
+      else
+        []
+      end
+    end
+  end
+
+  defp old_message_indexes(_, _keep_recent_tokens), do: []
+
+  defp tool_result_positions(messages) do
+    messages
+    |> Enum.with_index()
+    |> Enum.flat_map(fn
+      {%Message{content: blocks}, message_index} when is_list(blocks) ->
+        blocks
+        |> Enum.with_index()
+        |> Enum.flat_map(fn
+          {%{type: type} = block, block_index}
+          when type in ["tool_result", "server_tool_result"] ->
+            [
+              %{
+                message_index: message_index,
+                block_index: block_index,
+                bytes: content_bytes(block)
+              }
+            ]
+
+          _ ->
+            []
+        end)
+
+      _ ->
+        []
+    end)
+  end
+
+  defp clear_tool_results_in_message(
+         %Message{content: blocks} = message,
+         message_index,
+         keep_positions,
+         acc
+       )
+       when is_list(blocks) do
+    {blocks, acc} =
+      blocks
+      |> Enum.with_index()
+      |> Enum.map_reduce(acc, fn
+        {%{type: type} = block, block_index}, acc
+        when type in ["tool_result", "server_tool_result"] ->
+          position = {message_index, block_index}
+
+          if MapSet.member?(keep_positions, position) do
+            {block, acc}
+          else
+            bytes = content_bytes(block)
+
+            {
+              %{block | content: "[tool result cleared: #{bytes} bytes]"},
+              %{
+                results_cleared: acc.results_cleared + 1,
+                bytes_cleared: acc.bytes_cleared + bytes
+              }
+            }
+          end
+
+        {block, _block_index}, acc ->
+          {block, acc}
+      end)
+
+    {%{message | content: blocks}, acc}
+  end
+
+  defp clear_tool_results_in_message(message, _message_index, _keep_positions, acc),
+    do: {message, acc}
+
+  defp content_bytes(%{content: content}) when is_binary(content), do: byte_size(content)
+  defp content_bytes(%{content: content}), do: content |> inspect() |> byte_size()
+  defp content_bytes(_block), do: 0
 
   defp fallback_compact_state(%State{} = state, messages) do
     case state.config.compaction.fallback do
@@ -190,9 +389,21 @@ defmodule Alloy.Context.Compactor do
       state.config.provider_config
       |> Map.delete(:provider_state)
       |> Map.delete("provider_state")
-      |> Map.put(:system_prompt, @summary_system_prompt)
+      |> Map.put(
+        :system_prompt,
+        Map.get(
+          state.config.compaction,
+          :summary_system_prompt,
+          default_summary_system_prompt()
+        )
+      )
 
-    prompt = build_summary_prompt(prepared.messages_to_summarize, prepared.previous_summary)
+    prompt =
+      build_summary_prompt(
+        prepared.messages_to_summarize,
+        prepared.previous_summary,
+        Map.get(state.config.compaction, :summary_prompt, default_summary_prompt())
+      )
 
     with {:ok, response} <- provider.complete([Message.user(prompt)], [], config),
          {:ok, summary_text} <- extract_summary_text(response) do
@@ -203,7 +414,7 @@ defmodule Alloy.Context.Compactor do
     end
   end
 
-  defp build_summary_prompt(messages_to_summarize, previous_summary) do
+  defp build_summary_prompt(messages_to_summarize, previous_summary, summary_prompt) do
     previous_summary_section =
       case previous_summary do
         nil ->
@@ -218,7 +429,7 @@ defmodule Alloy.Context.Compactor do
     #{serialize_messages(messages_to_summarize)}
     </conversation>
 
-    #{@summary_prompt}
+    #{summary_prompt}
     """
   end
 
@@ -433,12 +644,16 @@ defmodule Alloy.Context.Compactor do
         %{type: type} = block when type in ["tool_result", "server_tool_result"] ->
           %{block | content: "[compacted]"}
 
+        %{type: "thinking", signature: signature} when is_binary(signature) ->
+          nil
+
         %{type: "thinking", thinking: text} = block when byte_size(text) > @truncate_length ->
           %{block | thinking: String.slice(text, 0, @truncate_length) <> "..."}
 
         block ->
           block
       end)
+      |> Enum.reject(&is_nil/1)
 
     %{msg | content: compacted_blocks}
   end

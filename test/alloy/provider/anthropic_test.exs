@@ -156,6 +156,32 @@ defmodule Alloy.Provider.AnthropicTest do
       assert tool["allowed_callers"] == ["human", "code_execution"]
     end
 
+    test "includes strict true on strict tools" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{
+          name: "search",
+          description: "Search",
+          strict: true,
+          input_schema: %{
+            type: "object",
+            properties: %{query: %{type: "string"}},
+            required: ["query"],
+            additionalProperties: false
+          }
+        }
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [tool] = decoded["tools"]
+      assert tool["strict"] == true
+    end
+
     test "omits allowed_callers from tool definition when not present" do
       config = config_that_captures_request()
 
@@ -201,6 +227,23 @@ defmodule Alloy.Provider.AnthropicTest do
       assert tool_result_msg["role"] == "user"
       assert is_list(tool_result_msg["content"])
       assert hd(tool_result_msg["content"])["type"] == "tool_result"
+    end
+
+    test "extra_body params merge into the request body" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:extra_body, %{
+          mcp_servers: [%{type: "url", url: "https://mcp.example.test"}]
+        })
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert decoded["mcp_servers"] == [
+               %{"type" => "url", "url" => "https://mcp.example.test"}
+             ]
     end
   end
 
@@ -255,6 +298,70 @@ defmodule Alloy.Provider.AnthropicTest do
         |> Enum.sort()
 
       assert merged_beta_values == ["code-execution-2025-08-25", "context-1m-2025-08-07"]
+    end
+
+    test "emits advanced tool-use fields and beta header when used" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{
+          name: "search",
+          description: "Search",
+          input_schema: %{type: "object", properties: %{query: %{type: "string"}}},
+          input_examples: [%{query: "release notes"}],
+          defer_loading: true
+        }
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      assert_received {:request_headers, headers}
+
+      decoded = Jason.decode!(body)
+      assert [tool] = decoded["tools"]
+      assert tool["input_examples"] == [%{"query" => "release notes"}]
+      assert tool["defer_loading"] == true
+
+      assert beta_values(headers) == ["advanced-tool-use-2025-11-20"]
+    end
+
+    test "advanced tool-use beta merges with memory beta" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:memory, {Alloy.Test.MemoryStore, %{}})
+
+      tool_defs = [
+        %{
+          name: "search",
+          description: "Search",
+          input_schema: %{type: "object", properties: %{}},
+          input_examples: [%{}]
+        }
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_headers, headers}
+
+      assert beta_values(headers) == [
+               "advanced-tool-use-2025-11-20",
+               "context-management-2025-06-27"
+             ]
+    end
+
+    test "does not add advanced tool-use beta when advanced fields are absent" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{name: "read", description: "Read", input_schema: %{type: "object", properties: %{}}}
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_headers, headers}
+
+      refute "advanced-tool-use-2025-11-20" in beta_values(headers)
     end
 
     test "does not include code_execution tool when code_execution is false" do
@@ -454,6 +561,118 @@ defmodule Alloy.Provider.AnthropicTest do
       assert List.last(tools)["cache_control"] == %{"type" => "ephemeral"}
     end
 
+    test "last message string content gets cache_control when cache: true" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:cache, true)
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      [message] = decoded["messages"]
+
+      assert [%{"type" => "text", "text" => "Hi", "cache_control" => %{"type" => "ephemeral"}}] =
+               message["content"]
+    end
+
+    test "last message block content gets cache_control on its last block" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:cache, true)
+
+      messages = [
+        %Message{
+          role: :user,
+          content: [
+            %{type: "text", text: "First"},
+            %{type: "text", text: "Second"}
+          ]
+        }
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      [message] = decoded["messages"]
+      [first, last] = message["content"]
+      refute Map.has_key?(first, "cache_control")
+      assert last["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "last message cache_control skips trailing thinking blocks" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:cache, true)
+
+      messages = [
+        %Message{
+          role: :assistant,
+          content: [
+            %{type: "text", text: "Prefill"},
+            %{type: "thinking", thinking: "Reasoning", signature: "sig_123"}
+          ]
+        }
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      [message] = decoded["messages"]
+      [text, thinking] = message["content"]
+
+      assert text["cache_control"] == %{"type" => "ephemeral"}
+      refute Map.has_key?(thinking, "cache_control")
+    end
+
+    test "last message cache_control is omitted when only thinking blocks qualify" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:cache, true)
+
+      messages = [
+        %Message{
+          role: :assistant,
+          content: [
+            %{type: "thinking", thinking: "Reasoning", signature: "sig_123"},
+            %{type: "redacted_thinking", data: "opaque"}
+          ]
+        }
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      [message] = decoded["messages"]
+      assert count_cache_controls(message) == 0
+    end
+
+    test "cache true keeps total cache_control breakpoints at three" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:system_prompt, "You are helpful.")
+        |> Map.put(:cache, true)
+
+      tool_defs = [
+        %{name: "read", description: "Read", input_schema: %{type: "object", properties: %{}}}
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert count_cache_controls(decoded) <= 4
+      assert count_cache_controls(decoded) == 3
+    end
+
     test "tools have no cache_control when cache is not set" do
       config = config_that_captures_request()
 
@@ -472,6 +691,9 @@ defmodule Alloy.Provider.AnthropicTest do
 
       [tool] = decoded["tools"]
       refute Map.has_key?(tool, "cache_control")
+
+      [message] = decoded["messages"]
+      refute is_list(message["content"])
     end
 
     test "includes cache usage in response" do
@@ -1229,5 +1451,31 @@ defmodule Alloy.Provider.AnthropicTest do
         )
       end)
     end)
+  end
+
+  defp count_cache_controls(value) when is_map(value) do
+    own = if Map.has_key?(value, "cache_control"), do: 1, else: 0
+
+    own +
+      (value
+       |> Map.values()
+       |> Enum.map(&count_cache_controls/1)
+       |> Enum.sum())
+  end
+
+  defp count_cache_controls(value) when is_list(value) do
+    value
+    |> Enum.map(&count_cache_controls/1)
+    |> Enum.sum()
+  end
+
+  defp count_cache_controls(_value), do: 0
+
+  defp beta_values(headers) do
+    headers
+    |> Enum.filter(fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
+    |> Enum.flat_map(fn {_name, value} -> String.split(value, ",", trim: true) end)
+    |> Enum.map(&String.trim/1)
+    |> Enum.sort()
   end
 end

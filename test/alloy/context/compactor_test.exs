@@ -112,6 +112,34 @@ defmodule Alloy.Context.CompactorTest do
 
   defp assistant_tool_call_message?(_message), do: false
 
+  defp tool_result_content(messages, id) do
+    messages
+    |> Enum.flat_map(fn
+      %Message{content: blocks} when is_list(blocks) -> blocks
+      _ -> []
+    end)
+    |> Enum.find_value(fn
+      %{type: "tool_result", tool_use_id: ^id, content: content} -> content
+      %{type: "server_tool_result", tool_use_id: ^id, content: content} -> content
+      _ -> nil
+    end)
+  end
+
+  defp bulky_tool_messages(count, size) do
+    Enum.flat_map(1..count, fn index ->
+      id = "t#{index}"
+
+      [
+        Message.assistant_blocks([
+          %{type: "tool_use", id: id, name: "read_file", input: %{path: "file#{index}.txt"}}
+        ]),
+        Message.tool_results([
+          %{type: "tool_result", tool_use_id: id, content: String.duplicate("#{index}", size)}
+        ])
+      ]
+    end)
+  end
+
   defp tool_pairs_intact?(messages) do
     Enum.with_index(messages)
     |> Enum.all?(fn
@@ -172,6 +200,201 @@ defmodule Alloy.Context.CompactorTest do
       assert Enum.at(compacted.messages, 1).role == :user
       assert summary_message?(Enum.at(compacted.messages, 1))
       assert Enum.at(compacted.messages, 1).content =~ "Alpha goal"
+    end
+
+    test "uses custom summary prompts from compaction config" do
+      messages = [
+        Message.user("original request"),
+        Message.assistant(String.duplicate("a", 900)),
+        Message.user("latest")
+      ]
+
+      state =
+        build_state(messages,
+          max_tokens: 250,
+          compaction: [
+            reserve_tokens: 25,
+            keep_recent_tokens: 20,
+            summary_system_prompt: "My app owns the compaction system prompt.",
+            summary_prompt: "CUSTOM HANDOFF FORMAT"
+          ],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("Custom")}, test_pid: self()}
+        )
+
+      {:compacted, _compacted} = Compactor.maybe_compact(state)
+
+      assert_received {:summary_request, [%Message{role: :user, content: prompt}], [], config}
+      assert config.system_prompt == "My app owns the compaction system prompt."
+      assert prompt =~ "CUSTOM HANDOFF FORMAT"
+    end
+
+    test "clears bulky old tool results before summarizing and skips provider when enough" do
+      messages =
+        [Message.user("original")] ++
+          bulky_tool_messages(5, 400) ++
+          [Message.user("latest")]
+
+      state =
+        build_state(messages,
+          max_tokens: 540,
+          compaction: [reserve_tokens: 100, keep_recent_tokens: 10],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("unused")}, test_pid: self()}
+        )
+
+      {:compacted, compacted} = Compactor.maybe_compact(state)
+
+      refute_received {:summary_request, _, _, _}
+      assert tool_result_content(compacted.messages, "t1") == "[tool result cleared: 400 bytes]"
+      assert tool_result_content(compacted.messages, "t2") == "[tool result cleared: 400 bytes]"
+      assert tool_result_content(compacted.messages, "t3") == String.duplicate("3", 400)
+      assert tool_result_content(compacted.messages, "t4") == String.duplicate("4", 400)
+      assert tool_result_content(compacted.messages, "t5") == String.duplicate("5", 400)
+    end
+
+    test "clears old tool results in a single-prompt tool loop before summarizing" do
+      messages = [Message.user("task")] ++ bulky_tool_messages(6, 400)
+
+      state =
+        build_state(messages,
+          max_tokens: 540,
+          compaction: [reserve_tokens: 100, keep_recent_tokens: 10],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("unused")}, test_pid: self()}
+        )
+
+      {:compacted, compacted} = Compactor.maybe_compact(state)
+
+      refute_received {:summary_request, _, _, _}
+      assert tool_result_content(compacted.messages, "t1") == "[tool result cleared: 400 bytes]"
+      assert tool_result_content(compacted.messages, "t2") == "[tool result cleared: 400 bytes]"
+      assert tool_result_content(compacted.messages, "t3") == "[tool result cleared: 400 bytes]"
+      assert tool_result_content(compacted.messages, "t4") == String.duplicate("4", 400)
+      assert tool_result_content(compacted.messages, "t5") == String.duplicate("5", 400)
+      assert tool_result_content(compacted.messages, "t6") == String.duplicate("6", 400)
+    end
+
+    test "emits telemetry when tool results are cleared" do
+      test_pid = self()
+      handler_id = "compaction-cleared-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        handler_id,
+        [:alloy, :compaction, :cleared],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:cleared, measurements, metadata})
+        end,
+        nil
+      )
+
+      messages =
+        [Message.user("original")] ++
+          bulky_tool_messages(4, 300) ++
+          [Message.user("latest")]
+
+      state =
+        build_state(messages,
+          max_tokens: 380,
+          compaction: [reserve_tokens: 100, keep_recent_tokens: 10],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("unused")}, test_pid: self()}
+        )
+
+      try do
+        {:compacted, _compacted} = Compactor.maybe_compact(state)
+        assert_received {:cleared, %{results_cleared: 1, bytes_cleared: 300}, %{turn: 1}}
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
+    test "falls through to summarization when clearing tool results is not enough" do
+      messages =
+        [Message.user("original")] ++
+          bulky_tool_messages(4, 200) ++
+          [Message.assistant(String.duplicate("analysis", 600)), Message.user("latest")]
+
+      state =
+        build_state(messages,
+          max_tokens: 600,
+          compaction: [reserve_tokens: 100, keep_recent_tokens: 10],
+          provider: ProbeProvider,
+          provider_config: %{
+            summary_response: {:ok, summary_text("ClearThenSummary")},
+            test_pid: self()
+          }
+        )
+
+      {:compacted, compacted} = Compactor.maybe_compact(state)
+
+      assert_received {:summary_request, _, _, _}
+      assert Enum.any?(compacted.messages, &summary_message?/1)
+    end
+
+    test "clear_tool_results false skips clearing and goes directly to summarization" do
+      messages =
+        [Message.user("original")] ++
+          bulky_tool_messages(4, 300) ++
+          [Message.user("latest")]
+
+      state =
+        build_state(messages,
+          max_tokens: 380,
+          compaction: [
+            reserve_tokens: 100,
+            keep_recent_tokens: 10,
+            clear_tool_results: false
+          ],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("NoClear")}, test_pid: self()}
+        )
+
+      {:compacted, compacted} = Compactor.maybe_compact(state)
+
+      assert_received {:summary_request, _, _, _}
+      assert Enum.any?(compacted.messages, &summary_message?/1)
+    end
+
+    test "tool-result clearing does not touch thinking blocks" do
+      signed_thinking = String.duplicate("signed", 80)
+      unsigned_thinking = String.duplicate("unsigned", 80)
+
+      reasoning = %{
+        type: "reasoning",
+        raw: %{
+          "id" => "rs_1",
+          "type" => "reasoning",
+          "encrypted_content" => "opaque"
+        }
+      }
+
+      messages =
+        [
+          Message.user("original"),
+          Message.assistant_blocks([
+            %{type: "thinking", thinking: signed_thinking, signature: "sig-1"},
+            %{type: "thinking", thinking: unsigned_thinking},
+            reasoning
+          ])
+        ] ++ bulky_tool_messages(4, 300) ++ [Message.user("latest")]
+
+      state =
+        build_state(messages,
+          max_tokens: 700,
+          compaction: [reserve_tokens: 100, keep_recent_tokens: 10],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("unused")}, test_pid: self()}
+        )
+
+      {:compacted, compacted} = Compactor.maybe_compact(state)
+      thinking_message = Enum.at(compacted.messages, 1)
+
+      assert [
+               %{type: "thinking", thinking: ^signed_thinking, signature: "sig-1"},
+               %{type: "thinking", thinking: ^unsigned_thinking},
+               ^reasoning
+             ] = thinking_message.content
     end
 
     test "preserves recent messages intact based on the keep_recent_tokens budget" do
@@ -577,6 +800,31 @@ defmodule Alloy.Context.CompactorTest do
 
       compacted_msg = Enum.at(compacted, 1)
       assert String.length(compacted_msg.content) <= 203
+    end
+
+    test "drops signed thinking blocks instead of truncating them" do
+      signed = String.duplicate("s", 500)
+      unsigned = String.duplicate("u", 500)
+
+      messages = [
+        Message.user("original"),
+        Message.assistant_blocks([
+          %{type: "thinking", thinking: signed, signature: "signed-token"},
+          %{type: "thinking", thinking: unsigned},
+          %{type: "text", text: "after thinking"}
+        ]),
+        Message.assistant("recent"),
+        Message.user("latest")
+      ]
+
+      compacted = Compactor.compact_messages(messages, keep_recent: 2)
+
+      compacted_msg = Enum.at(compacted, 1)
+      refute Enum.any?(compacted_msg.content, &match?(%{signature: "signed-token"}, &1))
+      assert Enum.any?(compacted_msg.content, &match?(%{type: "thinking"}, &1))
+
+      unsigned_block = Enum.find(compacted_msg.content, &match?(%{type: "thinking"}, &1))
+      assert String.length(unsigned_block.thinking) <= 203
     end
 
     test "handles all messages within keep_recent window" do

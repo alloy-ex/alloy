@@ -138,12 +138,56 @@ defmodule Alloy.Tool.ExecutorTest do
       state = build_state([CrashingTool])
       tool_call = %{id: "call_crash", name: "crasher", type: "tool_use", input: %{}}
 
-      result = Executor.execute_all([tool_call], state.tool_fns, state)
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          result = Executor.execute_all([tool_call], state.tool_fns, state)
 
-      assert %Message{role: :user, content: [block]} = result
-      assert block.content =~ "Tool crashed"
-      assert block.content =~ "boom!"
-      assert block.is_error == true
+          assert %Message{role: :user, content: [block]} = result
+          assert block.content =~ "Tool crasher crashed: boom!"
+          assert block.content =~ "CrashingTool.execute/2"
+          assert block.content =~ "Check the input and try again."
+          refute block.content =~ "\n"
+          refute block.content =~ "lib/alloy"
+          assert block.is_error == true
+        end)
+
+      assert log =~ "Tool crasher crashed: boom!"
+      assert log =~ "CrashingTool.execute/2"
+      assert log =~ "lib/alloy/tool/executor.ex"
+    end
+
+    test "exception telemetry keeps full stacktrace while model-visible result is short" do
+      state = build_state([CrashingTool])
+      tool_call = %{id: "call_crash", name: "crasher", type: "tool_use", input: %{}}
+      test_pid = self()
+
+      stop_handler_id = "tool-error-telemetry-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        stop_handler_id,
+        [:alloy, :tool, :stop],
+        fn _event, _measurements, metadata, _config ->
+          send(test_pid, {:tool_stop, metadata})
+        end,
+        nil
+      )
+
+      try do
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, %Message{role: :user, content: [block]}, [_meta]} =
+                   Executor.execute_all([tool_call], state.tool_fns, state,
+                     on_event: fn _ -> :ok end
+                   )
+
+          refute block.content =~ "\n"
+        end)
+
+        assert_receive {:tool_stop, %{error: error}}
+        assert error =~ "boom!"
+        assert error =~ "lib/alloy/tool/executor.ex"
+      after
+        :telemetry.detach(stop_handler_id)
+      end
     end
 
     test "tool returning {:error, reason} produces is_error block" do
@@ -274,7 +318,10 @@ defmodule Alloy.Tool.ExecutorTest do
 
       assert %Message{role: :user, content: [block]} = result
       assert block.tool_use_id == "call_slow"
-      assert block.content =~ "crashed"
+
+      assert block.content ==
+               "Tool slow_echo timed out after 50ms. Try a smaller input or raise :tool_timeout."
+
       assert block.is_error == true
     end
 

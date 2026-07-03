@@ -18,6 +18,7 @@ defmodule Alloy.Provider.Anthropic do
   - `:api_url` - Base URL (default: "https://api.anthropic.com")
   - `:api_version` - API version header (default: "2023-06-01")
   - `:extra_headers` - Additional headers as `[{name, value}]`
+  - `:extra_body` - Additional request body fields, merged last
   - `:req_options` - Additional options passed to Req (useful for testing)
   - `:extended_thinking` - Enable extended thinking. Pass a keyword list with
     `:budget_tokens` (e.g., `[budget_tokens: 5000]`). Thinking blocks are
@@ -54,6 +55,7 @@ defmodule Alloy.Provider.Anthropic do
   @code_execution_beta "code-execution-2025-08-25"
   @memory_tool_type "memory_20250818"
   @memory_beta "context-management-2025-06-27"
+  @advanced_tool_use_beta "advanced-tool-use-2025-11-20"
 
   @typedoc """
   Configuration for the Anthropic provider. See the module doc for field
@@ -67,6 +69,7 @@ defmodule Alloy.Provider.Anthropic do
           optional(:api_url) => String.t(),
           optional(:api_version) => String.t(),
           optional(:extra_headers) => [{String.t(), String.t()}],
+          optional(:extra_body) => map(),
           optional(:req_options) => keyword(),
           optional(:extended_thinking) => keyword(),
           optional(:on_event) => (term() -> :ok),
@@ -84,7 +87,7 @@ defmodule Alloy.Provider.Anthropic do
       ([
          url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
          method: :post,
-         headers: build_headers(config),
+         headers: build_headers(config, tool_defs),
          body: Jason.encode!(body)
        ] ++ Map.get(config, :req_options, []))
       |> Keyword.put(:retry, false)
@@ -134,7 +137,7 @@ defmodule Alloy.Provider.Anthropic do
       ([
          url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
          method: :post,
-         headers: build_headers(config),
+         headers: build_headers(config, tool_defs),
          body: Jason.encode!(body),
          into: stream_handler
        ] ++ Map.get(config, :req_options, []))
@@ -297,6 +300,7 @@ defmodule Alloy.Provider.Anthropic do
     }
 
     cache? = Map.get(config, :cache, false)
+    body = maybe_add_cache_to_conversation_tail(body, cache?)
 
     body =
       case Map.get(config, :system_prompt) do
@@ -332,25 +336,37 @@ defmodule Alloy.Provider.Anthropic do
       |> maybe_add_code_execution(config)
       |> maybe_add_memory_tool(config)
 
-    case Map.get(config, :extended_thinking) do
-      nil ->
-        body
+    body =
+      case Map.get(config, :extended_thinking) do
+        nil ->
+          body
 
-      opts when is_list(opts) ->
-        budget = Keyword.get(opts, :budget_tokens)
+        opts when is_list(opts) ->
+          budget = Keyword.get(opts, :budget_tokens)
 
-        unless is_integer(budget) and budget > 0 do
-          raise ArgumentError,
-                "extended_thinking requires a positive integer :budget_tokens, got: #{inspect(budget)}"
-        end
+          unless is_integer(budget) and budget > 0 do
+            raise ArgumentError,
+                  "extended_thinking requires a positive integer :budget_tokens, got: #{inspect(budget)}"
+          end
 
-        Map.put(body, "thinking", %{"type" => "enabled", "budget_tokens" => budget})
+          Map.put(body, "thinking", %{"type" => "enabled", "budget_tokens" => budget})
 
-      _opts ->
-        # Non-list value (e.g., extended_thinking: true) — silently ignore
-        body
-    end
+        _opts ->
+          # Non-list value (e.g., extended_thinking: true) — silently ignore
+          body
+      end
+
+    Map.merge(body, stringify_extra_body(Map.get(config, :extra_body, %{})))
   end
+
+  defp stringify_extra_body(extra_body) when is_map(extra_body) do
+    Map.new(extra_body, fn
+      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+      {key, value} -> {key, value}
+    end)
+  end
+
+  defp stringify_extra_body(_), do: %{}
 
   defp maybe_add_code_execution(body, config) do
     if Map.get(config, :code_execution, false) do
@@ -378,7 +394,7 @@ defmodule Alloy.Provider.Anthropic do
     end
   end
 
-  defp build_headers(config) do
+  defp build_headers(config, tool_defs) do
     extra_headers = Map.get(config, :extra_headers, [])
     {beta_values, other_headers} = split_anthropic_beta_headers(extra_headers)
 
@@ -395,11 +411,25 @@ defmodule Alloy.Provider.Anthropic do
         {_module, _store} -> [@memory_beta | beta_values]
       end
 
+    beta_values =
+      if advanced_tool_use?(tool_defs) do
+        [@advanced_tool_use_beta | beta_values]
+      else
+        beta_values
+      end
+
     [
       {"x-api-key", config.api_key},
       {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
       {"content-type", "application/json"}
     ] ++ build_beta_headers(beta_values) ++ other_headers
+  end
+
+  defp advanced_tool_use?(tool_defs) do
+    Enum.any?(tool_defs, fn tool_def ->
+      Map.get(tool_def, :defer_loading) == true or
+        match?([_ | _], Map.get(tool_def, :input_examples))
+    end)
   end
 
   defp split_anthropic_beta_headers(headers) do
@@ -423,6 +453,53 @@ defmodule Alloy.Provider.Anthropic do
 
     [{"anthropic-beta", merged_value}]
   end
+
+  defp maybe_add_cache_to_conversation_tail(body, false), do: body
+
+  defp maybe_add_cache_to_conversation_tail(%{"messages" => []} = body, true), do: body
+
+  defp maybe_add_cache_to_conversation_tail(%{"messages" => messages} = body, true) do
+    {init, [last]} = Enum.split(messages, -1)
+    Map.put(body, "messages", init ++ [add_cache_to_message_tail(last)])
+  end
+
+  defp add_cache_to_message_tail(%{"content" => content} = message) when is_binary(content) do
+    Map.put(message, "content", [
+      %{"type" => "text", "text" => content, "cache_control" => %{"type" => "ephemeral"}}
+    ])
+  end
+
+  defp add_cache_to_message_tail(%{"content" => blocks} = message)
+       when is_list(blocks) and blocks != [] do
+    Map.put(message, "content", add_cache_to_last_cacheable_block(blocks))
+  end
+
+  defp add_cache_to_message_tail(message), do: message
+
+  defp add_cache_to_last_cacheable_block(blocks) do
+    {blocks, _added?} =
+      blocks
+      |> Enum.reverse()
+      |> Enum.map_reduce(false, fn
+        block, false ->
+          if cacheable_message_block?(block) do
+            {Map.put(block, "cache_control", %{"type" => "ephemeral"}), true}
+          else
+            {block, false}
+          end
+
+        block, true ->
+          {block, true}
+      end)
+
+    Enum.reverse(blocks)
+  end
+
+  defp cacheable_message_block?(%{"type" => type}) when type in ["thinking", "redacted_thinking"],
+    do: false
+
+  defp cacheable_message_block?(block) when is_map(block), do: true
+  defp cacheable_message_block?(_block), do: false
 
   defp format_message(%Message{role: role, content: content}) when is_binary(content) do
     %{"role" => to_string(role), "content" => content}
@@ -506,17 +583,36 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do
-    base = %{
-      "name" => name,
-      "description" => desc,
-      "input_schema" => Alloy.Provider.stringify_keys(schema)
-    }
+    base =
+      %{
+        "name" => name,
+        "description" => desc,
+        "input_schema" => Alloy.Provider.stringify_keys(schema)
+      }
+      |> maybe_put_strict(def_map)
+      |> maybe_put_input_examples(def_map)
+      |> maybe_put_defer_loading(def_map)
 
     case Map.get(def_map, :allowed_callers) do
       nil -> base
       callers -> Map.put(base, "allowed_callers", Enum.map(callers, &to_string/1))
     end
   end
+
+  defp maybe_put_strict(tool, %{strict: true}), do: Map.put(tool, "strict", true)
+  defp maybe_put_strict(tool, _def_map), do: tool
+
+  defp maybe_put_input_examples(tool, %{input_examples: examples}) when is_list(examples) do
+    Map.put(tool, "input_examples", examples)
+  end
+
+  defp maybe_put_input_examples(tool, _def_map), do: tool
+
+  defp maybe_put_defer_loading(tool, %{defer_loading: true}) do
+    Map.put(tool, "defer_loading", true)
+  end
+
+  defp maybe_put_defer_loading(tool, _def_map), do: tool
 
   # --- Response Parsing ---
 

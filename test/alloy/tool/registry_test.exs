@@ -48,6 +48,57 @@ defmodule Alloy.Tool.RegistryTest do
     def allowed_callers, do: [:human]
   end
 
+  defmodule StrictTool do
+    @behaviour Alloy.Tool
+    @impl true
+    def name, do: "strict_tool"
+    @impl true
+    def description, do: "A strict tool"
+    @impl true
+    def input_schema,
+      do: %{
+        type: "object",
+        properties: %{query: %{type: "string"}},
+        required: ["query"],
+        additionalProperties: false
+      }
+
+    @impl true
+    def execute(_input, _ctx), do: {:ok, "ok"}
+    @impl true
+    def strict?, do: true
+  end
+
+  defmodule InvalidStrictTool do
+    @behaviour Alloy.Tool
+    @impl true
+    def name, do: "invalid_strict"
+    @impl true
+    def description, do: "A strict tool with a loose schema"
+    @impl true
+    def input_schema, do: %{type: "object", properties: %{query: %{type: "string"}}}
+    @impl true
+    def execute(_input, _ctx), do: {:ok, "ok"}
+    @impl true
+    def strict?, do: true
+  end
+
+  defmodule AdvancedTool do
+    @behaviour Alloy.Tool
+    @impl true
+    def name, do: "advanced"
+    @impl true
+    def description, do: "An advanced tool"
+    @impl true
+    def input_schema, do: %{type: "object", properties: %{query: %{type: "string"}}}
+    @impl true
+    def execute(_input, _ctx), do: {:ok, "ok"}
+    @impl true
+    def input_examples, do: [%{query: "release notes"}]
+    @impl true
+    def defer_loading?, do: true
+  end
+
   describe "build/1" do
     test "basic tool produces definitions without metadata" do
       {defs, fns} = Registry.build([BasicTool])
@@ -101,6 +152,39 @@ defmodule Alloy.Tool.RegistryTest do
 
     test "empty tool list returns empty results" do
       assert Registry.build([]) == {[], %{}}
+    end
+
+    test "strict tools include strict metadata" do
+      {defs, _fns} = Registry.build([StrictTool])
+
+      assert [%{name: "strict_tool", strict: true}] = defs
+    end
+
+    test "strict tools must set additionalProperties false" do
+      error =
+        assert_raise ArgumentError, fn ->
+          Registry.build([InvalidStrictTool])
+        end
+
+      message = Exception.message(error)
+
+      assert message =~
+               ~s(strict tool "invalid_strict" input_schema must include additionalProperties: false)
+
+      assert message =~
+               "OpenAI strict mode also requires every property to be listed in required."
+    end
+
+    test "advanced tool metadata is included only when present" do
+      {defs, _fns} = Registry.build([AdvancedTool, BasicTool])
+
+      advanced_def = Enum.find(defs, &(&1.name == "advanced"))
+      assert advanced_def.input_examples == [%{query: "release notes"}]
+      assert advanced_def.defer_loading == true
+
+      basic_def = Enum.find(defs, &(&1.name == "basic"))
+      refute Map.has_key?(basic_def, :input_examples)
+      refute Map.has_key?(basic_def, :defer_loading)
     end
   end
 end

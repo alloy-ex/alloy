@@ -51,6 +51,12 @@ defmodule Alloy.Tool.Inline do
     (default `nil`, omitted from the tool definition)
   - `:result_type` - as `c:Alloy.Tool.result_type/0`
     (default `nil`, omitted from the tool definition)
+  - `:strict` - request provider strict-mode schema enforcement
+    (default `false`)
+  - `:input_examples` - example input maps for providers that support them
+    (default `[]`)
+  - `:defer_loading` - request provider-side deferred tool loading
+    (default `false`)
   """
 
   @enforce_keys [:name, :description, :input_schema, :execute]
@@ -62,6 +68,9 @@ defmodule Alloy.Tool.Inline do
     :max_result_chars,
     :allowed_callers,
     :result_type,
+    input_examples: [],
+    strict: false,
+    defer_loading: false,
     concurrent?: true
   ]
 
@@ -76,7 +85,10 @@ defmodule Alloy.Tool.Inline do
           concurrent?: boolean(),
           max_result_chars: pos_integer() | :unlimited | nil,
           allowed_callers: [atom()] | nil,
-          result_type: :text | :structured | nil
+          result_type: :text | :structured | nil,
+          input_examples: [map()],
+          strict: boolean(),
+          defer_loading: boolean()
         }
 
   @doc false
@@ -103,6 +115,24 @@ defmodule Alloy.Tool.Inline do
       raise ArgumentError,
             "inline tool #{inspect(tool.name)} :execute must be a 2-arity function " <>
               "(input, context). Got: #{inspect(tool.execute)}"
+    end
+
+    unless is_boolean(tool.strict) do
+      raise ArgumentError,
+            "inline tool #{inspect(tool.name)} :strict must be a boolean. " <>
+              "Got: #{inspect(tool.strict)}"
+    end
+
+    unless is_list(tool.input_examples) and Enum.all?(tool.input_examples, &is_map/1) do
+      raise ArgumentError,
+            "inline tool #{inspect(tool.name)} :input_examples must be a list of maps. " <>
+              "Got: #{inspect(tool.input_examples)}"
+    end
+
+    unless is_boolean(tool.defer_loading) do
+      raise ArgumentError,
+            "inline tool #{inspect(tool.name)} :defer_loading must be a boolean. " <>
+              "Got: #{inspect(tool.defer_loading)}"
     end
 
     tool

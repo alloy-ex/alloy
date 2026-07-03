@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.12.3"
+  @version "0.12.4"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -75,8 +75,8 @@ defmodule Alloy.MixProject do
         Core: [
           Alloy,
           Alloy.Agent.Config,
-          Alloy.Agent.Events,
           Alloy.Agent.Server,
+          Alloy.Events,
           Alloy.ModelCatalog,
           Alloy.ModelMetadata,
           Alloy.Agent.State,
@@ -109,6 +109,10 @@ defmodule Alloy.MixProject do
         ],
         Context: [
           Alloy.Context.Compactor
+        ],
+        Memory: [
+          Alloy.Memory,
+          Alloy.Memory.Router
         ],
         Middleware: [
           Alloy.Middleware

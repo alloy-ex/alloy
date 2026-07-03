@@ -242,15 +242,19 @@ defmodule Alloy.Provider.OpenAICompat do
 
   defp format_user_content_block(_), do: nil
 
-  defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do
-    %{
-      "type" => "function",
-      "function" => %{
-        "name" => name,
-        "description" => desc,
-        "parameters" => Alloy.Provider.stringify_keys(schema)
-      }
+  defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do
+    function = %{
+      "name" => name,
+      "description" => desc,
+      "parameters" => Alloy.Provider.stringify_keys(schema)
     }
+
+    function =
+      if Map.get(def_map, :strict) == true,
+        do: Map.put(function, "strict", true),
+        else: function
+
+    %{"type" => "function", "function" => function}
   end
 
   # --- Response Parsing ---

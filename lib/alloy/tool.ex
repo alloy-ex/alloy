@@ -15,6 +15,12 @@ defmodule Alloy.Tool do
     (`:human`, `:code_execution`). Defaults to `[:human]`.
   - `result_type/0` — declares whether the tool returns `:text` or
     `:structured` data. Defaults to `:text`.
+  - `strict?/0` — requests provider strict-mode schema enforcement. Defaults
+    to `false`.
+  - `input_examples/0` — example inputs for providers that support advanced
+    tool-use metadata. Defaults to `[]`.
+  - `defer_loading?/0` — requests provider-side deferred loading where
+    supported. Defaults to `false`.
 
   ## Structured Results
 
@@ -116,6 +122,24 @@ defmodule Alloy.Tool do
   @callback result_type() :: :text | :structured
 
   @doc """
+  Whether providers should use strict schema enforcement for this tool.
+
+  Strict tools must declare `additionalProperties: false` on their top-level
+  input schema. Alloy validates this instead of mutating the schema silently.
+  """
+  @callback strict?() :: boolean()
+
+  @doc """
+  Example tool inputs for provider tool-use guidance.
+  """
+  @callback input_examples() :: [map()]
+
+  @doc """
+  Whether providers that support deferred tool loading should defer this tool.
+  """
+  @callback defer_loading?() :: boolean()
+
+  @doc """
   Maximum characters in the tool result before truncation.
   The executor truncates results exceeding this, keeping head + tail.
   Defaults to `:unlimited` when not implemented.
@@ -129,7 +153,15 @@ defmodule Alloy.Tool do
   """
   @callback concurrent?() :: boolean()
 
-  @optional_callbacks [allowed_callers: 0, result_type: 0, max_result_chars: 0, concurrent?: 0]
+  @optional_callbacks [
+    allowed_callers: 0,
+    result_type: 0,
+    strict?: 0,
+    input_examples: 0,
+    defer_loading?: 0,
+    max_result_chars: 0,
+    concurrent?: 0
+  ]
 
   @doc """
   Build an inline tool — a tool defined as data instead of a module.

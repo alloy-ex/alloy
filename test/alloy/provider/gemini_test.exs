@@ -128,6 +128,34 @@ defmodule Alloy.Provider.GeminiTest do
       assert {"x-goog-api-key", "gem-test-key"} in headers
     end
 
+    test "omits strict field because Gemini has no strict tool equivalent" do
+      config = config_that_captures_request()
+
+      Gemini.complete(
+        [Message.user("Hi")],
+        [
+          %{
+            name: "search",
+            description: "Search",
+            strict: true,
+            input_schema: %{
+              type: "object",
+              properties: %{query: %{type: "string"}},
+              required: ["query"],
+              additionalProperties: false
+            }
+          }
+        ],
+        config
+      )
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [%{"functionDeclarations" => [tool]}] = decoded["tools"]
+      refute Map.has_key?(tool, "strict")
+    end
+
     test "formats tool results as function responses using the original tool call name" do
       config = config_that_captures_request()
 
