@@ -23,6 +23,8 @@ defmodule Alloy.Provider.Codex do
     (default: `System.tmp_dir!/0`)
   - `:timeout_ms` - Timeout for a single `codex exec` invocation
     (default: `120_000`)
+  - `:receive_timeout` - Optional turn deadline timeout injected by Alloy's
+    retry loop; when present it caps `:timeout_ms`
   - `:command_runner` - Test hook matching `System.cmd/3`
   - `:system_prompt` - System prompt string
 
@@ -90,6 +92,7 @@ defmodule Alloy.Provider.Codex do
           optional(:auth_path) => String.t(),
           optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
+          optional(:receive_timeout) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:command_runner) => (String.t(), [String.t()], keyword() ->
                                           {String.t(), integer()})
@@ -191,7 +194,7 @@ defmodule Alloy.Provider.Codex do
 
   defp run_codex(prompt, paths, config) do
     executable = Map.get(config, :codex_bin, @default_codex_bin)
-    timeout = Map.get(config, :timeout_ms, @default_timeout_ms)
+    timeout = effective_timeout(config)
 
     args =
       [
@@ -213,6 +216,18 @@ defmodule Alloy.Provider.Codex do
       run_injected(config, executable, args, paths)
     else
       run_port(executable, args, paths, timeout)
+    end
+  end
+
+  defp effective_timeout(config) do
+    timeout_ms = Map.get(config, :timeout_ms, @default_timeout_ms)
+
+    case Map.get(config, :receive_timeout) do
+      receive_timeout when is_integer(receive_timeout) and receive_timeout > 0 ->
+        min(receive_timeout, timeout_ms)
+
+      _ ->
+        timeout_ms
     end
   end
 

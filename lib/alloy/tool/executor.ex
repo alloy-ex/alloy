@@ -66,7 +66,7 @@ defmodule Alloy.Tool.Executor do
                 pair
 
               {{:exit, reason}, tag} ->
-                crashed(call_from(tag), reason, on_event, seq_ref, corr_id, turn)
+                crashed(call_from(tag), reason, tool_timeout, on_event, seq_ref, corr_id, turn)
             end)
           end
 
@@ -117,13 +117,14 @@ defmodule Alloy.Tool.Executor do
           rescue
             e ->
               stacktrace = __STACKTRACE__
-              err = "Tool crashed: #{Exception.message(e)}"
+              visible_error = tool_crash_message(call[:name], e, stacktrace)
+              diagnostic_error = Exception.format(:error, e, stacktrace)
 
-              Logger.warning(
+              Logger.error(
                 "Tool #{call[:name]} crashed: #{Exception.message(e)}\n#{Exception.format_stacktrace(stacktrace)}"
               )
 
-              {block_fn.(call[:id], err, true), err, nil}
+              {block_fn.(call[:id], visible_error, true), diagnostic_error, nil}
           end
 
         :error ->
@@ -170,8 +171,17 @@ defmodule Alloy.Tool.Executor do
      Map.merge(meta, %{correlation_id: corr_id, start_event_seq: sseq, end_event_seq: eseq})}
   end
 
-  defp crashed(call, reason, on_event, seq_ref, corr_id, turn) do
-    error = "Tool execution crashed: #{inspect(reason)}"
+  defp crashed(call, reason, tool_timeout, on_event, seq_ref, corr_id, turn) do
+    error =
+      case reason do
+        :timeout ->
+          "Tool #{call[:name]} timed out after #{tool_timeout}ms. " <>
+            "Try a smaller input or raise :tool_timeout."
+
+        _ ->
+          "Tool #{call[:name]} crashed during execution: #{inspect(reason)}. " <>
+            "Check the input and try again."
+      end
 
     meta = %{
       id: call[:id],
@@ -189,6 +199,24 @@ defmodule Alloy.Tool.Executor do
 
   defp call_from({:execute, c}), do: c
   defp call_from({:blocked, c, _}), do: c
+
+  defp tool_crash_message(tool_name, exception, stacktrace) do
+    "Tool #{tool_name} crashed: #{Exception.message(exception)} " <>
+      "(#{format_top_stack_frame(stacktrace)}). Check the input and try again."
+  end
+
+  defp format_top_stack_frame([{module, function, arity_or_args, info} | _]) do
+    arity = stack_arity(arity_or_args)
+    file = info |> Keyword.get(:file, "unknown") |> to_string() |> Path.basename()
+    line = Keyword.get(info, :line, "?")
+
+    "#{inspect(module)}.#{function}/#{arity} at #{file}:#{line}"
+  end
+
+  defp format_top_stack_frame(_stacktrace), do: "unknown location"
+
+  defp stack_arity(arity) when is_integer(arity), do: arity
+  defp stack_arity(args) when is_list(args), do: length(args)
 
   defp emit_start(on_event, call, seq_ref, corr_id, turn) do
     seq = :atomics.add_get(seq_ref, 1, 1)

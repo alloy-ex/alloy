@@ -9,7 +9,7 @@
 
 Alloy is the completion-tool-call loop and nothing else. Send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. No opinions on sessions, persistence, memory, scheduling, or UI — those belong in your application, where OTP already gives you the runtime.
 
-Alloy is a harness, not a framework. Three runtime dependencies, ~7,500 lines — small enough to read in an afternoon, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
+Alloy is a harness, not a framework. Three runtime dependencies, ~9,000 lines — small enough to read in an afternoon, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and tell me the version",
@@ -48,6 +48,15 @@ and could help any Alloy consumer, it likely belongs here. If it needs a
 database table, product defaults, UI decisions, or tenancy logic, it belongs in
 your application layer.
 
+## Non-goals
+
+Alloy does not own multi-agent orchestration; use the
+[sub-agents recipe](https://hexdocs.pm/alloy/sub-agents.html), where an agent
+spawns itself via a function call. Alloy does not sandbox your machine; use
+`:bash_executor` with containers or another isolated runner. Sessions,
+persistence, scheduling, hosted queues, dashboards, and UI stay in your
+application layer. The library stays small so those choices remain yours.
+
 ## What's in the box
 
 - **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
@@ -56,7 +65,7 @@ your application layer.
 - **Streaming** — token-by-token from any provider, unified interface
 - **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
 - **Middleware** — custom hooks, tool blocking, argument editing
-- **Context compaction** — summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
+- **Context compaction** — tool-result clearing plus summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
 - **Memory primitive** — `Alloy.Memory` behaviour for Anthropic's `memory_20250818` tool. Alloy owns the wire format and path validation; you own the store (in-memory, disk, Postgres — whatever fits)
 - **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
 - **Reasoning blocks** — DeepSeek/xAI `reasoning_content` parsed as first-class thinking blocks
@@ -66,7 +75,7 @@ your application layer.
 - **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
 - **Cost guard** — `max_budget_cents` halts the loop before overspending
 - **Pluggable model catalog** — `Alloy.ModelCatalog` behaviour; bring your own context-window source (e.g., an `llm_db` adapter)
-- **~7,500 lines** — small enough to read, understand, and extend
+- **~9,000 lines** — small enough to read, understand, and extend
 
 ## Installation
 
@@ -210,6 +219,13 @@ provider-native conversation:
   )
 ```
 
+For native OpenAI Responses, Alloy automatically preserves opaque reasoning
+items across stateless tool-call turns. When `store` is not `true` and no
+`previous_response_id` / `provider_state.response_id` is present, the request
+adds `include: ["reasoning.encrypted_content"]` and echoes returned reasoning
+items back verbatim before their related function calls; `result.text` ignores
+those opaque blocks.
+
 ### Provider-native tools and citations
 
 Responses-compatible providers can expose built-in server-side tools without
@@ -287,7 +303,7 @@ Resolution order: explicit `max_tokens` → `model_metadata_overrides` →
 fine — Alloy falls back to the default.
 
 Use `compaction:` when you want to tune how much room Alloy reserves before it
-summarizes older context:
+compacts older context:
 
 ```elixir
 {:ok, result} = Alloy.run("Summarise this repository",
@@ -295,10 +311,22 @@ summarizes older context:
   compaction: [
     reserve_tokens: 12_000,
     keep_recent_tokens: 8_000,
+    clear_tool_results: true,
+    keep_recent_tool_results: 3,
     fallback: :truncate
   ]
 )
 ```
+
+Alloy first clears old `tool_result` and `server_tool_result` content in one
+batch, preserving the newest `keep_recent_tool_results` results, then only
+calls the summarizer if the run is still over budget. Batched clearing matters
+with prompt caching: clearing invalidates cached prefixes, so Alloy amortizes
+that cost instead of dripping changes across turns.
+
+Set `summary_system_prompt:` and `summary_prompt:` inside `compaction:` when
+your application needs to own the handoff format. Both values must be strings;
+omitting them uses Alloy's default summary prompts.
 
 ### Cost guard
 
@@ -439,6 +467,7 @@ logging, or custom metrics:
   [:alloy, :turn, :start],
   [:alloy, :turn, :stop],
   [:alloy, :provider, :request],
+  [:alloy, :compaction, :cleared],
   [:alloy, :compaction, :done],
   [:alloy, :tool, :start],
   [:alloy, :tool, :stop],
@@ -453,6 +482,7 @@ logging, or custom metrics:
 | `[:alloy, :turn, :start]` | `system_time` | `turn` |
 | `[:alloy, :turn, :stop]` | — | `turn`, `status` |
 | `[:alloy, :provider, :request]` | `duration_ms` | `provider`, `model`, `streaming`, `attempt`, `result` |
+| `[:alloy, :compaction, :cleared]` | `results_cleared`, `bytes_cleared` | `turn` |
 | `[:alloy, :compaction, :done]` | `messages_before`, `messages_after` | `turn` |
 | `[:alloy, :tool, :start]` | — | tool identity, correlation |
 | `[:alloy, :tool, :stop]` | `duration_ms` | tool identity, result |
@@ -590,9 +620,13 @@ defmodule MyApp.Tools.WebSearch do
     %{
       type: "object",
       properties: %{query: %{type: "string", description: "Search query"}},
-      required: ["query"]
+      required: ["query"],
+      additionalProperties: false
     }
   end
+
+  @impl true
+  def strict?, do: true
 
   @impl true
   def execute(%{"query" => query}, _context) do
@@ -601,6 +635,17 @@ defmodule MyApp.Tools.WebSearch do
   end
 end
 ```
+
+Prefer strict mode for tools that have stable schemas. Set `strict?/0` on a
+module tool, or `strict: true` on an inline tool, and include
+`additionalProperties: false` in the top-level JSON Schema. Alloy validates
+that requirement instead of silently rewriting your schema. OpenAI strict mode
+also requires every property to be listed in `required`.
+
+For Anthropic advanced tool use, add `input_examples/0` or `input_examples:`
+with representative argument maps to improve parameter selection. Set
+`defer_loading?/0` or `defer_loading: true` for tools that should be exposed
+through Anthropic's deferred-loading path; other providers ignore these fields.
 
 ### Inline tools
 

@@ -54,7 +54,7 @@ defmodule Alloy.Testing do
 
   ## Options
 
-  - `:tools` - list of tool modules or inline tools (default: `[Alloy.Test.EchoTool]`)
+  - `:tools` - list of tool modules or inline tools (default: an inline `echo` tool)
   - `:system_prompt` - system prompt string
   - `:max_turns` - maximum turns (default: 10)
   - `:middleware` - list of middleware modules
@@ -68,7 +68,7 @@ defmodule Alloy.Testing do
     config = %Config{
       provider: TestProvider,
       provider_config: %{agent_pid: pid},
-      tools: Keyword.get(opts, :tools, [Alloy.Test.EchoTool]),
+      tools: Keyword.get(opts, :tools, default_tools()),
       system_prompt: Keyword.get(opts, :system_prompt),
       max_turns: Keyword.get(opts, :max_turns, 10),
       middleware: Keyword.get(opts, :middleware, []),
@@ -110,6 +110,26 @@ defmodule Alloy.Testing do
   """
   @spec error_response(term()) :: {:error, term()}
   def error_response(reason), do: TestProvider.error_response(reason)
+
+  @doc false
+  @spec default_tools() :: [Alloy.Tool.Inline.t()]
+  def default_tools do
+    [
+      Alloy.Tool.inline(
+        name: "echo",
+        description: "Echoes input back",
+        input_schema: %{
+          type: "object",
+          properties: %{text: %{type: "string"}},
+          required: ["text"]
+        },
+        execute: fn
+          %{"text" => text}, _context -> {:ok, "Echo: #{text}"}
+          %{text: text}, _context -> {:ok, "Echo: #{text}"}
+        end
+      )
+    ]
+  end
 
   @doc """
   Extract the text content from the last assistant message in a result.

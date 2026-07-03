@@ -95,6 +95,51 @@ defmodule Alloy.Provider.OpenAITest do
       tool_block = Enum.find(blocks, &(&1.type == "tool_use"))
       assert tool_block.name == "read"
     end
+
+    test "round-trips reasoning items before their function calls in stateless mode" do
+      reasoning = reasoning_item("rs_1", "encrypted-state")
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(
+              response_payload([
+                reasoning,
+                function_call_item(
+                  "call_reasoned",
+                  "read",
+                  Jason.encode!(%{"file_path" => "mix.exs"})
+                )
+              ])
+            )
+        })
+
+      assert {:ok, result} = OpenAI.complete([Message.user("Read")], [], config)
+      assert [%Message{role: :assistant, content: blocks} = assistant_message] = result.messages
+      assert [%{type: "reasoning", raw: ^reasoning}, %{type: "tool_use"}] = blocks
+      assert Message.text(assistant_message) == ""
+
+      capture_config = config_that_captures_request()
+
+      messages = [
+        Message.user("Read"),
+        assistant_message,
+        Message.tool_results([
+          Message.tool_result_block("call_reasoned", "file contents")
+        ])
+      ]
+
+      OpenAI.complete(messages, [], capture_config)
+
+      assert_received {:request_body, body}
+      input = Jason.decode!(body)["input"]
+      reasoning_index = Enum.find_index(input, &(&1["type"] == "reasoning"))
+      function_index = Enum.find_index(input, &(&1["type"] == "function_call"))
+
+      assert Enum.at(input, reasoning_index) == reasoning
+      assert reasoning_index < function_index
+    end
   end
 
   describe "complete/3 request formatting" do
@@ -158,6 +203,55 @@ defmodule Alloy.Provider.OpenAITest do
       assert tool["parameters"]["type"] == "object"
     end
 
+    test "includes strict true on strict function tools" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{
+          name: "search",
+          description: "Search",
+          strict: true,
+          input_schema: %{
+            type: "object",
+            properties: %{query: %{type: "string"}},
+            required: ["query"],
+            additionalProperties: false
+          }
+        }
+      ]
+
+      OpenAI.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [tool] = decoded["tools"]
+      assert tool["strict"] == true
+    end
+
+    test "omits Anthropic advanced-tool-use fields" do
+      config = config_that_captures_request()
+
+      tool_defs = [
+        %{
+          name: "search",
+          description: "Search",
+          input_schema: %{type: "object", properties: %{query: %{type: "string"}}},
+          input_examples: [%{query: "release notes"}],
+          defer_loading: true
+        }
+      ]
+
+      OpenAI.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [tool] = decoded["tools"]
+      refute Map.has_key?(tool, "input_examples")
+      refute Map.has_key?(tool, "defer_loading")
+    end
+
     test "formats tool flow as function_call + function_call_output input items" do
       config = config_that_captures_request()
 
@@ -214,6 +308,68 @@ defmodule Alloy.Provider.OpenAITest do
       assert decoded["include"] == ["inline_citations"]
       assert decoded["tool_choice"] == "required"
       assert decoded["parallel_tool_calls"] == false
+    end
+
+    test "stateless requests include encrypted reasoning content" do
+      config = config_that_captures_request()
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert decoded["include"] == ["reasoning.encrypted_content"]
+    end
+
+    test "previous_response_id requests do not include encrypted reasoning content" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:previous_response_id, "resp_prev")
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert decoded["previous_response_id"] == "resp_prev"
+      refute Map.has_key?(decoded, "include")
+    end
+
+    test "stateless reasoning include merges with caller include values" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:include, ["inline_citations"])
+
+      OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert decoded["include"] == ["inline_citations", "reasoning.encrypted_content"]
+    end
+
+    test "store true does not add encrypted reasoning include or echo raw reasoning blocks" do
+      reasoning = reasoning_item("rs_store", "encrypted-state")
+
+      config =
+        config_that_captures_request()
+        |> Map.put(:store, true)
+
+      messages = [
+        Message.assistant_blocks([
+          %{type: "reasoning", raw: reasoning},
+          %{type: "tool_use", id: "call_1", name: "read", input: %{}}
+        ])
+      ]
+
+      OpenAI.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      refute Map.has_key?(decoded, "include")
+      refute Enum.any?(decoded["input"], &(&1["type"] == "reasoning"))
+      assert Enum.any?(decoded["input"], &(&1["type"] == "function_call"))
     end
 
     test "explicit previous_response_id overrides provider_state response_id" do
@@ -686,6 +842,15 @@ defmodule Alloy.Provider.OpenAITest do
       "call_id" => call_id,
       "name" => name,
       "arguments" => arguments
+    }
+  end
+
+  defp reasoning_item(id, encrypted_content) do
+    %{
+      "id" => id,
+      "type" => "reasoning",
+      "summary" => [],
+      "encrypted_content" => encrypted_content
     }
   end
 

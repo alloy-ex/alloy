@@ -6,12 +6,17 @@ defmodule Alloy.Agent.Config do
   duration of the run.
   """
 
+  alias Alloy.Context.Compactor
   alias Alloy.ModelMetadata
 
   @type compaction :: %{
           reserve_tokens: pos_integer(),
           keep_recent_tokens: pos_integer(),
-          fallback: :truncate
+          fallback: :truncate,
+          clear_tool_results: boolean(),
+          keep_recent_tool_results: non_neg_integer(),
+          summary_system_prompt: String.t(),
+          summary_prompt: String.t()
         }
 
   @typedoc """
@@ -75,7 +80,15 @@ defmodule Alloy.Agent.Config do
     timeout_ms: 120_000,
     tool_timeout: 120_000,
     middleware: [],
-    compaction: %{reserve_tokens: 16_384, keep_recent_tokens: 20_000, fallback: :truncate},
+    compaction: %{
+      reserve_tokens: 16_384,
+      keep_recent_tokens: 20_000,
+      fallback: :truncate,
+      clear_tool_results: true,
+      keep_recent_tool_results: 3,
+      summary_system_prompt: Compactor.default_summary_system_prompt(),
+      summary_prompt: Compactor.default_summary_prompt()
+    },
     compaction_explicit: %{reserve_tokens: false, keep_recent_tokens: false},
     working_directory: ".",
     context: %{},
@@ -209,7 +222,11 @@ defmodule Alloy.Agent.Config do
             config.compaction_explicit.keep_recent_tokens,
             default_keep_recent_tokens(max_tokens)
           ),
-        fallback: config.compaction.fallback
+        fallback: config.compaction.fallback,
+        clear_tool_results: config.compaction.clear_tool_results,
+        keep_recent_tool_results: config.compaction.keep_recent_tool_results,
+        summary_system_prompt: config.compaction.summary_system_prompt,
+        summary_prompt: config.compaction.summary_prompt
       }
 
     %{
@@ -308,7 +325,26 @@ defmodule Alloy.Agent.Config do
           do: validate_compaction_tokens!(compaction.keep_recent_tokens, :keep_recent_tokens),
           else: default_keep_recent_tokens(max_tokens)
         ),
-      fallback: fallback
+      fallback: fallback,
+      clear_tool_results:
+        compaction
+        |> Map.get(:clear_tool_results, true)
+        |> validate_clear_tool_results!(),
+      keep_recent_tool_results:
+        compaction
+        |> Map.get(:keep_recent_tool_results, 3)
+        |> validate_keep_recent_tool_results!(),
+      summary_system_prompt:
+        compaction
+        |> Map.get(
+          :summary_system_prompt,
+          Compactor.default_summary_system_prompt()
+        )
+        |> validate_compaction_prompt!(:summary_system_prompt),
+      summary_prompt:
+        compaction
+        |> Map.get(:summary_prompt, Compactor.default_summary_prompt())
+        |> validate_compaction_prompt!(:summary_prompt)
     }
 
     {resolved, explicit}
@@ -347,6 +383,30 @@ defmodule Alloy.Agent.Config do
       {"fallback", value}, acc ->
         Map.put(acc, :fallback, value)
 
+      {:clear_tool_results, value}, acc ->
+        Map.put(acc, :clear_tool_results, value)
+
+      {"clear_tool_results", value}, acc ->
+        Map.put(acc, :clear_tool_results, value)
+
+      {:keep_recent_tool_results, value}, acc ->
+        Map.put(acc, :keep_recent_tool_results, value)
+
+      {"keep_recent_tool_results", value}, acc ->
+        Map.put(acc, :keep_recent_tool_results, value)
+
+      {:summary_system_prompt, value}, acc ->
+        Map.put(acc, :summary_system_prompt, value)
+
+      {"summary_system_prompt", value}, acc ->
+        Map.put(acc, :summary_system_prompt, value)
+
+      {:summary_prompt, value}, acc ->
+        Map.put(acc, :summary_prompt, value)
+
+      {"summary_prompt", value}, acc ->
+        Map.put(acc, :summary_prompt, value)
+
       {key, _value}, _acc ->
         raise ArgumentError, "unsupported compaction option: #{inspect(key)}"
     end)
@@ -360,6 +420,27 @@ defmodule Alloy.Agent.Config do
   defp validate_compaction_tokens!(value, field) do
     raise ArgumentError,
           "#{field} must be a positive integer, got: #{inspect(value)}"
+  end
+
+  defp validate_keep_recent_tool_results!(value) when is_integer(value) and value >= 0, do: value
+
+  defp validate_keep_recent_tool_results!(value) do
+    raise ArgumentError,
+          "keep_recent_tool_results must be a non-negative integer, got: #{inspect(value)}"
+  end
+
+  defp validate_clear_tool_results!(value) when is_boolean(value), do: value
+
+  defp validate_clear_tool_results!(value) do
+    raise ArgumentError,
+          "clear_tool_results must be a boolean, got: #{inspect(value)}"
+  end
+
+  defp validate_compaction_prompt!(value, _field) when is_binary(value), do: value
+
+  defp validate_compaction_prompt!(value, field) do
+    raise ArgumentError,
+          "#{field} must be a string, got: #{inspect(value)}"
   end
 
   defp validate_compaction_fallback(:truncate), do: :truncate

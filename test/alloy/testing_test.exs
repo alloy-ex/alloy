@@ -58,6 +58,15 @@ defmodule Alloy.TestingTest do
       assert result.status == :completed
       assert_received {:ctx, %{tenant: "acme"}}
     end
+
+    test "default tools are shipped with the application" do
+      app_modules = Application.spec(:alloy, :modules)
+
+      assert Enum.all?(Alloy.Testing.default_tools(), fn
+               %Alloy.Tool.Inline{} -> true
+               module when is_atom(module) -> module in app_modules
+             end)
+    end
   end
 
   describe "assert_tool_called/2" do

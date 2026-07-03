@@ -5,14 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.4] - 2026-07-03
+
+### Fixed
+
+- **`Alloy.Testing` default tools now ship in Hex.** The default echo tool is
+  an inline `Alloy.Tool.Inline` instead of a `test/support` module.
+- **Signed thinking blocks are never truncated.** Deterministic fallback
+  compaction now drops signed thinking blocks instead of mutating provider
+  signatures.
+- **Tool crash results are model-legible.** Tool result errors are one
+  actionable line, while full stacktraces remain in logs and telemetry.
+- **Codex provider honors turn deadlines.** `:receive_timeout` now caps the
+  Codex port timeout and still kills the subprocess on expiry.
 
 ### Added
 
+- **Batched tool-result clearing before summary compaction.** Old
+  `tool_result` and `server_tool_result` content is cleared in one batch before
+  any summarizer call, with `:clear_tool_results`,
+  `:keep_recent_tool_results`, and `[:alloy, :compaction, :cleared]`
+  `bytes_cleared` telemetry.
 - **`:thinking` on `Alloy.Result`** (#36): a run result now surfaces the final
   assistant reasoning text alongside `:text`, so callers no longer have to dig
   it out of the last message's content blocks. Adds an `Alloy.Message.thinking/1`
   helper for per-message extraction.
+- **User-owned compaction prompts.** `:summary_system_prompt` and
+  `:summary_prompt` are now configurable under `compaction:`.
+- **OpenAI Responses reasoning persistence.** Stateless Responses calls request
+  `reasoning.encrypted_content`, preserve raw reasoning items, and round-trip
+  them before related function calls.
+- **Strict tool schemas.** Tools can opt into `strict?/0` or `strict: true`;
+  OpenAI, OpenAICompat, and Anthropic emit strict tool definitions, and Alloy
+  validates `additionalProperties: false`.
+- **Anthropic advanced tool-use metadata.** Tools can provide
+  `input_examples` and `defer_loading`; Anthropic emits the fields and merges
+  the `advanced-tool-use-2025-11-20` beta header when needed.
+- **Anthropic `extra_body` passthrough.** Provider-specific body fields such as
+  server-side MCP connector config can be merged into the request.
+
+### Changed
+
+- **Anthropic prompt caching adds a conversation-tail breakpoint.** With
+  `cache: true`, the last content block of the last message gets
+  `cache_control`, alongside existing system/tool breakpoints.
+- **Docs grouping updated.** `Alloy.Events` is grouped under Core,
+  `Alloy.Agent.Events` is left ungrouped as the deprecated shim, and
+  `Alloy.Memory` / `Alloy.Memory.Router` have a Memory group.
+
+### Docs
+
+- README documents non-goals, the compaction knobs and cache trade-off, strict
+  tools, Anthropic input examples/deferred loading, and OpenAI reasoning-item
+  persistence.
+- MCP recipe documents remote Anthropic MCP mounting via `mcp_servers`,
+  beta headers, and provider passthrough while keeping the client-side recipe
+  for local/stdio MCP.
 
 ## [0.12.3] - 2026-06-11
 

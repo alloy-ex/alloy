@@ -30,6 +30,10 @@ defmodule Alloy.Provider.OpenAI do
   - `:x_search` - `true` or a config map to append an `x_search` tool
   - `:req_options` - Additional options passed to Req
 
+  In stateless mode (`store` not `true` with no previous response ID), Alloy
+  automatically requests encrypted reasoning content and round-trips opaque
+  reasoning output items between tool calls.
+
   ## Example
 
       Alloy.run("Summarize this code.",
@@ -172,6 +176,7 @@ defmodule Alloy.Provider.OpenAI do
       |> maybe_put_previous_response_id(config)
       |> maybe_put_optional_request_field("store", Map.get(config, :store))
       |> maybe_put_optional_request_field("include", Map.get(config, :include))
+      |> maybe_put_reasoning_include(config)
       |> maybe_put_optional_request_field("tool_choice", Map.get(config, :tool_choice))
       |> maybe_put_optional_request_field(
         "parallel_tool_calls",
@@ -201,16 +206,30 @@ defmodule Alloy.Provider.OpenAI do
   defp stringify_extra_body(_), do: %{}
 
   defp maybe_put_previous_response_id(body, config) do
-    previous_response_id =
-      Map.get(config, :previous_response_id) ||
-        get_in(config, [:provider_state, :response_id])
+    maybe_put_optional_request_field(body, "previous_response_id", previous_response_id(config))
+  end
 
-    maybe_put_optional_request_field(body, "previous_response_id", previous_response_id)
+  defp previous_response_id(config) do
+    Map.get(config, :previous_response_id) ||
+      get_in(config, [:provider_state, :response_id])
   end
 
   defp maybe_put_optional_request_field(body, _key, nil), do: body
   defp maybe_put_optional_request_field(body, _key, value) when value == [], do: body
   defp maybe_put_optional_request_field(body, key, value), do: Map.put(body, key, value)
+
+  defp maybe_put_reasoning_include(body, config) do
+    if stateless_reasoning_echo?(config) do
+      put_reasoning_include(body)
+    else
+      body
+    end
+  end
+
+  defp put_reasoning_include(body) do
+    includes = body |> Map.get("include", []) |> List.wrap()
+    Map.put(body, "include", Enum.uniq(includes ++ ["reasoning.encrypted_content"]))
+  end
 
   defp built_in_tools(config) do
     []
@@ -254,39 +273,32 @@ defmodule Alloy.Provider.OpenAI do
         prompt -> [%{"role" => "system", "content" => prompt}]
       end
 
-    convo_items = Enum.flat_map(messages, &format_input_item/1)
+    stateless? = stateless_reasoning_echo?(config)
+    convo_items = Enum.flat_map(messages, &format_input_item(&1, stateless?))
     system_items ++ convo_items
   end
 
-  defp format_input_item(%Message{role: :user, content: content}) when is_binary(content) do
+  defp stateless_reasoning_echo?(config) do
+    Map.get(config, :store) != true and is_nil(previous_response_id(config))
+  end
+
+  defp format_input_item(%Message{role: :user, content: content}, _stateless?)
+       when is_binary(content) do
     [%{"role" => "user", "content" => content}]
   end
 
-  defp format_input_item(%Message{role: :assistant, content: content}) when is_binary(content) do
+  defp format_input_item(%Message{role: :assistant, content: content}, _stateless?)
+       when is_binary(content) do
     [%{"role" => "assistant", "content" => content}]
   end
 
-  defp format_input_item(%Message{role: :assistant, content: blocks}) when is_list(blocks) do
-    function_calls =
-      blocks
-      |> Enum.filter(&(&1[:type] == "tool_use"))
-      |> Enum.map(&format_assistant_function_call_item/1)
-
-    text_parts =
-      blocks
-      |> Enum.filter(&(&1[:type] == "text"))
-      |> Enum.map_join("\n", & &1.text)
-
-    assistant_text_item =
-      case text_parts do
-        "" -> []
-        text -> [%{"role" => "assistant", "content" => text}]
-      end
-
-    assistant_text_item ++ function_calls
+  defp format_input_item(%Message{role: :assistant, content: blocks}, stateless?)
+       when is_list(blocks) do
+    Enum.flat_map(blocks, &format_assistant_block(&1, stateless?))
   end
 
-  defp format_input_item(%Message{role: :user, content: blocks}) when is_list(blocks) do
+  defp format_input_item(%Message{role: :user, content: blocks}, _stateless?)
+       when is_list(blocks) do
     if Enum.any?(blocks, &(&1[:type] == "tool_result")) do
       blocks
       |> Enum.map(fn
@@ -329,6 +341,21 @@ defmodule Alloy.Provider.OpenAI do
 
   defp format_user_content_block(_block), do: nil
 
+  defp format_assistant_block(%{type: "text", text: text}, _stateless?)
+       when is_binary(text) and text != "" do
+    [%{"role" => "assistant", "content" => text}]
+  end
+
+  defp format_assistant_block(%{type: "tool_use"} = block, _stateless?) do
+    [format_assistant_function_call_item(block)]
+  end
+
+  defp format_assistant_block(%{type: "reasoning", raw: raw}, true) when is_map(raw) do
+    [raw]
+  end
+
+  defp format_assistant_block(_block, _stateless?), do: []
+
   defp unsupported_media_notice(mime_type) do
     %{
       "type" => "input_text",
@@ -336,13 +363,15 @@ defmodule Alloy.Provider.OpenAI do
     }
   end
 
-  defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do
-    %{
+  defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do
+    tool = %{
       "type" => "function",
       "name" => name,
       "description" => desc,
       "parameters" => Alloy.Provider.stringify_keys(schema)
     }
+
+    if Map.get(def_map, :strict) == true, do: Map.put(tool, "strict", true), else: tool
   end
 
   defp format_assistant_function_call_item(%{id: id, name: name, input: input}) do
@@ -537,6 +566,10 @@ defmodule Alloy.Provider.OpenAI do
       {:error, _} = err ->
         err
     end
+  end
+
+  defp parse_output_item(%{"type" => "reasoning"} = item) do
+    {:ok, [%{type: "reasoning", raw: item}]}
   end
 
   defp parse_output_item(_item), do: {:ok, []}

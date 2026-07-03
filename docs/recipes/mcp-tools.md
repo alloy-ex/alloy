@@ -129,6 +129,15 @@ Then just add it to `tools:`:
   )
 ```
 
+## Remote MCP without a client
+
+For remote HTTP MCP servers on Anthropic, you can also mount the server
+provider-side instead of running a client in your app. Pass Anthropic's
+`mcp_servers` body field and the matching beta header through `extra_body` /
+`extra_headers` on the provider config. The client-side gateway above remains
+the right pattern for local or stdio MCP servers and for providers without a
+server-side MCP connector.
+
 ## Variant: one tool per MCP tool
 
 When you want the model to see full per-tool schemas (better argument

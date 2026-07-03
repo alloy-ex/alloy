@@ -2110,6 +2110,68 @@ defmodule Alloy.Agent.TurnTest do
       assert is_integer(measurements.messages_before)
       assert is_integer(measurements.messages_after)
     end
+
+    test "emits matching turn metadata for compaction cleared and done events" do
+      test_pid = self()
+      handler_id = "compaction-turn-consistency-#{inspect(make_ref())}"
+
+      :telemetry.attach_many(
+        handler_id,
+        [[:alloy, :compaction, :cleared], [:alloy, :compaction, :done]],
+        fn event, _measurements, metadata, _config ->
+          send(test_pid, {:compaction_event, event, metadata.turn})
+        end,
+        nil
+      )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.text_response("ok")
+        ])
+
+      messages =
+        [Message.user("task")] ++
+          Enum.flat_map(1..6, fn index ->
+            id = "t#{index}"
+
+            [
+              Message.assistant_blocks([
+                %{type: "tool_use", id: id, name: "read_file", input: %{path: "file#{index}.txt"}}
+              ]),
+              Message.tool_results([
+                %{
+                  type: "tool_result",
+                  tool_use_id: id,
+                  content: String.duplicate("#{index}", 400)
+                }
+              ])
+            ]
+          end)
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_tokens: 540,
+        compaction: %{
+          reserve_tokens: 100,
+          keep_recent_tokens: 10,
+          fallback: :truncate,
+          clear_tool_results: true,
+          keep_recent_tool_results: 3
+        }
+      }
+
+      try do
+        state = State.init(config, messages)
+        _result = Turn.run_loop(state)
+
+        assert_received {:compaction_event, [:alloy, :compaction, :cleared], cleared_turn}
+        assert_received {:compaction_event, [:alloy, :compaction, :done], done_turn}
+        assert cleared_turn == done_turn
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
   end
 
   describe "prompt too long recovery" do
