@@ -251,6 +251,62 @@ defmodule Alloy.Provider.CodexTest do
       assert result.messages == [Message.assistant("stdin ok")]
     end
 
+    test "collects output even when the process exits before os_pid can be read" do
+      # Regression: Port.info(port, :os_pid) returns nil when the spawned
+      # process has already exited. The output and exit_status messages are
+      # still in the mailbox, so a fast-exiting codex must succeed, not
+      # error with "port closed before os_pid was available". The race is
+      # timing-dependent; the instant-exit script plus repetition makes it
+      # likely under the old code and proves the nil branch under the new.
+      temp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "alloy-codex-provider-fastexit-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(temp_dir)
+      on_exit(fn -> File.rm_rf(temp_dir) end)
+
+      auth_path = Path.join(temp_dir, "auth.json")
+      File.write!(auth_path, "{}")
+
+      script_path = Path.join(temp_dir, "fast-codex.sh")
+
+      File.write!(
+        script_path,
+        """
+        #!/bin/sh
+        output=""
+
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--output-last-message" ]; then
+            shift
+            output="$1"
+          fi
+
+          shift
+        done
+
+        cat > /dev/null
+        printf '%s' '{"stop_reason":"end_turn","text":"fast exit","tool_calls":[]}' > "$output"
+        printf '%s\\n' '{"event":"done"}'
+        """
+      )
+
+      File.chmod!(script_path, 0o755)
+
+      config = %{
+        model: "gpt-5.4",
+        codex_bin: script_path,
+        auth_path: auth_path
+      }
+
+      for _run <- 1..20 do
+        assert {:ok, result} = Codex.complete([Message.user("Hi")], [], config)
+        assert result.messages == [Message.assistant("fast exit")]
+      end
+    end
+
     test "returns a timeout error instead of hanging when the real shell-backed run exceeds timeout_ms" do
       temp_dir =
         Path.join(
