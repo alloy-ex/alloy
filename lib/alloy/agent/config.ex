@@ -60,6 +60,7 @@ defmodule Alloy.Agent.Config do
           retry_backoff_ms: pos_integer(),
           timeout_ms: pos_integer(),
           tool_timeout: pos_integer(),
+          unknown_tool: (String.t() -> String.t()) | nil,
           middleware: [module()],
           compaction: compaction(),
           compaction_explicit: %{
@@ -97,6 +98,7 @@ defmodule Alloy.Agent.Config do
     retry_backoff_ms: 1_000,
     timeout_ms: 120_000,
     tool_timeout: 120_000,
+    unknown_tool: nil,
     middleware: [],
     compaction: %{
       reserve_tokens: 16_384,
@@ -162,6 +164,7 @@ defmodule Alloy.Agent.Config do
       retry_backoff_ms: Keyword.get(opts, :retry_backoff_ms, 1_000),
       timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
       tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
+      unknown_tool: Keyword.get(opts, :unknown_tool),
       middleware: Keyword.get(opts, :middleware, []),
       compaction: compaction,
       compaction_explicit: compaction_explicit,

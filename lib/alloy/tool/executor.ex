@@ -38,6 +38,7 @@ defmodule Alloy.Tool.Executor do
       tool_fns: tool_fns,
       context: build_context(state),
       timeout: state.config.tool_timeout,
+      unknown_tool: state.config.unknown_tool,
       on_event: Keyword.get(opts, :on_event, fn _ -> :ok end),
       seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
       corr_id: Keyword.get(opts, :event_correlation_id, random_id()),
@@ -210,19 +211,25 @@ defmodule Alloy.Tool.Executor do
   defp invoke({:blocked, _call, reason}, _run), do: {:error, "Blocked: #{reason}", nil}
 
   defp invoke({:execute, call}, run) do
-    with {:ok, tool} <- fetch_tool(run.tool_fns, call[:name]),
+    with {:ok, tool} <- fetch_tool(run, call[:name]),
          input = call[:input] || %{},
          :ok <- check_input(input, tool) do
       execute_tool(tool, input, call, run.context)
     end
   end
 
-  defp fetch_tool(tool_fns, name) do
-    case Map.fetch(tool_fns, name) do
+  defp fetch_tool(run, name) do
+    case Map.fetch(run.tool_fns, name) do
       {:ok, tool} -> {:ok, Registry.to_inline(tool)}
-      :error -> {:error, "Unknown tool: #{name}", nil}
+      :error -> {:error, unknown_tool_message(run.unknown_tool, name), nil}
     end
   end
+
+  # What the model is told when it calls a tool it was not given. The host may
+  # know better than "unknown": a tool reachable some other way reads, under the
+  # default, exactly like one that does not exist.
+  defp unknown_tool_message(nil, name), do: "Unknown tool: #{name}"
+  defp unknown_tool_message(fun, name) when is_function(fun, 1), do: fun.(name)
 
   # Only the shape every tool's execute/2 relies on: an object holding the
   # schema's required keys. Types are not checked or coerced; third-party

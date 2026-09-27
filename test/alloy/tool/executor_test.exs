@@ -145,6 +145,28 @@ defmodule Alloy.Tool.ExecutorTest do
       assert block.is_error == true
     end
 
+    test "the host words the unknown-tool error when it knows more" do
+      state =
+        build_state([SuccessTool],
+          unknown_tool: fn name -> "`#{name}` is not a direct tool; call it from run_script" end
+        )
+
+      tool_call = %{id: "call_x", name: "restart_agent", type: "tool_use", input: %{}}
+
+      assert %Message{content: [block]} = Executor.execute_all([tool_call], state.tool_fns, state)
+      assert block.content == "`restart_agent` is not a direct tool; call it from run_script"
+      assert block.is_error == true
+    end
+
+    test "unknown_tool comes through Config.from_opts, and defaults to nil" do
+      message = fn name -> "no #{name}" end
+
+      assert Config.from_opts(provider: {Alloy.Provider.Test, []}, unknown_tool: message).unknown_tool ==
+               message
+
+      assert Config.from_opts(provider: {Alloy.Provider.Test, []}).unknown_tool == nil
+    end
+
     test "returns error block when tool raises an exception" do
       state = build_state([CrashingTool])
       tool_call = %{id: "call_crash", name: "crasher", type: "tool_use", input: %{}}
@@ -796,7 +818,8 @@ defmodule Alloy.Tool.ExecutorTest do
       middleware: Keyword.get(opts, :middleware, []),
       working_directory: Keyword.get(opts, :working_directory, "."),
       context: Keyword.get(opts, :context, %{}),
-      tool_timeout: Keyword.get(opts, :tool_timeout, 120_000)
+      tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
+      unknown_tool: Keyword.get(opts, :unknown_tool)
     }
 
     State.init(config)
