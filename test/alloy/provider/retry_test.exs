@@ -54,6 +54,12 @@ defmodule Alloy.Provider.RetryTest do
     end
 
     # Provider-specific error formats
+    test "a CLI provider's malformed reply is retryable" do
+      assert Retry.retryable?(
+               "malformed_reply: Claude Code returned tool_use without any tool calls"
+             )
+    end
+
     test "Anthropic rate_limit_error is retryable" do
       assert Retry.retryable?("rate_limit_error: rate limited")
     end

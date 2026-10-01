@@ -82,6 +82,10 @@ defmodule Alloy.Provider.Retry do
   def retryable?("INTERNAL:" <> _), do: true
   def retryable?("UNAVAILABLE:" <> _), do: true
 
+  # A reply that broke its own contract — a CLI provider's tool_use naming no
+  # tool. The same request is usually answered properly the next time.
+  def retryable?("malformed_reply:" <> _), do: true
+
   # Network-level failures from Req/Finch/Mint.
   # Providers wrap these as: "HTTP request failed: #{inspect(reason)}"
   # Match the bare atom name (e.g. "econnrefused") rather than the

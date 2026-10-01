@@ -69,6 +69,38 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert unescaped == "Checking.\nOne moment."
     end
 
+    # 8e9a1d83: this was the whole of a metric_flow agent's turn, six times.
+    test "a tool_use naming no tool ends the turn on its text" do
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            {envelope(%{
+               "stop_reason" => "tool_use",
+               "text" => "Here is the help page.",
+               "tool_calls" => []
+             }), 0}
+          end)
+      }
+
+      assert {:ok, result} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert result.stop_reason == :end_turn
+      assert result.messages == [Message.assistant("Here is the help page.")]
+    end
+
+    test "a tool_use naming no tool and saying nothing is a retryable error" do
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            {envelope(%{"stop_reason" => "tool_use", "text" => " ", "tool_calls" => []}), 0}
+          end)
+      }
+
+      assert {:error, reason} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert Alloy.Provider.Retry.retryable?(reason)
+    end
+
     test "a reply with real line breaks keeps a literal \\n it quotes" do
       text = "Use `\\n` in the regex.\nThat is all."
 

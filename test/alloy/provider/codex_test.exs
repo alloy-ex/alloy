@@ -28,6 +28,27 @@ defmodule Alloy.Provider.CodexTest do
       assert result.response_metadata.command_status == 0
     end
 
+    test "a tool_use naming no tool ends the turn on its text, or is retried without one" do
+      reply = fn text ->
+        %{
+          model: "gpt-5.4",
+          command_runner:
+            fake_runner(fn _args, _opts, output_path ->
+              payload = %{stop_reason: "tool_use", text: text, tool_calls: []}
+              File.write!(output_path, Jason.encode!(payload))
+              "codex\n#{Jason.encode!(payload)}\n"
+            end)
+        }
+      end
+
+      assert {:ok, result} = Codex.complete([Message.user("Hi")], [], reply.("Done."))
+      assert result.stop_reason == :end_turn
+      assert result.messages == [Message.assistant("Done.")]
+
+      assert {:error, reason} = Codex.complete([Message.user("Hi")], [], reply.(""))
+      assert Alloy.Provider.Retry.retryable?(reason)
+    end
+
     test "returns tool_use blocks when Codex requests tools" do
       tool_defs = [
         %{

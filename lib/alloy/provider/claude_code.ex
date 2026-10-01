@@ -696,6 +696,28 @@ defmodule Alloy.Provider.ClaudeCode do
     end
   end
 
+  # A tool_use that names no tool. This failed the turn, and the agent's whole
+  # reply became the error string, so the request it was answering was lost:
+  # six times on metric_flow from 09-23 to 10-01 (8e9a1d83).
+  #
+  # With text, the text is the reply and the turn ends on it — it has already
+  # streamed to the user, and `Alloy.Provider.Retry` never retries once chunks
+  # are out. With none, there is nothing to show, so the error is
+  # `malformed_reply:`, which `Retry` asks again for.
+  defp parse_payload(
+         %{"stop_reason" => "tool_use", "text" => text, "tool_calls" => []} = payload,
+         config,
+         envelope,
+         messages
+       )
+       when is_binary(text) do
+    if String.trim(text) == "" do
+      {:error, "malformed_reply: Claude Code returned tool_use without any tool calls"}
+    else
+      parse_payload(%{payload | "stop_reason" => "end_turn"}, config, envelope, messages)
+    end
+  end
+
   defp parse_payload(
          %{"stop_reason" => "tool_use", "text" => text, "tool_calls" => tool_calls},
          config,
@@ -744,10 +766,6 @@ defmodule Alloy.Provider.ClaudeCode do
          {:ok, arguments} <- fetch_arguments(tool_call) do
       {:ok, %{type: "tool_use", id: call_id, name: name, input: arguments}}
     end
-  end
-
-  defp finalize_tool_blocks(_text, []) do
-    {:error, "Claude Code returned tool_use without any tool calls"}
   end
 
   defp finalize_tool_blocks(text, tool_blocks) do

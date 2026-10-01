@@ -546,6 +546,22 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
+  # See `Alloy.Provider.ClaudeCode` for why a tool_use with no tool calls ends
+  # the turn on its text, or is retried when it has none.
+  defp parse_payload(
+         %{"stop_reason" => "tool_use", "text" => text, "tool_calls" => []} = payload,
+         config,
+         command_result,
+         messages
+       )
+       when is_binary(text) do
+    if String.trim(text) == "" do
+      {:error, "malformed_reply: Codex returned tool_use without any tool calls"}
+    else
+      parse_payload(%{payload | "stop_reason" => "end_turn"}, config, command_result, messages)
+    end
+  end
+
   defp parse_payload(
          %{"stop_reason" => "tool_use", "text" => text, "tool_calls" => tool_calls},
          config,
@@ -590,10 +606,6 @@ defmodule Alloy.Provider.Codex do
          {:ok, arguments} <- fetch_arguments(tool_call) do
       {:ok, %{type: "tool_use", id: call_id, name: name, input: arguments}}
     end
-  end
-
-  defp finalize_tool_blocks(_text, []) do
-    {:error, "Codex returned tool_use without any tool calls"}
   end
 
   defp finalize_tool_blocks(text, tool_blocks) do
