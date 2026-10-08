@@ -9,14 +9,17 @@ defmodule Alloy.Agent.Config do
   alias Alloy.Context.Compactor
   alias Alloy.ModelMetadata
 
+  # The summary prompts are optional because a bare `%Config{}` omits them;
+  # `from_opts/1` always fills them and the Compactor falls back to its
+  # defaults when they are absent.
   @type compaction :: %{
+          optional(:summary_system_prompt) => String.t(),
+          optional(:summary_prompt) => String.t(),
           reserve_tokens: pos_integer(),
           keep_recent_tokens: pos_integer(),
           fallback: :truncate,
           clear_tool_results: boolean(),
-          keep_recent_tool_results: non_neg_integer(),
-          summary_system_prompt: String.t(),
-          summary_prompt: String.t()
+          keep_recent_tool_results: non_neg_integer()
         }
 
   @typedoc """
@@ -85,9 +88,9 @@ defmodule Alloy.Agent.Config do
       keep_recent_tokens: 20_000,
       fallback: :truncate,
       clear_tool_results: true,
-      keep_recent_tool_results: 3,
-      summary_system_prompt: Compactor.default_summary_system_prompt(),
-      summary_prompt: Compactor.default_summary_prompt()
+      # Summary prompts are filled in at runtime by `resolve_compaction/2`;
+      # calling Compactor here would make Config compile-depend on it.
+      keep_recent_tool_results: 3
     },
     compaction_explicit: %{reserve_tokens: false, keep_recent_tokens: false},
     working_directory: ".",

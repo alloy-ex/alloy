@@ -30,7 +30,7 @@ defmodule Alloy.Provider.Test do
   as `:agent_pid`.
   """
   @spec start_link([{:ok, Alloy.Provider.completion_response()} | {:error, term()}]) ::
-          {:ok, pid()}
+          Agent.on_start()
   def start_link(responses) when is_list(responses) do
     Agent.start_link(fn -> responses end)
   end

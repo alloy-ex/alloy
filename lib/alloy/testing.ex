@@ -33,16 +33,16 @@ defmodule Alloy.Testing do
       end
   """
 
+  alias Alloy.Agent.{Config, State, Turn}
+  alias Alloy.Message
+  alias Alloy.Provider.Test, as: TestProvider
+
   @doc false
   defmacro __using__(_opts) do
     quote do
       import Alloy.Testing
     end
   end
-
-  alias Alloy.Agent.{Config, State, Turn}
-  alias Alloy.Message
-  alias Alloy.Provider.Test, as: TestProvider
 
   @doc """
   Run the agent turn loop with scripted provider responses.
@@ -228,9 +228,9 @@ defmodule Alloy.Testing do
   end
 
   @doc false
+  @spec safe_atom_get(map(), String.t()) :: term()
   def safe_atom_get(map, string_key) when is_binary(string_key) do
-    String.to_existing_atom(string_key)
-    |> then(&Map.get(map, &1))
+    Map.get(map, String.to_existing_atom(string_key))
   rescue
     ArgumentError -> nil
   end

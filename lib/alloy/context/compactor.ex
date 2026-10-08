@@ -18,10 +18,10 @@ defmodule Alloy.Context.Compactor do
       serialized conversation
   """
 
-  require Logger
-
   alias Alloy.Agent.State
   alias Alloy.Message
+
+  require Logger
 
   @default_keep_recent 10
   @truncate_length 200

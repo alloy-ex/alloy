@@ -16,7 +16,10 @@ defmodule Alloy.MixProject do
       docs: docs(),
       dialyzer: [
         plt_local_path: "priv/plts/project.plt",
-        plt_core_path: "priv/plts/core.plt"
+        plt_core_path: "priv/plts/core.plt",
+        # Third-party callers rely on our specs, so hold them to what the
+        # code actually returns.
+        flags: [:error_handling, :extra_return, :missing_return, :unmatched_returns]
       ],
       elixirc_paths: elixirc_paths(Mix.env())
     ]

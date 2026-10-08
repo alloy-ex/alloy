@@ -42,8 +42,9 @@ defmodule Alloy.Usage do
   Returns total tokens consumed (input + output).
   """
   @spec total(t()) :: non_neg_integer()
-  def total(%__MODULE__{} = usage) do
-    usage.input_tokens + usage.output_tokens
+  def total(%__MODULE__{input_tokens: input, output_tokens: output})
+      when is_integer(input) and is_integer(output) do
+    input + output
   end
 
   @doc """

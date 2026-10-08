@@ -53,10 +53,15 @@ defmodule Alloy.Agent.Server do
   """
 
   use GenServer
-  require Logger
 
   alias Alloy.Agent.{Config, State, Turn}
   alias Alloy.{Message, Middleware, Result, Session, Usage}
+
+  require Logger
+
+  # :phoenix_pubsub is an optional dependency; calls are guarded at runtime
+  # by Code.ensure_loaded?/1, so a missing module must not warn at compile time.
+  @compile {:no_warn_undefined, Phoenix.PubSub}
 
   @type result :: Result.t()
 
@@ -267,7 +272,7 @@ defmodule Alloy.Agent.Server do
         # Subscribe to PubSub topics if configured.
         # Use state.config (post-middleware) so session_start middleware can update
         # pubsub/subscribe fields and have them reflected in actual subscriptions.
-        maybe_subscribe_pubsub(state)
+        :ok = maybe_subscribe_pubsub(state)
         {:ok, state}
     end
   end
@@ -275,13 +280,7 @@ defmodule Alloy.Agent.Server do
   @impl GenServer
   def terminate(_reason, state) do
     # Kill any running async Turn task — prevents orphaned tasks after shutdown.
-    if state.current_task do
-      {_ref, task_pid, _request_id} = state.current_task
-      # terminate_child/2 may return {:error, :not_found} if the Task already
-      # finished between the GenServer receiving :stop and terminate/2 running.
-      # This is safe to ignore — the Task is gone either way.
-      Task.Supervisor.terminate_child(Alloy.TaskSupervisor, task_pid)
-    end
+    :ok = stop_current_task(state.current_task)
 
     state =
       case Middleware.run(:session_end, state) do
@@ -594,8 +593,7 @@ defmodule Alloy.Agent.Server do
   # ── Private ───────────────────────────────────────────────────────────────
 
   defp broadcast(pubsub, topic, message) do
-    # credo:disable-for-next-line Credo.Check.Refactor.Apply
-    case apply(pubsub_module(), :broadcast, [pubsub, topic, message]) do
+    case Phoenix.PubSub.broadcast(pubsub, topic, message) do
       :ok ->
         :ok
 
@@ -611,15 +609,14 @@ defmodule Alloy.Agent.Server do
   defp maybe_subscribe_pubsub(%State{config: %{pubsub: nil}}), do: :ok
 
   defp maybe_subscribe_pubsub(%State{config: config}) do
-    unless Code.ensure_loaded?(pubsub_module()) do
+    unless Code.ensure_loaded?(Phoenix.PubSub) do
       raise ArgumentError,
             "Alloy: pubsub: is configured but :phoenix_pubsub is not available. " <>
               "Add {:phoenix_pubsub, \"~> 2.1\"} to your mix.exs dependencies."
     end
 
-    for topic <- config.subscribe do
-      # credo:disable-for-next-line Credo.Check.Refactor.Apply
-      case apply(pubsub_module(), :subscribe, [config.pubsub, topic]) do
+    Enum.each(config.subscribe, fn topic ->
+      case Phoenix.PubSub.subscribe(config.pubsub, topic) do
         :ok ->
           :ok
 
@@ -628,11 +625,17 @@ defmodule Alloy.Agent.Server do
             "Alloy: failed to subscribe to PubSub topic #{inspect(topic)}: #{inspect(reason)}"
           )
       end
-    end
+    end)
   end
 
-  defp pubsub_module do
-    Module.concat(Phoenix, PubSub)
+  defp stop_current_task(nil), do: :ok
+
+  defp stop_current_task({_ref, task_pid, _request_id}) do
+    # terminate_child/2 may return {:error, :not_found} if the Task already
+    # finished between the GenServer receiving :stop and terminate/2 running.
+    # This is safe to ignore — the Task is gone either way.
+    _ = Task.Supervisor.terminate_child(Alloy.TaskSupervisor, task_pid)
+    :ok
   end
 
   defp set_running(state) do

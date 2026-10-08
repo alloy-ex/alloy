@@ -439,11 +439,13 @@ defmodule Alloy.Provider.Codex do
         {:error, _} = err -> {:halt, err}
       end
     end)
-    |> case do
-      {:error, _} = err -> err
-      blocks -> finalize_tool_blocks(text, Enum.reverse(blocks))
-    end
+    |> finalize_reduced_tool_blocks(text)
   end
+
+  defp finalize_reduced_tool_blocks({:error, _} = err, _text), do: err
+
+  defp finalize_reduced_tool_blocks(blocks, text),
+    do: finalize_tool_blocks(text, Enum.reverse(blocks))
 
   defp build_tool_block(tool_call, index) do
     with {:ok, call_id} <- tool_call_id(tool_call, index),
