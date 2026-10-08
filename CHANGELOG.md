@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool calls, including late signatures and parallel calls, for the next request.
 - OpenAICompat's `stream_options: false` now omits the field from streaming
   requests. Explicit `extra_body` stream option maps are preserved.
+- Codex process timeouts use an absolute monotonic deadline, so progress output
+  cannot extend `:timeout_ms` or the turn's `:receive_timeout` cap.
 
 
 ## [0.12.4] - 2026-07-03

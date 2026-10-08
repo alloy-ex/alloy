@@ -352,6 +352,49 @@ defmodule Alloy.Provider.CodexTest do
              "expected timeout to fire within ~200ms + grace, took #{elapsed}ms"
     end
 
+    test "progress output cannot extend the real shell-backed run's deadline" do
+      temp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "alloy-codex-provider-progress-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(temp_dir)
+      on_exit(fn -> File.rm_rf(temp_dir) end)
+
+      auth_path = Path.join(temp_dir, "auth.json")
+      File.write!(auth_path, "{}")
+      script_path = Path.join(temp_dir, "chatty-codex.sh")
+
+      File.write!(script_path, """
+      #!/bin/sh
+      cat > /dev/null
+      tick=0
+      while [ "$tick" -lt 80 ]; do
+        printf '%s\\n' '{"event":"progress"}'
+        tick=$((tick + 1))
+        sleep 0.05
+      done
+      """)
+
+      File.chmod!(script_path, 0o755)
+
+      config = %{
+        model: "gpt-5.4",
+        codex_bin: script_path,
+        auth_path: auth_path,
+        timeout_ms: 30_000,
+        receive_timeout: 1_000
+      }
+
+      started_at = System.monotonic_time(:millisecond)
+      result = Codex.complete([Message.user("progress")], [], config)
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert {:error, "codex exec timed out after 1000ms"} = result
+      assert elapsed < 3_000, "progress reset the turn deadline: #{elapsed}ms"
+    end
+
     test "receive_timeout caps a larger timeout_ms for the real shell-backed run" do
       temp_dir =
         Path.join(

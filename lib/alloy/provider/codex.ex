@@ -257,6 +257,7 @@ defmodule Alloy.Provider.Codex do
   # whose children we'd otherwise orphan.
   defp run_port(executable, args, paths, timeout) do
     shell_command = build_port_command(executable, args, paths)
+    deadline = System.monotonic_time(:millisecond) + timeout
 
     port =
       Port.open(
@@ -275,8 +276,8 @@ defmodule Alloy.Provider.Codex do
     # and exit_status messages are still in the mailbox, so collect them;
     # there is just no OS pid left to kill on timeout.
     case Port.info(port, :os_pid) do
-      {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, [])
-      nil -> collect_port(port, nil, timeout, [])
+      {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, deadline, [])
+      nil -> collect_port(port, nil, timeout, deadline, [])
     end
   rescue
     error in ErlangError ->
@@ -297,19 +298,33 @@ defmodule Alloy.Provider.Codex do
       shell_escape(paths.prompt_path)
   end
 
-  defp collect_port(port, os_pid, timeout, acc) do
+  defp collect_port(port, os_pid, timeout, deadline, acc) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      timeout_port(port, os_pid, timeout)
+    else
+      receive_port(port, os_pid, timeout, deadline, remaining, acc)
+    end
+  end
+
+  defp receive_port(port, os_pid, timeout, deadline, remaining, acc) do
     receive do
       {^port, {:data, data}} when is_binary(data) ->
-        collect_port(port, os_pid, timeout, [acc, data])
+        collect_port(port, os_pid, timeout, deadline, [acc, data])
 
       {^port, {:exit_status, status}} ->
         {:ok, %{output: IO.iodata_to_binary(acc), status: status}}
     after
-      timeout ->
-        _ = kill_os_process(os_pid)
-        _ = close_and_drain(port)
-        {:error, "codex exec timed out after #{timeout}ms"}
+      remaining ->
+        timeout_port(port, os_pid, timeout)
     end
+  end
+
+  defp timeout_port(port, os_pid, timeout) do
+    _ = kill_os_process(os_pid)
+    _ = close_and_drain(port)
+    {:error, "codex exec timed out after #{timeout}ms"}
   end
 
   # SIGTERM with a 100ms grace window, then SIGKILL. Best-effort — if
