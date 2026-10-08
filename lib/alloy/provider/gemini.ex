@@ -243,20 +243,6 @@ defmodule Alloy.Provider.Gemini do
     }
   end
 
-  defp format_content_block(
-         %{type: "server_tool_result", tool_use_id: id, content: content} = block,
-         messages
-       ) do
-    %{
-      "functionResponse" => %{
-        "id" => id,
-        "name" => lookup_tool_name(messages, id) || "unknown_tool",
-        "response" =>
-          normalize_function_response_payload(content, Map.get(block, :is_error, false))
-      }
-    }
-  end
-
   defp format_content_block(%{type: "image", mime_type: mime_type, data: data}, _messages) do
     %{"inlineData" => %{"mimeType" => mime_type, "data" => data}}
   end
@@ -284,7 +270,6 @@ defmodule Alloy.Provider.Gemini do
       %Message{role: :assistant, content: blocks} when is_list(blocks) ->
         Enum.find_value(blocks, fn
           %{type: "tool_use", id: ^tool_use_id, name: name} -> name
-          %{type: "server_tool_use", id: ^tool_use_id, name: name} -> name
           _ -> nil
         end)
 

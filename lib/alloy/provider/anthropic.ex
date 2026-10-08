@@ -506,8 +506,19 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp format_message(%Message{role: role, content: blocks}) when is_list(blocks) do
-    %{"role" => to_string(role), "content" => Enum.map(blocks, &format_content_block/1)}
+    content =
+      blocks
+      |> Enum.reject(&legacy_server_tool_result?/1)
+      |> Enum.map(&format_content_block/1)
+
+    %{"role" => to_string(role), "content" => content}
   end
+
+  # Alloy <= 0.12.4 answered server_tool_use blocks with a client-side
+  # "server_tool_result", which the API rejects. Dropping them lets
+  # transcripts persisted by those versions continue.
+  defp legacy_server_tool_result?(%{type: "server_tool_result"}), do: true
+  defp legacy_server_tool_result?(_block), do: false
 
   defp format_content_block(%{type: "thinking", thinking: thinking} = block) do
     %{"type" => "thinking", "thinking" => thinking}
@@ -529,17 +540,6 @@ defmodule Alloy.Provider.Anthropic do
 
   defp format_content_block(%{type: "server_tool_use", id: id, name: name, input: input}) do
     %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input}
-  end
-
-  defp format_content_block(
-         %{
-           type: "server_tool_result",
-           tool_use_id: id,
-           content: content
-         } = block
-       ) do
-    result = %{"type" => "server_tool_result", "tool_use_id" => id, "content" => content}
-    if Map.get(block, :is_error), do: Map.put(result, "is_error", true), else: result
   end
 
   defp format_content_block(%{type: "image", mime_type: mime_type, data: data}) do

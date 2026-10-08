@@ -418,55 +418,6 @@ defmodule Alloy.Tool.ExecutorTest do
     end
   end
 
-  describe "execute_all/4 — server_tool_use (code_execution)" do
-    test "server_tool_use call produces server_tool_result block" do
-      state = build_state([SuccessTool])
-      call = %{id: "srvtoolu_01", name: "success", type: "server_tool_use", input: %{}}
-
-      assert {:ok, %Message{role: :user, content: [block]}, [meta]} =
-               Executor.execute_all([call], state.tool_fns, state, on_event: fn _ -> :ok end)
-
-      assert block.type == "server_tool_result"
-      assert block.tool_use_id == "srvtoolu_01"
-      assert block.content == "it worked"
-      refute Map.get(block, :is_error)
-
-      assert meta.id == "srvtoolu_01"
-      assert meta.name == "success"
-    end
-
-    test "server_tool_use error produces server_tool_result error block" do
-      state = build_state([ErrorTool])
-      call = %{id: "srvtoolu_02", name: "error_tool", type: "server_tool_use", input: %{}}
-
-      assert {:ok, %Message{role: :user, content: [block]}, [_meta]} =
-               Executor.execute_all([call], state.tool_fns, state, on_event: fn _ -> :ok end)
-
-      assert block.type == "server_tool_result"
-      assert block.tool_use_id == "srvtoolu_02"
-      assert block.content == "something went wrong"
-      assert block.is_error == true
-    end
-
-    test "mixed server_tool_use and tool_use in same batch produce correct result types" do
-      state = build_state([SuccessTool, ErrorTool])
-
-      calls = [
-        %{id: "toolu_01", name: "success", type: "tool_use", input: %{}},
-        %{id: "srvtoolu_01", name: "error_tool", type: "server_tool_use", input: %{}}
-      ]
-
-      assert {:ok, %Message{role: :user, content: blocks}, _metas} =
-               Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
-
-      regular = Enum.find(blocks, &(&1.tool_use_id == "toolu_01"))
-      server = Enum.find(blocks, &(&1.tool_use_id == "srvtoolu_01"))
-
-      assert regular.type == "tool_result"
-      assert server.type == "server_tool_result"
-    end
-  end
-
   describe "execute_all/4 — events and metadata" do
     test "emits tool_start/tool_end and returns tool metadata" do
       state = build_state([SuccessTool])

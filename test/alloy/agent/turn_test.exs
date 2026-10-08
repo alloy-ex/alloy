@@ -276,6 +276,30 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  describe "run_loop/1 with server-executed tools" do
+    test "answers only client tool_use blocks when a response mixes in server_tool_use" do
+      responses = [
+        TestProvider.tool_use_response([
+          %{type: "server_tool_use", id: "srvtoolu_01", name: "code_execution", input: %{}},
+          %{type: "tool_use", id: "toolu_01", name: "echo", input: %{"text" => "hi"}}
+        ]),
+        TestProvider.text_response("done")
+      ]
+
+      state = Alloy.Testing.run_with_responses("go", responses)
+
+      assert state.status == :completed
+
+      results_message =
+        Enum.find(state.messages, fn msg ->
+          msg.role == :user and is_list(msg.content) and
+            Enum.any?(msg.content, &(&1[:type] == "tool_result"))
+        end)
+
+      assert [%{type: "tool_result", tool_use_id: "toolu_01"}] = results_message.content
+    end
+  end
+
   describe "run_loop/1 with max_turns" do
     test "stops at max_turns" do
       # Create responses that always ask for tools (infinite loop)

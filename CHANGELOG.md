@@ -33,8 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:missing_return`, `:extra_return` and `:error_handling`. Docs must build
   without warnings.
 
+### Deprecated
+
+- `Alloy.Message.server_tool_result_block/3`. No provider accepts the block
+  it builds; it will be removed in 0.13.
+
 ### Fixed
 
+- **Anthropic server tools are no longer answered by the client.** When a
+  response mixed a server tool (`code_execution`, `web_search`, tool search)
+  with a local tool call, Alloy also "executed" the `server_tool_use` block
+  and sent back a `server_tool_result`, a block type the API rejects, so
+  the next request failed with HTTP 400. `Alloy.Message.tool_calls/1` now
+  returns only client `tool_use` blocks. Transcripts persisted by earlier
+  versions still work: the Anthropic provider drops stale
+  `server_tool_result` blocks when it builds a request.
 - OpenAI-compatible Gemini streams preserve opaque thought signatures on
   tool calls, including late signatures and parallel calls, for the next request.
 - OpenAICompat's `stream_options: false` now omits the field from streaming

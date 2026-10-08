@@ -418,21 +418,19 @@ defmodule Alloy.Provider.AnthropicTest do
       assert server_call.input == %{"file_path" => "mix.exs"}
     end
 
-    test "formats server_tool_result blocks for round-trip" do
+    test "keeps server_tool_use in history and drops legacy server_tool_result blocks" do
       config = config_that_captures_request()
 
+      # Shape written by Alloy <= 0.12.4, which answered server tools itself.
       messages = [
-        Message.user("Read mix.exs"),
+        Message.user("Run it"),
         Message.assistant_blocks([
-          %{
-            type: "server_tool_use",
-            id: "srvtoolu_01",
-            name: "read",
-            input: %{"file_path" => "mix.exs"}
-          }
+          %{type: "server_tool_use", id: "srvtoolu_01", name: "code_execution", input: %{}},
+          %{type: "tool_use", id: "toolu_01", name: "read", input: %{"file_path" => "a"}}
         ]),
         Message.tool_results([
-          %{type: "server_tool_result", tool_use_id: "srvtoolu_01", content: "file contents here"}
+          %{type: "server_tool_result", tool_use_id: "srvtoolu_01", content: "stale"},
+          %{type: "tool_result", tool_use_id: "toolu_01", content: "file contents"}
         ])
       ]
 
@@ -441,17 +439,9 @@ defmodule Alloy.Provider.AnthropicTest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      # server_tool_use should be preserved in assistant message
-      assistant_msg = Enum.find(decoded["messages"], &(&1["role"] == "assistant"))
-      server_block = hd(assistant_msg["content"])
-      assert server_block["type"] == "server_tool_use"
-      assert server_block["id"] == "srvtoolu_01"
-
-      # server_tool_result should be preserved in user message
-      result_msg = List.last(decoded["messages"])
-      result_block = hd(result_msg["content"])
-      assert result_block["type"] == "server_tool_result"
-      assert result_block["tool_use_id"] == "srvtoolu_01"
+      [_user, assistant, results] = decoded["messages"]
+      assert Enum.map(assistant["content"], & &1["type"]) == ["server_tool_use", "tool_use"]
+      assert [%{"type" => "tool_result", "tool_use_id" => "toolu_01"}] = results["content"]
     end
   end
 
