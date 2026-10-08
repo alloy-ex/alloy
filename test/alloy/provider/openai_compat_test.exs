@@ -84,6 +84,87 @@ defmodule Alloy.Provider.OpenAICompatTest do
   # ── Gemini 3.x thought signatures (PR #24) ───────────────────────────
 
   describe "Gemini 3.x thought signatures" do
+    test "streamed parallel tool signatures survive later deltas and round-trip unchanged" do
+      signatures = ["opaque+/= signature", "late-signature"]
+
+      calls = [
+        %{
+          "index" => 0,
+          "id" => "call_1",
+          "function" => %{"name" => "read", "arguments" => ""},
+          "extra_content" => %{"google" => %{"thought_signature" => hd(signatures)}}
+        },
+        %{
+          "index" => 1,
+          "id" => "call_2",
+          "function" => %{"name" => "write", "arguments" => ""}
+        },
+        %{
+          "index" => 0,
+          "function" => %{"arguments" => "{}"},
+          "extra_content" => %{"google" => %{"thought_signature" => nil}}
+        },
+        %{
+          "index" => 1,
+          "function" => %{"arguments" => "{}"},
+          "extra_content" => %{"google" => %{"thought_signature" => List.last(signatures)}}
+        }
+      ]
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        conn = Plug.Conn.send_chunked(conn, 200)
+
+        conn =
+          Enum.reduce(calls, conn, fn call, conn ->
+            chunk = %{"choices" => [%{"delta" => %{"tool_calls" => [call]}}]}
+            {:ok, conn} = Plug.Conn.chunk(conn, "data: #{Jason.encode!(chunk)}\n\n")
+            conn
+          end)
+
+        finish = %{"choices" => [%{"delta" => %{}, "finish_reason" => "tool_calls"}]}
+        {:ok, conn} = Plug.Conn.chunk(conn, "data: #{Jason.encode!(finish)}\n\ndata: [DONE]\n\n")
+        conn
+      end)
+
+      config = %{
+        api_url: "http://localhost",
+        model: "gemini-3.8-flash",
+        req_options: [plug: {Req.Test, __MODULE__}]
+      }
+
+      assert {:ok, response} =
+               OpenAICompat.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert response.stop_reason == :tool_use
+      [assistant] = response.messages
+      assert Enum.map(assistant.content, & &1[:thought_signature]) == signatures
+      assert Enum.map(assistant.content, & &1.id) == ["call_1", "call_2"]
+
+      results = %Message{
+        role: :user,
+        content: [
+          %{type: "tool_result", tool_use_id: "call_1", content: "read done"},
+          %{type: "tool_result", tool_use_id: "call_2", content: "write done"}
+        ]
+      }
+
+      assert {:ok, _} =
+               OpenAICompat.complete(
+                 [Message.user("Hi"), assistant, results],
+                 [],
+                 config_that_captures_request()
+               )
+
+      assert_received {:request_body, body}
+      outgoing = Enum.find(Jason.decode!(body)["messages"], &(&1["role"] == "assistant"))
+
+      assert Enum.map(
+               outgoing["tool_calls"],
+               &get_in(&1, ["extra_content", "google", "thought_signature"])
+             ) ==
+               signatures
+    end
+
     test "thought_signature in a tool call response is preserved on the block" do
       config =
         config_with_response(%{

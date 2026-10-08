@@ -156,7 +156,14 @@ defmodule Alloy.Provider.OpenAIStream do
     tool_calls =
       Enum.reduce(tool_call_deltas, acc.tool_calls, fn tc_delta, tool_calls ->
         index = tc_delta["index"]
-        existing = Map.get(tool_calls, index, %{id: nil, name: nil, arguments_buffer: ""})
+
+        existing =
+          Map.get(tool_calls, index, %{
+            id: nil,
+            name: nil,
+            arguments_buffer: "",
+            thought_signature: nil
+          })
 
         existing =
           case tc_delta do
@@ -174,6 +181,15 @@ defmodule Alloy.Provider.OpenAIStream do
           case get_in(tc_delta, ["function", "arguments"]) do
             nil -> existing
             args -> %{existing | arguments_buffer: existing.arguments_buffer <> args}
+          end
+
+        existing =
+          case get_in(tc_delta, ["extra_content", "google", "thought_signature"]) do
+            signature when is_binary(signature) and signature != "" ->
+              %{existing | thought_signature: signature}
+
+            _ ->
+              existing
           end
 
         Map.put(tool_calls, index, existing)
@@ -207,6 +223,12 @@ defmodule Alloy.Provider.OpenAIStream do
         case input_result do
           {:ok, input} ->
             block = %{type: "tool_use", id: tc.id, name: tc.name, input: input}
+
+            block =
+              if is_binary(tc.thought_signature),
+                do: Map.put(block, :thought_signature, tc.thought_signature),
+                else: block
+
             {:cont, [block | blocks]}
 
           {:error, reason} ->

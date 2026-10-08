@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:missing_return`, `:extra_return` and `:error_handling`. Docs must build
   without warnings.
 
+### Fixed
+
+- OpenAI-compatible Gemini streams preserve opaque thought signatures on
+  tool calls, including late signatures and parallel calls, for the next request.
+
 ## [0.12.4] - 2026-07-03
 
 ### Fixed
