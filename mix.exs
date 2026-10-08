@@ -98,12 +98,13 @@ defmodule Alloy.MixProject do
       source_ref: "v#{@version}",
       extras: [
         "docs/events.md",
+        "docs/provider-compatibility.md",
         "docs/recipes/sub-agents.md",
         "docs/recipes/mcp-tools.md",
         "livebooks/quickstart.livemd"
       ],
       groups_for_extras: [
-        Guides: ~r{docs/events\.md|livebooks/.*},
+        Guides: ~r{docs/(events|provider-compatibility)\.md|livebooks/.*},
         Recipes: ~r{docs/recipes/.*}
       ],
       groups_for_modules: [

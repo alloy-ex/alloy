@@ -17,7 +17,7 @@ Alloy is a harness, not a framework. Four runtime dependencies, ~9,000 lines —
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.12.0"
+result.text #=> "The version is 0.12.4"
 ```
 
 ## Why Alloy?
@@ -62,7 +62,7 @@ application layer. The library stays small so those choices remain yours.
 - **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
 - **4 built-in tools** — read, write, edit, bash — plus inline tools defined as data with `Alloy.Tool.inline/1`
 - **GenServer agents** — supervised, stateful, message-passing (moving to the optional `alloy_agent` runtime package in 0.13)
-- **Streaming** — token-by-token from any provider, unified interface
+- **Streaming** — incremental HTTP provider output; Codex replays final text through the same interface
 - **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
 - **Middleware** — custom hooks, tool blocking, argument editing
 - **Context compaction** — tool-result clearing plus summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
@@ -114,13 +114,18 @@ result.text #=> "4"
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and summarize the dependencies",
   provider: {Alloy.Provider.Gemini,
-    api_key: "...", model: "gemini-2.5-flash-lite"},
+    api_key: "...", model: "gemini-3.5-flash"},
   tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Bash],
   max_turns: 10
 )
 ```
 
-Gemini model IDs Alloy now budgets for include `gemini-2.5-pro`,
+For new Gemini integrations, Google recommends `gemini-3.8-flash` or
+`gemini-3.5-flash-lite`. Use a context-window override for models absent from
+the catalog. 2.5 access is restricted to prior active users, not universally
+retired. See [provider compatibility](docs/provider-compatibility.md).
+
+Existing Gemini model IDs Alloy budgets for include `gemini-2.5-pro`,
 `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-pro-preview`, and
 `gemini-3-flash-preview`.
 
@@ -175,7 +180,7 @@ For a persistent agent process with conversation state, use `Alloy.Agent.Server.
 end)
 ```
 
-All providers support streaming. If a custom provider doesn't implement
+HTTP providers stream incrementally; Codex emulates streaming by replaying final text. If a custom provider doesn't implement
 `stream/4`, the turn loop falls back to `complete/3` automatically.
 
 `Alloy.run/2` remains the buffered convenience API. Use `Alloy.stream/3`
@@ -330,7 +335,12 @@ omitting them uses Alloy's default summary prompts.
 
 ### Cost guard
 
-Cap how much an agent run can spend:
+Check accumulated provider-reported cost estimates. The built-in providers
+currently do not calculate monetary costs, so this option does not enforce an
+expense cap with them. Use a custom provider supplying `estimated_cost_cents`
+and application billing controls. [Accounting limitations](docs/provider-compatibility.md#usage-and-releases).
+
+For a provider that reports cost estimates:
 
 ```elixir
 {:ok, result} = Alloy.run("Research this codebase thoroughly",
@@ -573,13 +583,17 @@ end
 
 | Vendor | Recommended Module | Example Models |
 |--------|---------------------|----------------|
-| Anthropic | `Alloy.Provider.Anthropic` | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
-| Gemini | `Alloy.Provider.Gemini` | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-3-pro-preview`, `gemma-4-26b-a4b-it` (open-weight) |
-| OpenAI | `Alloy.Provider.OpenAI` | `gpt-5.4` |
-| xAI | `Alloy.Provider.OpenAI` with `api_url: "https://api.x.ai"` | `grok-4.20-0309-reasoning`, `grok-4.20-multi-agent-0309`, `grok-4.1-fast-reasoning`, `grok-code-fast-1` |
+| Anthropic | `Alloy.Provider.Anthropic` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` |
+| Gemini | `Alloy.Provider.Gemini` | `gemini-3.8-flash`, `gemini-3.5-flash-lite` |
+| OpenAI | `Alloy.Provider.OpenAI` | `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-luna` |
+| xAI | `Alloy.Provider.XAI` | `grok-4.7` |
 | Other OpenAI-compatible APIs | `Alloy.Provider.OpenAICompat` | `kimi-k2.6` (Moonshot), `qwen3-coder-plus` (1M ctx), `glm-4.6`, `mistral-large-2512`, plus Ollama, OpenRouter, DeepSeek, Groq, Together |
 
-Use `Alloy.Provider.OpenAI` for native Responses APIs like OpenAI and xAI.
+The table lists current example IDs, not a built-in catalog or a live-tested
+model allowlist. Check [provider compatibility](docs/provider-compatibility.md)
+for context overrides, adaptive thinking, and MCP version constraints.
+
+Use `Alloy.Provider.OpenAI` for OpenAI Responses and `Alloy.Provider.XAI` for xAI Responses.
 Use `Alloy.Provider.Gemini` for Gemini's native GenerateContent API.
 Use `Alloy.Provider.OpenAICompat` for chat-completions compatible APIs and local runtimes.
 
@@ -713,4 +727,8 @@ MIT — see [LICENSE](LICENSE).
 ## Releases
 
 Hex.pm publishing is handled by GitHub Actions on `v*` tags.
-Successful publishes also dispatch the landing-site version sync workflow.
+When `ALLOY_WEBSITE_SYNC_TOKEN` is configured, successful publishes also
+dispatch the landing-site version sync workflow. The token needs Contents:
+write on `alloy-ex/alloy-ex.github.io`; without it the dispatch is skipped
+with a warning. GitHub Release entries are separate from Hex publishing.
+Check [Hex](https://hex.pm/packages/alloy) for published package versions.

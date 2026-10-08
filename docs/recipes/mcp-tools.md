@@ -30,6 +30,14 @@ children = [
 ]
 ```
 
+This example uses the client's 2025 protocol contract. Anubis 1.5 itself
+requires Elixir 1.18 or later; this optional application dependency has a
+higher floor than Alloy. The current Anubis 2.1 documentation still lists
+protocol support only through 2025-11-25. The 2026 MCP revision changes the
+client lifecycle and requires more than editing `protocol_version`.
+[Client versions](https://anubis-mcp.hexdocs.pm/readme.html),
+[protocol changes](https://modelcontextprotocol.io/specification/2026-07-28/changelog).
+
 ## The gateway tool
 
 ```elixir
@@ -91,7 +99,14 @@ defmodule MyApp.Tools.MCP do
     end
   end
 
-  # Tool list rarely changes; fetch once and cache for the VM's lifetime.
+  # Static-server example only. Refresh this cache when the server's tool
+  # list changes; wire the client's discovery notifications in your app.
+  def refresh_tools do
+    :persistent_term.erase({__MODULE__, :tools})
+    cached_tools()
+  end
+
+  # Fetch once and cache until explicitly refreshed.
   defp cached_tools do
     case :persistent_term.get({__MODULE__, :tools}, :missing) do
       :missing ->
@@ -137,6 +152,35 @@ provider-side instead of running a client in your app. Pass Anthropic's
 `extra_headers` on the provider config. The client-side gateway above remains
 the right pattern for local or stdio MCP servers and for providers without a
 server-side MCP connector.
+
+The current connector requires a matching `mcp_toolset` in `tools` and the
+`mcp-client-2025-11-20` beta header; the April beta is deprecated.
+[Official contract](https://platform.claude.com/docs/en/agents-and-tools/mcp-connector).
+
+```elixir
+Alloy.run("Search the connected documentation",
+  tools: [],
+  provider: {Alloy.Provider.Anthropic,
+    api_key: System.fetch_env!("ANTHROPIC_API_KEY"),
+    model: "claude-sonnet-5-5",
+    extra_headers: [{"anthropic-beta", "mcp-client-2025-11-20"}],
+    extra_body: %{
+      "mcp_servers" => [%{
+        "type" => "url", "name" => "docs",
+        "url" => "https://your-mcp-server.example/mcp"
+      }],
+      "tools" => [%{"type" => "mcp_toolset", "mcp_server_name" => "docs"}]
+    }
+  }
+)
+```
+
+`extra_body` merges last, so its `tools` array replaces generated local tool
+definitions. This example explicitly uses only provider-side MCP tools. When
+combining local and remote tools, include both definitions in the final array.
+Server authorization and tool allowlisting belong in your application. The
+connector supports remote tool calls and is not eligible for zero data
+retention; local stdio and other MCP features need an application client.
 
 ## Variant: one tool per MCP tool
 
