@@ -7,13 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Mint is now constrained to `~> 1.11`** (and through it HPAX `~> 1.1`).
+  Mint 1.9 and earlier carry several advisories on the HTTP/1 client path
+  every Alloy provider uses by default, including memory-exhaustion DoS from
+  unbounded response headers and chunked bodies (CVE-2026-58229,
+  CVE-2026-56810, CVE-2026-82728) and response smuggling on pooled
+  connections (CVE-2026-82672, CVE-2026-94194, CVE-2026-59249), plus HTTP/2
+  issues (CVE-2026-91043, CVE-2026-92103, CVE-2026-59246). HPAX before 1.0.4
+  has an HPACK decoding DoS (CVE-2026-58226). These matter because Alloy talks
+  to user-configured, possibly untrusted, OpenAI-compatible endpoints. If your
+  application pins Mint below 1.11, run `mix deps.update mint hpax`.
+- Req is required at `>= 0.6.1 and < 0.8.0` (tested on 0.7.5).
+
 ### Changed
 
-- Require patched Req (at least 0.6.1), constrain Mint to 1.11 and its patched
-  HPAX dependency for downstream consumers, and refresh the tested lockfile.
 - Restrict test-only Plug to patched 1.19/1.20 versions.
 - Pin the contributor toolchain to Elixir 1.20.4 / OTP 28.5.0.7, add OTP 29
   coverage, dependency audits, weekly CI, and explicit read-only CI permissions.
+- **Stricter quality gates.** `mix ci` runs every gate CI enforces: format,
+  unused-lock check, `hex.audit` (advisories), warnings-as-errors compile,
+  compile-time cycle check, strict Credo with opt-in correctness checks,
+  tests with a coverage floor, and Dialyzer with `:unmatched_returns`,
+  `:missing_return`, `:extra_return` and `:error_handling`. Docs must build
+  without warnings.
 
 ## [0.12.4] - 2026-07-03
 

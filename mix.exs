@@ -21,7 +21,35 @@ defmodule Alloy.MixProject do
         # code actually returns.
         flags: [:error_handling, :extra_return, :missing_return, :unmatched_returns]
       ],
+      test_coverage: [
+        # Ratchet: raise as coverage improves, never lower it.
+        summary: [threshold: 84],
+        ignore_modules: [~r/^Alloy\.Test\./, Alloy.StreamTestHelpers]
+      ],
+      aliases: aliases(),
       elixirc_paths: elixirc_paths(Mix.env())
+    ]
+  end
+
+  def cli do
+    [preferred_envs: [ci: :test]]
+  end
+
+  # `mix ci` runs every gate CI enforces, in the order that fails fastest.
+  # Docs build separately (`MIX_ENV=dev mix docs --warnings-as-errors`)
+  # because ex_doc is a dev-only dependency.
+  defp aliases do
+    [
+      ci: [
+        "format --check-formatted",
+        "deps.unlock --check-unused",
+        "hex.audit",
+        "compile --warnings-as-errors --force",
+        "xref graph --format cycles --label compile-connected --fail-above 0",
+        "credo",
+        "test --warnings-as-errors --cover",
+        "dialyzer"
+      ]
     ]
   end
 
@@ -40,8 +68,10 @@ defmodule Alloy.MixProject do
       # Req 0.6.1 fixes GHSA-655f-mp8p-96gv (decompression bomb).
       # Bound the tested API range while allowing the patched 0.6 line.
       {:req, ">= 0.6.1 and < 0.8.0"},
-      # Library lockfiles are not used by downstream applications. Mint 1.11
-      # constrains the transport and requires the patched HPAX 1.1 line.
+      # Not used directly: a security floor for the transport Req uses.
+      # Downstream apps don't inherit our lockfile, so the constraint is the
+      # only way to keep them off Mint < 1.11 (HTTP/1 DoS and smuggling CVEs)
+      # and HPAX < 1.0.4. See CHANGELOG "Security".
       {:mint, "~> 1.11"},
       {:jason, "~> 1.2"},
       {:telemetry, "~> 1.0"},

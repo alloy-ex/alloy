@@ -34,11 +34,10 @@ We use TDD. For every change:
 
 1. Write a test that fails (`mix test path/to/test.exs`)
 2. Implement the minimum code to make it pass
-3. Run the full suite: `mix test`
-4. Check formatting: `mix format`
-5. Check style: `mix credo --strict`
+3. Run every gate: `mix ci`
 
-All of these run automatically in CI and as pre-commit hooks.
+`mix ci` is the same command CI runs on its lint legs. Format, compile and
+Credo also run as pre-commit hooks.
 
 ## Pull requests
 
@@ -50,13 +49,24 @@ All of these run automatically in CI and as pre-commit hooks.
 
 ## Quality gates
 
+`mix ci` runs, in order:
+
 ```bash
-mix hex.audit                 # No known locked dependency advisories
-mix test                      # All tests pass
-mix format --check-formatted  # No formatting issues
-mix credo --strict            # No style warnings
-mix dialyzer                  # No type errors
+mix format --check-formatted   # No formatting drift
+mix deps.unlock --check-unused # No stale lockfile entries
+mix hex.audit                  # No retired packages or security advisories
+mix compile --warnings-as-errors --force  # Includes Elixir 1.20 type warnings
+mix xref graph --format cycles --label compile-connected --fail-above 0
+mix credo                      # strict: true, see .credo.exs for the policy
+mix test --warnings-as-errors --cover    # Coverage floor in mix.exs
+mix dialyzer                   # With :unmatched_returns, :missing_return, ...
 ```
+
+Docs must also build cleanly: `MIX_ENV=dev mix docs --warnings-as-errors`.
+
+Fix what a gate reports rather than suppressing it. If an exception is truly
+needed, configure it in `.credo.exs` (or the relevant config) with a comment
+explaining why, and mention it in the PR.
 
 ## Good first issues
 

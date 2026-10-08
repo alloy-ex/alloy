@@ -28,6 +28,7 @@ jobs:
           - elixir: "1.20.4"
             otp: "28.5.0.7"
             lint: true
+            docs: true
           - elixir: "1.19.6"
             otp: "27"
             lint: true
@@ -66,16 +67,17 @@ jobs:
           restore-keys: ${{ runner.os }}-plt-${{ matrix.elixir }}-${{ matrix.otp }}-
 
       - run: mix deps.get
-      - run: mix hex.audit
+
+      # Lint legs run every gate through the same alias contributors use
+      # locally (see `aliases/0` in mix.exs), so CI and `mix ci` can't drift.
+      - run: mix ci
         if: ${{ matrix.lint }}
-      - run: mix compile --warnings-as-errors
-        if: ${{ matrix.lint }}
+
       - run: mix compile
         if: ${{ !matrix.lint }}
       - run: mix test
-      - run: mix format --check-formatted
-        if: ${{ matrix.lint }}
-      - run: mix credo --strict
-        if: ${{ matrix.lint }}
-      - run: mix dialyzer
-        if: ${{ matrix.lint }}
+        if: ${{ !matrix.lint }}
+
+      - name: Docs build without warnings
+        if: ${{ matrix.docs }}
+        run: MIX_ENV=dev mix docs --warnings-as-errors
