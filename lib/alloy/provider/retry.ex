@@ -9,6 +9,7 @@ defmodule Alloy.Provider.Retry do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Provider.Error
 
   @doc """
   Call a provider with retry, backoff, and fallback logic.
@@ -49,8 +50,10 @@ defmodule Alloy.Provider.Retry do
 
   @doc false
   @spec retryable?(term()) :: boolean()
+  def retryable?(%Error{} = error), do: Error.retryable?(error)
 
-  # HTTP status errors — providers return strings via parse_error/2.
+  # String errors from custom providers (built-in providers return
+  # %Alloy.Provider.Error{}). The generic format is "HTTP <status>: <body>".
   # The generic fallback format is "HTTP <status>: <body>".
   # Retryable: 408 (request timeout), 429 (rate limit), and 5xx server errors.
   def retryable?("HTTP 408:" <> _), do: true
@@ -178,8 +181,9 @@ defmodule Alloy.Provider.Retry do
           attempt = state.config.max_retries - retries_left + 1
           base = round(state.config.retry_backoff_ms * :math.pow(2, attempt - 1))
           # Full jitter: uniform random in [0, 2*base) — prevents thundering herd
-          # when multiple agents hit the same rate limit simultaneously.
-          backoff = :rand.uniform(base * 2)
+          # when multiple agents hit the same rate limit simultaneously. Never
+          # retry sooner than the provider's Retry-After.
+          backoff = max(:rand.uniform(base * 2), retry_after_ms(reason))
           remaining = deadline - System.monotonic_time(:millisecond)
 
           if remaining < backoff do
@@ -207,6 +211,9 @@ defmodule Alloy.Provider.Retry do
         {error, chunks_emitted?}
     end
   end
+
+  defp retry_after_ms(%Error{retry_after_ms: ms}) when is_integer(ms), do: ms
+  defp retry_after_ms(_reason), do: 0
 
   # Calls the provider and returns {result, chunks_emitted?}.
   # For streaming calls, wraps on_chunk to detect whether any chunks were

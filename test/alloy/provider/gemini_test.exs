@@ -2,6 +2,7 @@ defmodule Alloy.Provider.GeminiTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
+  alias Alloy.Provider.Error
   alias Alloy.Provider.Gemini
 
   describe "complete/3 with text response" do
@@ -275,8 +276,10 @@ defmodule Alloy.Provider.GeminiTest do
             })
         })
 
-      assert {:error, message} = Gemini.complete([Message.user("Hi")], [], config)
-      assert message == "INVALID_ARGUMENT: bad request"
+      assert {:error, %Error{kind: :invalid_request} = error} =
+               Gemini.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) == "INVALID_ARGUMENT: bad request"
     end
   end
 

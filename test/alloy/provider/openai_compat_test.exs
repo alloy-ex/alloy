@@ -2,6 +2,7 @@ defmodule Alloy.Provider.OpenAICompatTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
+  alias Alloy.Provider.Error
   alias Alloy.Provider.OpenAICompat
 
   # ── Helpers ──────────────────────────────────────────────────────────
@@ -319,8 +320,10 @@ defmodule Alloy.Provider.OpenAICompatTest do
             ])
         })
 
-      assert {:error, message} = OpenAICompat.complete([Message.user("Hi")], [], config)
-      assert message =~ "missing thought_signature"
+      assert {:error, %Error{kind: :invalid_request} = error} =
+               OpenAICompat.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) =~ "missing thought_signature"
     end
   end
 

@@ -46,7 +46,7 @@ defmodule Alloy.Provider.Anthropic do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.SSE
+  alias Alloy.Provider.HTTP
 
   @default_api_url "https://api.anthropic.com"
   @default_api_version "2023-06-01"
@@ -83,24 +83,14 @@ defmodule Alloy.Provider.Anthropic do
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
-    req_opts =
-      ([
-         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
-         method: :post,
-         headers: build_headers(config, tool_defs),
-         body: Jason.encode!(body)
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200, body: resp_body}} ->
-        parse_response(resp_body)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, parse_error(status, resp_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, resp_body} <-
+           HTTP.post_json(
+             messages_url(config),
+             build_headers(config, tool_defs),
+             body,
+             Map.get(config, :req_options, [])
+           ) do
+      parse_response(resp_body)
     end
   end
 
@@ -131,44 +121,20 @@ defmodule Alloy.Provider.Anthropic do
       on_event: on_event
     }
 
-    stream_handler = SSE.req_stream_handler(initial_acc, &handle_sse_raw_event/2)
-
-    req_opts =
-      ([
-         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
-         method: :post,
-         headers: build_headers(config, tool_defs),
-         body: Jason.encode!(body),
-         into: stream_handler
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200} = resp} ->
-        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
-        build_stream_response(sse_acc)
-
-      {:ok, %{status: status} = resp} ->
-        error_body = streaming_error_body(resp, initial_acc)
-        {:error, parse_error(status, error_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, sse_acc} <-
+           HTTP.stream_sse(
+             messages_url(config),
+             build_headers(config, tool_defs),
+             body,
+             initial_acc,
+             &handle_sse_raw_event/2,
+             Map.get(config, :req_options, [])
+           ) do
+      build_stream_response(sse_acc)
     end
   end
 
-  # When streaming (into: handler), the error body is consumed by the SSE
-  # callback and resp.body is left as "". Recover it from the SSE buffer.
-  defp streaming_error_body(resp, initial_acc) do
-    case resp.body do
-      "" ->
-        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
-        sse_acc.buffer
-
-      body ->
-        body
-    end
-  end
+  defp messages_url(config), do: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages"
 
   # Bridge from SSE module's raw events to Anthropic's typed event handler.
   # Anthropic events always have an event type and JSON-decodable data.
@@ -695,28 +661,5 @@ defmodule Alloy.Provider.Anthropic do
       cache_creation_input_tokens: Map.get(usage, "cache_creation_input_tokens", 0),
       cache_read_input_tokens: Map.get(usage, "cache_read_input_tokens", 0)
     }
-  end
-
-  defp parse_error(status, body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, %{"type" => "error", "error" => error}} ->
-        "#{error["type"]}: #{error["message"]}"
-
-      {:ok, %{"error" => error}} when is_map(error) ->
-        "#{error["type"]}: #{error["message"]}"
-
-      _ ->
-        "HTTP #{status}: #{body}"
-    end
-  end
-
-  defp parse_error(status, body) when is_map(body) do
-    case body do
-      %{"type" => "error", "error" => error} ->
-        "#{error["type"]}: #{error["message"]}"
-
-      _ ->
-        "HTTP #{status}: #{inspect(body)}"
-    end
   end
 end

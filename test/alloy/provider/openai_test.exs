@@ -4,6 +4,7 @@ defmodule Alloy.Provider.OpenAITest do
   import Alloy.StreamTestHelpers
 
   alias Alloy.Message
+  alias Alloy.Provider.Error
   alias Alloy.Provider.OpenAI
 
   describe "complete/3 with text response" do
@@ -700,8 +701,10 @@ defmodule Alloy.Provider.OpenAITest do
             })
         })
 
-      assert {:error, reason} = OpenAI.complete([Message.user("Hi")], [], config)
-      assert reason =~ "invalid_request_error"
+      assert {:error, %Error{kind: :invalid_request} = reason} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "invalid_request_error"
     end
 
     test "returns error on rate limit" do
@@ -717,8 +720,10 @@ defmodule Alloy.Provider.OpenAITest do
             })
         })
 
-      assert {:error, reason} = OpenAI.complete([Message.user("Hi")], [], config)
-      assert reason =~ "rate_limit"
+      assert {:error, %Error{kind: :rate_limited} = reason} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "rate_limit"
     end
   end
 
@@ -782,8 +787,8 @@ defmodule Alloy.Provider.OpenAITest do
       assert {:error, reason} =
                OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      assert reason =~ "invalid_request_error"
-      assert reason =~ "max_output_tokens"
+      assert Exception.message(reason) =~ "invalid_request_error"
+      assert Exception.message(reason) =~ "max_output_tokens"
     end
 
     test "returns raw body when stream error response is not JSON" do
@@ -792,8 +797,8 @@ defmodule Alloy.Provider.OpenAITest do
       assert {:error, reason} =
                OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      assert reason =~ "503"
-      assert reason =~ "Service Unavailable"
+      assert %Error{kind: :server_error} = reason
+      assert Exception.message(reason) == "HTTP 503: Service Unavailable"
     end
 
     test "request body includes stream: true" do

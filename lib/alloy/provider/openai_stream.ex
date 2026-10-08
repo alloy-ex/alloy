@@ -21,7 +21,7 @@ defmodule Alloy.Provider.OpenAIStream do
   """
 
   alias Alloy.Message
-  alias Alloy.Provider.SSE
+  alias Alloy.Provider.HTTP
 
   @doc """
   Execute a streaming request against an OpenAI-compatible endpoint.
@@ -46,29 +46,9 @@ defmodule Alloy.Provider.OpenAIStream do
       on_chunk: on_chunk
     }
 
-    stream_handler = SSE.req_stream_handler(initial_acc, &handle_event/2)
-
-    req_opts =
-      ([
-         url: url,
-         method: :post,
-         headers: headers,
-         body: Jason.encode!(body),
-         into: stream_handler
-       ] ++ req_options)
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200} = resp} ->
-        acc = Map.get(resp.private, :sse_acc, initial_acc)
-        build_response(acc)
-
-      {:ok, %{status: status} = resp} ->
-        error_body = streaming_error_body(resp, initial_acc)
-        {:error, parse_error(status, error_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, acc} <-
+           HTTP.stream_sse(url, headers, body, initial_acc, &handle_event/2, req_options) do
+      build_response(acc)
     end
   end
 
@@ -79,19 +59,6 @@ defmodule Alloy.Provider.OpenAIStream do
 
   defp put_stream_options(body),
     do: Map.put_new(body, "stream_options", %{"include_usage" => true})
-
-  # When streaming (into: handler), the error body is consumed by the SSE
-  # callback and resp.body is left as "". Recover it from the SSE buffer.
-  defp streaming_error_body(resp, initial_acc) do
-    case resp.body do
-      "" ->
-        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
-        sse_acc.buffer
-
-      body ->
-        body
-    end
-  end
 
   # ── SSE Event Handling ───────────────────────────────────────────────
 
@@ -267,18 +234,4 @@ defmodule Alloy.Provider.OpenAIStream do
   defp parse_finish_reason("length"), do: :end_turn
   defp parse_finish_reason("content_filter"), do: :end_turn
   defp parse_finish_reason(_), do: :end_turn
-
-  defp parse_error(status, body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, %{"error" => error}} -> "#{error["type"]}: #{error["message"]}"
-      _ -> "HTTP #{status}: #{body}"
-    end
-  end
-
-  defp parse_error(status, body) when is_map(body) do
-    case body do
-      %{"error" => error} -> "#{error["type"]}: #{error["message"]}"
-      _ -> "HTTP #{status}: #{inspect(body)}"
-    end
-  end
 end

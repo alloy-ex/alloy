@@ -13,7 +13,7 @@ defmodule Alloy.Agent.Turn do
   alias Alloy.Events
   alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.{Message, Middleware}
-  alias Alloy.Provider.Retry
+  alias Alloy.Provider.{Error, Retry}
   alias Alloy.Tool.Executor
 
   require Logger
@@ -248,6 +248,14 @@ defmodule Alloy.Agent.Turn do
     |> fail(reason)
   end
 
+  # Result.error stays a string for compatibility; the structured error is
+  # kept alongside it for callers that want the kind, status or code.
+  defp fail(state, %Error{} = error) do
+    state
+    |> State.merge_run_metadata(%{provider_error: error})
+    |> fail(Exception.message(error))
+  end
+
   defp fail(state, reason) do
     state = %{state | status: :error, error: reason}
 
@@ -373,13 +381,9 @@ defmodule Alloy.Agent.Turn do
     Enum.flat_map(messages, &Message.tool_calls/1)
   end
 
-  defp prompt_too_long?(reason) when is_binary(reason) do
-    String.contains?(reason, "prompt is too long") or
-      String.contains?(reason, "context_length_exceeded") or
-      String.contains?(reason, "maximum context length")
-  end
-
-  defp prompt_too_long?(_), do: false
+  defp prompt_too_long?(%Error{kind: kind}), do: kind == :context_overflow
+  defp prompt_too_long?(reason) when is_binary(reason), do: Error.overflow_text?(reason)
+  defp prompt_too_long?(_reason), do: false
 
   defp maybe_complete_or_continue(state, opts, deadline) do
     if until_tool_pending?(state) do

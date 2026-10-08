@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Built-in providers return `{:error, %Alloy.Provider.Error{}}`** instead of
+  a string when called directly. `Alloy.run/2` and `Alloy.Agent.Server` are
+  unaffected: `result.error` is still the same string
+  (`Exception.message/1` of the struct), and the struct is added at
+  `result.metadata.run.provider_error`. The struct implements `String.Chars`,
+  so interpolating it still works; code that applies `=~` or binary
+  patterns to a provider's raw error should use `Exception.message/1`.
 - Restrict test-only Plug to patched 1.19/1.20 versions.
 - Pin the contributor toolchain to Elixir 1.20.4 / OTP 28.5.0.7, add OTP 29
   coverage, dependency audits, weekly CI, and explicit read-only CI permissions.
@@ -50,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Custom providers that only return `:tool_use`/`:end_turn` are unaffected.
   A provider returning an unknown stop reason now fails the run with a clear
   error instead of crashing the loop.
+- **`Alloy.Provider.Error`** — structured provider failures with a `:kind`
+  (`:rate_limited`, `:overloaded`, `:server_error`, `:timeout`, `:network`,
+  `:context_overflow`, `:quota`, `:auth`, `:invalid_request`, `:unknown`),
+  plus `:status`, `:type`, `:code` and `:retry_after_ms`. Custom providers
+  may return it; string errors keep working.
 
 ### Deprecated
 
@@ -58,6 +70,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Retries are classified on HTTP status and error code, not message
+  text.** Previously not retried: Anthropic `api_error` (500) and
+  `timeout_error` (504), OpenAI 503 `server_is_overloaded` and 429s whose
+  type was not `rate_limit_error`. Quota and spend-limit 429s
+  (`insufficient_quota`, `*_spend_limit_exceeded`) are no longer retried.
+  `Retry-After` / `retry-after-ms` is honoured, within the turn deadline.
+- **Context-overflow recovery now works for Gemini and OpenAI Responses.**
+  Their overflow errors ("exceeds the maximum number of tokens", "exceeds
+  the context window") were not recognised, so the one-shot compaction retry
+  never ran.
 - **A `:tool_use` response with no client tool calls** (only server-executed
   tools) now completes instead of sending an empty tool-results message.
 - **Anthropic server tools are no longer answered by the client.** When a

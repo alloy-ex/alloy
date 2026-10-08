@@ -35,7 +35,7 @@ defmodule Alloy.Provider.Gemini do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.SSE
+  alias Alloy.Provider.HTTP
 
   @default_api_url "https://generativelanguage.googleapis.com"
   @default_api_version "v1beta"
@@ -65,24 +65,14 @@ defmodule Alloy.Provider.Gemini do
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
-    req_opts =
-      ([
-         url: request_url(config, "generateContent"),
-         method: :post,
-         headers: build_headers(config),
-         body: Jason.encode!(body)
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200, body: resp_body}} ->
-        parse_response(resp_body)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, parse_error(status, resp_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, resp_body} <-
+           HTTP.post_json(
+             request_url(config, "generateContent"),
+             build_headers(config),
+             body,
+             Map.get(config, :req_options, [])
+           ) do
+      parse_response(resp_body)
     end
   end
 
@@ -100,30 +90,16 @@ defmodule Alloy.Provider.Gemini do
       on_chunk: on_chunk
     }
 
-    stream_handler = SSE.req_stream_handler(initial_acc, &handle_sse_event/2)
-
-    req_opts =
-      ([
-         url: request_url(config, "streamGenerateContent"),
-         method: :post,
-         headers: build_headers(config),
-         params: [alt: "sse"],
-         body: Jason.encode!(body),
-         into: stream_handler
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200} = resp} ->
-        acc = Map.get(resp.private, :sse_acc, initial_acc)
-        build_stream_response(acc)
-
-      {:ok, %{status: status} = resp} ->
-        error_body = streaming_error_body(resp, initial_acc)
-        {:error, parse_error(status, error_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, acc} <-
+           HTTP.stream_sse(
+             request_url(config, "streamGenerateContent"),
+             build_headers(config),
+             body,
+             initial_acc,
+             &handle_sse_event/2,
+             [params: [alt: "sse"]] ++ Map.get(config, :req_options, [])
+           ) do
+      build_stream_response(acc)
     end
   end
 
@@ -390,20 +366,6 @@ defmodule Alloy.Provider.Gemini do
     }
   end
 
-  defp parse_error(status, body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, decoded} -> parse_error(status, decoded)
-      {:error, _} -> "HTTP #{status}: #{body}"
-    end
-  end
-
-  defp parse_error(status, %{"error" => %{"message" => message} = error}) do
-    code = error["status"] || error["code"] || status
-    "#{code}: #{message}"
-  end
-
-  defp parse_error(status, body), do: "HTTP #{status}: #{inspect(body)}"
-
   defp handle_sse_event(acc, %{data: "[DONE]"}), do: acc
 
   defp handle_sse_event(acc, %{data: data}) do
@@ -466,18 +428,6 @@ defmodule Alloy.Provider.Gemini do
        messages: [%Message{role: :assistant, content: acc.content_blocks}],
        usage: usage
      }}
-  end
-
-  defp streaming_error_body(resp, initial_acc) do
-    case resp.body do
-      "" ->
-        resp.private
-        |> Map.get(:sse_acc, initial_acc)
-        |> Map.get(:buffer, "")
-
-      body ->
-        body
-    end
   end
 
   defp generated_tool_call_id(name) do

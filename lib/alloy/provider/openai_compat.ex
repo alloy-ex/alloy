@@ -66,7 +66,7 @@ defmodule Alloy.Provider.OpenAICompat do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.OpenAIStream
+  alias Alloy.Provider.{HTTP, OpenAIStream}
 
   @default_max_tokens 4096
   @default_chat_path "/v1/chat/completions"
@@ -94,26 +94,15 @@ defmodule Alloy.Provider.OpenAICompat do
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
-    url = "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
 
-    req_opts =
-      ([
-         url: url,
-         method: :post,
-         headers: build_headers(config),
-         body: Jason.encode!(body)
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200, body: resp_body}} ->
-        parse_response(resp_body)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, parse_error(status, resp_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, resp_body} <-
+           HTTP.post_json(
+             chat_url(config),
+             build_headers(config),
+             body,
+             Map.get(config, :req_options, [])
+           ) do
+      parse_response(resp_body)
     end
   end
 
@@ -126,16 +115,16 @@ defmodule Alloy.Provider.OpenAICompat do
     body =
       if config[:stream_options] == false, do: Map.put(body, "stream_options", false), else: body
 
-    url = "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
-
     OpenAIStream.stream(
-      url,
+      chat_url(config),
       build_headers(config),
       body,
       on_chunk,
       Map.get(config, :req_options, [])
     )
   end
+
+  defp chat_url(config), do: "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
 
   defp build_headers(config) do
     base = [{"content-type", "application/json"}]
@@ -358,24 +347,4 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_finish_reason("stop"), do: :end_turn
   defp parse_finish_reason("tool_calls"), do: :tool_use
   defp parse_finish_reason(_), do: :end_turn
-
-  # Gemini 3.x wraps errors in a list (PR #24)
-  defp parse_error(status, [item | _]) when is_map(item), do: parse_error(status, item)
-
-  defp parse_error(status, body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, %{"error" => error}} -> "#{error["type"]}: #{error["message"]}"
-      _ -> "HTTP #{status}: #{body}"
-    end
-  end
-
-  defp parse_error(status, body) when is_map(body) do
-    case body do
-      %{"error" => error} when is_map(error) -> "#{error["type"]}: #{error["message"]}"
-      %{"error" => error} when is_binary(error) -> "HTTP #{status}: #{error}"
-      _ -> "HTTP #{status}: #{inspect(body)}"
-    end
-  end
-
-  defp parse_error(status, body), do: "HTTP #{status}: #{inspect(body)}"
 end

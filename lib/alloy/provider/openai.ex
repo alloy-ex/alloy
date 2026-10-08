@@ -55,7 +55,7 @@ defmodule Alloy.Provider.OpenAI do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.SSE
+  alias Alloy.Provider.HTTP
 
   @default_api_url "https://api.openai.com"
   @default_max_tokens 4096
@@ -88,27 +88,14 @@ defmodule Alloy.Provider.OpenAI do
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
-    req_opts =
-      ([
-         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/responses",
-         method: :post,
-         headers: [
-           {"authorization", "Bearer #{config.api_key}"},
-           {"content-type", "application/json"}
-         ],
-         body: Jason.encode!(body)
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200, body: resp_body}} ->
-        parse_response(resp_body)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, parse_error(status, resp_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, resp_body} <-
+           HTTP.post_json(
+             responses_url(config),
+             headers(config),
+             body,
+             Map.get(config, :req_options, [])
+           ) do
+      parse_response(resp_body)
     end
   end
 
@@ -121,13 +108,6 @@ defmodule Alloy.Provider.OpenAI do
       |> build_request_body(tool_defs, config)
       |> Map.put("stream", true)
 
-    url = "#{Map.get(config, :api_url, @default_api_url)}/v1/responses"
-
-    headers = [
-      {"authorization", "Bearer #{config.api_key}"},
-      {"content-type", "application/json"}
-    ]
-
     initial_acc = %{
       buffer: "",
       content: "",
@@ -136,30 +116,23 @@ defmodule Alloy.Provider.OpenAI do
       on_chunk: on_chunk
     }
 
-    stream_handler = SSE.req_stream_handler(initial_acc, &handle_stream_event/2)
-
-    req_opts =
-      ([
-         url: url,
-         method: :post,
-         headers: headers,
-         body: Jason.encode!(body),
-         into: stream_handler
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200} = resp} ->
-        acc = Map.get(resp.private, :sse_acc, initial_acc)
-        build_stream_response(acc)
-
-      {:ok, %{status: status} = resp} ->
-        error_body = streaming_error_body(resp, initial_acc)
-        {:error, parse_error(status, error_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, acc} <-
+           HTTP.stream_sse(
+             responses_url(config),
+             headers(config),
+             body,
+             initial_acc,
+             &handle_stream_event/2,
+             Map.get(config, :req_options, [])
+           ) do
+      build_stream_response(acc)
     end
+  end
+
+  defp responses_url(config), do: "#{Map.get(config, :api_url, @default_api_url)}/v1/responses"
+
+  defp headers(config) do
+    [{"authorization", "Bearer #{config.api_key}"}, {"content-type", "application/json"}]
   end
 
   # --- Request Building ---
@@ -385,19 +358,6 @@ defmodule Alloy.Provider.OpenAI do
 
   # --- Streaming ---
 
-  # When streaming (into: handler), a non-200 body can be consumed by the SSE
-  # callback and resp.body may be "". Recover it from the SSE buffer.
-  defp streaming_error_body(resp, initial_acc) do
-    case resp.body do
-      "" ->
-        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
-        sse_acc.buffer
-
-      body ->
-        body
-    end
-  end
-
   defp handle_stream_event(acc, %{data: "[DONE]"}), do: acc
 
   defp handle_stream_event(acc, %{event: event_name, data: data}) do
@@ -613,23 +573,6 @@ defmodule Alloy.Provider.OpenAI do
 
       _other ->
         {:error, "Invalid tool call arguments payload for #{name}"}
-    end
-  end
-
-  defp parse_error(status, body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, %{"error" => error}} ->
-        format_error_payload(error)
-
-      _ ->
-        "HTTP #{status}: #{body}"
-    end
-  end
-
-  defp parse_error(status, body) when is_map(body) do
-    case body do
-      %{"error" => error} -> format_error_payload(error)
-      _ -> "HTTP #{status}: #{inspect(body)}"
     end
   end
 

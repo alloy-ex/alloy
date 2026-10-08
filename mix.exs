@@ -23,7 +23,7 @@ defmodule Alloy.MixProject do
       ],
       test_coverage: [
         # Ratchet: raise as coverage improves, never lower it.
-        summary: [threshold: 84],
+        summary: [threshold: 86],
         ignore_modules: [~r/^Alloy\.Test\./, Alloy.StreamTestHelpers]
       ],
       aliases: aliases(),
@@ -125,6 +125,7 @@ defmodule Alloy.MixProject do
           Alloy.Provider,
           Alloy.Provider.Anthropic,
           Alloy.Provider.Codex,
+          Alloy.Provider.Error,
           Alloy.Provider.Gemini,
           Alloy.Provider.OpenAI,
           Alloy.Provider.OpenAICompat,

@@ -13,8 +13,7 @@
 # VariableRebinding, ModuleDependencies, ABCSize (CyclomaticComplexity and
 # Nesting already bound function size).
 #
-# Pending, enabled alongside the fix that clears them:
-#   - Design.DuplicatedCode — provider HTTP/error-parsing consolidation
+# Pending, enabled alongside the fix that clears it:
 #   - Warning.LeakyEnvironment — subprocess environment handling (bash, codex)
 %{
   configs: [
@@ -40,6 +39,7 @@
           {Credo.Check.Consistency.TabsOrSpaces, []},
 
           ## Design
+          {Credo.Check.Design.DuplicatedCode, []},
           {Credo.Check.Design.AliasUsage,
            [priority: :low, if_nested_deeper_than: 2, if_called_more_often_than: 0]},
           {Credo.Check.Design.SkipTestWithoutComment, []},

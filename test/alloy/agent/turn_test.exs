@@ -2356,6 +2356,44 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  describe "structured provider errors" do
+    test "a :context_overflow error triggers compaction and a retry" do
+      overflow = %Alloy.Provider.Error{
+        kind: :context_overflow,
+        status: 400,
+        type: "INVALID_ARGUMENT",
+        message: "The input token count (1200000) exceeds the maximum number of tokens allowed"
+      }
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          {:error, overflow},
+          TestProvider.text_response("Recovered after compaction")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_tokens: 200_000,
+        compaction: %{reserve_tokens: 1_000, keep_recent_tokens: 5_000, fallback: :truncate}
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Hello")]))
+
+      assert result.status == :completed
+      assert result.run_metadata == %{prompt_too_long_recovery: true}
+    end
+
+    test "the error stays a string; the struct is kept in run metadata" do
+      error = %Alloy.Provider.Error{kind: :auth, status: 401, message: "bad key"}
+      state = Alloy.Testing.run_with_responses("hi", [{:error, error}])
+
+      assert state.status == :error
+      assert state.error == "HTTP 401: bad key"
+      assert Alloy.Result.from_state(state).metadata.run.provider_error == error
+    end
+  end
+
   describe "run_loop/1 with until_tool" do
     test "continues loop when model ends turn without calling the target tool" do
       {:ok, pid} =

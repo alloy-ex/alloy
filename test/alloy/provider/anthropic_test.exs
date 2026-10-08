@@ -2,7 +2,7 @@ defmodule Alloy.Provider.AnthropicTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
-  alias Alloy.Provider.Anthropic
+  alias Alloy.Provider.{Anthropic, Error}
 
   # We test by intercepting the HTTP call via a custom Req adapter
   # that returns canned responses.
@@ -466,8 +466,10 @@ defmodule Alloy.Provider.AnthropicTest do
             })
         })
 
-      assert {:error, reason} = Anthropic.complete([Message.user("Hi")], [], config)
-      assert reason =~ "invalid_request_error"
+      assert {:error, %Error{kind: :invalid_request} = reason} =
+               Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "invalid_request_error"
     end
 
     test "returns error on overloaded response" do
@@ -481,8 +483,10 @@ defmodule Alloy.Provider.AnthropicTest do
             })
         })
 
-      assert {:error, reason} = Anthropic.complete([Message.user("Hi")], [], config)
-      assert reason =~ "overloaded"
+      assert {:error, %Error{kind: :overloaded} = reason} =
+               Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "overloaded"
     end
   end
 
@@ -959,8 +963,8 @@ defmodule Alloy.Provider.AnthropicTest do
       assert {:error, reason} =
                Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      assert reason =~ "invalid_request_error"
-      assert reason =~ "max_tokens"
+      assert Exception.message(reason) =~ "invalid_request_error"
+      assert Exception.message(reason) =~ "max_tokens"
     end
 
     test "returns raw body when stream error is not JSON" do
@@ -969,8 +973,8 @@ defmodule Alloy.Provider.AnthropicTest do
       assert {:error, reason} =
                Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      assert reason =~ "502"
-      assert reason =~ "Bad Gateway"
+      assert %Error{kind: :server_error} = reason
+      assert Exception.message(reason) == "HTTP 502: Bad Gateway"
     end
   end
 
@@ -1291,8 +1295,10 @@ defmodule Alloy.Provider.AnthropicTest do
         req_options: [plug: {Req.Test, __MODULE__}]
       }
 
-      assert {:error, "HTTP 429: Too Many Requests"} =
+      assert {:error, %Error{kind: :rate_limited} = error} =
                Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) == "HTTP 429: Too Many Requests"
     end
 
     test "req_options cannot re-enable Req retry (retry: false is enforced)" do
@@ -1316,8 +1322,10 @@ defmodule Alloy.Provider.AnthropicTest do
         ]
       }
 
-      assert {:error, "HTTP 429: Too Many Requests"} =
+      assert {:error, %Error{kind: :rate_limited} = error} =
                Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) == "HTTP 429: Too Many Requests"
 
       # Must have been called exactly once — no Req retry
       assert :counters.get(calls, 1) == 1,
@@ -1380,16 +1388,10 @@ defmodule Alloy.Provider.AnthropicTest do
       req_options: [plug: {Req.Test, __MODULE__}, retry: false]
     }
     |> tap(fn _ ->
-      Req.Test.stub(__MODULE__, fn conn ->
-        {:ok, body, conn} = Plug.Conn.read_body(conn)
-        send(test_pid, {:request_body, body})
-        conn = Plug.Conn.send_chunked(conn, 200)
-
-        Enum.reduce(chunks, conn, fn chunk, conn ->
-          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
-          conn
-        end)
-      end)
+      Req.Test.stub(
+        __MODULE__,
+        Alloy.StreamTestHelpers.sse_chunks_capturing_plug(test_pid, chunks)
+      )
     end)
   end
 
