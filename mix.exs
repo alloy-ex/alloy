@@ -37,16 +37,18 @@ defmodule Alloy.MixProject do
 
   defp deps do
     [
-      # ~> 0.6 floor: req 0.6.0 fixes GHSA-px9f-whj3-246m (multipart header
-      # injection) and GHSA-655f-mp8p-96gv (decompression bomb) — relevant
-      # because Alloy can target user-configured OpenAI-compatible endpoints.
-      {:req, "~> 0.6"},
+      # Req 0.6.1 fixes GHSA-655f-mp8p-96gv (decompression bomb).
+      # Bound the tested API range while allowing the patched 0.6 line.
+      {:req, ">= 0.6.1 and < 0.8.0"},
+      # Library lockfiles are not used by downstream applications. Mint 1.11
+      # constrains the transport and requires the patched HPAX 1.1 line.
+      {:mint, "~> 1.11"},
       {:jason, "~> 1.2"},
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:plug, "~> 1.16", only: :test},
+      {:plug, "~> 1.19.5 or ~> 1.20.3", only: :test},
       {:phoenix_pubsub, "~> 2.1", optional: true}
     ]
   end

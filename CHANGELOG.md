@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Require patched Req (at least 0.6.1), constrain Mint to 1.11 and its patched
+  HPAX dependency for downstream consumers, and refresh the tested lockfile.
+- Restrict test-only Plug to patched 1.19/1.20 versions.
+- Pin the contributor toolchain to Elixir 1.20.4 / OTP 28.5.0.7, add OTP 29
+  coverage, dependency audits, weekly CI, and explicit read-only CI permissions.
+
 ## [0.12.4] - 2026-07-03
 
 ### Fixed

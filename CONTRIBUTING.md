@@ -14,7 +14,7 @@ Rule of thumb: if it needs a database table, product defaults, or tenancy logic,
 git clone https://github.com/alloy-ex/alloy.git
 cd alloy
 mix deps.get
-mix test          # 671 tests, should all pass
+mix test          # All tests should pass
 ```
 
 The dev toolchain is pinned in `.tool-versions` (works with mise and asdf) to
@@ -22,6 +22,11 @@ match CI's primary matrix leg — Elixir 1.20 brings the gradual type checker,
 so `mix compile --warnings-as-errors` locally catches what CI would. The
 library itself still supports `~> 1.17`; the pin is for contributors, not
 consumers.
+
+Use a patched runtime for development and production: Elixir 1.18.5,
+1.19.6, or 1.20.4 (or a later patch in those supported lines). The 1.17 CI
+leg checks source compatibility; it is not a security-maintained runtime
+recommendation. CI also covers OTP 29 and audits locked Hex dependencies.
 
 ## Development workflow
 
@@ -46,6 +51,7 @@ All of these run automatically in CI and as pre-commit hooks.
 ## Quality gates
 
 ```bash
+mix hex.audit                 # No known locked dependency advisories
 mix test                      # All tests pass
 mix format --check-formatted  # No formatting issues
 mix credo --strict            # No style warnings
