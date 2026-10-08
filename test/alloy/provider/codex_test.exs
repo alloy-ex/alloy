@@ -435,6 +435,47 @@ defmodule Alloy.Provider.CodexTest do
       assert elapsed < 5_000,
              "expected receive_timeout to cap the port timeout, took #{elapsed}ms"
     end
+
+    # Alloy.Provider.Retry injects the turn deadline into :req_options (the
+    # shape HTTP providers hand to Req), not as a top-level key.
+    test "the turn deadline injected into :req_options caps the port timeout" do
+      temp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "alloy-codex-provider-req-options-timeout-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(temp_dir)
+      on_exit(fn -> File.rm_rf(temp_dir) end)
+
+      auth_path = Path.join(temp_dir, "auth.json")
+      File.write!(auth_path, "{}")
+
+      script_path = Path.join(temp_dir, "slow-codex.sh")
+
+      File.write!(script_path, """
+      #!/bin/sh
+      cat > /dev/null
+      sleep 30
+      """)
+
+      File.chmod!(script_path, 0o755)
+
+      config = %{
+        model: "gpt-5.4",
+        codex_bin: script_path,
+        auth_path: auth_path,
+        timeout_ms: 30_000,
+        req_options: [receive_timeout: 150]
+      }
+
+      started_at = System.monotonic_time(:millisecond)
+      result = Codex.complete([Message.user("deadline")], [], config)
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert {:error, "codex exec timed out after 150ms"} = result
+      assert elapsed < 5_000, "turn deadline was not applied, took #{elapsed}ms"
+    end
   end
 
   describe "stream/4" do

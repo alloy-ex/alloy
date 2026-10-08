@@ -23,8 +23,9 @@ defmodule Alloy.Provider.Codex do
     (default: `System.tmp_dir!/0`)
   - `:timeout_ms` - Timeout for a single `codex exec` invocation
     (default: `120_000`)
-  - `:receive_timeout` - Optional turn deadline timeout injected by Alloy's
-    retry loop; when present it caps `:timeout_ms`
+  - `:receive_timeout` - Optional cap on `:timeout_ms`. Alloy's retry loop
+    passes the remaining turn deadline as `req_options: [receive_timeout: ms]`
+    (the shape HTTP providers use); the smallest of the three wins.
   - `:command_runner` - Test hook matching `System.cmd/3`
   - `:system_prompt` - System prompt string
 
@@ -93,6 +94,7 @@ defmodule Alloy.Provider.Codex do
           optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
           optional(:receive_timeout) => pos_integer(),
+          optional(:req_options) => keyword(),
           optional(:system_prompt) => String.t(),
           optional(:command_runner) => (String.t(), [String.t()], keyword() ->
                                           {String.t(), integer()})
@@ -220,15 +222,13 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp effective_timeout(config) do
-    timeout_ms = Map.get(config, :timeout_ms, @default_timeout_ms)
-
-    case Map.get(config, :receive_timeout) do
-      receive_timeout when is_integer(receive_timeout) and receive_timeout > 0 ->
-        min(receive_timeout, timeout_ms)
-
-      _ ->
-        timeout_ms
-    end
+    [
+      Map.get(config, :timeout_ms, @default_timeout_ms),
+      Map.get(config, :receive_timeout),
+      config |> Map.get(:req_options, []) |> Keyword.get(:receive_timeout)
+    ]
+    |> Enum.filter(&(is_integer(&1) and &1 > 0))
+    |> Enum.min()
   end
 
   # Test path: the caller supplies a synchronous function matching

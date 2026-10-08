@@ -41,7 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests. Explicit `extra_body` stream option maps are preserved.
 - Codex process timeouts use an absolute monotonic deadline, so progress output
   cannot extend `:timeout_ms` or the turn's `:receive_timeout` cap.
-
+- **The Codex provider now honours the turn deadline in real runs.** The
+  0.12.4 note claimed this, but the retry loop passes the deadline as
+  `req_options: [receive_timeout: ms]` and Codex only read a top-level
+  `:receive_timeout`, so production runs always waited the full
+  `:timeout_ms`. All three caps are now respected; the smallest wins.
 
 ## [0.12.4] - 2026-07-03
 
