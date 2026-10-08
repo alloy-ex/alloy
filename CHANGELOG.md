@@ -33,6 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:missing_return`, `:extra_return` and `:error_handling`. Docs must build
   without warnings.
 
+### Added
+
+- **More provider stop reasons.** `Alloy.Provider.stop_reason/0` adds
+  `:max_tokens`, `:refusal` and `:pause_turn`, and `Alloy.Result` gains a
+  `:stop_reason` field. The loop now:
+  - completes a truncated answer (`:max_tokens`) with
+    `result.stop_reason == :max_tokens`, so callers can detect truncation
+    instead of receiving it silently;
+  - fails the run when `:max_tokens` cuts off a tool call (its arguments are
+    incomplete). The orphaned call gets an error result, so the transcript
+    stays valid for a follow-up request;
+  - fails on `:refusal` and discards the refused partial output;
+  - resends the conversation unchanged on `:pause_turn`.
+
+  Custom providers that only return `:tool_use`/`:end_turn` are unaffected.
+  A provider returning an unknown stop reason now fails the run with a clear
+  error instead of crashing the loop.
+
 ### Deprecated
 
 - `Alloy.Message.server_tool_result_block/3`. No provider accepts the block
@@ -40,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `:tool_use` response with no client tool calls** (only server-executed
+  tools) now completes instead of sending an empty tool-results message.
 - **Anthropic server tools are no longer answered by the client.** When a
   response mixed a server tool (`code_execution`, `web_search`, tool search)
   with a local tool call, Alloy also "executed" the `server_tool_use` block

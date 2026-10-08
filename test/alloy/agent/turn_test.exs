@@ -300,6 +300,114 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  describe "run_loop/1 stop reasons" do
+    defp scripted(stop_reason, blocks) do
+      {:ok,
+       %{
+         stop_reason: stop_reason,
+         messages: [Message.assistant_blocks(blocks)],
+         usage: %{input_tokens: 1, output_tokens: 1}
+       }}
+    end
+
+    test "records the provider stop reason on the result" do
+      state = Alloy.Testing.run_with_responses("hi", [TestProvider.text_response("done")])
+
+      assert state.status == :completed
+      assert Alloy.Result.from_state(state).stop_reason == :end_turn
+    end
+
+    test ":max_tokens without a tool call completes and exposes the truncation" do
+      responses = [scripted(:max_tokens, [%{type: "text", text: "partial ans"}])]
+
+      state = Alloy.Testing.run_with_responses("hi", responses)
+
+      assert state.status == :completed
+      result = Alloy.Result.from_state(state)
+      assert result.stop_reason == :max_tokens
+      assert result.text == "partial ans"
+    end
+
+    test ":max_tokens inside a tool call fails without running the tool and keeps the transcript valid" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "write",
+          description: "w",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, _ctx ->
+            send(test_pid, :tool_ran)
+            {:ok, "written"}
+          end
+        )
+
+      responses = [
+        scripted(:max_tokens, [%{type: "tool_use", id: "toolu_1", name: "write", input: %{}}])
+      ]
+
+      state = Alloy.Testing.run_with_responses("hi", responses, tools: [tool])
+
+      assert state.status == :error
+      assert state.error =~ "max_tokens"
+      refute_received :tool_ran
+
+      assert %Message{role: :user, content: [%{type: "tool_result", tool_use_id: "toolu_1"} = r]} =
+               List.last(state.messages)
+
+      assert r.is_error
+    end
+
+    test ":refusal fails the run and discards the refused output" do
+      responses = [scripted(:refusal, [%{type: "text", text: "Here is how to"}])]
+
+      state = Alloy.Testing.run_with_responses("hi", responses)
+
+      assert state.status == :error
+      assert state.error =~ "refus"
+      refute Enum.any?(state.messages, &(&1.role == :assistant))
+      assert Alloy.Result.from_state(state).stop_reason == :refusal
+    end
+
+    test ":pause_turn calls the provider again without adding a user message" do
+      responses = [
+        scripted(:pause_turn, [
+          %{type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: %{}}
+        ]),
+        TestProvider.text_response("finished")
+      ]
+
+      state = Alloy.Testing.run_with_responses("search", responses)
+
+      assert state.status == :completed
+      assert Enum.map(state.messages, & &1.role) == [:user, :assistant, :assistant]
+      assert Alloy.Result.from_state(state).text == "finished"
+    end
+
+    test ":tool_use with no client tool calls completes instead of sending empty results" do
+      responses = [
+        scripted(:tool_use, [
+          %{type: "server_tool_use", id: "srvtoolu_1", name: "code_execution", input: %{}},
+          %{type: "text", text: "ran it"}
+        ])
+      ]
+
+      state = Alloy.Testing.run_with_responses("go", responses)
+
+      assert state.status == :completed
+      assert Enum.map(state.messages, & &1.role) == [:user, :assistant]
+    end
+
+    test "an unknown stop reason from a custom provider fails with a clear error" do
+      responses = [scripted(:something_new, [%{type: "text", text: "?"}])]
+
+      state = Alloy.Testing.run_with_responses("hi", responses)
+
+      assert state.status == :error
+      assert state.error =~ "something_new"
+    end
+  end
+
   describe "run_loop/1 with max_turns" do
     test "stops at max_turns" do
       # Create responses that always ask for tools (infinite loop)

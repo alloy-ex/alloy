@@ -19,6 +19,7 @@ defmodule Alloy.Agent.State do
           usage: Usage.t(),
           status: status(),
           error: term() | nil,
+          stop_reason: Alloy.Provider.stop_reason() | nil,
           tool_calls: [map()],
           tool_defs: [map()],
           tool_fns: %{String.t() => Alloy.Tool.Registry.tool()},
@@ -35,6 +36,7 @@ defmodule Alloy.Agent.State do
   defstruct [
     :config,
     :error,
+    :stop_reason,
     messages: [],
     messages_new: [],
     turn: 0,

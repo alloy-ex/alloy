@@ -170,35 +170,93 @@ defmodule Alloy.Agent.Turn do
           )
 
         case result do
-          {:ok, %{stop_reason: :tool_use, messages: new_msgs, usage: usage} = provider_response} ->
-            state =
-              state
-              |> State.append_messages(new_msgs)
-              |> State.increment_turn()
-              |> State.merge_usage(usage)
-              |> State.merge_provider_state(Map.get(provider_response, :provider_state))
-              |> State.put_provider_response_metadata(
-                Map.get(provider_response, :response_metadata)
-              )
+          {:ok, %{stop_reason: :refusal} = response} ->
+            refuse(state, response)
 
-            handle_tool_use(state, new_msgs, opts, deadline)
-
-          {:ok, %{stop_reason: :end_turn, messages: new_msgs, usage: usage} = provider_response} ->
-            state =
-              state
-              |> State.append_messages(new_msgs)
-              |> State.increment_turn()
-              |> State.merge_usage(usage)
-              |> State.merge_provider_state(Map.get(provider_response, :provider_state))
-              |> State.put_provider_response_metadata(
-                Map.get(provider_response, :response_metadata)
-              )
-
-            maybe_complete_or_continue(state, opts, deadline)
+          {:ok, %{stop_reason: stop_reason, messages: new_msgs} = response} ->
+            state
+            |> State.append_messages(new_msgs)
+            |> account_response(response)
+            |> continue_after(stop_reason, new_msgs, opts, deadline)
 
           {:error, reason} ->
             handle_provider_error(reason, state, opts, deadline, prompt_retried?)
         end
+    end
+  end
+
+  defp account_response(state, %{stop_reason: stop_reason, usage: usage} = response) do
+    %{state | stop_reason: stop_reason}
+    |> State.increment_turn()
+    |> State.merge_usage(usage)
+    |> State.merge_provider_state(Map.get(response, :provider_state))
+    |> State.put_provider_response_metadata(Map.get(response, :response_metadata))
+  end
+
+  defp continue_after(state, :tool_use, new_msgs, opts, deadline) do
+    case extract_tool_calls(new_msgs) do
+      # Only server-executed tools ran: there is nothing for the client to
+      # answer, and an empty tool-results message is rejected by every API.
+      [] -> maybe_complete_or_continue(state, opts, deadline)
+      _calls -> handle_tool_use(state, new_msgs, opts, deadline)
+    end
+  end
+
+  defp continue_after(state, :end_turn, _new_msgs, opts, deadline),
+    do: maybe_complete_or_continue(state, opts, deadline)
+
+  defp continue_after(state, :pause_turn, _new_msgs, opts, deadline),
+    do: do_turn(state, opts, deadline)
+
+  defp continue_after(state, :max_tokens, new_msgs, opts, deadline) do
+    case extract_tool_calls(new_msgs) do
+      [] -> maybe_complete_or_continue(state, opts, deadline)
+      calls -> abandon_truncated_tool_calls(state, calls)
+    end
+  end
+
+  defp continue_after(state, stop_reason, _new_msgs, _opts, _deadline) do
+    fail(state, "Provider returned an unsupported stop_reason: #{inspect(stop_reason)}")
+  end
+
+  # Refused output must be discarded, so the response's messages are not kept.
+  defp refuse(state, response) do
+    details = get_in(response, [:response_metadata, :stop_details])
+
+    reason =
+      case details do
+        nil -> "The model refused to continue (stop_reason: refusal)"
+        details -> "The model refused to continue (stop_reason: refusal): #{inspect(details)}"
+      end
+
+    state
+    |> account_response(response)
+    |> fail(reason)
+  end
+
+  # A tool call cut off by max_tokens has incomplete arguments, so it must not
+  # run. Answer each call with an error so the transcript stays valid for a
+  # follow-up request, then fail the run.
+  defp abandon_truncated_tool_calls(state, calls) do
+    reason = "Output hit the max_tokens limit while writing a tool call; raise :max_tokens"
+
+    results =
+      Enum.map(calls, &Message.tool_result_block(&1.id, "Not executed: #{reason}", true))
+
+    state
+    |> State.append_messages(Message.tool_results(results))
+    |> fail(reason)
+  end
+
+  defp fail(state, reason) do
+    state = %{state | status: :error, error: reason}
+
+    case Middleware.run(:on_error, state) do
+      {:halted, halted_reason} ->
+        %{state | status: :halted, error: "Halted by middleware: #{halted_reason}"}
+
+      %State{} = state ->
+        state
     end
   end
 
@@ -217,15 +275,7 @@ defmodule Alloy.Agent.Turn do
       |> do_turn_after_compaction(opts, deadline, true)
       |> State.merge_run_metadata(%{prompt_too_long_recovery: true})
     else
-      state = %{state | status: :error, error: reason}
-
-      case Middleware.run(:on_error, state) do
-        {:halted, halted_reason} ->
-          %{state | status: :halted, error: "Halted by middleware: #{halted_reason}"}
-
-        %State{} = state ->
-          state
-      end
+      fail(state, reason)
     end
   end
 

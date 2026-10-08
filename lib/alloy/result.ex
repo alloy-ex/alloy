@@ -15,6 +15,10 @@ defmodule Alloy.Result do
     * `:tool_calls` — list of tool execution metadata maps
     * `:metadata` — auxiliary result metadata such as provider-owned state
     * `:status` — final run status (`:completed`, `:max_turns`, `:budget_exceeded`, `:error`, `:halted`)
+    * `:stop_reason` — why the model stopped on the last provider response
+      (`:end_turn`, `:tool_use`, `:max_tokens`, `:refusal`, `:pause_turn`), or
+      `nil` if no response arrived. Check for `:max_tokens` to detect a
+      truncated answer on a `:completed` run.
     * `:turns` — number of agent loop iterations
     * `:error` — error term (or `nil` on success)
     * `:request_id` — correlation ID for async requests (or `nil` for sync)
@@ -33,6 +37,7 @@ defmodule Alloy.Result do
           tool_calls: [map()],
           metadata: map(),
           status: State.status(),
+          stop_reason: Alloy.Provider.stop_reason() | nil,
           turns: non_neg_integer(),
           error: term() | nil,
           request_id: binary() | nil
@@ -43,6 +48,7 @@ defmodule Alloy.Result do
     :thinking,
     :error,
     :request_id,
+    :stop_reason,
     messages: [],
     usage: %Usage{},
     tool_calls: [],
@@ -68,6 +74,7 @@ defmodule Alloy.Result do
       tool_calls: state.tool_calls,
       metadata: build_metadata(state),
       status: state.status,
+      stop_reason: state.stop_reason,
       turns: state.turn,
       error: state.error
     }

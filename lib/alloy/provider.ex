@@ -9,7 +9,7 @@ defmodule Alloy.Provider do
   ## Completion Response
 
   Providers return a map with:
-  - `:stop_reason` - `:tool_use` (continue looping) or `:end_turn` (done)
+  - `:stop_reason` - why the model stopped (see `t:stop_reason/0`)
   - `:messages` - list of `Alloy.Message` structs from the response
   - `:usage` - map with `:input_tokens` and `:output_tokens`
   - `:provider_state` - optional opaque map Alloy feeds back to the same provider
@@ -18,7 +18,23 @@ defmodule Alloy.Provider do
     layer (for example, citations or server-side tool usage)
   """
 
-  @type stop_reason :: :tool_use | :end_turn
+  @typedoc """
+  Why the model stopped. Map the wire value to the closest of:
+
+  - `:tool_use` - the model called client tools; Alloy runs them and loops
+  - `:end_turn` - the model finished (also stop sequences)
+  - `:max_tokens` - output hit the token limit (Anthropic `max_tokens` or
+    `model_context_window_exceeded`, OpenAI `incomplete`/`length`, Gemini
+    `MAX_TOKENS`). A truncated answer still completes, with the reason on
+    `Alloy.Result`; a truncated tool call fails the run because it cannot
+    be executed.
+  - `:refusal` - a safety system stopped the output. Alloy discards the
+    partial output and fails the run; put details in `:response_metadata`
+    under `:stop_details`.
+  - `:pause_turn` - the provider paused a long server-side tool loop; Alloy
+    sends the conversation back unchanged so it can continue.
+  """
+  @type stop_reason :: :tool_use | :end_turn | :max_tokens | :refusal | :pause_turn
   @type tool_def :: %{name: String.t(), description: String.t(), input_schema: map()}
 
   @type completion_response :: %{
