@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - OpenAI-compatible Gemini streams preserve opaque thought signatures on
   tool calls, including late signatures and parallel calls, for the next request.
+- OpenAICompat's `stream_options: false` now omits the field from streaming
+  requests. Explicit `extra_body` stream option maps are preserved.
+
 
 ## [0.12.4] - 2026-07-03
 

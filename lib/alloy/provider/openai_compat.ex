@@ -18,6 +18,10 @@ defmodule Alloy.Provider.OpenAICompat do
   - `:system_prompt` - System prompt string
   - `:chat_path` - Path to completions endpoint (default: "/v1/chat/completions")
   - `:extra_headers` - Additional headers as `[{name, value}]`
+  - `:extra_body` - Additional body fields, merged last
+  - `:stream_options` - Set to `false` to omit usage-request options from
+    streaming requests. Custom option maps can be supplied through
+    `extra_body: %{"stream_options" => options}`.
   - `:req_options` - Additional options passed to Req
 
   ## Examples
@@ -80,6 +84,8 @@ defmodule Alloy.Provider.OpenAICompat do
           optional(:system_prompt) => String.t(),
           optional(:chat_path) => String.t(),
           optional(:extra_headers) => [{String.t(), String.t()}],
+          optional(:extra_body) => map(),
+          optional(:stream_options) => false,
           optional(:req_options) => keyword()
         }
 
@@ -116,6 +122,10 @@ defmodule Alloy.Provider.OpenAICompat do
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     body = build_request_body(messages, tool_defs, config)
+
+    body =
+      if config[:stream_options] == false, do: Map.put(body, "stream_options", false), else: body
+
     url = "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
 
     OpenAIStream.stream(

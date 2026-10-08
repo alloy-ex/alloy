@@ -81,6 +81,58 @@ defmodule Alloy.Provider.OpenAICompatTest do
     end
   end
 
+  describe "stream options" do
+    test "provider config can omit stream_options for endpoints that reject it" do
+      config = Map.put(config_that_captures_stream(), :stream_options, false)
+      assert {:ok, _} = OpenAICompat.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+      assert decoded["stream"] == true
+      refute Map.has_key?(decoded, "stream_options")
+    end
+
+    test "extra_body false omits stream_options instead of sending a boolean" do
+      config = Map.put(config_that_captures_stream(), :extra_body, %{"stream_options" => false})
+      assert {:ok, _} = OpenAICompat.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "stream_options")
+    end
+
+    test "preserves caller-provided stream options" do
+      options = %{"include_usage" => false, "custom_flag" => true}
+      config = Map.put(config_that_captures_stream(), :extra_body, %{"stream_options" => options})
+      assert {:ok, _} = OpenAICompat.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["stream_options"] == options
+    end
+
+    test "a streaming opt-out does not add fields to non-streaming requests" do
+      config = Map.put(config_that_captures_request(), :stream_options, false)
+      assert {:ok, _} = OpenAICompat.complete([Message.user("Hi")], [], config)
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "stream_options")
+    end
+  end
+
+  defp config_that_captures_stream do
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      send(test_pid, {:request_body, body})
+      event = %{"choices" => [%{"delta" => %{"content" => "ok"}, "finish_reason" => "stop"}]}
+      conn = Plug.Conn.send_chunked(conn, 200)
+      {:ok, conn} = Plug.Conn.chunk(conn, "data: #{Jason.encode!(event)}\n\ndata: [DONE]\n\n")
+      conn
+    end)
+
+    %{
+      api_url: "http://localhost",
+      model: "test-model",
+      req_options: [plug: {Req.Test, __MODULE__}]
+    }
+  end
+
   # ── Gemini 3.x thought signatures (PR #24) ───────────────────────────
 
   describe "Gemini 3.x thought signatures" do

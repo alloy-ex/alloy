@@ -2,8 +2,10 @@ defmodule Alloy.Provider.OpenAIStream do
   @moduledoc """
   Shared OpenAI-format SSE stream parser.
 
-  Used by all OpenAI-compatible providers (OpenAI, DeepSeek, Mistral,
-  OpenRouter, xAI, Ollama). Each provider calls `stream/5` with its
+  Used by `Alloy.Provider.OpenAICompat` for Chat Completions providers
+  such as DeepSeek, Mistral, OpenRouter, Gemini, xAI, and Ollama.
+  The native OpenAI and xAI providers use Responses API parsing instead.
+  Each compatible provider calls `stream/5` with its
   own URL and headers; this module handles SSE parsing and response
   normalization.
 
@@ -32,12 +34,7 @@ defmodule Alloy.Provider.OpenAIStream do
     body =
       body
       |> Map.put("stream", true)
-      # stream_options is an OpenAI extension for usage counts in streaming
-      # responses. All officially supported providers (OpenAI, DeepSeek,
-      # Mistral, Ollama, OpenRouter, xAI) either support it or silently ignore
-      # it. If a custom provider rejects unknown fields, set
-      # `stream_options: false` in the provider config to skip this injection.
-      |> Map.put("stream_options", %{"include_usage" => true})
+      |> put_stream_options()
 
     initial_acc = %{
       buffer: "",
@@ -74,6 +71,14 @@ defmodule Alloy.Provider.OpenAIStream do
         {:error, "HTTP request failed: #{inspect(reason)}"}
     end
   end
+
+  # Request usage by default, but preserve custom options and omit the field
+  # entirely when the caller disables it for a less compatible endpoint.
+  defp put_stream_options(%{"stream_options" => false} = body),
+    do: Map.delete(body, "stream_options")
+
+  defp put_stream_options(body),
+    do: Map.put_new(body, "stream_options", %{"include_usage" => true})
 
   # When streaming (into: handler), the error body is consumed by the SSE
   # callback and resp.body is left as "". Recover it from the SSE buffer.
