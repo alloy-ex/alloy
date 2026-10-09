@@ -382,10 +382,18 @@ defmodule Alloy.Agent.Turn do
     |> Map.put(:system_prompt, config.system_prompt)
     |> Map.put(:provider_state, provider_state)
     |> maybe_put_memory(config.memory)
+    |> maybe_enable_code_execution(config.code_execution)
   end
 
   defp maybe_put_memory(provider_config, nil), do: provider_config
   defp maybe_put_memory(provider_config, memory), do: Map.put(provider_config, :memory, memory)
+
+  # The top-level option only turns code execution on, so a provider config
+  # that already sets :code_execution itself is left alone when it is false.
+  defp maybe_enable_code_execution(provider_config, true),
+    do: Map.put(provider_config, :code_execution, true)
+
+  defp maybe_enable_code_execution(provider_config, false), do: provider_config
 
   defp extract_tool_calls(messages) do
     Enum.flat_map(messages, &Message.tool_calls/1)

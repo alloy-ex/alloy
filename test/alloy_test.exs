@@ -57,6 +57,43 @@ defmodule AlloyTest do
     end
   end
 
+  describe "Alloy.run/2 with code_execution: true" do
+    test "enables the Anthropic code execution tool" do
+      parent = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:captured, conn.req_headers, Jason.decode!(body)})
+
+        response = %{
+          "type" => "message",
+          "role" => "assistant",
+          "stop_reason" => "end_turn",
+          "content" => [%{"type" => "text", "text" => "55"}],
+          "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+        }
+
+        conn
+        |> Plug.Conn.put_resp_header("content-type", "application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(response))
+      end
+
+      assert {:ok, _result} =
+               Alloy.run("What is fib(10)?",
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: "sk-test", model: "claude-sonnet-4-6", req_options: [plug: plug]},
+                 code_execution: true
+               )
+
+      assert_receive {:captured, headers, body}
+      assert Enum.any?(body["tools"] || [], &(&1["name"] == "code_execution"))
+
+      assert {"anthropic-beta", beta} = List.keyfind(headers, "anthropic-beta", 0)
+      assert beta =~ "code-execution"
+    end
+  end
+
   describe "Alloy.stream/3" do
     test "streams text for a one-shot conversation" do
       {:ok, pid} =
