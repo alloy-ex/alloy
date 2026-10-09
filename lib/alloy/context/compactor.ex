@@ -27,8 +27,10 @@ defmodule Alloy.Context.Compactor do
       serialized conversation
   """
 
+  @behaviour Alloy.Middleware
+
   alias Alloy.Agent.State
-  alias Alloy.Message
+  alias Alloy.{Message, Middleware}
   alias Alloy.Provider.Retry
 
   require Logger
@@ -112,6 +114,46 @@ defmodule Alloy.Context.Compactor do
   """
   @spec summary_prefix() :: String.t()
   def summary_prefix, do: @summary_prefix
+
+  @doc """
+  Compaction as middleware.
+
+  On `:before_completion` it compacts when the history nears the budget;
+  on `:on_context_overflow` (the provider rejected the request as too long)
+  it compacts regardless of the estimate. Either way, when the messages
+  changed it emits `[:alloy, :compaction, :done]` and runs the
+  `:after_compaction` hook. Every other hook returns the state unchanged.
+  """
+  @impl Middleware
+  @spec call(Middleware.hook(), State.t()) :: State.t() | {:halt, String.t()}
+  def call(:before_completion, %State{} = state) do
+    case maybe_compact(state) do
+      {:unchanged, state} -> state
+      {:compacted, compacted} -> after_compaction(state, compacted)
+    end
+  end
+
+  def call(:on_context_overflow, %State{} = state) do
+    case force_compact(state) do
+      %State{messages: messages} = compacted when messages == state.messages -> compacted
+      compacted -> after_compaction(state, compacted)
+    end
+  end
+
+  def call(_hook, state), do: state
+
+  defp after_compaction(%State{} = before, %State{} = compacted) do
+    :telemetry.execute(
+      [:alloy, :compaction, :done],
+      %{messages_before: length(before.messages), messages_after: length(compacted.messages)},
+      %{turn: before.turn + 1}
+    )
+
+    case Middleware.run(:after_compaction, compacted) do
+      {:halted, reason} -> {:halt, reason}
+      %State{} = state -> state
+    end
+  end
 
   @doc """
   Forces compaction regardless of reserve budget.
@@ -588,9 +630,8 @@ defmodule Alloy.Context.Compactor do
     summary_state = %{state | messages: [Message.user(prompt)], tool_defs: []}
 
     deadline =
-      Keyword.get_lazy(opts, :deadline, fn ->
+      Keyword.get(opts, :deadline) || state.deadline ||
         System.monotonic_time(:millisecond) + state.config.timeout_ms
-      end)
 
     no_chunks = fn _chunk -> :ok end
 

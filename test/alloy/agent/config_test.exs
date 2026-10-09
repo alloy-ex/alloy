@@ -153,6 +153,37 @@ defmodule Alloy.Agent.ConfigTest do
     end
   end
 
+  describe "compaction middleware" do
+    defmodule Logging do
+      @behaviour Alloy.Middleware
+      @impl true
+      def call(_hook, state), do: state
+    end
+
+    test "runs first by default" do
+      config = Config.from_opts(provider: {Alloy.Provider.Test, []}, middleware: [Logging])
+      assert config.middleware == [Compactor, Logging]
+    end
+
+    test "compaction: false leaves it out" do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          middleware: [Logging],
+          compaction: false
+        )
+
+      assert config.middleware == [Logging]
+    end
+
+    test "listing it yourself sets its position" do
+      config =
+        Config.from_opts(provider: {Alloy.Provider.Test, []}, middleware: [Logging, Compactor])
+
+      assert config.middleware == [Logging, Compactor]
+    end
+  end
+
   describe "compaction option" do
     test "derives reserve and keep_recent token defaults from max_tokens" do
       config =

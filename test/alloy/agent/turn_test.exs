@@ -1199,7 +1199,7 @@ defmodule Alloy.Agent.TurnTest do
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
-        middleware: [AfterCompactionTrackingMiddleware],
+        middleware: [Alloy.Context.Compactor, AfterCompactionTrackingMiddleware],
         context: %{test_pid: test_pid},
         # Tiny budget to force compaction
         max_tokens: 50,
@@ -1266,7 +1266,7 @@ defmodule Alloy.Agent.TurnTest do
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
-        middleware: [AfterCompactionHaltMiddleware],
+        middleware: [Alloy.Context.Compactor, AfterCompactionHaltMiddleware],
         max_tokens: 50,
         compaction: %{fallback: :truncate, reserve_tokens: 10, keep_recent_tokens: 5},
         max_retries: 0,
@@ -2327,6 +2327,7 @@ defmodule Alloy.Agent.TurnTest do
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
+        middleware: [Alloy.Context.Compactor],
         max_tokens: 100,
         compaction: %{reserve_tokens: 5, keep_recent_tokens: 50, fallback: :truncate}
       }
@@ -2390,6 +2391,7 @@ defmodule Alloy.Agent.TurnTest do
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
+        middleware: [Alloy.Context.Compactor],
         max_tokens: 540,
         compaction: %{
           reserve_tokens: 100,
@@ -2420,21 +2422,70 @@ defmodule Alloy.Agent.TurnTest do
           TestProvider.error_response(
             "invalid_request_error: prompt is too long: 204301 tokens > 200000 maximum"
           ),
+          TestProvider.text_response("Summary of the earlier work"),
           TestProvider.text_response("Recovered after compaction")
         ])
 
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
+        middleware: [Alloy.Context.Compactor],
         max_tokens: 200_000,
-        compaction: %{reserve_tokens: 1_000, keep_recent_tokens: 5_000, fallback: :truncate}
+        compaction: %{reserve_tokens: 1_000, keep_recent_tokens: 10, fallback: :truncate}
       }
 
-      state = State.init(config, [Message.user("Hello")])
-      result = Turn.run_loop(state)
+      result = Turn.run_loop(State.init(config, long_history()))
 
       assert result.status == :completed
+      assert State.last_assistant_text(result) == "Recovered after compaction"
       assert result.run_metadata == %{prompt_too_long_recovery: true}
+    end
+
+    test "any :on_context_overflow middleware that shrinks the history gets a retry" do
+      defmodule KeepLatestOnOverflow do
+        @behaviour Alloy.Middleware
+
+        @impl true
+        def call(:on_context_overflow, state),
+          do: %{state | messages: [List.last(state.messages)]}
+
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          {:error, %Alloy.Provider.Error{kind: :context_overflow, message: "too long"}},
+          TestProvider.text_response("Recovered")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        middleware: [KeepLatestOnOverflow]
+      }
+
+      result = Turn.run_loop(State.init(config, long_history()))
+
+      assert result.status == :completed
+      assert [%Message{content: "latest"}, %Message{role: :assistant}] = result.messages
+    end
+
+    test "fails without a retry when no middleware can shrink the history" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.error_response(
+            "invalid_request_error: prompt is too long: 204301 tokens > 200000 maximum"
+          ),
+          TestProvider.text_response("never requested")
+        ])
+
+      config = %Config{provider: TestProvider, provider_config: %{agent_pid: pid}}
+      result = Turn.run_loop(State.init(config, long_history()))
+
+      assert result.status == :error
+      assert result.error =~ "prompt is too long"
+      assert result.turn == 0
+      refute Map.has_key?(result.run_metadata, :prompt_too_long_recovery)
     end
 
     test "does not retry prompt-too-long more than once" do
@@ -2475,17 +2526,19 @@ defmodule Alloy.Agent.TurnTest do
       {:ok, pid} =
         TestProvider.start_link([
           {:error, overflow},
+          TestProvider.text_response("Summary of the earlier work"),
           TestProvider.text_response("Recovered after compaction")
         ])
 
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
+        middleware: [Alloy.Context.Compactor],
         max_tokens: 200_000,
-        compaction: %{reserve_tokens: 1_000, keep_recent_tokens: 5_000, fallback: :truncate}
+        compaction: %{reserve_tokens: 1_000, keep_recent_tokens: 10, fallback: :truncate}
       }
 
-      result = Turn.run_loop(State.init(config, [Message.user("Hello")]))
+      result = Turn.run_loop(State.init(config, long_history()))
 
       assert result.status == :completed
       assert result.run_metadata == %{prompt_too_long_recovery: true}
@@ -2695,5 +2748,17 @@ defmodule Alloy.Agent.TurnTest do
     after
       0 -> []
     end
+  end
+
+  # A history the compactor can shrink: the first message is kept, and the
+  # middle turns fall outside a small keep_recent_tokens window.
+  defp long_history do
+    [
+      Message.user("original"),
+      Message.assistant(String.duplicate("a", 400)),
+      Message.user(String.duplicate("b", 400)),
+      Message.assistant(String.duplicate("c", 400)),
+      Message.user("latest")
+    ]
   end
 end

@@ -159,7 +159,7 @@ defmodule Alloy.Agent.Config do
       retry_backoff_ms: Keyword.get(opts, :retry_backoff_ms, 1_000),
       timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
       tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
-      middleware: Keyword.get(opts, :middleware, []),
+      middleware: resolve_middleware(Keyword.get(opts, :middleware, []), opts[:compaction]),
       compaction: compaction,
       compaction_explicit: compaction_explicit,
       working_directory: Keyword.get(opts, :working_directory, "."),
@@ -200,6 +200,15 @@ defmodule Alloy.Agent.Config do
           "alloy_agent package in Alloy 0.13; pass them to AlloyAgent.start_link/1. " <>
           "All unknown options: #{inspect(unknown)}"
     end
+  end
+
+  # Compaction is middleware, on by default and first, so it runs before the
+  # caller's :before_completion middleware as it did when the loop called it
+  # directly. Listing it yourself sets its position instead.
+  defp resolve_middleware(middleware, false), do: middleware
+
+  defp resolve_middleware(middleware, _compaction) do
+    if Compactor in middleware, do: middleware, else: [Compactor | middleware]
   end
 
   # `memory: binding` is shorthand for `tools: [Alloy.Memory.tool(binding)]`.
@@ -371,6 +380,7 @@ defmodule Alloy.Agent.Config do
   end
 
   defp normalize_compaction(nil), do: %{}
+  defp normalize_compaction(false), do: %{}
 
   defp normalize_compaction(compaction) when is_map(compaction),
     do: normalize_compaction_map(compaction)

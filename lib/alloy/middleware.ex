@@ -3,15 +3,31 @@ defmodule Alloy.Middleware do
   Behaviour for middleware that wraps the agent loop.
 
   Middleware runs at defined hook points:
-  - `:before_completion` - Before calling the provider
+  - `:before_completion` - Before calling the provider. Middleware may
+    rewrite `state.messages` here; compaction does.
   - `:after_completion` - After provider response with :end_turn (final state)
-  - `:after_compaction` - After context compaction occurs (only fires when messages changed)
+  - `:after_compaction` - After compaction changed the messages
   - `:after_tool_request` - After provider response with :tool_use (gates tool execution)
+  - `:before_tool_call` - Before each tool call; may block or edit the call
   - `:after_tool_execution` - After tools have been executed
+  - `:on_context_overflow` - The provider rejected the request as too long.
+    Middleware may shrink `state.messages`; if the messages changed, the
+    loop retries the request once, otherwise the run fails.
   - `:on_error` - When an error occurs
+  - `:session_start`, `:session_end` - Not fired by the loop; reserved for
+    runtimes such as `alloy_agent` that wrap it in a process
 
-  Middleware can modify state (e.g., add logging, enforce policies,
-  track metrics) but should not change the fundamental loop behavior.
+  Middleware runs in list order and should return the state unchanged for
+  hooks it does not handle (`def call(_hook, state), do: state`), since
+  new hooks may be added.
+
+  ## Compaction
+
+  `Alloy.Context.Compactor` is middleware: it compacts on
+  `:before_completion` when the history nears the context budget, and
+  forces compaction on `:on_context_overflow`. `Alloy.run/2` puts it first
+  in the list unless you pass `compaction: false` or list it yourself
+  (to run it after other middleware).
   """
 
   alias Alloy.Agent.State
@@ -22,6 +38,7 @@ defmodule Alloy.Middleware do
           | :after_compaction
           | :after_tool_request
           | :after_tool_execution
+          | :on_context_overflow
           | :on_error
           | :before_tool_call
           | :session_start

@@ -4,6 +4,11 @@ defmodule Alloy.Agent.State do
 
   Tracks the conversation history, turn count, token usage, and
   current status. Passed through each iteration of the agent loop.
+
+  `deadline` is the monotonic time in milliseconds (see
+  `System.monotonic_time/1`) by which the run's provider requests must
+  finish; `Alloy.Agent.Turn.run_loop/2` sets it. Middleware that makes its
+  own provider request, as compaction does, should finish by it.
   """
 
   alias Alloy.Agent.Config
@@ -26,6 +31,7 @@ defmodule Alloy.Agent.State do
           provider_response_metadata: map(),
           run_metadata: map(),
           started_at: integer() | nil,
+          deadline: integer() | nil,
           agent_id: String.t()
         }
 
@@ -45,6 +51,7 @@ defmodule Alloy.Agent.State do
     provider_response_metadata: %{},
     run_metadata: %{},
     started_at: nil,
+    deadline: nil,
     agent_id: ""
   ]
 

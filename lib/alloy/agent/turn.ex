@@ -9,7 +9,6 @@ defmodule Alloy.Agent.Turn do
   """
 
   alias Alloy.Agent.State
-  alias Alloy.Context.Compactor
   alias Alloy.Events
   alias Alloy.{Message, Middleware}
   alias Alloy.Provider.{Error, Retry}
@@ -51,7 +50,8 @@ defmodule Alloy.Agent.Turn do
     deadline =
       System.monotonic_time(:millisecond) + state.config.timeout_ms - @deadline_headroom_ms
 
-    run_span(state.config.provider_config[:model], fn -> loop(state, opts, deadline) end)
+    state = %{state | deadline: deadline}
+    run_span(state.config.provider_config[:model], fn -> loop(state, opts) end)
   end
 
   # :telemetry.span/3 accepts extra stop measurements only from telemetry 1.3,
@@ -88,30 +88,26 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  defp loop(%State{turn: turn, config: config} = state, _opts, _deadline)
+  defp loop(%State{turn: turn, config: config} = state, _opts)
        when turn >= config.max_turns do
     %{state | status: :max_turns}
   end
 
-  defp loop(%State{} = state, opts, deadline) do
-    case run_turn(state, opts, deadline) do
-      {:continue, state} -> loop(state, opts, deadline)
+  defp loop(%State{} = state, opts) do
+    case run_turn(state, opts) do
+      {:continue, state} -> loop(state, opts)
       {:halt, state} -> state
     end
   end
 
-  # One turn: compaction, one provider response and the tool calls it asks
-  # for. Every step returns {:continue, state} to start another turn or
-  # {:halt, state} with the final status set.
-  defp run_turn(%State{} = state, opts, deadline) do
+  # One turn: one provider response and the tool calls it asks for. Every
+  # step returns {:continue, state} to start another turn or {:halt, state}
+  # with the final status set.
+  defp run_turn(%State{} = state, opts) do
     turn = state.turn + 1
 
     :telemetry.span([:alloy, :turn], %{turn: turn}, fn ->
-      step =
-        with {:continue, state} <- compact(state, turn, deadline) do
-          complete(state, opts, deadline, false)
-        end
-
+      step = complete(state, opts, false)
       {step, %{turn: turn, status: step_status(step)}}
     end)
   end
@@ -119,27 +115,9 @@ defmodule Alloy.Agent.Turn do
   defp step_status({:continue, %State{}}), do: :running
   defp step_status({:halt, %State{status: status}}), do: status
 
-  defp compact(%State{} = state, turn, deadline) do
-    messages_before = length(State.messages(state))
-
-    case Compactor.maybe_compact(state, turn: turn, deadline: deadline) do
-      {:unchanged, state} ->
-        {:continue, state}
-
-      {:compacted, state} ->
-        :telemetry.execute(
-          [:alloy, :compaction, :done],
-          %{messages_before: messages_before, messages_after: length(State.messages(state))},
-          %{turn: turn}
-        )
-
-        run_middleware(:after_compaction, state)
-    end
-  end
-
-  defp complete(%State{} = state, opts, deadline, prompt_retried?) do
+  defp complete(%State{} = state, opts, overflow_retried?) do
     with {:continue, state} <- run_middleware(:before_completion, state) do
-      case request(state, opts, deadline) do
+      case request(state, opts) do
         {:ok, %{stop_reason: :refusal} = response} ->
           {:halt, refuse(state, response)}
 
@@ -150,12 +128,12 @@ defmodule Alloy.Agent.Turn do
           |> continue_after(stop_reason, new_msgs, opts)
 
         {:error, reason} ->
-          handle_provider_error(reason, state, opts, deadline, prompt_retried?)
+          handle_provider_error(reason, state, opts, overflow_retried?)
       end
     end
   end
 
-  defp request(%State{} = state, opts, deadline) do
+  defp request(%State{} = state, opts) do
     provider = state.config.provider
     provider_config = build_provider_config(state)
     provider_event_turn = state.turn + 1
@@ -176,7 +154,7 @@ defmodule Alloy.Agent.Turn do
         do: Map.put(provider_config, :on_event, on_event),
         else: provider_config
 
-    Retry.call_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline)
+    Retry.call_with_retry(state, provider, provider_config, streaming?, on_chunk, state.deadline)
   end
 
   defp account_response(state, %{stop_reason: stop_reason, usage: usage} = response) do
@@ -267,29 +245,39 @@ defmodule Alloy.Agent.Turn do
   defp halt(%State{} = state, reason),
     do: %{state | status: :halted, error: "Halted by middleware: #{reason}"}
 
-  defp handle_provider_error(reason, state, opts, deadline, false = _prompt_retried?) do
-    if prompt_too_long?(reason) do
-      Logger.info("[Turn] Prompt too long — forcing compaction and retrying")
-
-      :telemetry.execute(
-        [:alloy, :turn, :prompt_too_long_recovery],
-        %{},
-        %{turn: state.turn + 1}
-      )
-
-      {next, state} =
-        state
-        |> Compactor.force_compact(turn: state.turn + 1, deadline: deadline)
-        |> complete(opts, deadline, true)
-
-      {next, State.merge_run_metadata(state, %{prompt_too_long_recovery: true})}
-    else
-      {:halt, fail(state, reason)}
-    end
+  defp handle_provider_error(reason, state, opts, false = _overflow_retried?) do
+    if prompt_too_long?(reason),
+      do: recover_from_overflow(reason, state, opts),
+      else: {:halt, fail(state, reason)}
   end
 
-  defp handle_provider_error(reason, state, _opts, _deadline, true = _prompt_retried?),
+  defp handle_provider_error(reason, state, _opts, true = _overflow_retried?),
     do: {:halt, fail(state, reason)}
+
+  # The provider rejected the prompt as too long. :on_context_overflow
+  # middleware (compaction, unless it is turned off) may shrink the history;
+  # the request is retried once, and only if the messages changed.
+  defp recover_from_overflow(reason, state, opts) do
+    case run_middleware(:on_context_overflow, state) do
+      {:halt, state} ->
+        {:halt, state}
+
+      {:continue, %State{messages: messages}} when messages == state.messages ->
+        {:halt, fail(state, reason)}
+
+      {:continue, shrunk} ->
+        Logger.info("[Turn] Prompt too long — history shrunk by middleware, retrying")
+
+        :telemetry.execute(
+          [:alloy, :turn, :prompt_too_long_recovery],
+          %{},
+          %{turn: state.turn + 1}
+        )
+
+        {next, state} = complete(shrunk, opts, true)
+        {next, State.merge_run_metadata(state, %{prompt_too_long_recovery: true})}
+    end
+  end
 
   defp handle_tool_use(%State{} = state, tool_calls, opts) do
     case run_middleware(:after_tool_request, state) do
