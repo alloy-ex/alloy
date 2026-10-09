@@ -201,10 +201,11 @@ defmodule Alloy.Tool.Executor do
     {block, error, structured_data} =
       case outcome do
         {:ok, text, data} ->
-          {Message.tool_result_block(call[:id], text, false), nil, data}
+          {Message.tool_result_block(call[:id], valid_text(text), false), nil, data}
 
         {:error, visible, diagnostic} ->
-          {Message.tool_result_block(call[:id], visible, true), diagnostic || visible, nil}
+          {Message.tool_result_block(call[:id], valid_text(visible), true),
+           valid_text(diagnostic || visible), nil}
       end
 
     meta = %{
@@ -228,6 +229,12 @@ defmodule Alloy.Tool.Executor do
 
     {started.index, {block, meta}}
   end
+
+  # Tool output is sent back to the provider as JSON on every later turn.
+  # One invalid byte (a binary file, `cat` of a latin-1 log) would make
+  # every request of the session fail to encode, so it is replaced here.
+  defp valid_text(text) when is_binary(text), do: String.replace_invalid(text)
+  defp valid_text(other), do: other
 
   defp emit_end(meta, start_seq, run) do
     seq = :atomics.add_get(run.seq_ref, 1, 1)

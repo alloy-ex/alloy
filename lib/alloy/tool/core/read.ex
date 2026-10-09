@@ -18,6 +18,7 @@ defmodule Alloy.Tool.Core.Read do
   @behaviour Alloy.Tool
 
   @default_limit 2000
+  @binary_sniff_bytes 8_192
 
   @impl true
   def name, do: "read"
@@ -51,23 +52,45 @@ defmodule Alloy.Tool.Core.Read do
         limit = input["limit"] || @default_limit
 
         if File.regular?(path) do
-          lines =
-            path
-            |> File.stream!()
-            |> Stream.map(&String.trim_trailing(&1, "\n"))
-            |> Stream.with_index(1)
-            |> Stream.drop(offset - 1)
-            |> Stream.take(limit)
-            |> Enum.to_list()
-
-          if lines == [] do
-            {:ok, ""}
-          else
-            {:ok, format_lines(lines)}
-          end
+          read_text(path, offset, limit)
         else
           {:error, "File does not exist or is not a readable file: #{path}"}
         end
+    end
+  end
+
+  defp read_text(path, offset, limit) do
+    case binary?(path) do
+      {:ok, true} ->
+        {:error, "#{path} is a binary file; read only returns text files."}
+
+      {:ok, false} ->
+        lines =
+          path
+          |> File.stream!()
+          |> Stream.map(&String.trim_trailing(&1, "\n"))
+          |> Stream.with_index(1)
+          |> Stream.drop(offset - 1)
+          |> Stream.take(limit)
+          |> Enum.to_list()
+
+        if lines == [] do
+          {:ok, ""}
+        else
+          {:ok, format_lines(lines)}
+        end
+
+      {:error, reason} ->
+        {:error, "Cannot read #{path}: #{:file.format_error(reason)}"}
+    end
+  end
+
+  # Same heuristic as git and grep: a NUL byte near the start means binary.
+  defp binary?(path) do
+    case File.open(path, [:read, :binary], &IO.binread(&1, @binary_sniff_bytes)) do
+      {:ok, head} when is_binary(head) -> {:ok, String.contains?(head, <<0>>)}
+      {:ok, _eof} -> {:ok, false}
+      {:error, _reason} = error -> error
     end
   end
 

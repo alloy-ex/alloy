@@ -247,6 +247,48 @@ defmodule Alloy.Tool.ExecutorTest do
       assert elapsed_us < 1_000_000
     end
 
+    test "invalid UTF-8 in a result is replaced so the transcript stays encodable" do
+      bytes = <<"ok ", 0xFF, 0xFE, " end">>
+
+      tools =
+        for {name, result} <- [{"bad_ok", {:ok, bytes}}, {"bad_err", {:error, bytes}}] do
+          Alloy.Tool.inline(
+            name: name,
+            description: name,
+            input_schema: %{type: "object", properties: %{}},
+            execute: fn _input, _ctx -> result end
+          )
+        end
+
+      state = build_state(tools)
+
+      calls = [
+        %{id: "c_ok", name: "bad_ok", type: "tool_use", input: %{}},
+        %{id: "c_err", name: "bad_err", type: "tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{content: [ok, err]} = msg, [_ok_meta, err_meta]} =
+               Executor.execute_all(calls, state.tool_fns, state, [])
+
+      assert ok.content == "ok �� end"
+      assert err.content == "ok �� end"
+      assert err.is_error
+      assert String.valid?(err_meta.error)
+      assert {:ok, _json} = Jason.encode(msg.content)
+    end
+
+    @tag :tmp_dir
+    test "reading a non-UTF-8 text file does not poison the transcript", %{tmp_dir: tmp_dir} do
+      path = Path.join(tmp_dir, "latin1.txt")
+      File.write!(path, <<"caf", 0xE9, "\n">>)
+      state = build_state([Alloy.Tool.Core.Read])
+      call = %{id: "c_read", name: "read", type: "tool_use", input: %{"file_path" => path}}
+
+      assert %Message{content: [block]} = Executor.execute_all([call], state.tool_fns, state)
+      assert block.content =~ "caf�"
+      assert {:ok, _json} = Jason.encode(block)
+    end
+
     test "tool returning {:error, reason} produces is_error block" do
       state = build_state([ErrorTool])
       tool_call = %{id: "call_err", name: "error_tool", type: "tool_use", input: %{}}

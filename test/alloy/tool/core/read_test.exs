@@ -83,6 +83,33 @@ defmodule Alloy.Tool.Core.ReadTest do
       refute result =~ "5\tline 5"
     end
 
+    test "refuses binary files", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "image.png")
+      File.write!(file, <<0x89, "PNG\r\n", 0x1A, 0, 0, 0, 0x0D, "IHDR", 0xFF, 0xFE>>)
+
+      assert {:error, msg} = Read.execute(%{"file_path" => file}, %{})
+      assert msg =~ "binary file"
+      assert String.valid?(msg)
+    end
+
+    test "an unreadable file is an error, not a crash", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "secret.txt")
+      File.write!(file, "hidden\n")
+      File.chmod!(file, 0o000)
+      on_exit(fn -> File.chmod(file, 0o600) end)
+
+      assert {:error, msg} = Read.execute(%{"file_path" => file}, %{})
+      assert msg =~ "Cannot read"
+    end
+
+    test "a NUL byte after the first 8KB does not make a file binary", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "late_nul.txt")
+      File.write!(file, String.duplicate("a", 8_192) <> "\n" <> <<0>> <> "\n")
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file, "limit" => 1}, %{})
+      assert result =~ "1\taaaa"
+    end
+
     test "returns error for missing file" do
       assert {:error, msg} = Read.execute(%{"file_path" => "/nonexistent/file.txt"}, %{})
       assert msg =~ "does not exist" or msg =~ "not a readable file"
