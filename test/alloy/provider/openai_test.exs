@@ -143,6 +143,82 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
+  describe "complete/3 replaying output items" do
+    test "assistant message phase is kept and re-sent" do
+      commentary = Map.put(assistant_text_item("Checking the file."), "phase", "commentary")
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(
+              response_payload([commentary, function_call_item("call_1", "read", "{}")])
+            )
+        })
+
+      assert {:ok, %{messages: [assistant]}} = OpenAI.complete([Message.user("Hi")], [], config)
+      assert [%{type: "text", phase: "commentary"}, %{type: "tool_use"}] = assistant.content
+
+      messages = [
+        Message.user("Hi"),
+        assistant,
+        Message.tool_results([Message.tool_result_block("call_1", "contents")]),
+        Message.assistant_blocks([%{type: "text", text: "No phase"}])
+      ]
+
+      OpenAI.complete(messages, [], config_that_captures_request())
+
+      assert_received {:request_body, body}
+      replayed = Enum.filter(Jason.decode!(body)["input"], &(&1["role"] == "assistant"))
+
+      assert [
+               %{"content" => "Checking the file.", "phase" => "commentary"},
+               %{"content" => "No phase"} = plain
+             ] = replayed
+
+      refute Map.has_key?(plain, "phase")
+    end
+
+    test "unknown output items are kept and replayed in place when stateless" do
+      search = %{
+        "id" => "ws_1",
+        "type" => "web_search_call",
+        "status" => "completed",
+        "action" => %{"type" => "search", "query" => "alloy elixir"}
+      }
+
+      reasoning = reasoning_item("rs_1", "encrypted-state")
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(response_payload([reasoning, search, assistant_text_item("Found it.")]))
+        })
+
+      assert {:ok, %{messages: [assistant]}} = OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert [%{type: "reasoning"}, %{type: "output_item", raw: ^search}, %{type: "text"}] =
+               assistant.content
+
+      assert Message.text(assistant) == "Found it."
+      assert Message.tool_calls(assistant) == []
+
+      OpenAI.complete([Message.user("Hi"), assistant], [], config_that_captures_request())
+      assert_received {:request_body, body}
+
+      assert [_user, ^reasoning, ^search, %{"role" => "assistant", "content" => "Found it."}] =
+               Jason.decode!(body)["input"]
+
+      stored = Map.put(config_that_captures_request(), :store, true)
+      OpenAI.complete([Message.user("Hi"), assistant], [], stored)
+      assert_received {:request_body, body}
+
+      assert [_user, %{"role" => "assistant", "content" => "Found it."}] =
+               Jason.decode!(body)["input"]
+    end
+  end
+
   describe "complete/3 request formatting" do
     test "formats user messages correctly" do
       config = config_that_captures_request()

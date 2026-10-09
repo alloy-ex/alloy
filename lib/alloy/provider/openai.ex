@@ -321,16 +321,23 @@ defmodule Alloy.Provider.OpenAI do
 
   defp format_user_content_block(_block), do: nil
 
-  defp format_assistant_block(%{type: "text", text: text}, _stateless?)
+  defp format_assistant_block(%{type: "text", text: text} = block, _stateless?)
        when is_binary(text) and text != "" do
-    [%{"role" => "assistant", "content" => text}]
+    [
+      maybe_put_optional_request_field(
+        %{"role" => "assistant", "content" => text},
+        "phase",
+        block[:phase]
+      )
+    ]
   end
 
   defp format_assistant_block(%{type: "tool_use"} = block, _stateless?) do
     [format_assistant_function_call_item(block)]
   end
 
-  defp format_assistant_block(%{type: "reasoning", raw: raw}, true) when is_map(raw) do
+  defp format_assistant_block(%{type: type, raw: raw}, true)
+       when type in ["reasoning", "output_item"] and is_map(raw) do
     [raw]
   end
 
@@ -494,20 +501,11 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp parse_output_item(%{"type" => "message", "role" => "assistant", "content" => content})
-       when is_list(content) do
-    {:ok, parse_assistant_content(content)}
-  end
-
-  defp parse_output_item(%{"type" => "message", "role" => "assistant", "content" => text})
-       when is_binary(text) do
-    blocks =
-      case text do
-        "" -> []
-        _ -> [%{type: "text", text: text}]
-      end
-
-    {:ok, blocks}
+  defp parse_output_item(
+         %{"type" => "message", "role" => "assistant", "content" => content} = item
+       )
+       when is_list(content) or is_binary(content) do
+    {:ok, content |> parse_assistant_content() |> Enum.map(&put_phase(&1, item["phase"]))}
   end
 
   defp parse_output_item(%{"type" => "function_call", "name" => name} = call) do
@@ -524,7 +522,16 @@ defmodule Alloy.Provider.OpenAI do
     {:ok, [%{type: "reasoning", raw: item}]}
   end
 
+  # Built-in tool calls (web search, code interpreter, MCP), compaction items
+  # and types added later are kept whole, so a stateless replay sends the
+  # complete output back as the API expects.
+  defp parse_output_item(%{"type" => _type} = item),
+    do: {:ok, [%{type: "output_item", raw: item}]}
+
   defp parse_output_item(_item), do: {:ok, []}
+
+  defp parse_assistant_content(""), do: []
+  defp parse_assistant_content(text) when is_binary(text), do: [%{type: "text", text: text}]
 
   defp parse_assistant_content(content) when is_list(content) do
     content
@@ -625,4 +632,9 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp maybe_put_annotations(block, _annotations), do: block
+
+  # gpt-5.3-codex and later label assistant messages as "commentary" or
+  # "final_answer" and need the label back on every replayed message.
+  defp put_phase(block, phase) when is_binary(phase), do: Map.put(block, :phase, phase)
+  defp put_phase(block, _phase), do: block
 end
