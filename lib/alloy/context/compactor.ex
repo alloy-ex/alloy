@@ -10,9 +10,10 @@ defmodule Alloy.Context.Compactor do
   Compaction never splits a tool round: a kept tool result always keeps the
   assistant tool call before it, and truncation keeps the turn in progress
   whole. Because compaction edits earlier history, it removes every
-  `thinking` and `redacted_thinking` block from the settled turns it keeps
-  (signed thinking is bound to the history it was produced after); the
-  turn in progress keeps its thinking. If the compacted request is still
+  `thinking` and `redacted_thinking` block it keeps, including the turn in
+  progress (signed thinking is bound to the history it was produced after);
+  under manual thinking the turn in progress keeps its thinking, which that
+  mode requires. If the compacted request is still
   over budget, the largest retained tool results are shortened, keeping
   their beginning and a `[tool result truncated: ...]` marker.
 
@@ -193,26 +194,50 @@ defmodule Alloy.Context.Compactor do
     finalize(state, compacted)
   end
 
-  # Every compaction path edits earlier history, so the signed thinking kept
-  # after the edit no longer matches what it was produced after and the API
-  # rejects it (Claude 5.x, accounts created after 2026-08-31). Removing every
-  # thinking block from settled turns is a documented valid change; the turn
-  # still in progress keeps its thinking, because a tool_use sent without the
-  # signed thinking that preceded it is rejected too. See
+  # Every compaction path edits earlier history, so signed thinking kept
+  # after the edit no longer matches the history it was produced after, and
+  # Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 reject it for
+  # accounts created on or after 2026-08-31. That includes the turn in
+  # progress. Removing all of it is a documented valid change, and those
+  # models think adaptively, which does not require the turn in progress to
+  # start with thinking. Manual thinking (a budget) does require it, and the
+  # models that accept manual thinking do not check the history, so there
+  # the turn in progress keeps its thinking. See
   # https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
   defp finalize(%State{} = state, messages) do
     messages =
       messages
-      |> strip_settled_thinking()
+      |> strip_thinking(manual_thinking?(state))
       |> fit_tool_results(state)
 
     %{state | messages: messages, messages_new: []}
   end
 
-  defp strip_settled_thinking(messages) do
+  defp strip_thinking(messages, false = _manual?), do: Enum.flat_map(messages, &drop_thinking/1)
+
+  defp strip_thinking(messages, true = _manual?) do
     {settled, in_flight} = Enum.split(messages, in_flight_start(messages))
     Enum.flat_map(settled, &drop_thinking/1) ++ in_flight
   end
+
+  # Manual thinking is the deprecated :extended_thinking option or an
+  # extra_body thinking of type "enabled" (keys in either form, since
+  # extra_body is stringified when merged into the request).
+  defp manual_thinking?(%State{config: %{provider_config: %{extended_thinking: opts}}})
+       when is_list(opts),
+       do: true
+
+  defp manual_thinking?(%State{config: %{provider_config: provider_config}}) do
+    case Map.get(provider_config, :extra_body) do
+      %{"thinking" => thinking} -> manual_type?(thinking)
+      %{thinking: thinking} -> manual_type?(thinking)
+      _extra_body -> false
+    end
+  end
+
+  defp manual_type?(%{"type" => "enabled"}), do: true
+  defp manual_type?(%{type: "enabled"}), do: true
+  defp manual_type?(_thinking), do: false
 
   # The turn in progress is everything after the last real user message; a
   # conversation that ends with one has no turn in progress.
@@ -517,9 +542,9 @@ defmodule Alloy.Context.Compactor do
   defp content_bytes(%{content: content}), do: content |> inspect() |> byte_size()
   defp content_bytes(_block), do: 0
 
-  # The turn in progress is always kept whole: truncating it would drop the
-  # signed thinking its pending tool calls depend on. If it is too large on
-  # its own, fit_tool_results/2 shrinks its biggest results afterwards.
+  # The turn in progress is always kept whole, so its tool calls and results
+  # stay together. If it is too large on its own, fit_tool_results/2 shrinks
+  # its biggest results afterwards.
   defp fallback_compact(%State{config: %{compaction: %{fallback: :truncate}}}, messages) do
     count = length(messages)
     in_flight_count = count - in_flight_start(messages)
