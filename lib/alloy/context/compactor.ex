@@ -12,7 +12,10 @@ defmodule Alloy.Context.Compactor do
   whole. Because compaction edits earlier history, it removes every
   `thinking` and `redacted_thinking` block it keeps, including the turn in
   progress: signed thinking is bound to the history it was produced after.
-  If the compacted request is still
+  Under manual thinking (`"type" => "enabled"` in `:extra_body`), which
+  requires the turn in progress to start with thinking and whose models do
+  not check history, that turn keeps its thinking. If the compacted request
+  is still
   over budget, the largest retained tool results are shortened, keeping
   their beginning and a `[tool result truncated: ...]` marker.
 
@@ -125,7 +128,7 @@ defmodule Alloy.Context.Compactor do
   `:after_compaction` hook. Every other hook returns the state unchanged.
   """
   @impl Middleware
-  @spec call(Middleware.hook(), State.t()) :: State.t() | {:halt, String.t()}
+  @spec call(Middleware.hook(), State.t()) :: State.t() | {:halt, String.t(), State.t()}
   def call(:before_completion, %State{} = state) do
     case maybe_compact(state) do
       {:unchanged, unchanged} -> unchanged
@@ -149,10 +152,10 @@ defmodule Alloy.Context.Compactor do
       %{turn: before.turn + 1}
     )
 
-    # Middleware.run/2 reports a halt as {:halted, reason}; a middleware
-    # returns {:halt, reason} to request one.
-    case Middleware.run(:after_compaction, compacted) do
-      {:halted, reason} -> {:halt, reason}
+    # A halt in :after_compaction still keeps the compaction and the usage
+    # of its summary request, so it is passed on with that state.
+    case Middleware.run_hook(:after_compaction, compacted) do
+      {:halted, reason, halted} -> {:halt, reason, halted}
       %State{} = state -> state
     end
   end
@@ -190,7 +193,8 @@ defmodule Alloy.Context.Compactor do
     * `:turn` - turn number reported in compaction telemetry
       (default: `state.turn + 1`)
     * `:deadline` - monotonic time in milliseconds by which the summary
-      request must finish (default: now plus `config.timeout_ms`)
+      request must finish (default: `state.deadline`, or now plus
+      `config.timeout_ms` when that is unset)
 
   Returns `{:compacted, state}` when compaction occurred, or
   `{:unchanged, state}` when already within budget.

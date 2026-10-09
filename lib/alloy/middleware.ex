@@ -44,12 +44,22 @@ defmodule Alloy.Middleware do
           | :session_start
           | :session_end
 
-  @type call_result :: State.t() | {:block, String.t()} | {:halt, String.t()} | {:edit, map()}
+  @type call_result ::
+          State.t()
+          | {:block, String.t()}
+          | {:halt, String.t()}
+          | {:halt, String.t(), State.t()}
+          | {:edit, map()}
 
   @doc """
   Called at the specified hook point. Returns modified state,
   `{:block, reason}` for `:before_tool_call` to prevent execution,
   or `{:halt, reason}` to stop the entire agent loop immediately.
+
+  A halted run keeps the changes earlier middleware made to the state in
+  that hook (for example, compaction and the usage of its summary
+  request). Return `{:halt, reason, state}` to halt with changes of your
+  own.
   """
   @callback call(hook(), State.t()) :: call_result()
 
@@ -62,10 +72,24 @@ defmodule Alloy.Middleware do
   """
   @spec run(hook(), State.t()) :: State.t() | {:halted, String.t()}
   def run(hook, %State{} = state) do
+    case run_hook(hook, state) do
+      {:halted, reason, _state} -> {:halted, reason}
+      %State{} = state -> state
+    end
+  end
+
+  @doc false
+  # Like run/2, but a halt carries the state as it stood when the chain
+  # stopped, so the loop can keep work earlier middleware already paid for.
+  @spec run_hook(hook(), State.t()) :: State.t() | {:halted, String.t(), State.t()}
+  def run_hook(hook, %State{} = state) do
     Enum.reduce_while(state.config.middleware, state, fn middleware, acc ->
       case middleware.call(hook, acc) do
         {:halt, reason} ->
-          {:halt, {:halted, reason}}
+          {:halt, {:halted, reason, acc}}
+
+        {:halt, reason, %State{} = halted} ->
+          {:halt, {:halted, reason, halted}}
 
         %State{} = new_state ->
           {:cont, new_state}
@@ -106,6 +130,9 @@ defmodule Alloy.Middleware do
           {:halt, {:block, reason}}
 
         {:halt, reason} ->
+          {:halt, {:halted, reason}}
+
+        {:halt, reason, %State{}} ->
           {:halt, {:halted, reason}}
 
         {:edit, modified_call} ->

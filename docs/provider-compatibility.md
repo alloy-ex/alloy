@@ -76,9 +76,11 @@ extra_body: %{
 
 ### Switching provider mid-conversation
 
-Each assistant message records the provider that wrote it. Before every
-request, including to a fallback provider, `Alloy.Message.normalize_for/2`
-rewrites messages written by a different provider:
+Each assistant message records its provider, model and origin: a hash of
+the provider module, `:api_url` and `:api_key`. Before every request,
+including to a fallback provider, `Alloy.Message.normalize_for/3` rewrites
+messages from a different origin, meaning another provider, endpoint or
+account:
 
 - thinking becomes plain text, with signatures removed;
 - redacted thinking, raw OpenAI and xAI reasoning items, and Anthropic
@@ -88,10 +90,12 @@ rewrites messages written by a different provider:
 Gemini receives Google's placeholder thought signature on the first tool
 call of each step it did not produce.
 
-Switching models within one provider keeps everything. Anthropic and
-OpenAI drop reasoning the new model can't use themselves, and Gemini says
-to resend it. Encrypted reasoning only ever goes back to the provider that
-issued it, since OpenAI ties it to the issuing organisation.
+Switching models on one origin keeps everything. Anthropic and OpenAI drop
+reasoning the new model can't use themselves, and Gemini says to resend it.
+Encrypted reasoning only ever goes back to the endpoint and credentials
+that issued it, since OpenAI ties it to the issuing organisation. Rotating
+an API key counts as a new origin, so earlier reasoning is then sent as
+text. Messages saved without their `origin` are sent unchanged.
 
 Known limits:
 

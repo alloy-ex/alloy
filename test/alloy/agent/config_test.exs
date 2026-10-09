@@ -65,6 +65,27 @@ defmodule Alloy.Agent.ConfigTest do
       end
     end
 
+    test "removed provider options raise at startup, for fallbacks too" do
+      assert_raise ArgumentError, ~r/:extended_thinking was removed/, fn ->
+        Config.from_opts(
+          provider: {Alloy.Provider.Anthropic, extended_thinking: [budget_tokens: 1]}
+        )
+      end
+
+      assert_raise ArgumentError, ~r/:auth_path was removed/, fn ->
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          fallback_providers: [{Alloy.Provider.Codex, model: "m", auth_path: "/tmp/auth.json"}]
+        )
+      end
+
+      assert_raise ArgumentError, ~r/:extended_thinking was removed/, fn ->
+        [provider: {Alloy.Provider.Test, []}]
+        |> Config.from_opts()
+        |> Config.with_provider({Alloy.Provider.Anthropic, extended_thinking: [budget_tokens: 1]})
+      end
+    end
+
     test "agent-server options point at alloy_agent" do
       assert_raise ArgumentError, ~r/\[:pubsub, :max_pending\].*alloy_agent/s, fn ->
         Config.from_opts(
@@ -174,6 +195,16 @@ defmodule Alloy.Agent.ConfigTest do
         )
 
       assert config.middleware == [Logging]
+    end
+
+    test "compaction: false alongside the compactor in :middleware is a conflict" do
+      assert_raise ArgumentError, ~r/compaction: false conflicts/, fn ->
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          middleware: [Compactor],
+          compaction: false
+        )
+      end
     end
 
     test "listing it yourself sets its position" do

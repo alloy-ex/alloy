@@ -5,8 +5,20 @@ and nothing else. The supervised runtime moves to its own package,
 memory and compaction become ordinary parts of the loop, and everything
 0.12.5 deprecated is removed. Most apps that only call `Alloy.run/2` or
 `Alloy.stream/3` upgrade without code changes. Compile with
-`--warnings-as-errors` and run your tests: everything below fails loudly
-rather than silently.
+`--warnings-as-errors` and run your tests: most of what follows fails
+loudly, at compile time or with an `ArgumentError` at startup. A few
+changes don't, so check these by hand:
+
+- A `%Alloy.Agent.Config{}` you build yourself no longer compacts (§5).
+- Middleware that matches hooks exhaustively crashes only when a context
+  overflow actually happens (§5).
+- A memory store tied to the calling process fails as a tool error the
+  model reads, not as a crash (§4).
+- Middleware reading removed `Config` fields (`config.memory`,
+  `config.pubsub`, `config.max_budget_cents` and the like) gets a
+  `KeyError` only when that hook runs (§7).
+- Transcripts saved without the new message fields aren't rewritten when
+  you switch provider (§6).
 
 ## 1. The agent server moved to `alloy_agent`
 
@@ -86,7 +98,18 @@ What changes:
 - Two tools with the same name now raise at startup, for every tool, not
   only `memory`.
 
-Your `Alloy.Memory` store needs no changes.
+Your `Alloy.Memory` store's callbacks don't change, but they now run in a
+supervised task, like every tool, rather than in the process that called
+`Alloy.run/2`. Check stores that depend on the calling process:
+
+- the process dictionary;
+- an ETS table the caller owns (`:protected` or `:private`);
+- Logger metadata;
+- a `Repo.transaction` wrapped around `Alloy.run/2`, whose store writes
+  are no longer inside it.
+
+A store that raises no longer crashes the run. The model receives the
+error as the tool result, and Alloy logs it.
 
 ## 5. Compaction is middleware
 
@@ -104,18 +127,41 @@ puts it first in `:middleware`, so compaction behaves as before by default.
   nothing could be removed.
 - `:after_compaction` and `[:alloy, :compaction, :done]` now also fire
   after that forced compaction.
+- The retried request runs `:before_completion` again, compaction
+  included. If the history is still estimated to be over budget, for
+  example because of large tool definitions, it can be compacted a second
+  time in that turn. 0.12 didn't do this.
+- `[:alloy, :turn, :prompt_too_long_recovery]` still fires on the first
+  overflow of a turn, now with `retry: true | false` metadata saying
+  whether the request was retried.
+- A middleware halt keeps the changes earlier middleware made in the same
+  hook, so a halt after compaction keeps the compacted history and the
+  summary request's usage. Return `{:halt, reason, state}` to halt with
+  your own changes too.
 
 If your middleware matches hooks exhaustively, add a catch-all clause,
 `def call(_hook, state), do: state`, for `:on_context_overflow`.
 
-## 6. Messages record their provider
+## 6. Messages record where they came from
 
-Assistant messages produced by the loop now carry `provider` and `model`
-fields, and the loop uses them to rewrite one provider's reasoning before
-sending it to another (see `Alloy.Message.normalize_for/2`). Pattern
-matches are unaffected, but a test that compares whole messages with
-`==` against `Message.assistant("...")` needs to match the fields it
-cares about instead:
+Assistant messages produced by the loop now carry three new fields:
+
+- `provider`: the module;
+- `model`;
+- `origin`: a fingerprint of the module, `:api_url` and `:api_key`. It is
+  a hash; the key itself is never stored.
+
+Before each request, the loop uses `origin` to rewrite reasoning that came
+from a different provider, endpoint or account (see
+`Alloy.Message.normalize_for/3`).
+
+**Persist all three fields with your transcripts.** A message without an
+`origin` is sent as it is, so a reloaded conversation that then switches
+provider can fail with the HTTP 400s this release fixes.
+
+Pattern matches are unaffected. A test that compares whole messages with
+`==` against `Message.assistant("...")` needs to match only the fields it
+cares about:
 
 ```elixir
 assert [%Message{role: :assistant, content: "Hello"}] = result.messages
@@ -129,3 +175,12 @@ assert [%Message{role: :assistant, content: "Hello"}] = result.messages
 - Tools can declare `native_types/0` (`:native_types` for inline tools): a
   provider's built-in schema for the tool. Anthropic reads `:anthropic`.
 - `phoenix_pubsub` is no longer an optional dependency of Alloy.
+- `%Alloy.Agent.Config{}` drops `memory`, `pubsub`, `subscribe`,
+  `max_pending`, `on_shutdown` and `max_budget_cents`.
+- Module tools are validated at startup like inline tools: an invalid
+  `strict?/0`, `input_examples/0`, `defer_loading?/0` or `native_types/0`
+  raises `ArgumentError`.
+- Removed provider options (`:extended_thinking`, `:auth_path`) raise at
+  startup, for fallback providers as well as the primary.
+- `compaction: false` together with `Alloy.Context.Compactor` in
+  `:middleware` raises.

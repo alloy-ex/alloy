@@ -33,10 +33,14 @@ defmodule Alloy.Message do
   ## Provenance
 
   The loop records which provider and model wrote each assistant message in
-  `:provider` and `:model` (`nil` for messages you build yourself). When a
-  conversation moves to a different provider — a fallback provider, or a
-  model switch — `normalize_for/2` rewrites the other provider's messages
-  so the new one can read them; see its docs.
+  `:provider` and `:model`, and in `:origin` a fingerprint of the provider
+  module, its `:api_url` and its `:api_key` (a hash; the key itself is never
+  stored). All three are `nil` for messages you build yourself. When a
+  conversation moves to a different origin — a fallback provider, another
+  account or endpoint, or a different provider after a model switch —
+  `normalize_for/3` rewrites the other origin's messages so the new one can
+  read them; see its docs. Persist these fields with your transcripts:
+  without them a reloaded message is sent as it is.
   """
 
   @type role :: :user | :assistant
@@ -46,11 +50,12 @@ defmodule Alloy.Message do
           role: role(),
           content: String.t() | [content_block()],
           provider: module() | nil,
-          model: String.t() | nil
+          model: String.t() | nil,
+          origin: String.t() | nil
         }
 
   @enforce_keys [:role, :content]
-  defstruct [:role, :content, provider: nil, model: nil]
+  defstruct [:role, :content, provider: nil, model: nil, origin: nil]
 
   # Blocks every provider can read. Anything else in another provider's
   # message is that provider's own (signed reasoning, raw items, server tool
@@ -62,7 +67,7 @@ defmodule Alloy.Message do
 
   # Anthropic accepts tool-use ids matching ^[a-zA-Z0-9_-]+$; OpenAI accepts
   # at most 64 characters. Kimi, for one, uses ids like "functions.read:0".
-  @portable_tool_id ~r/^[a-zA-Z0-9_-]{1,64}$/
+  @portable_tool_id ~r/\A[a-zA-Z0-9_-]{1,64}\z/
 
   @doc """
   Creates a user message with text content.
@@ -185,11 +190,32 @@ defmodule Alloy.Message do
   def document(mime_type, uri), do: %{type: "document", mime_type: mime_type, uri: uri}
 
   @doc """
-  Prepares a conversation for `provider`.
+  The origin fingerprint for a provider and its config: a hash of the
+  module, `:api_url` and `:api_key`. Two configs share an origin exactly
+  when they reach the same endpoint with the same credentials.
+  """
+  @spec origin(module(), map()) :: String.t()
+  def origin(provider, config) when is_atom(provider) and is_map(config) do
+    input =
+      Enum.map_join(
+        [inspect(provider), Map.get(config, :api_url), Map.get(config, :api_key)],
+        "\n",
+        &origin_part/1
+      )
 
-  Assistant messages written by a different provider (see "Provenance")
-  are rewritten so `provider` can read them, following the rules the
-  providers document:
+    :sha256 |> :crypto.hash(input) |> Base.encode16(case: :lower) |> binary_slice(0, 16)
+  end
+
+  defp origin_part(nil), do: ""
+  defp origin_part(value) when is_binary(value), do: value
+  defp origin_part(value), do: inspect(value)
+
+  @doc """
+  Prepares a conversation for `provider` configured with `config`.
+
+  Assistant messages from a different origin (see "Provenance") — another
+  provider module, endpoint or account — are rewritten so `provider` can
+  read them, following the rules the providers document:
 
     * thinking becomes plain text (empty thinking is dropped), so the new
       model keeps the earlier reasoning without a signature it can't verify
@@ -200,40 +226,44 @@ defmodule Alloy.Message do
       with the tool results that answer them
     * a message left with no content is dropped
 
-  Messages from `provider` itself, user-built messages (no `:provider`) and
-  user messages are unchanged. Switching models within one provider changes
-  nothing: Anthropic, OpenAI and Gemini each document that their APIs
-  handle another model's reasoning themselves.
+  Messages from the same origin, messages without one (built by hand, or
+  persisted without the provenance fields) and user messages are
+  unchanged. Switching models on one origin changes nothing: Anthropic,
+  OpenAI and Gemini each document that their APIs handle another model's
+  reasoning themselves. The result depends only on the arguments, so the
+  same history is sent as the same bytes on every request.
 
   The loop applies this before every provider request, including fallback
   providers; call it yourself only when you call a provider directly.
   """
-  @spec normalize_for([t()], module()) :: [t()]
-  def normalize_for(messages, provider) when is_list(messages) and is_atom(provider) do
-    {messages, _renamed_ids} = Enum.flat_map_reduce(messages, %{}, &normalize(&1, &2, provider))
+  @spec normalize_for([t()], module(), map()) :: [t()]
+  def normalize_for(messages, provider, config \\ %{})
+      when is_list(messages) and is_atom(provider) and is_map(config) do
+    target = origin(provider, config)
+    {messages, _renamed_ids} = Enum.flat_map_reduce(messages, %{}, &normalize(&1, &2, target))
     messages
   end
 
-  defp normalize(%__MODULE__{role: :assistant, provider: from} = message, ids, provider)
-       when from in [nil, provider],
+  defp normalize(%__MODULE__{role: :assistant, origin: from} = message, ids, target)
+       when from in [nil, target],
        do: {[message], ids}
 
-  defp normalize(%__MODULE__{role: :assistant, content: text} = message, ids, _provider)
+  defp normalize(%__MODULE__{role: :assistant, content: text} = message, ids, _target)
        when is_binary(text),
        do: {[message], ids}
 
-  defp normalize(%__MODULE__{role: :assistant, content: blocks} = message, ids, _provider) do
+  defp normalize(%__MODULE__{role: :assistant, content: blocks} = message, ids, _target) do
     case Enum.flat_map_reduce(blocks, ids, &foreign_block/2) do
       {[], ids} -> {[], ids}
       {blocks, ids} -> {[%{message | content: blocks}], ids}
     end
   end
 
-  defp normalize(%__MODULE__{role: :user, content: blocks} = message, ids, _provider)
+  defp normalize(%__MODULE__{role: :user, content: blocks} = message, ids, _target)
        when is_list(blocks) and map_size(ids) > 0,
        do: {[%{message | content: Enum.map(blocks, &rename_result(&1, ids))}], ids}
 
-  defp normalize(message, ids, _provider), do: {[message], ids}
+  defp normalize(message, ids, _target), do: {[message], ids}
 
   defp foreign_block(%{type: "thinking", thinking: thinking}, ids) when is_binary(thinking) do
     case String.trim(thinking) do
@@ -246,6 +276,15 @@ defmodule Alloy.Message do
     case portable_tool_id(id) do
       ^id -> {[Map.drop(block, @signature_keys)], ids}
       new_id -> {[%{Map.drop(block, @signature_keys) | id: new_id}], Map.put(ids, id, new_id)}
+    end
+  end
+
+  # Blank text survives only for its signature, which is being removed, and
+  # Anthropic rejects an empty text block.
+  defp foreign_block(%{type: "text", text: text} = block, ids) when is_binary(text) do
+    case String.trim(text) do
+      "" -> {[], ids}
+      _text -> {[Map.drop(block, @signature_keys)], ids}
     end
   end
 

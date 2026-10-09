@@ -229,15 +229,17 @@ defmodule Alloy.Agent.Turn do
   defp fail(state, reason) do
     state = %{state | status: :error, error: reason}
 
-    case Middleware.run(:on_error, state) do
-      {:halted, halted_reason} -> halt(state, halted_reason)
+    case Middleware.run_hook(:on_error, state) do
+      {:halted, halted_reason, halted} -> halt(halted, halted_reason)
       %State{} = state -> state
     end
   end
 
+  # A halt keeps what earlier middleware in the chain did, such as a
+  # compaction whose summary request was already billed.
   defp run_middleware(hook, %State{} = state) do
-    case Middleware.run(hook, state) do
-      {:halted, reason} -> {:halt, halt(state, reason)}
+    case Middleware.run_hook(hook, state) do
+      {:halted, reason, halted} -> {:halt, halt(halted, reason)}
       %State{} = state -> {:continue, state}
     end
   end
@@ -256,28 +258,38 @@ defmodule Alloy.Agent.Turn do
 
   # The provider rejected the prompt as too long. :on_context_overflow
   # middleware (compaction, unless it is turned off) may shrink the history;
-  # the request is retried once, and only if the messages changed.
+  # the request is retried once, and only if the messages changed. The
+  # middleware's own changes (a summary request's usage) are kept either way.
   defp recover_from_overflow(reason, state, opts) do
     case run_middleware(:on_context_overflow, state) do
-      {:halt, state} ->
-        {:halt, state}
+      {:halt, halted} ->
+        overflow_event(state, false)
+        {:halt, put_provider_error(halted, reason)}
 
-      {:continue, %State{messages: messages}} when messages == state.messages ->
-        {:halt, fail(state, reason)}
+      {:continue, %State{messages: messages} = unchanged} when messages == state.messages ->
+        overflow_event(state, false)
+        {:halt, fail(unchanged, reason)}
 
       {:continue, shrunk} ->
         Logger.info("[Turn] Prompt too long — history shrunk by middleware, retrying")
-
-        :telemetry.execute(
-          [:alloy, :turn, :prompt_too_long_recovery],
-          %{},
-          %{turn: state.turn + 1}
-        )
-
+        overflow_event(state, true)
         {next, state} = complete(shrunk, opts, true)
         {next, State.merge_run_metadata(state, %{prompt_too_long_recovery: true})}
     end
   end
+
+  defp overflow_event(%State{turn: turn}, retry?) do
+    :telemetry.execute(
+      [:alloy, :turn, :prompt_too_long_recovery],
+      %{},
+      %{turn: turn + 1, retry: retry?}
+    )
+  end
+
+  defp put_provider_error(state, %Error{} = error),
+    do: State.merge_run_metadata(state, %{provider_error: error})
+
+  defp put_provider_error(state, _reason), do: state
 
   defp handle_tool_use(%State{} = state, tool_calls, opts) do
     case run_middleware(:after_tool_request, state) do

@@ -2,7 +2,8 @@ defmodule Alloy.Memory.IntegrationTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
-  alias Alloy.Test.MemoryStore
+  alias Alloy.Provider.Test, as: TestProvider
+  alias Alloy.Test.{EchoTool, MemoryStore}
 
   describe "Alloy.run/2 with :memory option" do
     test "raises on a malformed :memory value" do
@@ -25,7 +26,7 @@ defmodule Alloy.Memory.IntegrationTest do
 
       assert_raise ArgumentError, ~r/tool names must be unique.*"memory"/, fn ->
         Alloy.run("hi",
-          provider: {Alloy.Provider.Test, []},
+          provider: {TestProvider, []},
           memory: {MemoryStore, self()},
           tools: [other_memory]
         )
@@ -242,6 +243,43 @@ defmodule Alloy.Memory.IntegrationTest do
       assert block.tool_use_id == "toolu_mem1"
       refute block[:is_error]
       assert block.content =~ "created"
+    end
+  end
+
+  describe "memory calls through the executor" do
+    test "calls in one response run in the order the model made them, alongside other tools" do
+      {:ok, store_pid} = MemoryStore.start_link()
+      memory = fn id, input -> %{id: id, name: "memory", input: input} end
+
+      {:ok, provider} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            memory.("m1", %{
+              "command" => "create",
+              "path" => "/memories/prefs.md",
+              "file_text" => "units: imperial"
+            }),
+            %{id: "e1", name: "echo", input: %{"text" => "hi"}},
+            memory.("m2", %{
+              "command" => "str_replace",
+              "path" => "/memories/prefs.md",
+              "old_str" => "imperial",
+              "new_str" => "SI"
+            })
+          ]),
+          TestProvider.text_response("Saved")
+        ])
+
+      {:ok, result} =
+        Alloy.run("remember SI units",
+          provider: {TestProvider, agent_pid: provider},
+          tools: [EchoTool],
+          memory: {MemoryStore, store_pid}
+        )
+
+      assert MemoryStore.contents(store_pid) == %{"/memories/prefs.md" => "units: SI"}
+      assert Enum.map(result.tool_calls, & &1.id) == ["m1", "e1", "m2"]
+      assert Enum.all?(result.tool_calls, &is_nil(&1.error))
     end
   end
 end

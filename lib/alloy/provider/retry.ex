@@ -28,7 +28,7 @@ defmodule Alloy.Provider.Retry do
   def call_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline) do
     {result, chunks_emitted?} =
       do_provider_call(
-        normalize_for(state, provider),
+        normalize_for(state, provider, provider_config),
         provider,
         provider_config,
         streaming?,
@@ -122,7 +122,7 @@ defmodule Alloy.Provider.Retry do
 
           {result, chunks_emitted?} =
             do_provider_call(
-              normalize_for(state, fb_provider),
+              normalize_for(state, fb_provider, fb_provider_config),
               fb_provider,
               fb_provider_config,
               streaming?,
@@ -217,14 +217,19 @@ defmodule Alloy.Provider.Retry do
 
   # Normalized once per provider rather than per attempt: retries resend the
   # same history.
-  defp normalize_for(%State{} = state, provider),
-    do: %{state | messages: Message.normalize_for(state.messages, provider)}
+  defp normalize_for(%State{} = state, provider, provider_config),
+    do: %{state | messages: Message.normalize_for(state.messages, provider, provider_config)}
 
   # Provenance lets a later request to a different provider (a fallback, or
   # a model switch) rewrite blocks only this provider can read.
   defp record_origin(%{messages: messages} = response, provider, provider_config) do
     model = Map.get(provider_config, :model)
-    stamp = fn %Message{} = message -> %{message | provider: provider, model: model} end
+    origin = Message.origin(provider, provider_config)
+
+    stamp = fn %Message{} = message ->
+      %{message | provider: provider, model: model, origin: origin}
+    end
+
     %{response | messages: Enum.map(messages, stamp)}
   end
 

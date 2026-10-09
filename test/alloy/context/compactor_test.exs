@@ -780,6 +780,23 @@ defmodule Alloy.Context.CompactorTest do
     end
   end
 
+  describe "call/2 as middleware" do
+    test "leaves a history within budget alone and ignores other hooks" do
+      state = build_state([Message.user("hi"), Message.assistant("hello")], max_tokens: 200_000)
+
+      assert Compactor.call(:before_completion, state) == state
+      assert Compactor.call(:after_tool_execution, state) == state
+      assert Compactor.call(:session_start, state) == state
+    end
+
+    test "on overflow, a history with nothing to remove comes back unchanged" do
+      state = build_state([Message.user("just one message")], max_tokens: 200_000)
+
+      assert %State{messages: [%Message{content: "just one message"}]} =
+               Compactor.call(:on_context_overflow, state)
+    end
+  end
+
   describe "summary request" do
     defp summary_state(provider_pid, opts \\ []) do
       messages = [

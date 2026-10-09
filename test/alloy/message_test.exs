@@ -133,14 +133,20 @@ defmodule Alloy.MessageTest do
     end
   end
 
-  describe "normalize_for/2" do
+  describe "normalize_for/3" do
     @anthropic Alloy.Provider.Anthropic
     @openai Alloy.Provider.OpenAI
 
-    defp from(provider, blocks),
-      do: %{Message.assistant_blocks(blocks) | provider: provider, model: "m"}
+    defp from(provider, blocks, config \\ %{}) do
+      %{
+        Message.assistant_blocks(blocks)
+        | provider: provider,
+          model: "m",
+          origin: Message.origin(provider, config)
+      }
+    end
 
-    test "leaves the target provider's own, user-built and user messages alone" do
+    test "leaves the same origin's, user-built and user messages alone" do
       own = from(@anthropic, [%{type: "thinking", thinking: "t", signature: "sig"}])
 
       hand_built =
@@ -150,6 +156,26 @@ defmodule Alloy.MessageTest do
 
       messages = [Message.user("hi"), own, hand_built, other_model]
       assert Message.normalize_for(messages, @anthropic) == messages
+    end
+
+    # OpenAI ties encrypted reasoning to the organisation that issued it.
+    test "another account or endpoint of the same provider is a different origin" do
+      reasoning = %{type: "reasoning", raw: %{"type" => "reasoning", "encrypted_content" => "e"}}
+      text = %{type: "text", text: "answer"}
+      org_a = from(@openai, [reasoning, text], %{api_key: "key-a"})
+
+      assert [%Message{content: [^reasoning, ^text]}] =
+               Message.normalize_for([org_a], @openai, %{api_key: "key-a", model: "other"})
+
+      for config <- [%{api_key: "key-b"}, %{api_key: "key-a", api_url: "https://proxy.example"}] do
+        assert [%Message{content: [^text]}] = Message.normalize_for([org_a], @openai, config)
+      end
+    end
+
+    test "the origin fingerprint never contains the key" do
+      origin = Message.origin(@openai, %{api_key: "sk-secret-value"})
+      assert byte_size(origin) == 16
+      refute origin =~ "secret"
     end
 
     test "turns another provider's thinking into text and drops what only it can read" do

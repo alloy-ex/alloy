@@ -22,7 +22,7 @@ defmodule Alloy.Tool.Registry do
   """
   @spec build([tool()]) :: {[map()], %{String.t() => tool()}}
   def build(tools) when is_list(tools) do
-    specs = Enum.map(tools, &(&1 |> validate!() |> to_inline()))
+    specs = Enum.map(tools, &(&1 |> validate!() |> to_inline() |> Inline.validate!()))
     reject_duplicate_names!(specs)
     tool_defs = Enum.map(specs, &tool_def/1)
     tool_fns = tools |> Enum.zip(specs) |> Map.new(fn {tool, spec} -> {spec.name, tool} end)
@@ -72,7 +72,7 @@ defmodule Alloy.Tool.Registry do
     end
   end
 
-  defp validate!(%Inline{} = tool), do: Inline.validate!(tool)
+  defp validate!(%Inline{} = tool), do: tool
   defp validate!(mod) when is_atom(mod), do: mod
 
   defp validate!(other) do

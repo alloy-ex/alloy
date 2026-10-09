@@ -1938,6 +1938,149 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  describe "compaction as middleware" do
+    defmodule HaltBeforeCompletion do
+      @behaviour Alloy.Middleware
+      @impl true
+      def call(:before_completion, _state), do: {:halt, "budget reached"}
+      def call(_hook, state), do: state
+    end
+
+    defmodule HaltOnOverflow do
+      @behaviour Alloy.Middleware
+      @impl true
+      def call(:on_context_overflow, _state), do: {:halt, "no room left"}
+      def call(_hook, state), do: state
+    end
+
+    defmodule ReportHooks do
+      @behaviour Alloy.Middleware
+      @impl true
+      def call(hook, state) when hook in [:after_compaction, :on_error] do
+        send(state.config.context.test_pid, {:hook, hook})
+        state
+      end
+
+      def call(_hook, state), do: state
+    end
+
+    defp summary_response(input_tokens) do
+      {:ok,
+       %{
+         stop_reason: :end_turn,
+         messages: [Message.assistant("Summary of the earlier work")],
+         usage: %{input_tokens: input_tokens, output_tokens: 50}
+       }}
+    end
+
+    defp compacting_config(pid, middleware) do
+      %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        middleware: middleware,
+        context: %{test_pid: self()},
+        max_tokens: 200,
+        compaction: %{reserve_tokens: 20, keep_recent_tokens: 10, fallback: :truncate}
+      }
+    end
+
+    # The summary request is billed before the later middleware halts; 0.13.0
+    # development builds lost both the compaction and that usage.
+    test "a later :before_completion halt keeps the compaction and its usage" do
+      {:ok, pid} = TestProvider.start_link([summary_response(1_000)])
+
+      config = compacting_config(pid, [Alloy.Context.Compactor, HaltBeforeCompletion])
+      result = Turn.run_loop(State.init(config, long_history()))
+
+      assert result.status == :halted
+      assert result.error == "Halted by middleware: budget reached"
+      assert result.usage.input_tokens == 1_000
+      assert length(result.messages) < length(long_history())
+    end
+
+    test "a forced compaction on overflow fires :after_compaction and the done event" do
+      handler = "forced-compaction-#{inspect(make_ref())}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler,
+        [:alloy, :compaction, :done],
+        fn _event, _measurements, meta, _ -> send(test_pid, {:done, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          {:error, %Alloy.Provider.Error{kind: :context_overflow, message: "too long"}},
+          summary_response(10),
+          TestProvider.text_response("Recovered")
+        ])
+
+      config = %{
+        compacting_config(pid, [Alloy.Context.Compactor, ReportHooks])
+        | max_tokens: 200_000,
+          compaction: %{reserve_tokens: 1_000, keep_recent_tokens: 10, fallback: :truncate}
+      }
+
+      result = Turn.run_loop(State.init(config, long_history()))
+
+      assert result.status == :completed
+      assert_received {:hook, :after_compaction}
+      assert_received {:done, %{turn: 1}}
+    end
+
+    test "a halt in :on_context_overflow keeps the provider error" do
+      overflow = %Alloy.Provider.Error{kind: :context_overflow, message: "too long"}
+      {:ok, pid} = TestProvider.start_link([{:error, overflow}])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        middleware: [HaltOnOverflow]
+      }
+
+      result = Turn.run_loop(State.init(config, long_history()))
+
+      assert result.status == :halted
+      assert result.error == "Halted by middleware: no room left"
+      assert result.run_metadata.provider_error == overflow
+    end
+
+    test "an overflow nothing can shrink runs :on_error and reports retry: false" do
+      handler = "overflow-event-#{inspect(make_ref())}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler,
+        [:alloy, :turn, :prompt_too_long_recovery],
+        fn _event, _measurements, meta, _ -> send(test_pid, {:overflow, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          {:error, %Alloy.Provider.Error{kind: :context_overflow, message: "too long"}}
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        middleware: [ReportHooks],
+        context: %{test_pid: self()}
+      }
+
+      result = Turn.run_loop(State.init(config, long_history()))
+
+      assert result.status == :error
+      assert_received {:hook, :on_error}
+      assert_received {:overflow, %{turn: 1, retry: false}}
+    end
+  end
+
   describe "provenance" do
     test "each assistant message records the provider and model that wrote it" do
       {:ok, pid} = TestProvider.start_link([TestProvider.text_response("Hello")])
@@ -1945,8 +2088,10 @@ defmodule Alloy.Agent.TurnTest do
       config = %Config{provider: TestProvider, provider_config: %{agent_pid: pid, model: "m1"}}
       result = Turn.run_loop(State.init(config, [Message.user("hi")]))
 
-      assert [%Message{provider: nil}, %Message{provider: TestProvider, model: "m1"}] =
+      assert [%Message{provider: nil}, %Message{provider: TestProvider, model: "m1"} = reply] =
                result.messages
+
+      assert reply.origin == Message.origin(TestProvider, %{agent_pid: pid})
     end
 
     test "a fallback provider gets the primary's reasoning as text, without signatures" do
@@ -1961,7 +2106,8 @@ defmodule Alloy.Agent.TurnTest do
           %{type: "text", text: "ok"}
         ])
         | provider: TestProvider,
-          model: "primary"
+          model: "primary",
+          origin: Message.origin(TestProvider, %{})
       }
 
       config = %Config{

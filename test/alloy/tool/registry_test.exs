@@ -129,6 +129,21 @@ defmodule Alloy.Tool.RegistryTest do
       end
     end
 
+    test "a module tool's optional callbacks are validated like an inline tool's" do
+      defmodule BadNativeTool do
+        @behaviour Alloy.Tool
+        def name, do: "bad"
+        def description, do: "Bad"
+        def input_schema, do: %{type: "object"}
+        def execute(_input, _ctx), do: {:ok, "ok"}
+        def native_types, do: [anthropic: "memory_20250818"]
+      end
+
+      assert_raise ArgumentError, ~r/:native_types must be a map/, fn ->
+        Registry.build([BadNativeTool])
+      end
+    end
+
     test "native_types/0 reaches the definition; tools without it omit the key" do
       {[native, basic], _fns} = Registry.build([NativeTool, BasicTool])
 
