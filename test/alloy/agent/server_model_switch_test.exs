@@ -149,7 +149,7 @@ defmodule Alloy.Agent.ServerModelSwitchTest do
           provider: {Alloy.Provider.OpenAI, [api_key: "sk-test", model: "gpt-5.4"]}
         )
 
-      assert :sys.get_state(agent).config.max_tokens == 1_050_000
+      assert :sys.get_state(agent).config.max_tokens == 922_000
 
       assert :ok =
                Server.set_model(agent,

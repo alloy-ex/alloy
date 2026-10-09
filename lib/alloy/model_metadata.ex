@@ -3,23 +3,22 @@ defmodule Alloy.ModelMetadata do
   Built-in model metadata catalog used for context budgeting.
 
   This is the default implementation of the `Alloy.ModelCatalog` behaviour.
-  It ships a small, hand-curated set of entries so Alloy works out of the
-  box; it is not meant to track every model release. To use a richer or
-  self-maintained source (a static map, your own service, or an adapter over
-  [`llm_db`](https://hex.pm/packages/llm_db)), implement `Alloy.ModelCatalog`
-  and pass the module via the `:model_catalog` option.
+  It covers the native-provider families (Claude, GPT-5 and GPT-6, Gemini
+  2.5 and 3.x, and Grok) at the input limit each vendor documents. Anything
+  else, including models served through `Alloy.Provider.OpenAICompat` such as
+  Kimi, Qwen, GLM, Mistral or Gemma, and retired model ids, gets
+  `default_context_window/0` (200,000 tokens).
 
-  Per-run tweaks that don't warrant a catalog module belong in
-  `:model_metadata_overrides` — overrides always win over any catalog.
+  For other models, implement `Alloy.ModelCatalog` (a static map, your own
+  service, or an adapter over [`llm_db`](https://hex.pm/packages/llm_db)) and
+  pass the module via the `:model_catalog` option. Per-run tweaks that don't
+  warrant a catalog module belong in `:model_metadata_overrides`; overrides
+  always win over any catalog.
   """
 
   @behaviour Alloy.ModelCatalog
 
-  @type model_entry :: %{
-          name: String.t(),
-          limit: pos_integer(),
-          suffix_patterns: [String.t() | Regex.t()]
-        }
+  @type model_entry :: {Regex.t(), pos_integer()}
 
   @type override_entry ::
           pos_integer()
@@ -28,107 +27,49 @@ defmodule Alloy.ModelMetadata do
               optional(:suffix_patterns) => [String.t() | Regex.t()]
             }
 
+  @type overrides ::
+          %{optional(String.t()) => override_entry()} | [{String.t(), override_entry()}]
+
   @default_limit 200_000
 
-  @model_entries [
-    %{name: "o3-pro", limit: 200_000, suffix_patterns: [""]},
-    %{name: "gemini-flash-latest", limit: 1_048_576, suffix_patterns: [""]},
-    # Fable 5 and Opus 4.8 ship with a 1M-token context window by default
-    # on the Claude API (June 2026).
-    %{name: "claude-fable-5", limit: 1_000_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
-    %{name: "claude-opus-4-8", limit: 1_000_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
-    %{name: "claude-opus-4-6", limit: 200_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
-    %{name: "claude-sonnet-4-6", limit: 200_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
-    %{name: "claude-haiku-4-5", limit: 200_000, suffix_patterns: ["", ~r/^-\d{8}$/]},
-    %{name: "gpt-5", limit: 400_000, suffix_patterns: ["", ~r/^-\d{4}-\d{2}-\d{2}$/]},
-    %{name: "gpt-5.1", limit: 400_000, suffix_patterns: ["", ~r/^-\d{4}-\d{2}-\d{2}$/]},
-    %{name: "gpt-5.2", limit: 400_000, suffix_patterns: ["", ~r/^-\d{4}-\d{2}-\d{2}$/]},
-    %{name: "gpt-5.4", limit: 1_050_000, suffix_patterns: ["", ~r/^-\d{4}-\d{2}-\d{2}$/]},
-    # GPT-5.5 (API, Apr 2026). 400k window per current reporting; if OpenAI
-    # documents a larger window, prefer an override until this is updated.
-    %{name: "gpt-5.5", limit: 400_000, suffix_patterns: ["", ~r/^-\d{4}-\d{2}-\d{2}$/]},
-    %{
-      name: "gemini-2.5-flash",
-      limit: 1_048_576,
-      suffix_patterns: ["", ~r/^-preview-\d{2}-\d{4}$/]
-    },
-    %{
-      name: "gemini-2.5-pro",
-      limit: 1_048_576,
-      suffix_patterns: ["", ~r/^-preview-\d{2}-\d{4}$/]
-    },
-    %{
-      name: "gemini-2.5-flash-lite",
-      limit: 1_048_576,
-      suffix_patterns: ["", ~r/^-preview-\d{2}-\d{4}$/]
-    },
-    %{
-      name: "gemini-3-flash-preview",
-      limit: 1_048_576,
-      suffix_patterns: ["", ~r/^-\d{2}-\d{4}$/]
-    },
-    %{name: "gemini-3-pro-preview", limit: 1_048_576, suffix_patterns: ["", ~r/^-\d{2}-\d{4}$/]},
-    # Gemini 3.5 Flash is GA (June 2026); 3.5 Pro is still in limited preview
-    # and intentionally omitted until its GA model id is stable.
-    %{
-      name: "gemini-3.5-flash",
-      limit: 1_048_576,
-      suffix_patterns: ["", ~r/^-preview-\d{2}-\d{4}$/]
-    },
-    # grok-4.3 — xAI's recommended frontier model (API launch 2026-04-30).
-    # Exact-match only; no date-stamped variants documented yet (PR #41).
-    %{name: "grok-4.3", limit: 1_000_000, suffix_patterns: [""]},
-    %{name: "grok-4", limit: 2_000_000, suffix_patterns: [""]},
-    %{name: "grok-4-fast-reasoning", limit: 2_000_000, suffix_patterns: [""]},
-    %{name: "grok-4-fast-non-reasoning", limit: 2_000_000, suffix_patterns: [""]},
-    # grok-4.20 family — current xAI frontier API models. The `-0309`
-    # suffix is a date stamp; regex patterns accept any 4-digit stamp so
-    # future snapshots on the same family won't need a code change.
-    %{
-      name: "grok-4.20",
-      limit: 2_000_000,
-      suffix_patterns: [~r/^-\d{4}-(reasoning|non-reasoning)$/, ~r/^-multi-agent-\d{4}$/]
-    },
-    # Dash notation (grok-4-1-fast-*) for backward compat
-    %{name: "grok-4-1-fast-reasoning", limit: 2_000_000, suffix_patterns: [""]},
-    %{name: "grok-4-1-fast-non-reasoning", limit: 2_000_000, suffix_patterns: [""]},
-    # Dot notation (grok-4.1-fast*) matching actual xAI API model IDs
-    %{
-      name: "grok-4.1-fast",
-      limit: 2_000_000,
-      suffix_patterns: ["", "-reasoning", "-non-reasoning"]
-    },
-    %{name: "grok-code-fast-1", limit: 256_000, suffix_patterns: [""]},
-    %{name: "grok-3", limit: 131_072, suffix_patterns: ["", "-fast"]},
-    %{name: "grok-3-mini", limit: 131_072, suffix_patterns: ["", "-fast"]},
-    # Kimi (Moonshot AI) — OpenAICompat via api.moonshot.ai
-    %{name: "kimi-k2.5", limit: 256_000, suffix_patterns: [""]},
-    %{name: "kimi-k2.6", limit: 256_000, suffix_patterns: [""]},
-    # Gemma 4 (Google open-weight via Gemini API)
-    %{
-      name: "gemma-4",
-      limit: 256_000,
-      suffix_patterns: ["", ~r/^-\d{1,3}b$/, ~r/^-\d{1,3}b-it$/, ~r/^-\d{1,3}b-a\d+b-it$/]
-    },
-    # GLM (Zhipu AI) — OpenAICompat via open.bigmodel.cn
-    %{name: "glm-4.6", limit: 200_000, suffix_patterns: [""]},
-    # Qwen 3 family (Alibaba) — OpenAICompat via dashscope
-    %{
-      name: "qwen3-max",
-      limit: 256_000,
-      suffix_patterns: ["", "-preview"]
-    },
-    %{name: "qwen3-coder-plus", limit: 1_000_000, suffix_patterns: [""]},
-    %{name: "qwen3-vl-plus", limit: 256_000, suffix_patterns: [""]},
-    %{name: "qwen3-omni-flash", limit: 256_000, suffix_patterns: [""]},
-    %{name: "qwen3.5-397b-a17b", limit: 1_000_000, suffix_patterns: [""]},
-    # Mistral Large 3 — OpenAICompat via api.mistral.ai
-    %{
-      name: "mistral-large",
-      limit: 256_000,
-      suffix_patterns: ["-2512", "-latest"]
-    }
+  # Ordered family rows; the first match wins. A limit is the most input
+  # tokens the vendor's API accepts. Overstating it is the dangerous mistake:
+  # compaction would fire only after the API had started rejecting requests.
+  # Retired ids are left out, so they get the smaller default.
+  @families [
+    # https://platform.claude.com/docs/en/build-with-claude/context-windows
+    # and .../about-claude/model-deprecations, checked 2026-10-09. Ids from
+    # 4.6 on are dateless; older ones carry a -YYYYMMDD snapshot.
+    {~r/^claude-(opus-4-[678]|opus-5(-5)?|sonnet-4-6|sonnet-5(-5)?|haiku-5-5|fable-5(-1)?|mythos-5(-1)?|mythos-preview)$/,
+     1_000_000},
+    {~r/^claude-(opus|sonnet|haiku)-4-5(-\d{8})?$/, 200_000},
+    # OpenAI's context window includes output, so these use the "Maximum
+    # input tokens" on each model page, such as
+    # https://developers.openai.com/api/docs/models/gpt-6-astra.md and
+    # .../gpt-5.md, checked 2026-10-09. Pages that omit it share the window and
+    # output limit of a sibling that states it; gpt-5-pro and o3 have no such
+    # sibling, so they get the default.
+    {~r/^gpt-(6-(astra|sol|luna)|6\.1-sol|5\.6-(sol|terra|luna)|5\.[45](-pro)?)(-\d{4}-\d{2}-\d{2})?$/,
+     922_000},
+    {~r/^gpt-5(-mini|-nano|\.1|\.2(-pro)?|\.3-codex|\.4-(mini|nano)|\.6-cyber)?(-\d{4}-\d{2}-\d{2})?$/,
+     272_000},
+    # Input token limit on each https://ai.google.dev/gemini-api/docs/models
+    # page, checked 2026-10-09. 2.5 is limited to existing users but served.
+    {~r/^gemini-(2\.5-(pro|flash|flash-lite)|3-flash-preview|3\.1-pro-preview(-customtools)?|3\.[15]-flash-lite|3\.[5-8]-flash|flash-latest)$/,
+     1_048_576},
+    # https://docs.x.ai/developers/pricing and the per-model pages, checked
+    # 2026-10-09. The slugs retired in
+    # https://docs.x.ai/developers/migration/may-15-retirement now redirect
+    # to other models, so they are left out.
+    {~r/^grok-4\.(3(-latest)?|20(-[a-z0-9-]+)?)$/, 1_000_000},
+    {~r/^grok-(4\.[567](-latest)?|build-latest)$/, 500_000},
+    {~r/^grok-build-0\.1$/, 256_000}
   ]
+
+  # A limit-only override on a model the catalog knows also covers that
+  # model's snapshots, which every vendor stamps after the name: -20251001,
+  # -2025-08-07 or -0309-reasoning.
+  @snapshot_suffix ~r/^-\d{4}/
 
   @doc """
   Returns the known context window limit for a model name
@@ -139,7 +80,9 @@ defmodule Alloy.ModelMetadata do
   @impl Alloy.ModelCatalog
   @spec context_window(String.t()) :: pos_integer() | nil
   def context_window(model_name) when is_binary(model_name) do
-    context_window(model_name, %{})
+    Enum.find_value(@families, fn {pattern, limit} ->
+      if Regex.match?(pattern, model_name), do: limit
+    end)
   end
 
   @doc """
@@ -151,22 +94,16 @@ defmodule Alloy.ModelMetadata do
   - `%{"model-name" => 1_000_000}`
   - `%{"model-name" => %{limit: 1_000_000, suffix_patterns: ["", ~r/^-\d+$/]}}`
 
-  For overrides that only provide a limit, existing catalog suffix patterns are
-  reused when available; unknown models default to exact-match only.
+  An override without `:suffix_patterns` on a model the catalog knows also
+  covers that model's dated snapshots (a suffix starting with a four-digit
+  stamp, such as `-2026-03-05` or `-20251001`); on an unknown model it is
+  exact-match only.
 
   Returns `nil` when the model is not in the current catalog or overrides.
   """
-  @spec context_window(
-          String.t(),
-          %{optional(String.t()) => override_entry()} | [{String.t(), override_entry()}]
-        ) ::
-          pos_integer() | nil
+  @spec context_window(String.t(), overrides()) :: pos_integer() | nil
   def context_window(model_name, overrides) when is_binary(model_name) do
-    entries = override_entries(overrides) ++ @model_entries
-
-    Enum.find_value(entries, fn entry ->
-      if match_entry?(entry, model_name), do: entry.limit
-    end)
+    override_window(model_name, overrides) || context_window(model_name)
   end
 
   @doc """
@@ -177,16 +114,13 @@ defmodule Alloy.ModelMetadata do
   `Alloy.ModelCatalog` implementation. Returns `nil` when no override
   matches.
   """
-  @spec override_window(
-          String.t(),
-          %{optional(String.t()) => override_entry()} | [{String.t(), override_entry()}]
-        ) ::
-          pos_integer() | nil
-  def override_window(model_name, overrides) when is_binary(model_name) do
-    Enum.find_value(override_entries(overrides), fn entry ->
-      if match_entry?(entry, model_name), do: entry.limit
-    end)
+  @spec override_window(String.t(), overrides()) :: pos_integer() | nil
+  def override_window(model_name, overrides)
+      when is_binary(model_name) and (is_map(overrides) or is_list(overrides)) do
+    Enum.find_value(overrides, &override_limit(&1, model_name))
   end
+
+  def override_window(model_name, _overrides) when is_binary(model_name), do: nil
 
   @doc """
   Returns the default fallback context window for unknown models.
@@ -196,63 +130,45 @@ defmodule Alloy.ModelMetadata do
   def default_context_window, do: @default_limit
 
   @doc """
-  Returns the known model catalog.
+  Returns the ordered family rows: a pattern over the full model id and the
+  limit for ids it matches. The first matching row wins.
   """
   @spec catalog() :: [model_entry()]
-  def catalog, do: @model_entries
+  def catalog, do: @families
 
-  defp override_entries(overrides) when is_map(overrides) do
-    overrides
-    |> Enum.map(&build_override_entry/1)
-    |> Enum.reject(&is_nil/1)
+  defp override_limit({name, limit}, model_name) when is_integer(limit) do
+    override_limit({name, %{limit: limit}}, model_name)
   end
 
-  defp override_entries(overrides) when is_list(overrides) do
-    overrides
-    |> Enum.map(&build_override_entry/1)
-    |> Enum.reject(&is_nil/1)
+  defp override_limit({name, override}, model_name) when is_binary(name) and is_list(override) do
+    override_limit({name, Map.new(override)}, model_name)
   end
 
-  defp override_entries(_), do: []
-
-  defp build_override_entry({name, limit})
+  defp override_limit({name, %{limit: limit} = override}, model_name)
        when is_binary(name) and is_integer(limit) and limit > 0 do
-    %{name: name, limit: limit, suffix_patterns: override_suffix_patterns(name, nil)}
+    if override_matches?(name, suffix_patterns(name, override), model_name), do: limit
   end
 
-  defp build_override_entry({name, %{limit: limit} = override})
-       when is_binary(name) and is_integer(limit) and limit > 0 do
-    %{name: name, limit: limit, suffix_patterns: override_suffix_patterns(name, override)}
+  defp override_limit(_entry, _model_name), do: nil
+
+  defp suffix_patterns(_name, %{suffix_patterns: patterns}) when is_list(patterns), do: patterns
+
+  defp suffix_patterns(name, _override) do
+    if context_window(name), do: ["", @snapshot_suffix], else: [""]
   end
 
-  defp build_override_entry({name, override}) when is_binary(name) and is_list(override) do
-    build_override_entry({name, Map.new(override)})
-  end
+  defp override_matches?(name, suffixes, model_name) do
+    size = byte_size(name)
 
-  defp build_override_entry(_), do: nil
+    case model_name do
+      <<^name::binary-size(^size), suffix::binary>> ->
+        Enum.any?(suffixes, &suffix_matches?(&1, suffix))
 
-  defp override_suffix_patterns(_name, %{suffix_patterns: suffix_patterns})
-       when is_list(suffix_patterns) do
-    suffix_patterns
-  end
-
-  defp override_suffix_patterns(name, _override) do
-    case Enum.find(@model_entries, &(&1.name == name)) do
-      %{suffix_patterns: suffix_patterns} -> suffix_patterns
-      nil -> [""]
-    end
-  end
-
-  defp match_entry?(%{name: name, suffix_patterns: suffix_patterns}, model_name) do
-    case String.trim_leading(model_name, name) do
-      ^model_name ->
+      _ ->
         false
-
-      suffix ->
-        Enum.any?(suffix_patterns, &match_suffix?(&1, suffix))
     end
   end
 
-  defp match_suffix?(suffix, candidate) when is_binary(suffix), do: suffix == candidate
-  defp match_suffix?(%Regex{} = suffix, candidate), do: Regex.match?(suffix, candidate)
+  defp suffix_matches?(pattern, suffix) when is_binary(pattern), do: pattern == suffix
+  defp suffix_matches?(%Regex{} = pattern, suffix), do: Regex.match?(pattern, suffix)
 end
