@@ -66,6 +66,17 @@ defmodule Alloy.Tool.ExecutorTest do
     def result_type, do: :structured
   end
 
+  defmodule StrictEchoTool do
+    @behaviour Alloy.Tool
+    def name, do: "strict_echo"
+    def description, do: "Echoes text"
+
+    def input_schema,
+      do: %{type: "object", properties: %{text: %{type: "string"}}, required: ["text"]}
+
+    def execute(%{"text" => text}, _ctx), do: {:ok, "echo #{text}"}
+  end
+
   defmodule BlockingMiddleware do
     @behaviour Alloy.Middleware
 
@@ -298,6 +309,51 @@ defmodule Alloy.Tool.ExecutorTest do
       assert %Message{role: :user, content: [block]} = result
       assert block.content == "something went wrong"
       assert block.is_error == true
+    end
+  end
+
+  describe "execute_all/3 — input validation" do
+    test "missing required keys are an error result naming them, not a crash" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {block, meta} = run_one(StrictEchoTool, %{"other" => 1})
+
+          assert block.is_error
+          assert block.content =~ "Missing required parameter"
+          assert block.content =~ "text"
+          assert meta.error == block.content
+        end)
+
+      refute log =~ "FunctionClauseError"
+    end
+
+    test "required keys may be atoms or strings in the schema, and in the input" do
+      atom_schema = inline_with_schema(%{type: "object", required: [:a, "b"]})
+      string_schema = inline_with_schema(%{"type" => "object", "required" => ["a", "b"]})
+
+      for tool <- [atom_schema, string_schema] do
+        assert {%{is_error: true, content: content}, _} = run_one(tool, %{"a" => 1})
+        assert content =~ ": b."
+
+        for input <- [%{"a" => 1, "b" => 2}, %{"a" => 1, b: 2}] do
+          assert {block, %{error: nil}} = run_one(tool, input)
+          refute Map.has_key?(block, :is_error)
+        end
+      end
+    end
+
+    test "input that is not an object is an error result" do
+      {block, _meta} = run_one(StrictEchoTool, "just a string")
+
+      assert block.is_error
+      assert block.content =~ "must be a JSON object"
+    end
+
+    test "types are not checked, so loose schemas keep working" do
+      tool = inline_with_schema(%{type: "object", required: ["n"]})
+
+      assert {block, _} = run_one(tool, %{"n" => "not a number", "extra" => true})
+      refute Map.get(block, :is_error)
     end
   end
 
@@ -744,6 +800,28 @@ defmodule Alloy.Tool.ExecutorTest do
     }
 
     State.init(config)
+  end
+
+  defp inline_with_schema(schema) do
+    Alloy.Tool.inline(
+      name: "schema_tool",
+      description: "Returns its input",
+      input_schema: schema,
+      execute: fn input, _ctx -> {:ok, inspect(input)} end
+    )
+  end
+
+  defp run_one(%Alloy.Tool.Inline{name: name} = tool, input), do: run_one(tool, name, input)
+  defp run_one(tool, input), do: run_one(tool, tool.name(), input)
+
+  defp run_one(tool, name, input) do
+    state = build_state([tool])
+    call = %{id: "c1", name: name, input: input}
+
+    {:ok, %Message{content: [block]}, [meta]} =
+      Executor.execute_all([call], state.tool_fns, state, [])
+
+    {block, meta}
   end
 
   # Each call logs {:start, id} and {:done, id} so the tests can see what

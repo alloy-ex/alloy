@@ -155,14 +155,50 @@ defmodule Alloy.Tool.Executor do
   defp invoke({:blocked, _call, reason}, _run), do: {:error, "Blocked: #{reason}", nil}
 
   defp invoke({:execute, call}, run) do
-    case Map.fetch(run.tool_fns, call[:name]) do
-      {:ok, tool} -> execute_tool(Registry.to_inline(tool), call, run.context)
-      :error -> {:error, "Unknown tool: #{call[:name]}", nil}
+    with {:ok, tool} <- fetch_tool(run.tool_fns, call[:name]),
+         input = call[:input] || %{},
+         :ok <- check_input(input, tool) do
+      execute_tool(tool, input, call, run.context)
     end
   end
 
-  defp execute_tool(%Inline{execute: execute} = tool, call, context) do
-    case execute.(call[:input] || %{}, context) do
+  defp fetch_tool(tool_fns, name) do
+    case Map.fetch(tool_fns, name) do
+      {:ok, tool} -> {:ok, Registry.to_inline(tool)}
+      :error -> {:error, "Unknown tool: #{name}", nil}
+    end
+  end
+
+  # Only the shape every tool's execute/2 relies on: an object holding the
+  # schema's required keys. Types are not checked or coerced; third-party
+  # schemas are too loose for that to be safe.
+  defp check_input(input, %Inline{name: name, input_schema: schema}) when is_map(input) do
+    present = MapSet.new(Map.keys(input), &to_string/1)
+
+    case Enum.reject(required_keys(schema), &(&1 in present)) do
+      [] ->
+        :ok
+
+      missing ->
+        {:error,
+         "Missing required parameter(s) for #{name}: #{Enum.join(missing, ", ")}. " <>
+           "Call the tool again with every required parameter.", nil}
+    end
+  end
+
+  defp check_input(input, %Inline{name: name}) do
+    {:error, "Input for #{name} must be a JSON object, got: #{inspect(input)}", nil}
+  end
+
+  defp required_keys(schema) do
+    case Map.get(schema, :required, Map.get(schema, "required")) do
+      keys when is_list(keys) -> Enum.map(keys, &to_string/1)
+      _none -> []
+    end
+  end
+
+  defp execute_tool(%Inline{execute: execute} = tool, input, call, context) do
+    case execute.(input, context) do
       {:ok, text, data} when is_map(data) -> {:ok, maybe_truncate(text, tool), data}
       {:ok, text} -> {:ok, maybe_truncate(text, tool), nil}
       {:error, reason} -> {:error, reason, nil}
