@@ -1,7 +1,10 @@
 defmodule Alloy.Tool.Core.BashTest do
   use ExUnit.Case, async: true
 
+  alias Alloy.Agent.{Config, State}
+  alias Alloy.Message
   alias Alloy.Tool.Core.Bash
+  alias Alloy.Tool.{Executor, Registry}
 
   @moduletag :core_tools
 
@@ -170,6 +173,105 @@ defmodule Alloy.Tool.Core.BashTest do
     test "uses default working directory when not in context" do
       assert {:ok, result} = Bash.execute(%{"command" => "echo works"}, %{})
       assert result =~ "works"
+    end
+  end
+
+  describe "output limits" do
+    test "keeps the head and the tail, where errors appear", %{tmp_dir: tmp_dir} do
+      assert {:ok, result} =
+               Bash.execute(
+                 %{"command" => "seq 1 100000; echo THE_REAL_TAIL; exit 3"},
+                 %{working_directory: tmp_dir}
+               )
+
+      assert String.starts_with?(result, "1\n2\n3\n")
+      assert result =~ ~r/bytes of output truncated/
+      assert String.ends_with?(result, "100000\nTHE_REAL_TAIL\n\nexit code: 3")
+      assert String.length(result) <= Bash.max_result_chars()
+    end
+
+    test "the executor does not truncate bash output a second time" do
+      executor = fn _cmd, _dir -> {String.duplicate("a", 39_000) <> "THE_REAL_TAIL", 1} end
+      {_defs, tool_fns} = Registry.build([Bash])
+
+      state =
+        State.init(%Config{
+          provider: Alloy.Provider.Test,
+          provider_config: %{},
+          tools: [Bash],
+          context: %{bash_executor: executor}
+        })
+
+      call = %{id: "b", name: "bash", type: "tool_use", input: %{"command" => "x"}}
+
+      assert %Message{content: [%{content: out}]} =
+               Executor.execute_all([call], tool_fns, state)
+
+      assert length(Regex.scan(~r/truncated/, out)) == 1
+      assert String.ends_with?(out, "THE_REAL_TAIL\nexit code: 1")
+    end
+
+    test "multibyte output is only marked truncated when something was cut" do
+      short = String.duplicate("é", 10_000)
+      long = String.duplicate("é", 20_001)
+
+      assert {:ok, result} =
+               Bash.execute(%{"command" => "x"}, %{bash_executor: fn _, _ -> {short, 0} end})
+
+      assert result == short <> "\nexit code: 0"
+
+      assert {:ok, result} =
+               Bash.execute(%{"command" => "x"}, %{bash_executor: fn _, _ -> {long, 0} end})
+
+      assert result =~ "truncated"
+      assert String.length(result) < String.length(long)
+      assert String.valid?(result)
+    end
+
+    test "a timed-out command reports the output it produced", %{tmp_dir: tmp_dir} do
+      assert {:error, msg} =
+               Bash.execute(
+                 %{"command" => "echo started; sleep 5", "timeout" => 300},
+                 %{working_directory: tmp_dir}
+               )
+
+      assert msg =~ "started"
+      assert msg =~ "timed out"
+    end
+
+    @tag timeout: 60_000
+    test "huge output is capped while it streams, not buffered", %{tmp_dir: tmp_dir} do
+      bytes = 64 * 1024 * 1024
+      parent = self()
+
+      sampler =
+        spawn_link(fn ->
+          :erlang.garbage_collect()
+          sample_peak(:erlang.memory(:binary), parent)
+        end)
+
+      assert {:ok, result} =
+               Bash.execute(
+                 %{"command" => "head -c #{bytes} /dev/zero | tr '\\0' a", "timeout" => 50_000},
+                 %{working_directory: tmp_dir}
+               )
+
+      send(sampler, :stop)
+      assert_receive {:peak_growth, growth}, 1_000
+
+      # Buffering the whole output (as before) grows binary memory by
+      # roughly twice its size; streaming keeps it to a few chunks.
+      assert growth < div(bytes, 2)
+      assert result =~ "truncated"
+      assert String.length(result) <= Bash.max_result_chars()
+    end
+  end
+
+  defp sample_peak(base, parent, peak \\ 0) do
+    receive do
+      :stop -> send(parent, {:peak_growth, peak})
+    after
+      5 -> sample_peak(base, parent, max(peak, :erlang.memory(:binary) - base))
     end
   end
 

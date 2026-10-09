@@ -3,8 +3,11 @@ defmodule Alloy.Tool.Core.Bash do
   Built-in tool: execute shell commands via `bash -rc` (restricted shell).
 
   Returns stdout/stderr merged with the exit code appended. Output is
-  truncated at 30,000 characters to prevent context overflow.
-  Commands that exceed the timeout are killed, together with every
+  capped while the command runs: the first 8,000 and the last 20,000
+  bytes are kept (errors usually come last) and the middle is replaced by
+  a marker giving the number of bytes left out, so the result fits in
+  `max_result_chars/0` and memory stays bounded however much a command
+  prints. Commands that exceed the timeout are killed, together with every
   process they started, and return an error. The model's `timeout` is
   capped at 10 minutes, or at `:bash_max_timeout` (milliseconds) from the
   agent's `:context`.
@@ -45,7 +48,8 @@ defmodule Alloy.Tool.Core.Bash do
   @default_timeout 10_000
   @max_timeout 600_000
   @kill_grace_ms 2_000
-  @max_output 30_000
+  @head_bytes 8_000
+  @tail_bytes 20_000
 
   @impl true
   def name, do: "bash"
@@ -103,8 +107,8 @@ defmodule Alloy.Tool.Core.Bash do
         end)
 
       case Task.yield(task, timeout + @kill_grace_ms) || Task.shutdown(task, :brutal_kill) do
-        {:ok, {:exited, status, output}} -> {:ok, "#{truncate(output)}\nexit code: #{status}"}
-        {:ok, {:timeout, _output}} -> {:error, timeout_message(timeout)}
+        {:ok, {:exited, status, output}} -> {:ok, "#{output}\nexit code: #{status}"}
+        {:ok, {:timeout, output}} -> {:error, with_output(output, timeout_message(timeout))}
         {:exit, reason} -> {:error, "Executor crashed: #{inspect(reason)}"}
         nil -> {:error, timeout_message(timeout)}
       end
@@ -123,6 +127,9 @@ defmodule Alloy.Tool.Core.Bash do
   defp check_dir(dir) do
     if File.dir?(dir), do: :ok, else: {:error, "Working directory does not exist: #{dir}"}
   end
+
+  defp with_output("", message), do: message
+  defp with_output(output, message), do: output <> "\n\n" <> message
 
   defp timeout_message(timeout) do
     "Command timed out after #{timeout}ms. The process may have started a server, " <>
@@ -144,7 +151,7 @@ defmodule Alloy.Tool.Core.Bash do
       deadline: System.monotonic_time(:millisecond) + timeout
     }
 
-    result = collect(run, [])
+    result = collect(run, new_output())
     Process.demonitor(caller_ref, [:flush])
     result
   end
@@ -159,10 +166,10 @@ defmodule Alloy.Tool.Core.Bash do
   defp collect(%{port: port, caller_ref: caller_ref} = run, output) do
     receive do
       {^port, {:data, data}} ->
-        collect(run, [output | data])
+        collect(run, append(output, data))
 
       {^port, {:exit_status, status}} ->
-        {:exited, status, IO.iodata_to_binary(output)}
+        {:exited, status, render(output)}
 
       {:DOWN, ^caller_ref, :process, _pid, _reason} ->
         kill_group(run.os_pid)
@@ -170,7 +177,7 @@ defmodule Alloy.Tool.Core.Bash do
     after
       max(run.deadline - System.monotonic_time(:millisecond), 0) ->
         kill_group(run.os_pid)
-        {:timeout, IO.iodata_to_binary(output)}
+        {:timeout, render(output)}
     end
   end
 
@@ -195,7 +202,7 @@ defmodule Alloy.Tool.Core.Bash do
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
       {:ok, {output, exit_code}} ->
-        {:ok, "#{truncate(output)}\nexit code: #{exit_code}"}
+        {:ok, "#{new_output() |> append(output) |> render()}\nexit code: #{exit_code}"}
 
       {:exit, reason} ->
         {:error, "Executor crashed: #{inspect(reason)}"}
@@ -213,9 +220,55 @@ defmodule Alloy.Tool.Core.Bash do
 
   defp normalize_timeout(_timeout, max), do: min(@default_timeout, max)
 
-  defp truncate(output) when byte_size(output) > @max_output do
-    String.slice(output, 0, @max_output) <> "\n... (output truncated)"
+  # Output is capped as it streams: the first @head_bytes and the last
+  # @tail_bytes are kept and the middle is only counted, so a command that
+  # prints gigabytes costs a few chunks of memory. Errors usually come
+  # last, so most of the budget goes to the tail. The result (plus the
+  # marker and exit code) stays under max_result_chars/0, so the executor
+  # never truncates it a second time.
+  defp new_output, do: %{head: "", tail: [], tail_size: 0, total: 0}
+
+  defp append(output, data) do
+    output = %{output | total: output.total + byte_size(data)}
+    room = @head_bytes - byte_size(output.head)
+
+    case data do
+      <<to_head::binary-size(^room), rest::binary>> ->
+        append_tail(%{output | head: output.head <> to_head}, rest)
+
+      _fits_in_head ->
+        %{output | head: output.head <> data}
+    end
   end
 
-  defp truncate(output), do: output
+  defp append_tail(output, ""), do: output
+
+  defp append_tail(output, data) do
+    size = output.tail_size + byte_size(data)
+
+    if size > 2 * @tail_bytes do
+      tail = last_bytes(IO.iodata_to_binary([output.tail, data]), @tail_bytes)
+      %{output | tail: tail, tail_size: @tail_bytes}
+    else
+      %{output | tail: [output.tail, data], tail_size: size}
+    end
+  end
+
+  defp render(%{head: head, tail: tail, total: total}) do
+    tail = last_bytes(IO.iodata_to_binary(tail), @tail_bytes)
+
+    text =
+      case total - byte_size(head) - byte_size(tail) do
+        0 -> head <> tail
+        omitted -> head <> "\n\n[... #{omitted} bytes of output truncated ...]\n\n" <> tail
+      end
+
+    # A cut can split a multibyte character; the result must stay UTF-8.
+    String.replace_invalid(text)
+  end
+
+  defp last_bytes(binary, n) when byte_size(binary) > n,
+    do: binary_part(binary, byte_size(binary) - n, n)
+
+  defp last_bytes(binary, _n), do: binary
 end
