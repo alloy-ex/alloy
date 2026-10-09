@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Alloy 0.13 is the loop and nothing else: the supervised runtime moves to
+the `alloy_agent` package, memory and compaction become an ordinary tool
+and ordinary middleware, and what 0.12.5 deprecated is removed. See
+[Upgrading to 0.13](docs/upgrading-to-0.13.md).
+
+### Removed
+
+- **The agent runtime moved to [`alloy_agent`](https://github.com/alloy-ex/alloy_agent):**
+  `Alloy.Agent.Server`, `Alloy.Session`, `Alloy.send_message/3`,
+  `Alloy.cancel_request/2`, the `config :alloy, :pubsub` app-start PubSub
+  and the optional `phoenix_pubsub` dependency. The deprecated
+  `Alloy.Agent.Events` shim is gone; use `Alloy.Events`.
+- **Everything 0.12.5 deprecated:**
+  - `:max_budget_cents` and the `:budget_exceeded` status. Use the
+    budget middleware recipe.
+  - Anthropic `:extended_thinking`. Setting it now raises instead of
+    silently turning thinking off.
+  - Codex `:auth_path`. Setting it now returns an error instead of
+    silently running as the default account.
+  - `State.materialize/1`, `State.cleanup/1` and `state.messages_new`.
+  - `ModelMetadata.catalog/0` and its `model_entry` type.
+  - `Message.server_tool_result_block/3`.
+- `Alloy.Memory.Router`'s public functions (`dispatch_all/2`,
+  `memory_call?/1`, `tool_name/0`); the router is internal now.
+- `state.current_task` and `state.pending_requests`, which were server
+  state.
+
+### Changed
+
+- **Unknown options raise.** `Alloy.run/2`, `Alloy.stream/3` and
+  `Config.from_opts/1` ignored options they did not know, so a typo ran
+  silently without its setting. Server options name `alloy_agent` in the
+  error.
+- **Memory is an ordinary tool.** `Alloy.Memory.tool/1` builds it, and
+  `memory:` is shorthand for it.
+  - Memory calls run through the tool executor, so `:before_tool_call`
+    middleware, tool events, `:tool_timeout` and `result.tool_calls` cover
+    them; they bypassed all four.
+  - They run one at a time in call order.
+  - Memory now works with every provider: Anthropic gets its native
+    `memory_20250818` tool, and the others get a function tool with the
+    same commands.
+- **Compaction is middleware.** `Alloy.Context.Compactor` implements
+  `Alloy.Middleware`, and `Alloy.run/2` puts it first, so default behaviour
+  is unchanged.
+  - `compaction: false` turns it off, and listing it in `:middleware`
+    chooses its position.
+  - A hand-built `%Config{}` gets no compaction unless it lists the
+    compactor.
+  - On a context-overflow error the loop runs the new
+    `:on_context_overflow` hook and retries once, only if the messages
+    changed. 0.12 retried even when nothing could be removed.
+  - `:after_compaction` and `[:alloy, :compaction, :done]` now also fire
+    after that forced compaction.
+- **Tool names must be unique.** Two tools with the same name raise at
+  startup instead of reaching the API, which rejects them.
+
+### Added
+
+- `Alloy.Tool.native_types/0` (optional) and `:native_types` on inline
+  tools: a provider's built-in type for the tool, such as Anthropic's
+  `memory_20250818`.
+- The `:on_context_overflow` middleware hook.
+- `Alloy.Agent.State.deadline`: the monotonic deadline for the run's
+  provider requests, for middleware that makes its own.
+
 ## [0.12.5] - 2026-10-09
 
 ### Security

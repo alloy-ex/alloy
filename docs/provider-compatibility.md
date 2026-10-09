@@ -37,8 +37,8 @@ Alloy.run("Summarize this repository",
 )
 ```
 
-For current Claude models, use adaptive thinking through existing passthrough.
-Omit the legacy `extended_thinking` option. Thinking text is omitted by default
+For current Claude models, use adaptive thinking through existing passthrough
+(the `extended_thinking` option was removed in 0.13). Thinking text is omitted by default
 on several new models; request summarized display when your UI needs it.
 Do not carry old sampling or forced-tool-choice settings into a new model
 without checking its contract. [Thinking configuration](https://platform.claude.com/docs/en/build-with-claude/thinking).
@@ -88,9 +88,8 @@ meaning: `input_tokens` is uncached input, cache reads and writes are in
 `output_tokens` includes reasoning or thinking tokens. Total prompt tokens
 are the sum of the three input fields.
 
-No built-in provider attaches a monetary cost. `max_budget_cents` is
-deprecated (removed in 0.13) because it only acts on provider-reported costs;
-enforce a budget with `:before_completion` middleware that prices
+No built-in provider attaches a monetary cost, which is why the
+`max_budget_cents` option was removed in 0.13; enforce a budget with `:before_completion` middleware that prices
 `state.usage` (see "Budget limits" in the README). Application billing
 controls must still account for cache tiers, long-context surcharges and
 server-tool fees. `Alloy.Usage.estimate_cost/3` is a helper, not price

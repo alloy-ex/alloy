@@ -96,6 +96,7 @@ defmodule Alloy.MixProject do
       source_url: @source_url,
       source_ref: "v#{@version}",
       extras: [
+        "docs/upgrading-to-0.13.md",
         "docs/events.md",
         "docs/provider-compatibility.md",
         "docs/recipes/sub-agents.md",
@@ -103,7 +104,7 @@ defmodule Alloy.MixProject do
         "livebooks/quickstart.livemd"
       ],
       groups_for_extras: [
-        Guides: ~r{docs/(events|provider-compatibility)\.md|livebooks/.*},
+        Guides: ~r{docs/(upgrading-to-0\.13|events|provider-compatibility)\.md|livebooks/.*},
         Recipes: ~r{docs/recipes/.*}
       ],
       groups_for_modules: [
@@ -145,8 +146,7 @@ defmodule Alloy.MixProject do
           Alloy.Context.Compactor
         ],
         Memory: [
-          Alloy.Memory,
-          Alloy.Memory.Router
+          Alloy.Memory
         ],
         Middleware: [
           Alloy.Middleware
