@@ -32,6 +32,37 @@ defmodule Alloy.MemoryTest do
       assert reason =~ "upward traversal"
     end
 
+    test "rejects siblings that only share the /memories prefix" do
+      for path <- ["/memories_evil/x", "/memories..", "/memoriesfoo", "/memories.bak/a"] do
+        assert {:error, reason} = Memory.validate_path(path), path
+        assert reason =~ "must start with /memories"
+      end
+    end
+
+    test "rejects encoded, Windows-style and NUL traversal" do
+      for path <- [
+            "/memories/%2e%2e/secrets.env",
+            "/memories/%2E%2E%2Fsecrets.env",
+            "/memories/..\\..\\secrets.env",
+            "/memories/a\\b",
+            "/memories/a" <> <<0>> <> ".md"
+          ] do
+        assert {:error, _reason} = Memory.validate_path(path), inspect(path)
+      end
+    end
+
+    test "rejects .. as any segment" do
+      for path <- ["/memories/..", "/memories/a/../b", "/memories/../memories/x"] do
+        assert {:error, reason} = Memory.validate_path(path), path
+        assert reason =~ "upward traversal"
+      end
+    end
+
+    test "collapses . segments" do
+      assert Memory.validate_path("/memories/./a/./b.md") == {:ok, "/memories/a/b.md"}
+      assert Memory.validate_path("/memories/.") == {:ok, "/memories"}
+    end
+
     test "rejects non-string input" do
       assert {:error, reason} = Memory.validate_path(nil)
       assert reason =~ "must be a string"

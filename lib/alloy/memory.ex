@@ -41,10 +41,13 @@ defmodule Alloy.Memory do
 
   ## Path rules
 
-  All paths must start with `/memories/` (no leading path traversal,
-  no absolute filesystem paths leaking in). `Alloy.Memory.validate_path/1`
-  enforces this before routing a call to the store — the store does
-  not need to re-check.
+  All paths must be `/memories` or start with `/memories/`, with no `..`
+  segment and no `%`, `\\` or NUL byte. `Alloy.Memory.validate_path/1`
+  enforces this before routing a call to the store, so the store does
+  not need to re-check. The router also refuses to `delete` or `rename`
+  the `/memories` root itself, applies `view_range` to the text `view/2`
+  returns, and passes `""` as `new_str` when the model omits it (which
+  deletes `old_str`), as the memory tool contract specifies.
 
   ## Provider support
 
@@ -99,7 +102,8 @@ defmodule Alloy.Memory do
   Replace the first occurrence of `old_str` with `new_str` inside the
   file at `path`. The store should return an error if `old_str` is
   not found or if the match is non-unique — the model uses the error
-  message to decide what to do next.
+  message to decide what to do next. `new_str` is `""` when the model
+  omits it, which deletes `old_str`.
   """
   @callback str_replace(store(), path(), old_str :: String.t(), new_str :: String.t()) :: result()
 
@@ -121,34 +125,36 @@ defmodule Alloy.Memory do
   @callback rename(store(), old_path :: path(), new_path :: path()) :: result()
 
   @doc """
-  Validate that `path` is rooted at `/memories/` and contains no
-  upward traversal. Returns `{:ok, normalized}` or `{:error, reason}`.
+  Validate that `path` is `/memories` or lies under `/memories/` and
+  contains no traversal. Returns `{:ok, normalized}` or
+  `{:error, reason}`.
 
-  The returned path has any `./` segments collapsed and no trailing
-  slash (except the root `/memories/`).
+  Rejected: paths that merely share the prefix (`/memories_evil/x`,
+  `/memories..`), any `..` segment, and any `%`, `\\` or NUL byte, which
+  rules out URL-encoded (`%2e%2e%2f`) and Windows-style (`..\\`)
+  traversal before a store decodes or maps the path.
+
+  The returned path has repeated slashes and `.` segments collapsed and
+  no trailing slash, so the root is always `/memories`.
   """
   @spec validate_path(String.t()) :: {:ok, path()} | {:error, String.t()}
   def validate_path(path) when is_binary(path) do
-    cond do
-      not String.starts_with?(path, "/memories") ->
-        {:error, "path must start with /memories: #{inspect(path)}"}
+    segments = String.split(path, "/")
 
-      String.contains?(path, "/../") or String.ends_with?(path, "/..") ->
+    cond do
+      path != "/memories" and not String.starts_with?(path, "/memories/") ->
+        {:error, "path must start with /memories/ (or be /memories): #{inspect(path)}"}
+
+      String.contains?(path, ["%", "\\", <<0>>]) ->
+        {:error, "path must not contain %, \\ or NUL bytes: #{inspect(path)}"}
+
+      ".." in segments ->
         {:error, "path must not contain upward traversal: #{inspect(path)}"}
 
       true ->
-        {:ok, normalize(path)}
+        {:ok, "/" <> Enum.join(Enum.reject(segments, &(&1 in ["", "."])), "/")}
     end
   end
 
   def validate_path(other), do: {:error, "path must be a string, got: #{inspect(other)}"}
-
-  defp normalize("/memories"), do: "/memories"
-  defp normalize("/memories/"), do: "/memories"
-
-  defp normalize(path) do
-    path
-    |> String.replace(~r{/+}, "/")
-    |> String.replace_suffix("/", "")
-  end
 end
