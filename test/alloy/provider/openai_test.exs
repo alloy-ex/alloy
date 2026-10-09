@@ -293,7 +293,7 @@ defmodule Alloy.Provider.OpenAITest do
     test "includes native Responses API controls in the request body" do
       config =
         config_that_captures_request()
-        |> Map.put(:provider_state, %{response_id: "resp_prev"})
+        |> Map.put(:previous_response_id, "resp_prev")
         |> Map.put(:store, true)
         |> Map.put(:include, ["inline_citations"])
         |> Map.put(:tool_choice, "required")
@@ -373,7 +373,33 @@ defmodule Alloy.Provider.OpenAITest do
       assert Enum.any?(decoded["input"], &(&1["type"] == "function_call"))
     end
 
-    test "explicit previous_response_id overrides provider_state response_id" do
+    test "provider_state response_id does not chain the request" do
+      reasoning = reasoning_item("rs_prev", "encrypted-state")
+
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{response_id: "resp_prev"})
+
+      messages = [
+        Message.user("Read"),
+        Message.assistant_blocks([
+          %{type: "reasoning", raw: reasoning},
+          %{type: "tool_use", id: "call_1", name: "read", input: %{}}
+        ]),
+        Message.tool_results([Message.tool_result_block("call_1", "contents")])
+      ]
+
+      OpenAI.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      refute Map.has_key?(decoded, "previous_response_id")
+      assert decoded["include"] == ["reasoning.encrypted_content"]
+      assert reasoning in decoded["input"]
+    end
+
+    test "explicit previous_response_id is sent even when provider_state has another id" do
       config =
         config_that_captures_request()
         |> Map.put(:provider_state, %{response_id: "resp_prev"})
@@ -724,6 +750,47 @@ defmodule Alloy.Provider.OpenAITest do
                OpenAI.complete([Message.user("Hi")], [], config)
 
       assert Exception.message(reason) =~ "rate_limit"
+    end
+  end
+
+  describe "in the agent loop" do
+    test "a tool loop resends the history statelessly instead of chaining" do
+      parent = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+        send(parent, {:request, request})
+
+        output =
+          if Enum.any?(request["input"], &(&1["type"] == "function_call_output")) do
+            [assistant_text_item("done")]
+          else
+            [
+              reasoning_item("rs_1", "encrypted-state"),
+              function_call_item("call_1", "echo", ~s({"text":"hi"}))
+            ]
+          end
+
+        Plug.Conn.send_resp(conn, 200, Jason.encode!(response_payload(output)))
+      end
+
+      assert {:ok, result} =
+               Alloy.run("Echo hi",
+                 provider:
+                   {OpenAI, api_key: "sk-test", model: "gpt-5.4", req_options: [plug: plug]},
+                 tools: [Alloy.Test.EchoTool]
+               )
+
+      assert result.text == "done"
+      assert result.metadata.provider_state == %{response_id: "resp_test"}
+
+      assert_received {:request, _first}
+      assert_received {:request, second}
+
+      refute Map.has_key?(second, "previous_response_id")
+      assert second["include"] == ["reasoning.encrypted_content"]
+      assert [%{"role" => "user"}, %{"type" => "reasoning"} | _] = second["input"]
     end
   end
 

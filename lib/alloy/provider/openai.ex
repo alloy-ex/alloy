@@ -17,22 +17,37 @@ defmodule Alloy.Provider.OpenAI do
   - `:api_url` - Base URL (default: "https://api.openai.com"). Can point to
     compatible Responses APIs such as xAI's "https://api.x.ai"
   - `:provider_state` - opaque provider-owned state carried across turns.
-    For Responses APIs Alloy uses `%{response_id: "..."}`
+    Each response's ID is recorded as `%{response_id: "..."}`; it is
+    informational and never sent back automatically
   - `:store` - Persist the response server-side when supported
   - `:include` - Additional response fields to include
   - `:tool_choice` - Provider-native tool selection mode
   - `:parallel_tool_calls` - Whether the provider may issue tool calls in parallel
-  - `:previous_response_id` - Explicit Responses continuation ID. Overrides
-    `provider_state.response_id` when both are present
+  - `:previous_response_id` - Continue a stored response (see "Chaining
+    responses" below)
   - `:built_in_tools` - provider-native tool definitions to append to custom
     function tools
   - `:web_search` - `true` or a config map to append a `web_search` tool
   - `:x_search` - `true` or a config map to append an `x_search` tool
   - `:req_options` - Additional options passed to Req
 
-  In stateless mode (`store` not `true` with no previous response ID), Alloy
-  automatically requests encrypted reasoning content and round-trips opaque
-  reasoning output items between tool calls.
+  ## Conversation state
+
+  By default every request carries the full conversation, like every other
+  Alloy provider. In this stateless mode (`store` not `true` and no
+  `:previous_response_id`), Alloy requests encrypted reasoning content and
+  round-trips the opaque reasoning output items between tool calls.
+
+  ## Chaining responses
+
+  To continue a response stored server-side instead, pass its ID as
+  `:previous_response_id` together with only the messages added since that
+  response. The server prepends the stored conversation, so sending the full
+  history as well would duplicate it (and bill it twice). The ID of the
+  latest response is in `result.metadata.provider_state.response_id`. A
+  chained response must have been created with `store` enabled (the API's
+  default). Tool-loop turns within one run keep the same
+  `:previous_response_id`, so they still send only the run's new messages.
 
   ## Example
 
@@ -146,7 +161,10 @@ defmodule Alloy.Provider.OpenAI do
         "max_output_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
         "input" => input_items
       }
-      |> maybe_put_previous_response_id(config)
+      |> maybe_put_optional_request_field(
+        "previous_response_id",
+        Map.get(config, :previous_response_id)
+      )
       |> maybe_put_optional_request_field("store", Map.get(config, :store))
       |> maybe_put_optional_request_field("include", Map.get(config, :include))
       |> maybe_put_reasoning_include(config)
@@ -177,15 +195,6 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp stringify_extra_body(_), do: %{}
-
-  defp maybe_put_previous_response_id(body, config) do
-    maybe_put_optional_request_field(body, "previous_response_id", previous_response_id(config))
-  end
-
-  defp previous_response_id(config) do
-    Map.get(config, :previous_response_id) ||
-      get_in(config, [:provider_state, :response_id])
-  end
 
   defp maybe_put_optional_request_field(body, _key, nil), do: body
   defp maybe_put_optional_request_field(body, _key, value) when value == [], do: body
@@ -252,7 +261,7 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp stateless_reasoning_echo?(config) do
-    Map.get(config, :store) != true and is_nil(previous_response_id(config))
+    Map.get(config, :store) != true and is_nil(Map.get(config, :previous_response_id))
   end
 
   defp format_input_item(%Message{role: :user, content: content}, _stateless?)
