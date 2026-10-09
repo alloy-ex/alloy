@@ -3,13 +3,24 @@ defmodule Alloy.Provider.OpenAICompat do
   Generic OpenAI-compatible provider.
 
   Works with any API that implements the OpenAI chat completions format:
-  DeepSeek, Mistral, xAI/Grok, Ollama, OpenRouter, Together, Groq, etc.
+  DeepSeek, Mistral, Kimi, GLM, Ollama, OpenRouter, Together, Groq, etc.
+
+  Reasoning returned as `reasoning_content` (DeepSeek, Kimi, GLM) becomes a
+  `"thinking"` block and is sent back on later assistant messages, which
+  DeepSeek's thinking mode requires during tool calls.
+
+  Two providers have better native options:
+
+  - OpenAI: use `Alloy.Provider.OpenAI`. Starting with GPT-5.4, Chat
+    Completions does not support tool calling with reasoning enabled.
+  - xAI: use `Alloy.Provider.XAI`. xAI's Chat Completions endpoint is
+    deprecated and returns no reasoning content.
 
   ## Config
 
   Required:
   - `:api_url` - Base URL (e.g., "https://api.deepseek.com",
-    "https://api.mistral.ai", "https://api.x.ai", "http://localhost:11434")
+    "https://api.mistral.ai", "http://localhost:11434")
   - `:model` - Model name
 
   Optional:
@@ -32,7 +43,7 @@ defmodule Alloy.Provider.OpenAICompat do
         provider: {Alloy.Provider.OpenAICompat,
           api_key: System.get_env("DEEPSEEK_API_KEY"),
           api_url: "https://api.deepseek.com",
-          model: "deepseek-chat"
+          model: "deepseek-v4-pro"
         }
       )
 
@@ -41,15 +52,6 @@ defmodule Alloy.Provider.OpenAICompat do
         provider: {Alloy.Provider.OpenAICompat,
           api_url: "http://localhost:11434",
           model: "llama4"
-        }
-      )
-
-      # xAI chat completions compatibility
-      Alloy.run("Hello",
-        provider: {Alloy.Provider.OpenAICompat,
-          api_key: System.get_env("XAI_API_KEY"),
-          api_url: "https://api.x.ai",
-          model: "grok-code-fast-1"
         }
       )
 

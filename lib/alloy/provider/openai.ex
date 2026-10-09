@@ -3,13 +3,15 @@ defmodule Alloy.Provider.OpenAI do
   Provider for OpenAI's Responses API.
 
   Normalizes OpenAI's response output items (assistant messages + function
-  calls) to Alloy's content-block format.
+  calls) to Alloy's content-block format. Use this provider, not
+  `Alloy.Provider.OpenAICompat`, for OpenAI models: starting with GPT-5.4,
+  Chat Completions does not support tool calling with reasoning enabled.
 
   ## Config
 
   Required:
   - `:api_key` - OpenAI API key
-  - `:model` - Model name (e.g., "gpt-5.4", "gpt-5.1", "o3-pro")
+  - `:model` - Model name (e.g., "gpt-6-astra", "gpt-6.1-sol", "gpt-5.4")
 
   Optional:
   - `:max_tokens` - Max output tokens, reasoning tokens included. Omitted
@@ -17,7 +19,7 @@ defmodule Alloy.Provider.OpenAI do
     reasoning model with no tokens for its answer
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.openai.com"). Can point to
-    compatible Responses APIs such as xAI's "https://api.x.ai"
+    compatible Responses APIs; for xAI use `Alloy.Provider.XAI`
   - `:provider_state` - opaque provider-owned state carried across turns.
     Each response's ID is recorded as `%{response_id: "..."}`; it is
     informational and never sent back automatically
@@ -38,7 +40,11 @@ defmodule Alloy.Provider.OpenAI do
   By default every request carries the full conversation, like every other
   Alloy provider. In this stateless mode (`store` not `true` and no
   `:previous_response_id`), Alloy requests encrypted reasoning content and
-  round-trips the opaque reasoning output items between tool calls.
+  replays every output item: reasoning items are kept as
+  `%{type: "reasoning", raw: item}` blocks and other non-message items
+  (built-in tool calls, compaction items) as `%{type: "output_item", raw:
+  item}` blocks. An assistant message's `phase` is kept on its text blocks
+  and always sent back.
 
   ## Chaining responses
 
@@ -60,13 +66,6 @@ defmodule Alloy.Provider.OpenAI do
         }
       )
 
-      Alloy.run("Review this repo",
-        provider: {Alloy.Provider.OpenAI,
-          api_key: System.get_env("XAI_API_KEY"),
-          api_url: "https://api.x.ai",
-          model: "grok-4"
-        }
-      )
   """
 
   @behaviour Alloy.Provider

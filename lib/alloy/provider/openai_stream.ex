@@ -3,7 +3,7 @@ defmodule Alloy.Provider.OpenAIStream do
   Shared OpenAI-format SSE stream parser.
 
   Used by `Alloy.Provider.OpenAICompat` for Chat Completions providers
-  such as DeepSeek, Mistral, OpenRouter, Gemini, xAI, and Ollama.
+  such as DeepSeek, Mistral, OpenRouter, Gemini, and Ollama.
   The native OpenAI and xAI providers use Responses API parsing instead.
   Each compatible provider calls `stream/5` with its
   own URL and headers; this module handles SSE parsing and response
