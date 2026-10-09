@@ -881,6 +881,53 @@ defmodule Alloy.Provider.AnthropicTest do
       refute_received {:chunk, _}
     end
 
+    test "takes cumulative message_delta usage instead of adding it to message_start" do
+      # Numbers from the web search example in
+      # https://platform.claude.com/docs/en/build-with-claude/streaming
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{
+              "usage" => %{
+                "input_tokens" => 2679,
+                "cache_creation_input_tokens" => 0,
+                "cache_read_input_tokens" => 0,
+                "output_tokens" => 3
+              }
+            }
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "Answer."}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil},
+            "usage" => %{
+              "input_tokens" => 10_682,
+              "cache_creation_input_tokens" => 0,
+              "cache_read_input_tokens" => nil,
+              "output_tokens" => 510,
+              "server_tool_use" => %{"web_search_requests" => 1}
+            }
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      assert {:ok, result} = Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert result.usage == %{
+               input_tokens: 10_682,
+               output_tokens: 510,
+               cache_creation_input_tokens: 0,
+               cache_read_input_tokens: 0
+             }
+    end
+
     test "accumulates tool call input_json_delta without emitting chunks" do
       config =
         config_with_sse_stream([

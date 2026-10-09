@@ -213,24 +213,19 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   # The delta carries the message's final top-level fields (stop_reason,
-  # stop_details, container); null fields leave earlier values in place.
+  # stop_details, container). Its usage is cumulative, so it replaces the
+  # message_start counts rather than adding to them.
   defp handle_sse_event(acc, "message_delta", %{"delta" => delta} = event) do
-    usage = merge_sse_usage(Map.get(acc.message, "usage", %{}), Map.get(event, "usage", %{}))
-
-    message =
-      acc.message
-      |> Map.merge(Map.reject(delta, fn {_key, value} -> is_nil(value) end))
-      |> Map.put("usage", usage)
-
+    usage = put_present(Map.get(acc.message, "usage", %{}), Map.get(event, "usage", %{}))
+    message = acc.message |> put_present(delta) |> Map.put("usage", usage)
     %{acc | message: message}
   end
 
   defp handle_sse_event(acc, _event_type, _data), do: acc
 
-  defp merge_sse_usage(existing, new) do
-    Map.merge(existing, new, fn _k, v1, v2 ->
-      if is_number(v1) and is_number(v2), do: v1 + v2, else: v2
-    end)
+  # A null in a later event means "not reported here", not "reset".
+  defp put_present(map, updates) do
+    Map.merge(map, Map.reject(updates, fn {_key, value} -> is_nil(value) end))
   end
 
   defp build_stream_response(acc) do
