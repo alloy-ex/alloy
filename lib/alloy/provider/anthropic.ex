@@ -13,7 +13,10 @@ defmodule Alloy.Provider.Anthropic do
     "claude-sonnet-4-6", "claude-haiku-4-5")
 
   Optional:
-  - `:max_tokens` - Max output tokens (default: 4096)
+  - `:max_tokens` - Max output tokens, thinking included (default: 16_000).
+    Thinking is on by default on Claude 5.x models and counts toward this
+    limit, so a low value can cut off the answer (`stop_reason: :max_tokens`).
+    Raise it for long outputs or high effort.
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.anthropic.com")
   - `:api_version` - API version header (default: "2023-06-01")
@@ -72,7 +75,9 @@ defmodule Alloy.Provider.Anthropic do
 
   @default_api_url "https://api.anthropic.com"
   @default_api_version "2023-06-01"
-  @default_max_tokens 4096
+  # Thinking counts toward max_tokens and is on by default on Claude 5.x;
+  # this is the value Anthropic's thinking examples use.
+  @default_max_tokens 16_000
   # code_execution_20260120 and later support programmatic tool calling;
   # every model that has code execution accepts this version.
   @code_execution_tool_type "code_execution_20260521"

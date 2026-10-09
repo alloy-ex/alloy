@@ -162,6 +162,26 @@ defmodule Alloy.Provider.AnthropicTest do
       assert hd(decoded["messages"])["content"] == "Hello"
     end
 
+    test "defaults max_tokens to 16_000 so thinking leaves room for the answer" do
+      # The docs' adaptive thinking examples use max_tokens: 16000:
+      # https://platform.claude.com/docs/en/build-with-claude/thinking
+      config = Map.delete(config_that_captures_request(), :max_tokens)
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["max_tokens"] == 16_000
+    end
+
+    test "sends an explicit max_tokens unchanged" do
+      config = Map.put(config_that_captures_request(), :max_tokens, 1024)
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["max_tokens"] == 1024
+    end
+
     test "includes system prompt in request" do
       config =
         config_that_captures_request()
