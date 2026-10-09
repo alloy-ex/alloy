@@ -54,6 +54,25 @@ defmodule Alloy.Provider.OpenAIStream do
     end
   end
 
+  @doc false
+  # Shared with OpenAICompat's non-streaming path so both read finish
+  # reasons and usage the same way.
+  @spec completion_response([Message.content_block()], String.t() | nil, map()) ::
+          Alloy.Provider.completion_response()
+  def completion_response(content_blocks, finish_reason, usage) do
+    put_stop_details(
+      %{
+        stop_reason: stop_reason(finish_reason),
+        messages: [%Message{role: :assistant, content: content_blocks}],
+        usage: %{
+          input_tokens: Map.get(usage, "prompt_tokens", 0),
+          output_tokens: Map.get(usage, "completion_tokens", 0)
+        }
+      },
+      finish_reason
+    )
+  end
+
   # Request usage by default, but preserve custom options and omit the field
   # entirely when the caller disables it for a less compatible endpoint.
   defp put_stream_options(%{"stream_options" => false} = body),
@@ -234,24 +253,19 @@ defmodule Alloy.Provider.OpenAIStream do
 
       tool_blocks ->
         content_blocks = reasoning_blocks ++ text_blocks ++ Enum.reverse(tool_blocks)
-        stop_reason = parse_finish_reason(acc.finish_reason)
-        message = %Message{role: :assistant, content: content_blocks}
-
-        {:ok,
-         %{
-           stop_reason: stop_reason,
-           messages: [message],
-           usage: %{
-             input_tokens: Map.get(acc.usage, "prompt_tokens", 0),
-             output_tokens: Map.get(acc.usage, "completion_tokens", 0)
-           }
-         }}
+        {:ok, completion_response(content_blocks, acc.finish_reason, acc.usage)}
     end
   end
 
-  defp parse_finish_reason("stop"), do: :end_turn
-  defp parse_finish_reason("tool_calls"), do: :tool_use
-  defp parse_finish_reason("length"), do: :end_turn
-  defp parse_finish_reason("content_filter"), do: :end_turn
-  defp parse_finish_reason(_), do: :end_turn
+  defp stop_reason("length"), do: :max_tokens
+  defp stop_reason("content_filter"), do: :refusal
+  defp stop_reason(reason) when reason in ["tool_calls", "function_call"], do: :tool_use
+  # "stop", a reason omitted before [DONE], and provider-specific values.
+  defp stop_reason(_reason), do: :end_turn
+
+  defp put_stop_details(response, "content_filter") do
+    Map.put(response, :response_metadata, %{stop_details: %{"finish_reason" => "content_filter"}})
+  end
+
+  defp put_stop_details(response, _finish_reason), do: response
 end

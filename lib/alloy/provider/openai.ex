@@ -12,7 +12,9 @@ defmodule Alloy.Provider.OpenAI do
   - `:model` - Model name (e.g., "gpt-5.4", "gpt-5.1", "o3-pro")
 
   Optional:
-  - `:max_tokens` - Max output tokens (default: 4096)
+  - `:max_tokens` - Max output tokens, reasoning tokens included. Omitted
+    unless set, so the model's own limit applies: a small cap can leave a
+    reasoning model with no tokens for its answer
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.openai.com"). Can point to
     compatible Responses APIs such as xAI's "https://api.x.ai"
@@ -74,7 +76,6 @@ defmodule Alloy.Provider.OpenAI do
 
   @default_api_url "https://api.openai.com"
   @terminal_events ["response.completed", "response.incomplete", "response.failed"]
-  @default_max_tokens 4096
 
   @typedoc """
   Configuration for the OpenAI provider. See the module doc for field
@@ -156,11 +157,8 @@ defmodule Alloy.Provider.OpenAI do
     input_items = build_input_items(messages, config)
 
     body =
-      %{
-        "model" => config.model,
-        "max_output_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
-        "input" => input_items
-      }
+      %{"model" => config.model, "input" => input_items}
+      |> maybe_put_optional_request_field("max_output_tokens", Map.get(config, :max_tokens))
       |> maybe_put_optional_request_field(
         "previous_response_id",
         Map.get(config, :previous_response_id)

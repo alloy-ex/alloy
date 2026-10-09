@@ -14,7 +14,8 @@ defmodule Alloy.Provider.OpenAICompat do
 
   Optional:
   - `:api_key` - API key (omit for local providers like Ollama)
-  - `:max_tokens` - Max output tokens (default: 4096)
+  - `:max_tokens` - Max output tokens. Omitted unless set, so the server's
+    default applies
   - `:system_prompt` - System prompt string
   - `:chat_path` - Path to completions endpoint (default: "/v1/chat/completions")
   - `:extra_headers` - Additional headers as `[{name, value}]`
@@ -68,7 +69,6 @@ defmodule Alloy.Provider.OpenAICompat do
   alias Alloy.Message
   alias Alloy.Provider.{Error, HTTP, OpenAIStream}
 
-  @default_max_tokens 4096
   @default_chat_path "/v1/chat/completions"
 
   @typedoc """
@@ -143,11 +143,12 @@ defmodule Alloy.Provider.OpenAICompat do
   defp build_request_body(messages, tool_defs, config) do
     openai_messages = build_messages(messages, config)
 
-    body = %{
-      "model" => config.model,
-      "max_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
-      "messages" => openai_messages
-    }
+    body =
+      maybe_put(
+        %{"model" => config.model, "messages" => openai_messages},
+        "max_tokens",
+        Map.get(config, :max_tokens)
+      )
 
     body =
       case tool_defs do
@@ -158,6 +159,9 @@ defmodule Alloy.Provider.OpenAICompat do
     # Merge extra_body LAST so caller can override any field
     Map.merge(body, Map.get(config, :extra_body, %{}))
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp build_messages(messages, config) do
     system_msgs =
@@ -270,23 +274,10 @@ defmodule Alloy.Provider.OpenAICompat do
   end
 
   defp parse_response(%{"choices" => [choice | _]} = resp) do
-    message = choice["message"]
-    finish_reason = choice["finish_reason"]
-    usage = resp["usage"] || %{}
-
-    case parse_message_to_blocks(message) do
+    case parse_message_to_blocks(choice["message"]) do
       {:ok, content_blocks} ->
-        stop_reason = parse_finish_reason(finish_reason)
-
-        {:ok,
-         %{
-           stop_reason: stop_reason,
-           messages: [%Message{role: :assistant, content: content_blocks}],
-           usage: %{
-             input_tokens: Map.get(usage, "prompt_tokens", 0),
-             output_tokens: Map.get(usage, "completion_tokens", 0)
-           }
-         }}
+        usage = resp["usage"] || %{}
+        {:ok, OpenAIStream.completion_response(content_blocks, choice["finish_reason"], usage)}
 
       {:error, _} = err ->
         err
@@ -347,8 +338,4 @@ defmodule Alloy.Provider.OpenAICompat do
       sig -> Map.put(block, :thought_signature, sig)
     end
   end
-
-  defp parse_finish_reason("stop"), do: :end_turn
-  defp parse_finish_reason("tool_calls"), do: :tool_use
-  defp parse_finish_reason(_), do: :end_turn
 end

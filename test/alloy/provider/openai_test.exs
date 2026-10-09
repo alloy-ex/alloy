@@ -311,6 +311,19 @@ defmodule Alloy.Provider.OpenAITest do
       assert decoded["parallel_tool_calls"] == false
     end
 
+    test "sends max_output_tokens only when :max_tokens is set" do
+      # Reasoning tokens count against max_output_tokens, so a default
+      # would truncate reasoning models before they write any text.
+      config = Map.delete(config_that_captures_request(), :max_tokens)
+      OpenAI.complete([Message.user("Hi")], [], config)
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "max_output_tokens")
+
+      OpenAI.complete([Message.user("Hi")], [], Map.put(config, :max_tokens, 2048))
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["max_output_tokens"] == 2048
+    end
+
     test "stateless requests include encrypted reasoning content" do
       config = config_that_captures_request()
 

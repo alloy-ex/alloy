@@ -55,6 +55,17 @@ defmodule Alloy.Provider.OpenAICompatTest do
   end
 
   describe "request formatting" do
+    test "sends max_tokens only when :max_tokens is set" do
+      config = Map.delete(config_that_captures_request(), :max_tokens)
+      OpenAICompat.complete([Message.user("Hi")], [], config)
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "max_tokens")
+
+      OpenAICompat.complete([Message.user("Hi")], [], Map.put(config, :max_tokens, 2048))
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["max_tokens"] == 2048
+    end
+
     test "includes strict true inside function tool definitions" do
       config = config_that_captures_request()
 
@@ -416,6 +427,32 @@ defmodule Alloy.Provider.OpenAICompatTest do
 
       [%Message{role: :assistant, content: blocks}] = result.messages
       refute Enum.any?(blocks, &(&1.type == "thinking"))
+    end
+  end
+
+  describe "complete/3 finish reasons" do
+    test "map onto Alloy stop reasons the same way streaming does" do
+      for {finish_reason, stop_reason} <- [
+            {"stop", :end_turn},
+            {"length", :max_tokens},
+            {"content_filter", :refusal},
+            {"tool_calls", :tool_use},
+            {"function_call", :tool_use}
+          ] do
+        body = %{
+          "choices" => [
+            %{
+              "message" => %{"role" => "assistant", "content" => "x"},
+              "finish_reason" => finish_reason
+            }
+          ]
+        }
+
+        config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+        assert {:ok, %{stop_reason: ^stop_reason}} =
+                 OpenAICompat.complete([Message.user("Hi")], [], config)
+      end
     end
   end
 

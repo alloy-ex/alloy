@@ -225,10 +225,34 @@ defmodule Alloy.Provider.OpenAIStreamTest do
       assert {:ok, %{stop_reason: :tool_use}} = result
     end
 
-    test "length maps to :end_turn" do
+    test "length maps to :max_tokens" do
       chunks = [sse_chunk(text_delta("hi")), sse_chunk(finish_chunk("length")), sse_done()]
       {_, result} = collect_stream(chunks, test_name: :finish_length)
-      assert {:ok, %{stop_reason: :end_turn}} = result
+      assert {:ok, %{stop_reason: :max_tokens}} = result
+    end
+
+    test "content_filter maps to :refusal with the details" do
+      chunks = [
+        sse_chunk(text_delta("hi")),
+        sse_chunk(finish_chunk("content_filter")),
+        sse_done()
+      ]
+
+      {_, result} = collect_stream(chunks, test_name: :finish_filter)
+
+      assert {:ok, %{stop_reason: :refusal} = response} = result
+      assert response.response_metadata.stop_details == %{"finish_reason" => "content_filter"}
+    end
+
+    test "the deprecated function_call maps to :tool_use" do
+      chunks = [
+        sse_chunk(tool_call_start(0, "c1", "read")),
+        sse_chunk(finish_chunk("function_call")),
+        sse_done()
+      ]
+
+      {_, result} = collect_stream(chunks, test_name: :finish_function_call)
+      assert {:ok, %{stop_reason: :tool_use}} = result
     end
   end
 
