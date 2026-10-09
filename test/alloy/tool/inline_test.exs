@@ -313,4 +313,24 @@ defmodule Alloy.Tool.InlineTest do
       assert b_start >= a_done
     end
   end
+
+  describe "native_types" do
+    test "must map atoms to type strings" do
+      for bad <- [
+            [anthropic: "memory_20250818"],
+            %{"anthropic" => "memory_20250818"},
+            %{anthropic: 1}
+          ] do
+        assert_raise ArgumentError, ~r/:native_types must be a map/, fn ->
+          Alloy.Tool.inline(
+            name: "memory",
+            description: "Memory",
+            input_schema: %{type: "object"},
+            execute: fn _input, _ctx -> {:ok, "ok"} end,
+            native_types: bad
+          )
+        end
+      end
+    end
+  end
 end

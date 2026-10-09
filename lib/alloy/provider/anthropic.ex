@@ -106,7 +106,6 @@ defmodule Alloy.Provider.Anthropic do
   # The caller name that lets code execution call a tool. The API accepts it
   # with either newer tool version and tags programmatic calls with it.
   @code_execution_caller "code_execution_20260120"
-  @memory_tool_type "memory_20250818"
   @context_management_beta "context-management-2025-06-27"
 
   @typedoc """
@@ -126,7 +125,6 @@ defmodule Alloy.Provider.Anthropic do
           optional(:req_options) => keyword(),
           optional(:on_event) => (term() -> :ok),
           optional(:cache) => boolean(),
-          optional(:memory) => {module(), term()},
           optional(:code_execution) => boolean(),
           optional(:provider_state) => map()
         }
@@ -346,7 +344,7 @@ defmodule Alloy.Provider.Anthropic do
       |> maybe_add_cache_to_last_tool(cache?)
 
     tools =
-      client_tools ++ code_execution_tools(config) ++ memory_tools(config) ++ server_tools(config)
+      client_tools ++ code_execution_tools(config) ++ server_tools(config)
 
     body =
       body
@@ -382,11 +380,6 @@ defmodule Alloy.Provider.Anthropic do
     do: [%{"type" => @code_execution_tool_type, "name" => "code_execution"}]
 
   defp code_execution_tools(_config), do: []
-
-  defp memory_tools(%{memory: {_module, _store}}),
-    do: [%{"type" => @memory_tool_type, "name" => "memory"}]
-
-  defp memory_tools(_config), do: []
 
   # Anthropic runs these tools itself, so they are sent exactly as given.
   defp server_tools(config),
@@ -578,6 +571,11 @@ defmodule Alloy.Provider.Anthropic do
   # The API rejects cache_control on a tool with defer_loading: true.
   defp cacheable_tool?(%{"defer_loading" => true}), do: false
   defp cacheable_tool?(_tool), do: true
+
+  # An Anthropic-defined client tool, such as the memory tool, is sent as its
+  # type: the model already knows its schema, and the client still runs it.
+  defp format_tool_def(%{name: name, native_types: %{anthropic: type}}),
+    do: %{"type" => type, "name" => name}
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do
     base =

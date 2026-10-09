@@ -416,10 +416,10 @@ defmodule Alloy.Provider.AnthropicTest do
       # Code execution, memory, tool search (defer_loading) and tool use
       # examples need no beta header since February 17, 2026:
       # https://platform.claude.com/docs/en/release-notes/overview
-      config =
-        config_that_captures_request()
-        |> Map.put(:code_execution, true)
-        |> Map.put(:memory, {Alloy.Test.MemoryStore, %{}})
+      config = Map.put(config_that_captures_request(), :code_execution, true)
+
+      {[memory], _fns} =
+        Alloy.Tool.Registry.build([Alloy.Memory.tool({Alloy.Test.MemoryStore, %{}})])
 
       tool_defs = [
         %{
@@ -428,7 +428,8 @@ defmodule Alloy.Provider.AnthropicTest do
           input_schema: %{type: "object", properties: %{query: %{type: "string"}}},
           input_examples: [%{query: "release notes"}],
           defer_loading: true
-        }
+        },
+        memory
       ]
 
       Anthropic.complete([Message.user("Hi")], tool_defs, config)
@@ -436,7 +437,11 @@ defmodule Alloy.Provider.AnthropicTest do
       assert_received {:request_body, body}
       assert_received {:request_headers, headers}
 
-      assert [search, %{"name" => "code_execution"}, %{"name" => "memory"}] =
+      assert [
+               search,
+               %{"type" => "memory_20250818", "name" => "memory"},
+               %{"name" => "code_execution"}
+             ] =
                Jason.decode!(body)["tools"]
 
       assert search["input_examples"] == [%{"query" => "release notes"}]

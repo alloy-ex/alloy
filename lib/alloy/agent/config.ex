@@ -7,7 +7,6 @@ defmodule Alloy.Agent.Config do
   """
 
   alias Alloy.Context.Compactor
-  alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.ModelMetadata
 
   @options [
@@ -59,18 +58,6 @@ defmodule Alloy.Agent.Config do
           keep_recent_tool_results: non_neg_integer()
         }
 
-  @typedoc """
-  Memory store binding — `{store_module, opaque_store_term}`. The store
-  module implements `Alloy.Memory`. The store term is whatever the
-  module needs (keyword list, map, pid, struct) — Alloy passes it
-  through verbatim.
-
-  As of 0.12.0, memory is Anthropic-only. `Alloy.run/2` raises if
-  `:memory` is set with any other provider, or if `:tools` also contains a
-  tool named `"memory"` (the name the memory tool reserves).
-  """
-  @type memory :: {module(), term()} | nil
-
   @type t :: %__MODULE__{
           provider: module(),
           provider_config: map(),
@@ -96,8 +83,7 @@ defmodule Alloy.Agent.Config do
           code_execution: boolean(),
           model_metadata_overrides: map(),
           model_catalog: module(),
-          until_tool: String.t() | nil,
-          memory: memory()
+          until_tool: String.t() | nil
         }
 
   @enforce_keys [:provider, :provider_config]
@@ -131,8 +117,7 @@ defmodule Alloy.Agent.Config do
     code_execution: false,
     model_metadata_overrides: %{},
     model_catalog: ModelMetadata,
-    until_tool: nil,
-    memory: nil
+    until_tool: nil
   ]
 
   @doc """
@@ -160,7 +145,7 @@ defmodule Alloy.Agent.Config do
       )
 
     {compaction, compaction_explicit} = resolve_compaction(opts[:compaction], max_tokens)
-    tools = Keyword.get(opts, :tools, [])
+    tools = Keyword.get(opts, :tools, []) ++ memory_tools(Keyword.get(opts, :memory))
 
     %__MODULE__{
       provider: provider_mod,
@@ -187,8 +172,7 @@ defmodule Alloy.Agent.Config do
       code_execution: Keyword.get(opts, :code_execution, false),
       model_metadata_overrides: model_metadata_overrides,
       model_catalog: model_catalog,
-      until_tool: Keyword.get(opts, :until_tool),
-      memory: validate_memory(Keyword.get(opts, :memory), provider_mod, tools)
+      until_tool: Keyword.get(opts, :until_tool)
     }
   end
 
@@ -218,39 +202,9 @@ defmodule Alloy.Agent.Config do
     end
   end
 
-  defp validate_memory(nil, _provider, _tools), do: nil
-
-  defp validate_memory({module, _store} = memory, provider, tools)
-       when is_atom(module) do
-    cond do
-      provider != Alloy.Provider.Anthropic ->
-        raise ArgumentError,
-              "Alloy.Memory is Anthropic-only in 0.12.0. Got provider #{inspect(provider)} " <>
-                "with memory store module #{inspect(module)}. " <>
-                "Use Alloy.Provider.Anthropic or omit :memory."
-
-      # With :memory set, every "memory" call goes to the store, so a user
-      # tool of that name would never run.
-      Enum.any?(tools, &(tool_name(&1) == MemoryRouter.tool_name())) ->
-        raise ArgumentError,
-              ~s(:memory reserves the tool name "memory", but a tool named "memory" ) <>
-                "is also configured in :tools. Rename that tool or omit :memory."
-
-      true ->
-        memory
-    end
-  end
-
-  defp validate_memory(bad, _provider, _tools) do
-    raise ArgumentError,
-          ":memory must be a {module, store_opts} tuple where module implements " <>
-            "Alloy.Memory. Got: #{inspect(bad)}"
-  end
-
-  # Matches Alloy.Tool.Inline structs as plain maps so Config does not
-  # compile-depend on the tool modules.
-  defp tool_name(%{name: name}), do: name
-  defp tool_name(module) when is_atom(module), do: module.name()
+  # `memory: binding` is shorthand for `tools: [Alloy.Memory.tool(binding)]`.
+  defp memory_tools(nil), do: []
+  defp memory_tools(binding), do: [Alloy.Memory.tool(binding)]
 
   @doc """
   Returns an updated config with a new provider while preserving unrelated options.

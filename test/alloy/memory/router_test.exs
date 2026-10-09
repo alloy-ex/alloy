@@ -6,204 +6,102 @@ defmodule Alloy.Memory.RouterTest do
 
   setup do
     {:ok, pid} = MemoryStore.start_link()
-    {:ok, store: {MemoryStore, pid}}
+    {:ok, store: {MemoryStore, pid}, pid: pid}
   end
 
-  describe "memory_call?/1" do
-    test "recognises the memory tool by name" do
-      assert Router.memory_call?(%{type: "tool_use", name: "memory", id: "a", input: %{}})
-      refute Router.memory_call?(%{type: "tool_use", name: "bash", id: "b", input: %{}})
-      refute Router.memory_call?(%{type: "text", text: "hi"})
-    end
+  describe "dispatch/2" do
+    test "viewing a missing path is an error", %{store: store} do
+      assert {:error, message} =
+               Router.dispatch(store, %{"command" => "view", "path" => "/memories/missing.md"})
 
-    test "tool_name/0 returns the canonical string" do
-      assert Router.tool_name() == "memory"
-    end
-  end
-
-  describe "dispatch_all/2" do
-    test "routes view on empty path to not-found error block", %{store: store} do
-      [block] =
-        Router.dispatch_all(
-          [
-            %{
-              type: "tool_use",
-              id: "call_1",
-              name: "memory",
-              input: %{"command" => "view", "path" => "/memories/missing.md"}
-            }
-          ],
-          store
-        )
-
-      assert block.type == "tool_result"
-      assert block.tool_use_id == "call_1"
-      assert block.is_error == true
-      assert block.content =~ "not found"
+      assert message =~ "not found"
     end
 
     test "create + view round-trip", %{store: store} do
-      [create, view] =
-        Router.dispatch_all(
-          [
-            %{
-              type: "tool_use",
-              id: "c1",
-              name: "memory",
-              input: %{
-                "command" => "create",
-                "path" => "/memories/note.md",
-                "file_text" => "hello world"
-              }
-            },
-            %{
-              type: "tool_use",
-              id: "c2",
-              name: "memory",
-              input: %{"command" => "view", "path" => "/memories/note.md"}
-            }
-          ],
-          store
-        )
+      create = %{
+        "command" => "create",
+        "path" => "/memories/note.md",
+        "file_text" => "hello world"
+      }
 
-      assert create.is_error == false
-      assert view.is_error == false
-      assert view.content == "hello world"
+      assert {:ok, _} = Router.dispatch(store, create)
+
+      assert {:ok, "hello world"} =
+               Router.dispatch(store, %{"command" => "view", "path" => "/memories/note.md"})
     end
 
-    test "str_replace returns error when old_str missing", %{store: store} do
-      MemoryStore.create(elem(store, 1), "/memories/note.md", "hello")
+    test "str_replace returns an error when old_str is missing", %{store: store, pid: pid} do
+      MemoryStore.create(pid, "/memories/note.md", "hello")
 
-      [result] =
-        Router.dispatch_all(
-          [
-            %{
-              type: "tool_use",
-              id: "r1",
-              name: "memory",
-              input: %{
-                "command" => "str_replace",
-                "path" => "/memories/note.md",
-                "old_str" => "goodbye",
-                "new_str" => "bonjour"
-              }
-            }
-          ],
-          store
-        )
+      assert {:error, message} =
+               Router.dispatch(store, %{
+                 "command" => "str_replace",
+                 "path" => "/memories/note.md",
+                 "old_str" => "goodbye",
+                 "new_str" => "bonjour"
+               })
 
-      assert result.is_error == true
-      assert result.content =~ "not found"
+      assert message =~ "not found"
     end
 
-    test "invalid path is rejected before reaching the store", %{store: store} do
-      [result] =
-        Router.dispatch_all(
-          [
-            %{
-              type: "tool_use",
-              id: "t1",
-              name: "memory",
-              input: %{"command" => "view", "path" => "/etc/passwd"}
-            }
-          ],
-          store
-        )
+    test "an invalid path is rejected before reaching the store", %{store: store} do
+      assert {:error, message} =
+               Router.dispatch(store, %{"command" => "view", "path" => "/etc/passwd"})
 
-      assert result.is_error == true
-      assert result.content =~ "must start with /memories"
+      assert message =~ "must start with /memories"
     end
 
-    test "malformed input produces an error block", %{store: store} do
-      [result] =
-        Router.dispatch_all(
-          [
-            %{
-              type: "tool_use",
-              id: "m1",
-              name: "memory",
-              input: %{"command" => "nope"}
-            }
-          ],
-          store
-        )
-
-      assert result.is_error == true
-      assert result.content =~ "invalid memory tool input"
+    test "malformed input is an error", %{store: store} do
+      assert {:error, message} = Router.dispatch(store, %{"command" => "nope"})
+      assert message =~ "invalid memory tool input"
     end
 
-    test "refuses to delete or rename the /memories root", %{store: {_, pid} = store} do
+    test "refuses to delete or rename the /memories root", %{store: store, pid: pid} do
       MemoryStore.create(pid, "/memories/keep.md", "keep")
 
-      results =
-        dispatch(store, [
-          %{"command" => "delete", "path" => "/memories"},
-          %{"command" => "delete", "path" => "/memories/"},
-          %{"command" => "rename", "old_path" => "/memories", "new_path" => "/memories/x"},
-          %{"command" => "rename", "old_path" => "/memories/keep.md", "new_path" => "/memories"}
-        ])
+      for input <- [
+            %{"command" => "delete", "path" => "/memories"},
+            %{"command" => "delete", "path" => "/memories/"},
+            %{"command" => "rename", "old_path" => "/memories", "new_path" => "/memories/x"},
+            %{"command" => "rename", "old_path" => "/memories/keep.md", "new_path" => "/memories"}
+          ] do
+        assert {:error, message} = Router.dispatch(store, input)
+        assert message =~ "/memories directory itself"
+      end
 
-      assert Enum.all?(results, & &1.is_error)
-      assert Enum.all?(results, &(&1.content =~ "/memories directory itself"))
       assert MemoryStore.contents(pid) == %{"/memories/keep.md" => "keep"}
     end
 
-    test "str_replace without new_str deletes old_str", %{store: {_, pid} = store} do
+    test "str_replace without new_str deletes old_str", %{store: store, pid: pid} do
       MemoryStore.create(pid, "/memories/note.md", "keep this, drop this")
 
-      [result] =
-        dispatch(store, [
-          %{"command" => "str_replace", "path" => "/memories/note.md", "old_str" => ", drop this"}
-        ])
+      assert {:ok, _} =
+               Router.dispatch(store, %{
+                 "command" => "str_replace",
+                 "path" => "/memories/note.md",
+                 "old_str" => ", drop this"
+               })
 
-      refute result.is_error
       assert MemoryStore.contents(pid)["/memories/note.md"] == "keep this"
     end
 
-    test "view honours view_range", %{store: {_, pid} = store} do
+    test "view honours view_range", %{store: store, pid: pid} do
       MemoryStore.create(pid, "/memories/lines.md", "one\ntwo\nthree\nfour\n")
 
       view = fn range ->
-        %{"command" => "view", "path" => "/memories/lines.md", "view_range" => range}
+        Router.dispatch(store, %{
+          "command" => "view",
+          "path" => "/memories/lines.md",
+          "view_range" => range
+        })
       end
 
-      [middle, to_end, past_end, bad] =
-        dispatch(store, [view.([2, 3]), view.([3, -1]), view.([9, -1]), view.([0, 2])])
-
-      assert middle.content == "two\nthree"
-      assert to_end.content == "three\nfour"
-      assert past_end.is_error
-      assert past_end.content =~ "4 lines"
-      assert bad.is_error
-      assert bad.content =~ "view_range"
+      assert view.([2, 3]) == {:ok, "two\nthree"}
+      assert view.([3, -1]) == {:ok, "three\nfour"}
+      assert {:error, past_end} = view.([9, -1])
+      assert past_end =~ "4 lines"
+      assert {:error, bad} = view.([0, 2])
+      assert bad =~ "view_range"
     end
-
-    test "preserves call order across dispatch", %{store: store} do
-      calls =
-        for i <- 1..5 do
-          %{
-            type: "tool_use",
-            id: "call_#{i}",
-            name: "memory",
-            input: %{
-              "command" => "create",
-              "path" => "/memories/f#{i}.md",
-              "file_text" => "body #{i}"
-            }
-          }
-        end
-
-      results = Router.dispatch_all(calls, store)
-      assert Enum.map(results, & &1.tool_use_id) == Enum.map(calls, & &1.id)
-    end
-  end
-
-  defp dispatch(store, inputs) do
-    inputs
-    |> Enum.with_index()
-    |> Enum.map(fn {input, i} ->
-      %{type: "tool_use", id: "m#{i}", name: "memory", input: input}
-    end)
-    |> Router.dispatch_all(store)
   end
 end

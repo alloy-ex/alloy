@@ -11,7 +11,6 @@ defmodule Alloy.Agent.Turn do
   alias Alloy.Agent.State
   alias Alloy.Context.Compactor
   alias Alloy.Events
-  alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.{Message, Middleware}
   alias Alloy.Provider.{Error, Retry}
   alias Alloy.Tool.Executor
@@ -299,36 +298,18 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  # Memory calls go to the store before the other tools run (memory becomes
-  # an ordinary tool in 0.13); answer_tool_calls/3 puts every result back in
-  # call order.
   defp execute_tools(%State{} = state, tool_calls, opts) do
-    {memory_calls, regular_calls} = split_memory_calls(tool_calls, state.config.memory)
-    memory_results = dispatch_memory(memory_calls, state.config.memory)
-
-    case run_executor(regular_calls, state, opts) do
+    case run_executor(tool_calls, state, opts) do
       {:halted, reason} ->
-        {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, memory_results)}
+        {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, [])}
 
       {:ok, result_blocks, tool_call_meta} ->
         state
-        |> answer_tool_calls(tool_calls, memory_results ++ result_blocks)
+        |> answer_tool_calls(tool_calls, result_blocks)
         |> State.append_tool_calls(tool_call_meta)
         |> then(&run_middleware(:after_tool_execution, &1))
     end
   end
-
-  # Without a :memory store, "memory" is an ordinary tool name: the executor
-  # runs the user's tool of that name or reports it as unknown.
-  defp split_memory_calls(tool_calls, nil), do: {[], tool_calls}
-
-  defp split_memory_calls(tool_calls, _memory),
-    do: Enum.split_with(tool_calls, &MemoryRouter.memory_call?/1)
-
-  defp dispatch_memory([], _memory), do: []
-  defp dispatch_memory(calls, memory), do: MemoryRouter.dispatch_all(calls, memory)
-
-  defp run_executor([], _state, _opts), do: {:ok, [], []}
 
   defp run_executor(calls, state, opts) do
     executor_opts =
@@ -342,8 +323,7 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  # Appends one tool_result per call, in call order, whichever path produced
-  # it. A call without a result (the loop halted before it ran) is answered
+  # Appends one tool_result per call, in call order. A call without a result (the loop halted before it ran) is answered
   # with an error, because every API rejects a tool_use left unanswered and
   # the halted transcript must stay usable for the next request. Tool-call IDs
   # are unique per turn, so id-keyed lookup is safe.
@@ -364,12 +344,8 @@ defmodule Alloy.Agent.Turn do
     config.provider_config
     |> Map.put(:system_prompt, config.system_prompt)
     |> Map.put(:provider_state, provider_state)
-    |> maybe_put_memory(config.memory)
     |> maybe_enable_code_execution(config.code_execution)
   end
-
-  defp maybe_put_memory(provider_config, nil), do: provider_config
-  defp maybe_put_memory(provider_config, memory), do: Map.put(provider_config, :memory, memory)
 
   # The top-level option only turns code execution on, so a provider config
   # that already sets :code_execution itself is left alone when it is false.

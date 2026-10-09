@@ -1,14 +1,13 @@
 defmodule Alloy.Memory do
   @moduledoc """
-  Behaviour for a memory store compatible with Anthropic's `memory_20250818`
-  tool.
+  Behaviour for a memory store, and the memory tool that reads and writes
+  it.
 
-  Alloy's memory primitive mirrors Anthropic's client-side memory tool
-  contract one-for-one: six commands operating on a `/memories` directory
-  tree, where Anthropic defines the protocol (command vocabulary, return
-  string formats, path validation rules) and the store owns the backing
-  bytes. This matches the `BetaAbstractMemoryTool` split in the official
-  Python SDK.
+  The memory tool follows Anthropic's client-side `memory_20250818`
+  contract: six commands operating on a `/memories` directory tree, where
+  the contract defines the commands, results and path rules and the store
+  owns the bytes. This matches the `BetaAbstractMemoryTool` split in the
+  official Python SDK.
 
   ## Usage
 
@@ -23,9 +22,15 @@ defmodule Alloy.Memory do
       end
 
       Alloy.run("Remember that the user prefers SI units",
-        provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-sonnet-4-6"},
-        memory: {MyApp.Memory.Disk, root: "/var/agent/memories"}
+        provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-sonnet-5-5"},
+        tools: [Alloy.Memory.tool({MyApp.Memory.Disk, root: "/var/agent/memories"})]
       )
+
+  `memory: {MyApp.Memory.Disk, opts}` is shorthand for adding that tool.
+  The memory tool is an ordinary tool: it runs through the tool executor,
+  so `:before_tool_call` middleware, tool events and `:tool_timeout`
+  apply to it, and its calls run one at a time in the order the model
+  made them.
 
   ## The store term
 
@@ -51,10 +56,10 @@ defmodule Alloy.Memory do
 
   ## Provider support
 
-  As of Alloy 0.12.0, only `Alloy.Provider.Anthropic` wires the
-  `memory_20250818` tool. Configuring `:memory` with any other provider
-  raises at `Alloy.run/2` entry. When other providers ship their own
-  memory primitives, Alloy will route accordingly.
+  Every provider can use the memory tool. `Alloy.Provider.Anthropic` sends
+  it as Anthropic's built-in `memory_20250818` type, which Claude is
+  trained on; other providers receive it as a function tool with a JSON
+  schema for the same six commands.
 
   ## References
 
@@ -62,6 +67,41 @@ defmodule Alloy.Memory do
   - [Context management announcement (2025-09-29)](https://claude.com/blog/context-management)
   - [Python SDK `BetaAbstractMemoryTool`](https://github.com/anthropics/anthropic-sdk-python/blob/main/examples/memory/basic.py)
   """
+
+  alias Alloy.Memory.Router
+
+  @tool_name "memory"
+  @tool_type "memory_20250818"
+
+  @tool_description """
+  Persistent memory that outlives this conversation, stored as files \
+  under /memories. View /memories before starting a task, and record \
+  progress and lessons there as you work. Commands: view (read a file or \
+  list a directory; optional view_range [start_line, end_line], -1 for \
+  the end), create (path, file_text), str_replace (path, old_str, \
+  new_str), insert (path, insert_line, insert_text; line 0 is the top), \
+  delete (path) and rename (old_path, new_path).\
+  """
+
+  @tool_schema %{
+    "type" => "object",
+    "properties" => %{
+      "command" => %{
+        "type" => "string",
+        "enum" => ["view", "create", "str_replace", "insert", "delete", "rename"]
+      },
+      "path" => %{"type" => "string", "description" => "A path under /memories"},
+      "view_range" => %{"type" => "array", "items" => %{"type" => "integer"}},
+      "file_text" => %{"type" => "string"},
+      "old_str" => %{"type" => "string"},
+      "new_str" => %{"type" => "string"},
+      "insert_line" => %{"type" => "integer"},
+      "insert_text" => %{"type" => "string"},
+      "old_path" => %{"type" => "string"},
+      "new_path" => %{"type" => "string"}
+    },
+    "required" => ["command"]
+  }
 
   @typedoc """
   Opaque store handle. Whatever the user puts in the `{Module, opts}`
@@ -123,6 +163,33 @@ defmodule Alloy.Memory do
   Rename `old_path` to `new_path`. Both paths must be under `/memories/`.
   """
   @callback rename(store(), old_path :: path(), new_path :: path()) :: result()
+
+  @doc """
+  The memory tool for a `{store_module, store}` binding, ready for `:tools`.
+
+  The tool is named `"memory"` and runs its commands one at a time, in the
+  order the model made them, so a `create` followed by a `str_replace` on
+  the same file behaves as written.
+
+      tools: [Alloy.Memory.tool({MyApp.Memory.Disk, root: "/var/agent/memories"})]
+  """
+  @spec tool({module(), store()}) :: Alloy.Tool.Inline.t()
+  def tool({module, _store} = binding) when is_atom(module) do
+    Alloy.Tool.inline(
+      name: @tool_name,
+      description: @tool_description,
+      input_schema: @tool_schema,
+      execute: fn input, _context -> Router.dispatch(binding, input) end,
+      concurrent?: false,
+      native_types: %{anthropic: @tool_type}
+    )
+  end
+
+  def tool(other) do
+    raise ArgumentError,
+          "Alloy.Memory.tool/1 expects a {module, store} tuple where module " <>
+            "implements Alloy.Memory. Got: #{inspect(other)}"
+  end
 
   @doc """
   Validate that `path` is `/memories` or lies under `/memories/` and

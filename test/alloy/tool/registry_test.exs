@@ -99,7 +99,43 @@ defmodule Alloy.Tool.RegistryTest do
     def defer_loading?, do: true
   end
 
+  defmodule NativeTool do
+    @behaviour Alloy.Tool
+
+    @impl true
+    def name, do: "str_replace_based_edit_tool"
+    @impl true
+    def description, do: "Edit files"
+    @impl true
+    def input_schema, do: %{type: "object"}
+    @impl true
+    def execute(_input, _ctx), do: {:ok, "ok"}
+    @impl true
+    def native_types, do: %{anthropic: "text_editor_20250728"}
+  end
+
   describe "build/1" do
+    test "rejects two tools with the same name" do
+      duplicate =
+        Alloy.Tool.inline(
+          name: "basic",
+          description: "Another basic tool",
+          input_schema: %{type: "object"},
+          execute: fn _input, _ctx -> {:ok, "ok"} end
+        )
+
+      assert_raise ArgumentError, ~r/tool names must be unique.*"basic"/, fn ->
+        Registry.build([BasicTool, duplicate])
+      end
+    end
+
+    test "native_types/0 reaches the definition; tools without it omit the key" do
+      {[native, basic], _fns} = Registry.build([NativeTool, BasicTool])
+
+      assert native.native_types == %{anthropic: "text_editor_20250728"}
+      refute Map.has_key?(basic, :native_types)
+    end
+
     test "basic tool produces definitions without metadata" do
       {defs, fns} = Registry.build([BasicTool])
 

@@ -57,6 +57,7 @@ defmodule Alloy.Tool.Inline do
     (default `[]`)
   - `:defer_loading` - request provider-side deferred tool loading
     (default `false`)
+  - `:native_types` - as `c:Alloy.Tool.native_types/0` (default `%{}`)
   """
 
   @enforce_keys [:name, :description, :input_schema, :execute]
@@ -71,7 +72,8 @@ defmodule Alloy.Tool.Inline do
     input_examples: [],
     strict: false,
     defer_loading: false,
-    concurrent?: true
+    concurrent?: true,
+    native_types: %{}
   ]
 
   @type t :: %__MODULE__{
@@ -88,7 +90,8 @@ defmodule Alloy.Tool.Inline do
           result_type: :text | :structured | nil,
           input_examples: [map()],
           strict: boolean(),
-          defer_loading: boolean()
+          defer_loading: boolean(),
+          native_types: %{optional(atom()) => String.t()}
         }
 
   @doc false
@@ -135,6 +138,17 @@ defmodule Alloy.Tool.Inline do
               "Got: #{inspect(tool.defer_loading)}"
     end
 
+    unless native_types?(tool.native_types) do
+      raise ArgumentError,
+            "inline tool #{inspect(tool.name)} :native_types must be a map of " <>
+              "atom keys to type strings. Got: #{inspect(tool.native_types)}"
+    end
+
     tool
   end
+
+  defp native_types?(types) when is_map(types),
+    do: Enum.all?(types, fn {key, type} -> is_atom(key) and is_binary(type) end)
+
+  defp native_types?(_types), do: false
 end
