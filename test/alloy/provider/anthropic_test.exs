@@ -536,6 +536,28 @@ defmodule Alloy.Provider.AnthropicTest do
       assert server_call.input == %{"file_path" => "mix.exs"}
     end
 
+    # A transcript started on OpenAI Responses (e.g. via fallback_providers)
+    # carries opaque items only that API understands.
+    test "drops OpenAI-only reasoning and output_item blocks from history" do
+      config = config_that_captures_request()
+
+      messages = [
+        Message.user("Hi"),
+        Message.assistant_blocks([
+          %{type: "reasoning", raw: %{"type" => "reasoning", "id" => "rs_1"}},
+          %{type: "output_item", raw: %{"type" => "web_search_call", "id" => "ws_1"}},
+          %{type: "text", text: "Hello"}
+        ]),
+        Message.user("Again")
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      [_user, assistant, _again] = Jason.decode!(body)["messages"]
+      assert assistant["content"] == [%{"type" => "text", "text" => "Hello"}]
+    end
+
     test "keeps server_tool_use in history and drops legacy server_tool_result blocks" do
       config = config_that_captures_request()
 

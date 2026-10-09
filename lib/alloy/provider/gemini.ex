@@ -269,6 +269,12 @@ defmodule Alloy.Provider.Gemini do
     %{"fileData" => %{"mimeType" => mime_type, "fileUri" => uri}}
   end
 
+  # Opaque OpenAI Responses items in a transcript that switched provider;
+  # they mean nothing to Gemini, so they are dropped rather than turned
+  # into placeholder text the model would read.
+  defp format_content_block(%{type: type}, _messages) when type in ["reasoning", "output_item"],
+    do: nil
+
   defp format_content_block(block, _messages) when is_map(block) do
     %{
       "text" =>

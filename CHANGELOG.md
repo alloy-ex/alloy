@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `result.metadata.run.provider_error`. The struct implements `String.Chars`,
   so interpolating it still works; code that applies `=~` or binary
   patterns to a provider's raw error should use `Exception.message/1`.
+- **OpenAI, xAI and OpenAI-compatible providers no longer send a default
+  output cap** (`max_output_tokens`/`max_tokens` were 4,096). Reasoning
+  tokens count against the cap on current models, so responses came back
+  incomplete or empty. Set `:max_tokens` to cap output; some
+  OpenAI-compatible servers have small defaults of their own.
+- **`usage.input_tokens` means uncached input for every built-in provider.**
+  OpenAI-family and Gemini usage now reports cache reads in
+  `cache_read_input_tokens` (and writes in `cache_creation_input_tokens`)
+  instead of inside `input_tokens`, matching Anthropic. Total prompt tokens
+  are the sum of the three. Reported `input_tokens` drop by the cached
+  amount.
+- `Alloy.Provider.SSE.process_chunk/2` scans only the new bytes for event
+  boundaries (a large event went from 663 ms to 8 ms), so `buffer` must be
+  the remainder returned by the previous call, as in normal use.
 - **Anthropic default `max_tokens` is 16,000** (was 4,096). Adaptive
   thinking is on by default on Claude 5.x and counts toward `max_tokens`, so
   the old default truncated answers. Set `:max_tokens` to keep a lower cap.
@@ -75,6 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Custom providers that only return `:tool_use`/`:end_turn` are unaffected.
   A provider returning an unknown stop reason now fails the run with a clear
   error instead of crashing the loop.
+- `Alloy.Provider.Error.from_body/1` for errors a provider reports inside a
+  200 response (mid-stream `error` events, failed responses).
+- **OpenAI Responses replay keeps every output item.** Assistant `phase`
+  (which gpt-5.3-codex and later expect back) and items such as built-in tool
+  calls and compaction items are preserved as `%{type: "output_item", raw:
+  item}` blocks instead of being dropped.
 - **Anthropic `:server_tools`** — raw server tool definitions (web search,
   web fetch, `mcp_toolset`, tool search) appended after the generated tools,
   so local and server tools can be combined. Previously the only route was
@@ -112,6 +132,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenAI Responses (and xAI) no longer chain responses on their own.**
+  Every response's id was fed back as `previous_response_id` while the full
+  history was still sent, so from the second request of a run the server
+  replayed the conversation twice — duplicated context and billing — and
+  with `store: false` the request pointed at a response that was never
+  stored. The stateless encrypted-reasoning echo was also switched off after
+  the first request. Chaining is now explicit: pass `:previous_response_id`
+  and send only the new messages.
+- **OpenAI family:**
+  - `response.failed`, `response.incomplete`, `error` events and cut-off
+    streams are errors or `:max_tokens`/`:refusal` instead of partial
+    successes; Chat Completions `length` maps to `:max_tokens` and
+    `content_filter` to `:refusal`;
+  - OpenAICompat sends `reasoning_content` back on assistant messages, which
+    DeepSeek's thinking mode requires during tool calls (it returned HTTP 400
+    on the second request of every tool loop);
+  - atom keys in OpenAICompat `extra_body` now override generated fields
+    (they produced duplicate JSON keys and were ignored).
+- **Opaque OpenAI items no longer break other providers.** When a transcript
+  moves from OpenAI Responses to Anthropic or Gemini (for example through
+  `fallback_providers`), `reasoning` and `output_item` blocks are dropped
+  instead of being sent as invalid blocks (Anthropic) or placeholder text
+  (Gemini).
 - **Anthropic:**
   - every stop reason is mapped (`max_tokens`,
     `model_context_window_exceeded`, `refusal` with its `stop_details`,

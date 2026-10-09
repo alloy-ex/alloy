@@ -629,6 +629,28 @@ defmodule Alloy.Provider.GeminiTest do
     Gemini.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
   end
 
+  describe "history from other providers" do
+    test "drops OpenAI-only reasoning and output_item blocks" do
+      config = config_that_captures_request()
+
+      messages = [
+        Message.user("Hi"),
+        Message.assistant_blocks([
+          %{type: "reasoning", raw: %{"type" => "reasoning", "id" => "rs_1"}},
+          %{type: "output_item", raw: %{"type" => "web_search_call", "id" => "ws_1"}},
+          %{type: "text", text: "Hello"}
+        ]),
+        Message.user("Again")
+      ]
+
+      Gemini.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      [_user, model, _again] = Jason.decode!(body)["contents"]
+      assert model["parts"] == [%{"text" => "Hello"}]
+    end
+  end
+
   defp config_with_response(response) do
     %{
       api_key: "gem-test-key",

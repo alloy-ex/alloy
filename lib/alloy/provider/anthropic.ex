@@ -520,17 +520,21 @@ defmodule Alloy.Provider.Anthropic do
   defp format_message(%Message{role: role, content: blocks}) when is_list(blocks) do
     content =
       blocks
-      |> Enum.reject(&legacy_server_tool_result?/1)
+      |> Enum.reject(&unsendable_block?/1)
       |> Enum.map(&format_content_block/1)
 
     %{"role" => to_string(role), "content" => content}
   end
 
-  # Alloy <= 0.12.4 answered server_tool_use blocks with a client-side
-  # "server_tool_result", which the API rejects. Dropping them lets
-  # transcripts persisted by those versions continue.
-  defp legacy_server_tool_result?(%{type: "server_tool_result"}), do: true
-  defp legacy_server_tool_result?(_block), do: false
+  # Blocks the Messages API rejects, dropped so the transcript still works:
+  # "server_tool_result" was written by Alloy <= 0.12.4, which answered
+  # server tools client-side; "reasoning" and "output_item" are opaque
+  # OpenAI Responses items in a transcript that switched provider.
+  defp unsendable_block?(%{type: type})
+       when type in ["server_tool_result", "reasoning", "output_item"],
+       do: true
+
+  defp unsendable_block?(_block), do: false
 
   defp format_content_block(%{type: "thinking", thinking: thinking} = block) do
     %{"type" => "thinking", "thinking" => thinking}
