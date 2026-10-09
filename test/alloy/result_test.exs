@@ -162,6 +162,22 @@ defmodule Alloy.ResultTest do
     end
   end
 
+  describe "wrap/1" do
+    test "completed and max_turns runs are {:ok, result}" do
+      for status <- [:completed, :max_turns] do
+        result = %Result{status: status}
+        assert Result.wrap(result) == {:ok, result}
+      end
+    end
+
+    test "every other status is {:error, result}" do
+      for status <- [:error, :halted, :budget_exceeded] do
+        result = %Result{status: status}
+        assert Result.wrap(result) == {:error, result}
+      end
+    end
+  end
+
   describe "backwards compatibility" do
     test "pattern matches as a map" do
       result = %Result{text: "match me", status: :completed}

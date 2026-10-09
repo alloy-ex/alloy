@@ -129,15 +129,10 @@ defmodule Alloy do
     state = %{State.init(config, messages) | status: :running}
 
     try do
-      final_state = Turn.run_loop(state, turn_opts)
-
-      result = Result.from_state(final_state)
-
-      case final_state.status do
-        :completed -> {:ok, result}
-        :max_turns -> {:ok, result}
-        _ -> {:error, result}
-      end
+      state
+      |> Turn.run_loop(turn_opts)
+      |> Result.from_state()
+      |> Result.wrap()
     after
       State.cleanup(state)
     end

@@ -82,6 +82,10 @@ defmodule Alloy.Agent.Server do
   Blocks until the model reaches `end_turn` (including all tool calls).
   Conversation history is preserved for subsequent calls.
 
+  The result is tagged like `Alloy.run/2` (see `Alloy.Result.wrap/1`):
+  `{:ok, result}` for `:completed` and `:max_turns`, `{:error, result}`
+  otherwise. Before 0.12.5 a `:budget_exceeded` run returned `{:ok, result}`.
+
   ## Options
 
     - `:timeout` - GenServer call timeout in milliseconds (default: `30_000`).
@@ -337,15 +341,8 @@ defmodule Alloy.Agent.Server do
 
     final_state = Turn.run_loop(state)
 
-    result = build_result(final_state)
-
     # Keep messages but reset loop counters for next chat/2 call
-    new_state = reset_for_new_run(final_state)
-
-    case final_state.status do
-      status when status in [:error, :halted] -> {:reply, {:error, result}, new_state}
-      _ -> {:reply, {:ok, result}, new_state}
-    end
+    {:reply, final_state |> build_result() |> Result.wrap(), reset_for_new_run(final_state)}
   end
 
   # Reject synchronous stream_chat while an async Turn is in flight.
@@ -369,13 +366,7 @@ defmodule Alloy.Agent.Server do
     turn_opts = Keyword.merge(stream_opts, streaming: true, on_chunk: on_chunk)
     final_state = Turn.run_loop(state, turn_opts)
 
-    result = build_result(final_state)
-    new_state = reset_for_new_run(final_state)
-
-    case final_state.status do
-      status when status in [:error, :halted] -> {:reply, {:error, result}, new_state}
-      _ -> {:reply, {:ok, result}, new_state}
-    end
+    {:reply, final_state |> build_result() |> Result.wrap(), reset_for_new_run(final_state)}
   end
 
   @impl GenServer

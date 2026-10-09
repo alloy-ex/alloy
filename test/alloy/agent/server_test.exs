@@ -62,6 +62,17 @@ defmodule Alloy.Agent.ServerTest do
       assert Enum.at(messages, 2).content == "Second message"
     end
 
+    test "returns {:error, result} when the budget is exceeded, like Alloy.run/2" do
+      pid = start_provider([TestProvider.text_response("Should not reach")])
+      {:ok, agent} = Server.start_link(opts(pid, max_budget_cents: 0))
+
+      assert {:error, result} = Server.chat(agent, "Hello")
+      assert result.status == :budget_exceeded
+
+      assert {:error, %{status: :budget_exceeded}} =
+               Server.stream_chat(agent, "Hello", fn _chunk -> :ok end)
+    end
+
     test "returns :turns in result" do
       pid = start_provider([TestProvider.text_response("Done")])
       {:ok, agent} = Server.start_link(opts(pid))

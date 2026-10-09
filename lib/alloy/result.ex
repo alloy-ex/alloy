@@ -80,6 +80,20 @@ defmodule Alloy.Result do
     }
   end
 
+  @doc """
+  Tags a result the way `Alloy.run/2` and `Alloy.Agent.Server.chat/3`
+  return it.
+
+  `{:ok, result}` when the run completed or stopped at `:max_turns`;
+  `{:error, result}` for every other status (`:error`, `:halted`,
+  `:budget_exceeded`).
+  """
+  @spec wrap(t()) :: {:ok, t()} | {:error, t()}
+  def wrap(%__MODULE__{status: status} = result) when status in [:completed, :max_turns],
+    do: {:ok, result}
+
+  def wrap(%__MODULE__{} = result), do: {:error, result}
+
   # ── Access callbacks ─────────────────────────────────────────────────────
 
   @impl Access
