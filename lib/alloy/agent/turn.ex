@@ -301,68 +301,74 @@ defmodule Alloy.Agent.Turn do
     do: {:halt, fail(state, reason)}
 
   defp handle_tool_use(%State{} = state, tool_calls, opts) do
-    with {:continue, state} <- run_middleware(:after_tool_request, state) do
-      {memory_calls, regular_calls} = Enum.split_with(tool_calls, &MemoryRouter.memory_call?/1)
-      on_event = fn raw_event -> Events.emit(opts, state.turn, raw_event) end
-      event_seq_ref = Keyword.get(opts, :event_seq_ref)
-      event_correlation_id = Keyword.get(opts, :event_correlation_id)
-      event_turn = state.turn
-
-      memory_results =
-        case {memory_calls, state.config.memory} do
-          {[], _} -> []
-          {_calls, nil} -> []
-          {calls, memory} -> MemoryRouter.dispatch_all(calls, memory)
-        end
-
-      regular_result =
-        case regular_calls do
-          [] ->
-            {:ok, nil, []}
-
-          calls ->
-            Executor.execute_all(
-              calls,
-              state.tool_fns,
-              state,
-              on_event: on_event,
-              event_seq_ref: event_seq_ref,
-              event_correlation_id: event_correlation_id,
-              event_turn: event_turn
-            )
-        end
-
-      case regular_result do
-        {:halted, reason} ->
-          {:halt, halt(state, reason)}
-
-        {:ok, regular_msg, tool_call_meta} ->
-          state
-          |> State.append_messages(merge_tool_results(tool_calls, memory_results, regular_msg))
-          |> State.append_tool_calls(tool_call_meta)
-          |> then(&run_middleware(:after_tool_execution, &1))
-      end
+    case run_middleware(:after_tool_request, state) do
+      {:continue, state} -> execute_tools(state, tool_calls, opts)
+      {:halt, state} -> {:halt, answer_tool_calls(state, tool_calls, [])}
     end
   end
 
-  # Reassemble tool_result blocks in the original tool_call order,
-  # regardless of whether each result came from the memory router or
-  # the generic tool executor. Tool-call IDs are unique per turn, so
-  # id-keyed lookup is safe.
-  defp merge_tool_results(tool_calls, memory_results, regular_msg) do
-    regular_blocks =
-      case regular_msg do
-        %Message{content: blocks} when is_list(blocks) -> blocks
-        nil -> []
+  defp execute_tools(%State{} = state, tool_calls, opts) do
+    {memory_calls, regular_calls} = Enum.split_with(tool_calls, &MemoryRouter.memory_call?/1)
+    on_event = fn raw_event -> Events.emit(opts, state.turn, raw_event) end
+    event_seq_ref = Keyword.get(opts, :event_seq_ref)
+    event_correlation_id = Keyword.get(opts, :event_correlation_id)
+    event_turn = state.turn
+
+    memory_results =
+      case {memory_calls, state.config.memory} do
+        {[], _} -> []
+        {_calls, nil} -> []
+        {calls, memory} -> MemoryRouter.dispatch_all(calls, memory)
       end
 
-    by_id =
-      Enum.reduce(memory_results ++ regular_blocks, %{}, fn block, acc ->
-        Map.put(acc, block.tool_use_id, block)
+    regular_result =
+      case regular_calls do
+        [] ->
+          {:ok, nil, []}
+
+        calls ->
+          Executor.execute_all(
+            calls,
+            state.tool_fns,
+            state,
+            on_event: on_event,
+            event_seq_ref: event_seq_ref,
+            event_correlation_id: event_correlation_id,
+            event_turn: event_turn
+          )
+      end
+
+    case regular_result do
+      {:halted, reason} ->
+        {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, memory_results)}
+
+      {:ok, regular_msg, tool_call_meta} ->
+        state
+        |> answer_tool_calls(tool_calls, memory_results ++ result_blocks(regular_msg))
+        |> State.append_tool_calls(tool_call_meta)
+        |> then(&run_middleware(:after_tool_execution, &1))
+    end
+  end
+
+  defp result_blocks(%Message{content: blocks}) when is_list(blocks), do: blocks
+  defp result_blocks(nil), do: []
+
+  # Appends one tool_result per call, in call order, whichever path produced
+  # it. A call without a result (the loop halted before it ran) is answered
+  # with an error, because every API rejects a tool_use left unanswered and
+  # the halted transcript must stay usable for the next request. Tool-call IDs
+  # are unique per turn, so id-keyed lookup is safe.
+  defp answer_tool_calls(%State{} = state, tool_calls, result_blocks) do
+    by_id = Map.new(result_blocks, &{&1.tool_use_id, &1})
+
+    results =
+      Enum.map(tool_calls, fn %{id: id} ->
+        Map.get_lazy(by_id, id, fn ->
+          Message.tool_result_block(id, "Not executed: #{state.error}", true)
+        end)
       end)
 
-    ordered = Enum.map(tool_calls, fn %{id: id} -> Map.fetch!(by_id, id) end)
-    Message.tool_results(ordered)
+    State.append_messages(state, Message.tool_results(results))
   end
 
   defp build_provider_config(%State{config: config, provider_state: provider_state}) do

@@ -1304,6 +1304,69 @@ defmodule Alloy.Agent.TurnTest do
       assert result.error =~ "tool policy"
     end
 
+    test "a before_tool_call halt answers every tool call so the transcript stays valid" do
+      defmodule HaltSecondCallMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, state) do
+          case state.config.context[:current_tool_call] do
+            %{id: "t2"} -> {:halt, "second call refused"}
+            _call -> state
+          end
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t1", name: "echo", input: %{"text" => "one"}},
+            %{id: "t2", name: "echo", input: %{"text" => "two"}}
+          ])
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        middleware: [HaltSecondCallMiddleware]
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Echo twice")]))
+
+      assert result.status == :halted
+      assert_every_tool_call_answered(result.messages, ["t1", "t2"])
+    end
+
+    test "an after_tool_request halt answers every tool call so the transcript stays valid" do
+      defmodule HaltToolRequestMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:after_tool_request, _state), do: {:halt, "no tools today"}
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t1", name: "echo", input: %{"text" => "hi"}}
+          ])
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        middleware: [HaltToolRequestMiddleware]
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Echo hi")]))
+
+      assert result.status == :halted
+      assert result.error == "Halted by middleware: no tools today"
+      assert result.tool_calls == []
+      assert_every_tool_call_answered(result.messages, ["t1"])
+    end
+
     test "before_tool_call halt is distinguishable from :error status" do
       defmodule BeforeToolCallHaltingMiddleware2 do
         @behaviour Alloy.Middleware
@@ -2601,6 +2664,17 @@ defmodule Alloy.Agent.TurnTest do
       assert result.status == :completed
       assert result.turn == 1
     end
+  end
+
+  # The last message must answer each call of the preceding assistant message
+  # with an error result, or the next request on this transcript is rejected.
+  defp assert_every_tool_call_answered(messages, ids) do
+    [%Message{role: :assistant} = calls_msg, %Message{role: :user, content: results}] =
+      Enum.take(messages, -2)
+
+    assert Enum.map(Message.tool_calls(calls_msg), & &1.id) == ids
+    assert Enum.map(results, & &1.tool_use_id) == ids
+    assert Enum.all?(results, &(&1.type == "tool_result" and &1.is_error == true))
   end
 
   defp submit_tool(result) do
