@@ -37,10 +37,20 @@ defmodule Alloy.Provider.Gemini do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.HTTP
+  alias Alloy.Provider.{Error, HTTP}
 
   @default_api_url "https://generativelanguage.googleapis.com"
   @default_api_version "v1beta"
+
+  # finishReason values, from ai.google.dev/api/generate-content#FinishReason.
+  # Content filters and policy blocks: the output must not be used.
+  @refusal_reasons ~w(SAFETY RECITATION LANGUAGE BLOCKLIST PROHIBITED_CONTENT SPII
+                      IMAGE_SAFETY IMAGE_PROHIBITED_CONTENT IMAGE_RECITATION IMAGE_OTHER
+                      ESCALATION PUP_LIMITED_DISABLED)
+  # The model produced output that cannot be used; sampling again usually
+  # succeeds, so these are retried like a server error.
+  @generation_errors ~w(MALFORMED_FUNCTION_CALL MALFORMED_RESPONSE UNEXPECTED_TOOL_CALL
+                        TOO_MANY_TOOL_CALLS NO_IMAGE)
 
   @typedoc """
   Configuration for the Gemini provider. See the module doc for field
@@ -83,11 +93,13 @@ defmodule Alloy.Provider.Gemini do
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     body = build_request_body(messages, tool_defs, config)
 
+    # content_blocks is newest first. response and candidate hold the latest
+    # top-level and candidate fields (usage, finishReason, promptFeedback).
     initial_acc = %{
       buffer: "",
       content_blocks: [],
-      usage: %{},
-      finish_reason: nil,
+      response: %{},
+      candidate: %{},
       on_chunk: on_chunk
     }
 
@@ -284,33 +296,60 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp parse_response(%{"candidates" => [candidate | _]} = resp) do
-    content_blocks =
-      candidate
-      |> get_in(["content", "parts"])
-      |> List.wrap()
-      |> parse_content_parts()
-
-    usage = parse_usage(resp["usageMetadata"] || %{})
-
-    {:ok,
-     %{
-       stop_reason: parse_stop_reason(candidate["finishReason"], content_blocks),
-       messages: [%Message{role: :assistant, content: content_blocks}],
-       usage: usage,
-       response_metadata: build_response_metadata(resp, candidate)
-     }}
+    candidate
+    |> get_in(["content", "parts"])
+    |> List.wrap()
+    |> Enum.map(&parse_content_part/1)
+    |> respond(candidate, resp)
   end
 
-  defp parse_response(%{"promptFeedback" => prompt_feedback}) do
-    {:error, "Gemini prompt blocked: #{inspect(prompt_feedback)}"}
-  end
+  defp parse_response(%{"promptFeedback" => %{"blockReason" => _}} = resp),
+    do: prompt_blocked(resp)
 
   defp parse_response(other) do
     {:error, "Unexpected Gemini response payload: #{inspect(other)}"}
   end
 
-  defp parse_content_parts(parts) do
-    Enum.map(parts, &parse_content_part/1)
+  defp respond(_blocks, %{"finishReason" => reason} = candidate, _resp)
+       when reason in @generation_errors,
+       do: {:error, generation_error(:server_error, reason, candidate)}
+
+  defp respond(
+         _blocks,
+         %{"finishReason" => "MISSING_THOUGHT_SIGNATURE" = reason} = candidate,
+         _resp
+       ),
+       do: {:error, generation_error(:invalid_request, reason, candidate)}
+
+  defp respond(blocks, candidate, resp) do
+    {:ok,
+     %{
+       stop_reason: stop_reason(candidate["finishReason"], blocks),
+       messages: [%Message{role: :assistant, content: blocks}],
+       usage: parse_usage(resp["usageMetadata"] || %{}),
+       response_metadata: build_response_metadata(resp, candidate)
+     }}
+  end
+
+  # The API returns no candidates only when the prompt itself was blocked.
+  defp prompt_blocked(%{"promptFeedback" => %{"blockReason" => reason} = feedback} = resp) do
+    stop_details = maybe_put(%{block_reason: reason}, :safety_ratings, feedback["safetyRatings"])
+
+    {:ok,
+     %{
+       stop_reason: :refusal,
+       messages: [],
+       usage: parse_usage(resp["usageMetadata"] || %{}),
+       response_metadata: Map.put(build_response_metadata(resp, %{}), :stop_details, stop_details)
+     }}
+  end
+
+  defp generation_error(kind, reason, candidate) do
+    %Error{
+      kind: kind,
+      type: reason,
+      message: candidate["finishMessage"] || "Gemini stopped without a usable response"
+    }
   end
 
   defp parse_content_part(%{"text" => text, "thought" => true} = part) do
@@ -353,11 +392,23 @@ defmodule Alloy.Provider.Gemini do
     |> maybe_put(:finish_message, candidate["finishMessage"])
     |> maybe_put(:prompt_feedback, resp["promptFeedback"])
     |> maybe_put(:grounding_metadata, candidate["groundingMetadata"] || resp["groundingMetadata"])
+    |> maybe_put(:stop_details, refusal_details(candidate))
   end
 
-  defp parse_stop_reason(_finish_reason, content_blocks)
-       when is_list(content_blocks) do
-    if Enum.any?(content_blocks, &(&1[:type] == "tool_use")), do: :tool_use, else: :end_turn
+  defp refusal_details(%{"finishReason" => reason} = candidate) when reason in @refusal_reasons do
+    %{finish_reason: reason}
+    |> maybe_put(:finish_message, candidate["finishMessage"])
+    |> maybe_put(:safety_ratings, candidate["safetyRatings"])
+  end
+
+  defp refusal_details(_candidate), do: nil
+
+  # A truncated tool call stays :max_tokens: the loop must not run it.
+  defp stop_reason("MAX_TOKENS", _blocks), do: :max_tokens
+  defp stop_reason(reason, _blocks) when reason in @refusal_reasons, do: :refusal
+
+  defp stop_reason(_reason, blocks) do
+    if Enum.any?(blocks, &match?(%{type: "tool_use"}, &1)), do: :tool_use, else: :end_turn
   end
 
   # Alloy follows Anthropic's usage semantics, where input_tokens excludes
@@ -390,7 +441,7 @@ defmodule Alloy.Provider.Gemini do
     end
   end
 
-  defp handle_stream_chunk(acc, %{"candidates" => [candidate | _]} = resp) do
+  defp handle_stream_chunk(acc, %{"candidates" => [candidate | _]} = chunk) do
     blocks =
       candidate
       |> get_in(["content", "parts"])
@@ -400,18 +451,27 @@ defmodule Alloy.Provider.Gemini do
     Enum.each(blocks, &emit_text_delta(&1, acc.on_chunk))
 
     %{
-      acc
+      merge_response_fields(acc, chunk)
       | content_blocks: Enum.reduce(blocks, acc.content_blocks, &merge_stream_block/2),
-        usage: merge_usage(acc.usage, resp["usageMetadata"] || %{}),
-        finish_reason: candidate["finishReason"] || acc.finish_reason
+        candidate: Map.merge(acc.candidate, Map.delete(candidate, "content"))
     }
   end
 
-  defp handle_stream_chunk(acc, %{"usageMetadata" => usage}) do
-    %{acc | usage: merge_usage(acc.usage, usage)}
-  end
+  defp handle_stream_chunk(acc, %{} = chunk), do: merge_response_fields(acc, chunk)
 
-  defp handle_stream_chunk(acc, _other), do: acc
+  # Usage counts are running totals: a later chunk's count replaces the
+  # earlier one, and a count it leaves out keeps its last value.
+  defp merge_response_fields(acc, chunk) do
+    fields = Map.delete(chunk, "candidates")
+
+    response =
+      Map.merge(acc.response, fields, fn
+        "usageMetadata", previous, latest -> Map.merge(previous, latest)
+        _key, _previous, latest -> latest
+      end)
+
+    %{acc | response: response}
+  end
 
   defp emit_text_delta(%{type: "text", text: text}, on_chunk) when text != "", do: on_chunk.(text)
   defp emit_text_delta(_block, _on_chunk), do: :ok
@@ -439,21 +499,14 @@ defmodule Alloy.Provider.Gemini do
 
   defp merge_stream_block(block, blocks), do: [block | blocks]
 
-  defp merge_usage(existing, new) do
-    Map.merge(existing, new, fn _key, _old, latest -> latest end)
-  end
+  defp build_stream_response(%{
+         content_blocks: [],
+         response: %{"promptFeedback" => %{"blockReason" => _}} = resp
+       }),
+       do: prompt_blocked(resp)
 
-  defp build_stream_response(acc) do
-    usage = parse_usage(acc.usage)
-    content_blocks = Enum.reverse(acc.content_blocks)
-
-    {:ok,
-     %{
-       stop_reason: parse_stop_reason(acc.finish_reason, content_blocks),
-       messages: [%Message{role: :assistant, content: content_blocks}],
-       usage: usage
-     }}
-  end
+  defp build_stream_response(acc),
+    do: acc.content_blocks |> Enum.reverse() |> respond(acc.candidate, acc.response)
 
   defp generated_tool_call_id(name) do
     "gemini_call_#{name || "tool"}_#{System.unique_integer([:positive])}"

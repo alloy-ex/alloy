@@ -436,6 +436,112 @@ defmodule Alloy.Provider.GeminiTest do
     end
   end
 
+  describe "finish reasons" do
+    @refusal_reasons ~w(SAFETY RECITATION LANGUAGE BLOCKLIST PROHIBITED_CONTENT SPII
+                        IMAGE_SAFETY IMAGE_PROHIBITED_CONTENT IMAGE_RECITATION IMAGE_OTHER
+                        ESCALATION PUP_LIMITED_DISABLED)
+
+    test "MAX_TOKENS is :max_tokens, keeping the truncated output" do
+      response = gemini_response([%{"text" => "Truncat"}], "MAX_TOKENS")
+
+      for result <- [complete_with(response), stream_with([response])] do
+        assert {:ok, %{stop_reason: :max_tokens, messages: [message]}} = result
+        assert Message.text(message) == "Truncat"
+      end
+    end
+
+    test "a truncated function call is still :max_tokens so the loop can reject it" do
+      response =
+        gemini_response(
+          [%{"functionCall" => %{"id" => "c1", "name" => "read", "args" => %{}}}],
+          "MAX_TOKENS"
+        )
+
+      assert {:ok, %{stop_reason: :max_tokens}} = complete_with(response)
+    end
+
+    test "content filters are :refusal with the reason in stop_details" do
+      rating = %{"category" => "HARM_CATEGORY_HARASSMENT", "probability" => "HIGH"}
+
+      for reason <- @refusal_reasons do
+        response =
+          [%{"text" => "Partial"}]
+          |> gemini_response(reason)
+          |> update_in(["candidates", Access.at(0)], fn candidate ->
+            Map.merge(candidate, %{"finishMessage" => "Blocked.", "safetyRatings" => [rating]})
+          end)
+
+        for result <- [complete_with(response), stream_with([response])] do
+          assert {:ok, %{stop_reason: :refusal, response_metadata: metadata}} = result
+
+          assert metadata.stop_details == %{
+                   finish_reason: reason,
+                   finish_message: "Blocked.",
+                   safety_ratings: [rating]
+                 }
+        end
+      end
+    end
+
+    test "a blocked prompt with no candidates is :refusal with the block reason" do
+      rating = %{"category" => "HARM_CATEGORY_DANGEROUS_CONTENT", "probability" => "HIGH"}
+
+      response = %{
+        "promptFeedback" => %{"blockReason" => "PROHIBITED_CONTENT", "safetyRatings" => [rating]},
+        "usageMetadata" => %{"promptTokenCount" => 12, "totalTokenCount" => 12}
+      }
+
+      for result <- [complete_with(response), stream_with([response])] do
+        assert {:ok, %{stop_reason: :refusal, messages: [], usage: usage} = refusal} = result
+        assert usage.input_tokens == 12
+
+        assert refusal.response_metadata.stop_details == %{
+                 block_reason: "PROHIBITED_CONTENT",
+                 safety_ratings: [rating]
+               }
+      end
+    end
+
+    test "MALFORMED_FUNCTION_CALL is a retryable provider error" do
+      response =
+        [%{"text" => ""}]
+        |> gemini_response("MALFORMED_FUNCTION_CALL")
+        |> put_in(
+          ["candidates", Access.at(0), "finishMessage"],
+          "Malformed function call: read(path=)"
+        )
+
+      for result <- [complete_with(response), stream_with([response])] do
+        assert {:error, %Error{kind: :server_error} = error} = result
+        assert Error.retryable?(error)
+
+        assert Exception.message(error) ==
+                 "MALFORMED_FUNCTION_CALL: Malformed function call: read(path=)"
+      end
+    end
+
+    test "other generation failures are provider errors too" do
+      for reason <- ~w(MALFORMED_RESPONSE UNEXPECTED_TOOL_CALL TOO_MANY_TOOL_CALLS NO_IMAGE) do
+        response = gemini_response([], reason)
+
+        assert {:error, %Error{kind: :server_error, type: ^reason}} = complete_with(response)
+        assert {:error, %Error{kind: :server_error, type: ^reason}} = stream_with([response])
+      end
+    end
+
+    test "MISSING_THOUGHT_SIGNATURE is an invalid request, not retried" do
+      response = gemini_response([], "MISSING_THOUGHT_SIGNATURE")
+
+      assert {:error, %Error{kind: :invalid_request, type: "MISSING_THOUGHT_SIGNATURE"}} =
+               complete_with(response)
+    end
+
+    test "OTHER keeps the content-based stop reason" do
+      assert {:ok, %{stop_reason: :end_turn}} =
+               complete_with(gemini_response([%{"text" => "ok"}], "OTHER"))
+    end
+  end
+
   describe "error handling" do
     test "parses Gemini API errors" do
       config =
@@ -466,6 +572,16 @@ defmodule Alloy.Provider.GeminiTest do
   end
 
   defp sse_chunk(data) when is_map(data), do: "data: #{Jason.encode!(data)}\n\n"
+
+  defp complete_with(response) do
+    config = config_with_response(%{status: 200, body: Jason.encode!(response)})
+    Gemini.complete([Message.user("Hi")], [], config)
+  end
+
+  defp stream_with(responses) do
+    config = config_with_sse_stream(Enum.map(responses, &sse_chunk/1))
+    Gemini.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+  end
 
   defp config_with_response(response) do
     %{
