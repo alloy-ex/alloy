@@ -222,9 +222,6 @@ defmodule Alloy.Provider.RetryTest do
     end
   end
 
-  # ── Helpers ───────────────────────────────────────────────────────────────
-
-  # A provider that returns `responses` in order; `:ok` is a plain success.
   describe "streaming callbacks that raise" do
     import ExUnit.CaptureLog
     import Alloy.StreamTestHelpers
@@ -269,7 +266,7 @@ defmodule Alloy.Provider.RetryTest do
 
     test "a raising on_event is logged and the full text is kept", %{provider: provider} do
       on_event = fn
-        %{event: :text_delta, payload: "B"} -> exit(:liveview_down)
+        %{event: :text_delta, payload: "B"} -> raise "liveview_down"
         _envelope -> :ok
       end
 
@@ -286,8 +283,22 @@ defmodule Alloy.Provider.RetryTest do
       assert log =~ "on_event callback failed"
       assert log =~ "liveview_down"
     end
+
+    # Only raised exceptions (a bug in the UI callback) are absorbed. A throw
+    # or exit is deliberate control flow and stops the stream, as in 0.12.4.
+    test "a throw from on_chunk still aborts the stream", %{provider: provider} do
+      on_chunk = fn
+        "B" -> throw(:user_cancelled)
+        _chunk -> :ok
+      end
+
+      assert catch_throw(Alloy.stream("hi", on_chunk, provider: provider)) == :user_cancelled
+    end
   end
 
+  # ── Helpers ───────────────────────────────────────────────────────────────
+
+  # A provider that returns `responses` in order; `:ok` is a plain success.
   defp scripted_provider(responses) do
     {:ok, agent} = Agent.start_link(fn -> responses end)
 

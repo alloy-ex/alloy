@@ -487,15 +487,30 @@ defmodule Alloy.Provider.CodexTest do
       assert result.messages == [Message.assistant("fake ok")]
     end
 
-    test ":auth_path must name an auth.json file" do
+    # 0.12.4 copied any :auth_path file into a private CODEX_HOME; a file
+    # with another name still works that way until :auth_path is removed.
+    @tag :tmp_dir
+    test "an :auth_path not named auth.json is copied into a private CODEX_HOME",
+         %{tmp_dir: dir} do
+      token = Path.join(dir, "codex-token.json")
+      File.write!(token, ~s({"token":"t"}))
+      parent = self()
+
       config = %{
         model: "gpt-5.4",
-        auth_path: "/secrets/codex-token.json",
-        command_runner: fn _cmd, _args, _opts -> flunk("codex must not run") end
+        auth_path: token,
+        command_runner:
+          fake_runner(fn _args, opts, output_path ->
+            home = opts |> Keyword.fetch!(:env) |> List.keyfind("CODEX_HOME", 0) |> elem(1)
+            send(parent, {:home, home, File.read(Path.join(home, "auth.json"))})
+            File.write!(output_path, ~s({"stop_reason":"end_turn","text":"OK","tool_calls":[]}))
+            ""
+          end)
       }
 
-      assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
-      assert Exception.message(reason) =~ ":codex_home"
+      assert {:ok, _result} = Codex.complete([Message.user("Hi")], [], config)
+      assert_receive {:home, home, {:ok, ~s({"token":"t"})}}
+      refute home == dir
     end
   end
 

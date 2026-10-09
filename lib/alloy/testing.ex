@@ -94,19 +94,24 @@ defmodule Alloy.Testing do
   Takes a tool name and input map, generates a tool call block with
   a unique ID.
 
-  The input goes through a JSON round trip, so the tool receives string
-  keys exactly as it would from a real provider: `%{location: "Sydney"}`
-  arrives as `%{"location" => "Sydney"}`.
+  A map input goes through a JSON round trip, so the tool receives it
+  exactly as it would from a real provider: `%{location: "Sydney"}` arrives
+  as `%{"location" => "Sydney"}`, and atom values arrive as strings. Any
+  other input is passed through unchanged.
   """
-  @spec tool_response(String.t(), map()) :: {:ok, map()}
-  def tool_response(tool_name, input) when is_map(input) do
+  @spec tool_response(String.t(), term()) :: {:ok, map()}
+  def tool_response(tool_name, input) do
     call_id = "call_#{:crypto.strong_rand_bytes(4) |> Base.url_encode64(padding: false)}"
-    input = input |> Jason.encode!() |> Jason.decode!()
 
     TestProvider.tool_use_response([
-      %{type: "tool_use", id: call_id, name: tool_name, input: input}
+      %{type: "tool_use", id: call_id, name: tool_name, input: as_provider_input(input)}
     ])
   end
+
+  defp as_provider_input(input) when is_map(input),
+    do: input |> Jason.encode!() |> Jason.decode!()
+
+  defp as_provider_input(input), do: input
 
   @doc """
   Build a scripted error response for the test provider.

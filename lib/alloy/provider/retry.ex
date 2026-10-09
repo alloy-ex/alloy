@@ -250,22 +250,19 @@ defmodule Alloy.Provider.Retry do
   end
 
   # The caller's streaming callbacks run inside the provider's stream
-  # handler. If one fails there, the handler loses the delta it was
-  # accumulating, so the stored message silently misses text. A broken UI
-  # callback is logged and the stream carries on.
+  # handler. If one raises there, the handler loses the delta it was
+  # accumulating, so the stored message silently misses text. A raising (so
+  # buggy) UI callback is logged and the stream carries on. A throw or exit
+  # is deliberate control flow and still stops the stream, as it always has.
   defp notify(name, callback, payload) do
     callback.(payload)
     :ok
   rescue
     exception ->
-      log_callback_failure(name, Exception.format(:error, exception, __STACKTRACE__))
-  catch
-    kind, reason ->
-      log_callback_failure(name, Exception.format(kind, reason, __STACKTRACE__))
-  end
-
-  defp log_callback_failure(name, formatted) do
-    Logger.warning("[Alloy] #{name} callback failed; the stream continues.\n#{formatted}")
+      Logger.warning(
+        "[Alloy] #{name} callback failed; the stream continues.\n" <>
+          Exception.format(:error, exception, __STACKTRACE__)
+      )
   end
 
   # Sets receive_timeout in the provider's req_options based on remaining deadline.

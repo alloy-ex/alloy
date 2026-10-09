@@ -12,7 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`:allowed_paths` is enforced on a directory boundary.** It was a string
   prefix match, so allowing `/proj` also admitted `/proj-secrets/key.txt`. The
   path that was checked (symlinks resolved) is now the path that is opened,
-  and a symlink loop returns an error instead of hanging the tool.
+  and a symlink loop returns an error instead of hanging the tool. Custom
+  tools calling `Alloy.Tool.resolve_path/2` with `:allowed_paths` set get
+  that resolved path (for example `/private/var/...` on macOS).
 - **The bash tool no longer passes secrets to commands.** Variables whose
   names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or `CREDENTIAL` are
   removed from the command's environment by default, so a prompt-injected
@@ -52,14 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `result.metadata.run.provider_error`. The struct implements `String.Chars`,
   so interpolating it still works; code that applies `=~` or binary
   patterns to a provider's raw error should use `Exception.message/1`.
+  Messages keep their `"<type>: <message>"` shape when the error body has a
+  type; untyped bodies now read `"HTTP <status>: <message>"` (OpenAICompat
+  produced `": message"`, Gemini `"429: message"`), and a blocked Gemini
+  prompt is a `:refusal` instead of an error. `Alloy.Provider.OpenAIStream.stream/5`
+  returns the struct too.
 - **Turn telemetry fires in order.** Each `[:alloy, :turn, :stop]` is
   emitted when that turn ends; previously the loop recursed first, so stops
   arrived in reverse and turn 1's stop carried the run's final status. A
   turn the loop continues past now reports `status: :running`. Dashboards
   that read a turn's stop status as the run outcome should use
   `[:alloy, :run, :stop]`.
-- **`Alloy.Agent.Server.chat/3` returns `{:error, result}` for
-  `:budget_exceeded`**, as `Alloy.run/2` always did (it returned
+- **`Alloy.Agent.Server.chat/3` and `stream_chat/4` return `{:error, result}`
+  for `:budget_exceeded`**, as `Alloy.run/2` always did (it returned
   `{:ok, result}`), and its default call timeout is the agent's
   `timeout_ms` plus 10 seconds instead of 30 seconds, so a caller no longer
   gives up while the turn is still running.
@@ -69,18 +76,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thinking from earlier turns is the documented way to keep the transcript
   valid. Truncation never splits a tool round, and oversized retained tool
   results are shortened with a marker.
+- `Alloy.Context.Compactor`: in `compact_messages/2`, `:keep_recent` is a
+  minimum (whole tool rounds are kept) and `redacted_thinking` blocks are
+  dropped with other earlier-turn thinking; `force_compact/1` always
+  summarizes, which costs a provider call.
+- A limit-only `model_metadata_overrides` entry for a catalog model now also
+  covers its dated snapshots (`-2026-03-05`, `-20251001`, `-0309-...`) but
+  not other suffixes such as `-fast`; give `suffix_patterns` for those.
+- `Alloy.run/2` raises `ArgumentError` for an `:on_event` that is not a
+  1-arity function, as `Alloy.stream/3` already did.
 - **The compaction estimate counts the whole request** — system prompt, tool
   definitions and every block type, by bytes rather than characters (CJK text
   was undercounted about 3x) — so compaction fires earlier and more
   accurately.
+- **A tool is not called when the model omits a `required` key** (or sends
+  non-object input); the model gets an error result naming the missing keys
+  instead of a `FunctionClauseError` it can't act on. If a tool supplies a
+  default for a key, remove that key from `required`. Types are not checked
+  or coerced.
 - **Every tool call runs in a supervised, unlinked task** (previously
   sequential tools ran in the agent process). `self()` and the process
   dictionary inside a tool differ for sequential tools; Ecto's SQL sandbox
   still works through `$callers`. Event and telemetry handlers for tool
   start/end now run in the agent process.
-- `Alloy.Testing.tool_response/2` gives tools string-keyed input, as real
-  providers do. Tests that relied on atom keys were passing for the wrong
-  reason; update the tool or the test.
+- `Alloy.Testing.tool_response/2` gives tools input as real providers do: a
+  map goes through a JSON round trip, so keys are strings and atom values
+  become strings (`%{unit: :celsius}` arrives as `%{"unit" => "celsius"}`;
+  expect `"celsius"` in `assert_tool_called/3`). Tests that relied on atom
+  keys were passing for the wrong reason; update the tool or the test.
 - **Codex runs against your real `CODEX_HOME`** (or `:codex_home`) with
   `--ignore-user-config --ignore-rules`, and requires Codex CLI 0.122.0 or
   later. Your `$CODEX_HOME/AGENTS.md` and skills now reach Alloy runs; for
@@ -99,8 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenAI-family and Gemini usage now reports cache reads in
   `cache_read_input_tokens` (and writes in `cache_creation_input_tokens`)
   instead of inside `input_tokens`, matching Anthropic. Total prompt tokens
-  are the sum of the three. Reported `input_tokens` drop by the cached
-  amount.
+  are the sum of the three. Reported `input_tokens` — and with them
+  `Alloy.Usage.total/1` and `Alloy.Usage.estimate_cost/3` — drop by the
+  cached amount.
 - `Alloy.Provider.SSE.process_chunk/2` scans only the new bytes for event
   boundaries (a large event went from 663 ms to 8 ms), so `buffer` must be
   the remainder returned by the previous call, as in normal use.
@@ -160,9 +184,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   turn stop gains `duration` and `monotonic_time`, and turn metadata gains
   `telemetry_span_context`. The compaction summary request emits
   `[:alloy, :provider, :request]`.
-- **Tool input is checked before `execute/2`:** a non-map input or missing
-  `required` keys return an error result naming them, instead of a
-  `FunctionClauseError` the model can't act on. No type checking or coercion.
 - **Read pages large files**: output ends with
   `[Showing lines X-Y of N. Use offset=Z to continue.]` when cut, and binary
   files are refused.
@@ -202,10 +223,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:before_completion` middleware that prices `state.usage` with
   `Alloy.Usage.estimate_cost/3`.
 - `Alloy.Agent.State.materialize/1`, `Alloy.Agent.State.cleanup/1` and the
-  `messages_new` field: the history now lives in `state.messages`.
-- Codex `:auth_path`. Use `:codex_home` (its directory is used as
-  `CODEX_HOME`).
-- Anthropic `:extended_thinking`. It sends manual thinking
+  `messages_new` field (removed in 0.13): the history now lives in
+  `state.messages`.
+- Codex `:auth_path` (removed in 0.13; a warning is logged once per node).
+  Use `:codex_home`. An `auth.json` path uses its directory as `CODEX_HOME`;
+  a file with another name is still copied into a private per-call home, as
+  in 0.12.4.
+- Anthropic `:extended_thinking` (removed in 0.13). It sends manual thinking
   (`type: "enabled"` with `budget_tokens`), which Claude 4.7 and later
   reject. It keeps working for older models; for current ones pass
   `extra_body: %{"thinking" => %{"type" => "adaptive"}}` (see the provider
@@ -234,13 +258,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalidated the prompt cache).
 - **A stream callback that raises no longer corrupts history.** Text from a
   delta whose `on_chunk`/`on_event` raised was missing from the stored
-  message, so the UI and the transcript disagreed.
+  message, so the UI and the transcript disagreed. A raised exception is now
+  logged and the stream continues; a `throw` or `exit` from a callback still
+  stops the stream, as before.
 - `Alloy.run/2` passes `:on_event` through (it was silently ignored), and the
   documented top-level `code_execution: true` now reaches the provider.
 - `Alloy.Usage.estimate_cost/3` no longer rounds per-million rates to whole
   cents ($0.075/M priced as 8¢).
 - **A tool that calls `exit/1` or `throw/1` no longer kills the agent**, and
-  `:tool_timeout` now applies to sequential tools too. Cancelling a turn
+  `:tool_timeout` now applies to `concurrent?: false` tools too (they had no
+  time limit; they are now stopped after `:tool_timeout`, 120 s by
+  default). Cancelling a turn
   (`Alloy.Agent.Server.cancel_request/2`) still stops its in-flight tools: a
   supervised watcher kills them when the turn is killed.
 - **Tools run in the order the model called them.** Sequential tools used to
@@ -279,7 +307,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `store: false` the request pointed at a response that was never
   stored. The stateless encrypted-reasoning echo was also switched off after
   the first request. Chaining is now explicit: pass `:previous_response_id`
-  and send only the new messages.
+  and send only the new messages. If you continued a stored response by
+  passing `provider_state: %{response_id: id}`, pass
+  `previous_response_id: id` instead — that state is no longer sent.
 - **OpenAI family:**
   - `response.failed`, `response.incomplete`, `error` events and cut-off
     streams are errors or `:max_tokens`/`:refusal` instead of partial

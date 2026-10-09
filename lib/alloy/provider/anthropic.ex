@@ -35,8 +35,8 @@ defmodule Alloy.Provider.Anthropic do
     request fields or beta headers they need through `:extra_body` and
     `:extra_headers`.
   - `:req_options` - Additional options passed to Req (useful for testing)
-  - `:extended_thinking` - *Deprecated; configure thinking through
-    `:extra_body` instead (see "Thinking" below).* A keyword list with a
+  - `:extended_thinking` - *Deprecated, removed in 0.13; configure thinking
+    through `:extra_body` instead (see "Thinking" below).* A keyword list with a
     positive `:budget_tokens` (e.g., `[budget_tokens: 5000]`) sends
     `"thinking": {"type": "enabled", "budget_tokens": ...}`. It still works on
     the models that accept manual budgets (Claude Opus 4.5, Sonnet 4.5,
