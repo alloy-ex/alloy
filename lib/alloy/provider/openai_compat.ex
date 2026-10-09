@@ -182,7 +182,8 @@ defmodule Alloy.Provider.OpenAICompat do
     [%{"role" => "assistant", "content" => content}]
   end
 
-  defp format_message(%Message{role: :assistant, content: blocks}) when is_list(blocks) do
+  defp format_message(%Message{role: :assistant, content: blocks} = message)
+       when is_list(blocks) do
     tool_calls =
       blocks
       |> Enum.filter(&(&1[:type] == "tool_use"))
@@ -218,7 +219,10 @@ defmodule Alloy.Provider.OpenAICompat do
       )
 
     msg = if(tool_calls == [], do: msg, else: Map.put(msg, "tool_calls", tool_calls))
-    [msg]
+
+    # Thinking modes (DeepSeek, Kimi, GLM) need earlier reasoning back to
+    # keep continuity; DeepSeek rejects a tool loop without it (HTTP 400).
+    [maybe_put(msg, "reasoning_content", Message.thinking(message))]
   end
 
   defp format_message(%Message{role: :user, content: blocks}) when is_list(blocks) do

@@ -401,6 +401,58 @@ defmodule Alloy.Provider.OpenAICompatTest do
       refute Enum.any?(blocks, &(&1.type == "thinking"))
     end
 
+    test "reasoning_content is echoed back on the assistant message of a tool loop" do
+      # DeepSeek thinking mode rejects the next request (HTTP 400) when the
+      # reasoning_content of a tool-calling turn is missing.
+      response = %{
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => nil,
+              "reasoning_content" => "I should read the file.",
+              "tool_calls" => [
+                %{
+                  "id" => "call_1",
+                  "type" => "function",
+                  "function" => %{"name" => "read", "arguments" => "{}"}
+                }
+              ]
+            },
+            "finish_reason" => "tool_calls"
+          }
+        ]
+      }
+
+      config = config_with_response(%{status: 200, body: Jason.encode!(response)})
+
+      assert {:ok, %{messages: [assistant]}} =
+               OpenAICompat.complete([Message.user("Hi")], [], config)
+
+      results = Message.tool_results([Message.tool_result_block("call_1", "contents")])
+
+      OpenAICompat.complete(
+        [Message.user("Hi"), assistant, results],
+        [],
+        config_that_captures_request()
+      )
+
+      assert_received {:request_body, body}
+      outgoing = Enum.find(Jason.decode!(body)["messages"], &(&1["role"] == "assistant"))
+
+      assert outgoing["reasoning_content"] == "I should read the file."
+      assert [%{"id" => "call_1"}] = outgoing["tool_calls"]
+    end
+
+    test "assistant messages without thinking carry no reasoning_content" do
+      assistant = Message.assistant_blocks([%{type: "text", text: "Hello"}])
+      OpenAICompat.complete([Message.user("Hi"), assistant], [], config_that_captures_request())
+
+      assert_received {:request_body, body}
+      outgoing = Enum.find(Jason.decode!(body)["messages"], &(&1["role"] == "assistant"))
+      refute Map.has_key?(outgoing, "reasoning_content")
+    end
+
     test "empty reasoning_content is ignored" do
       config =
         config_with_response(%{
