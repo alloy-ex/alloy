@@ -110,6 +110,24 @@ defmodule Alloy.Tool.Core.ReadTest do
       assert result =~ "1\taaaa"
     end
 
+    test ":allowed_paths does not admit a sibling directory sharing the prefix", %{
+      tmp_dir: tmp_dir
+    } do
+      project = Path.join(tmp_dir, "project")
+      File.mkdir_p!(project)
+      File.mkdir_p!(project <> "-secrets")
+      File.write!(Path.join(project <> "-secrets", "key.txt"), "SECRET\n")
+      File.write!(Path.join(project, "ok.txt"), "fine\n")
+      ctx = %{allowed_paths: [project], working_directory: project}
+
+      assert {:error, msg} =
+               Read.execute(%{"file_path" => project <> "-secrets/key.txt"}, ctx)
+
+      assert msg =~ "outside allowed directories"
+      assert {:ok, result} = Read.execute(%{"file_path" => "ok.txt"}, ctx)
+      assert result =~ "fine"
+    end
+
     test "returns error for missing file" do
       assert {:error, msg} = Read.execute(%{"file_path" => "/nonexistent/file.txt"}, %{})
       assert msg =~ "does not exist" or msg =~ "not a readable file"

@@ -70,6 +70,25 @@ defmodule Alloy.Tool.Core.WriteTest do
       assert File.read!(file) == "abs"
     end
 
+    test ":allowed_paths admits new files inside the root and refuses escapes", %{
+      tmp_dir: tmp_dir
+    } do
+      project = Path.join(tmp_dir, "project")
+      File.mkdir_p!(project)
+      ctx = %{allowed_paths: [project], working_directory: project}
+
+      assert {:ok, _msg} =
+               Write.execute(%{"file_path" => "new/dir/file.txt", "content" => "x"}, ctx)
+
+      assert File.read!(Path.join(project, "new/dir/file.txt")) == "x"
+
+      assert {:error, msg} =
+               Write.execute(%{"file_path" => "../project-evil/file.txt", "content" => "x"}, ctx)
+
+      assert msg =~ "outside allowed directories"
+      refute File.exists?(Path.join(tmp_dir, "project-evil"))
+    end
+
     test "returns error when parent directory cannot be created", %{tmp_dir: tmp_dir} do
       # Create a read-only parent to prevent mkdir_p from creating children
       locked_dir = Path.join(tmp_dir, "locked")
