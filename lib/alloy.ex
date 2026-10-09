@@ -166,16 +166,11 @@ defmodule Alloy do
   defp do_run(message, opts, turn_opts) do
     config = Config.from_opts(opts)
     messages = build_messages(message, opts)
-    state = %{State.init(config, messages) | status: :running}
 
-    try do
-      state
-      |> Turn.run_loop(turn_opts)
-      |> Result.from_state()
-      |> Result.wrap()
-    after
-      State.cleanup(state)
-    end
+    %{State.init(config, messages) | status: :running}
+    |> Turn.run_loop(turn_opts)
+    |> Result.from_state()
+    |> Result.wrap()
   end
 
   defp build_messages(nil, opts) do

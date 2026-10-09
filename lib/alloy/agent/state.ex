@@ -194,9 +194,10 @@ defmodule Alloy.Agent.State do
   def last_assistant_thinking(%__MODULE__{} = state),
     do: find_last_assistant(state, &Message.thinking/1)
 
+  @doc deprecated: "A state owns no resources; drop the call. Removed in 0.13."
   @doc """
-  Clean up resources owned by this state. No-op currently; reserved
-  for future resource management.
+  Does nothing and returns `:ok`. A state owns no resources to release;
+  kept only so existing callers compile during 0.12.x.
   """
   @spec cleanup(t()) :: :ok
   def cleanup(%__MODULE__{}), do: :ok

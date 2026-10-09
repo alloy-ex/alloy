@@ -357,9 +357,6 @@ defmodule Alloy.Agent.Server do
       end
     end
 
-    # Cleanup last — after all consumers (middleware, callbacks) are done.
-    State.cleanup(state)
-
     :ok
   end
 
