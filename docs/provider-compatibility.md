@@ -93,6 +93,20 @@ OpenAI drop reasoning the new model can't use themselves, and Gemini says
 to resend it. Encrypted reasoning only ever goes back to the provider that
 issued it, since OpenAI ties it to the issuing organisation.
 
+Known limits:
+
+- **DeepSeek thinking mode with tools** requires `reasoning_content` on
+  every earlier assistant turn. Turns written by another provider have
+  none, so switching to DeepSeek in the middle of a tool conversation can
+  be rejected. Start a new conversation, or turn thinking off for it.
+- **Anthropic manual thinking** (`"type" => "enabled"`, Claude 4.6 and
+  earlier) requires the turn in progress to start with a thinking block,
+  which a turn written by another provider lacks. Adaptive thinking, the
+  only mode on current models, has no such rule.
+- **`OpenAICompat`** is one provider module for many vendors, so switching
+  vendors behind it counts as the same provider. Reasoning there is plain
+  text, which every vendor accepts.
+
 The provider tests check serialization, stream parsing, and opaque state
 round-trips using fixtures. Those checks do not certify every current model
 against a live API. Validate a new model on your application's evals before

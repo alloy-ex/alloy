@@ -9,7 +9,7 @@
 
 Alloy is the completion-tool-call loop and nothing else. Send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. No opinions on sessions, persistence, memory, scheduling, or UI — those belong in your application, where OTP already gives you the runtime.
 
-Alloy is a harness, not a framework. Four runtime dependencies, ~11,000 lines — small enough to read in a day, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
+Alloy is a harness, not a framework. Four runtime dependencies, ~10,000 lines — small enough to read in a day, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and tell me the version",
@@ -73,7 +73,7 @@ application layer. The library stays small so those choices remain yours.
 - **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
 - **Budget limits** — a small `:before_completion` middleware [recipe](#budget-limits) prices usage and halts the run
 - **Pluggable model catalog** — `Alloy.ModelCatalog` behaviour; bring your own context-window source (e.g., an `llm_db` adapter)
-- **~11,000 lines** — small enough to read, understand, and extend
+- **~10,000 lines** — small enough to read, understand, and extend
 
 ## Installation
 
