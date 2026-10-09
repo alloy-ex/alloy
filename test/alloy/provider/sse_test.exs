@@ -130,6 +130,71 @@ defmodule Alloy.Provider.SSETest do
     end
   end
 
+  describe "process_chunk/2 across chunk boundaries" do
+    test "finds an event boundary split between two chunks" do
+      {[], buffer} = SSE.process_chunk("", "data: a\n")
+      {events, buffer} = SSE.process_chunk(buffer, "\ndata: b\n\n")
+
+      assert [%{data: "a"}, %{data: "b"}] = events
+      assert buffer == ""
+    end
+
+    test "finds a CRLF boundary split between chunks" do
+      {[], buffer} = SSE.process_chunk("", "data: a\r")
+      assert {[%{data: "a"}], ""} = SSE.process_chunk(buffer, "\n\r\n")
+
+      {[], buffer} = SSE.process_chunk("", "data: b\r\n\r")
+      assert {[%{data: "b"}], ""} = SSE.process_chunk(buffer, "\n")
+    end
+
+    test "reassembles a multi-byte UTF-8 character split between chunks" do
+      <<first::binary-size(1), second::binary>> = "é"
+
+      {[], buffer} = SSE.process_chunk("", "data: caf" <> first)
+      assert {[%{data: "café"}], ""} = SSE.process_chunk(buffer, second <> "\n\n")
+    end
+
+    test "matches one-shot parsing whatever the chunk size" do
+      stream =
+        "event: a\r\ndata: {\"x\":\r\ndata: 1}\r\n\r\n: keep-alive\n\n" <>
+          "data: héllo\n\ndata: [DONE]\n\n"
+
+      expected = SSE.process_chunk("", stream)
+
+      for size <- 1..8 do
+        assert parse_in_chunks(stream, size) == expected
+      end
+    end
+
+    test "parses a large event in linear time" do
+      # Re-scanning the whole buffer on every chunk is quadratic: this took
+      # seconds before the scan became incremental.
+      data = String.duplicate("x", 8_000_000)
+
+      {microseconds, {[event], ""}} =
+        :timer.tc(fn -> parse_in_chunks("data: " <> data <> "\n\n", 256) end)
+
+      assert event.data == data
+      assert microseconds < 1_000_000
+    end
+  end
+
+  defp parse_in_chunks(stream, size) do
+    stream
+    |> chunks(size)
+    |> Enum.reduce({[], ""}, fn chunk, {events, buffer} ->
+      {new_events, buffer} = SSE.process_chunk(buffer, chunk)
+      {events ++ new_events, buffer}
+    end)
+  end
+
+  defp chunks(binary, size) when byte_size(binary) <= size, do: [binary]
+
+  defp chunks(binary, size) do
+    <<chunk::binary-size(^size), rest::binary>> = binary
+    [chunk | chunks(rest, size)]
+  end
+
   # ── req_stream_handler/2 ─────────────────────────────────────────────
 
   describe "req_stream_handler/2" do
