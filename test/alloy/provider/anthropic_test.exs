@@ -314,6 +314,57 @@ defmodule Alloy.Provider.AnthropicTest do
     end
   end
 
+  describe "server_tools" do
+    test "appends server tools after the generated tools" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:code_execution, true)
+        |> Map.put(:server_tools, [
+          %{"type" => "web_search_20260209", "name" => "web_search", "max_uses" => 3},
+          %{type: "web_fetch_20260209", name: "web_fetch"}
+        ])
+
+      tool_defs = [%{name: "read", description: "Read", input_schema: %{}}]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+
+      assert [
+               %{"name" => "read"},
+               %{"name" => "code_execution"},
+               %{"type" => "web_search_20260209", "name" => "web_search", "max_uses" => 3},
+               %{"type" => "web_fetch_20260209", "name" => "web_fetch"}
+             ] = Jason.decode!(body)["tools"]
+    end
+
+    test "sends server tools when there are no local tools" do
+      config =
+        Map.put(config_that_captures_request(), :server_tools, [
+          %{"type" => "web_search_20260209", "name" => "web_search"}
+        ])
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert [%{"name" => "web_search"}] = Jason.decode!(body)["tools"]
+    end
+
+    test "extra_body tools still replace every tool" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:server_tools, [%{"type" => "web_search_20260209", "name" => "web_search"}])
+        |> Map.put(:extra_body, %{"tools" => [%{"type" => "bash_20250124", "name" => "bash"}]})
+
+      tool_defs = [%{name: "read", description: "Read", input_schema: %{}}]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      assert [%{"name" => "bash"}] = Jason.decode!(body)["tools"]
+    end
+  end
+
   describe "code_execution support" do
     test "includes code_execution tool in request when code_execution is configured" do
       config =

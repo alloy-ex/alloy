@@ -18,7 +18,15 @@ defmodule Alloy.Provider.Anthropic do
   - `:api_url` - Base URL (default: "https://api.anthropic.com")
   - `:api_version` - API version header (default: "2023-06-01")
   - `:extra_headers` - Additional headers as `[{name, value}]`
-  - `:extra_body` - Additional request body fields, merged last
+  - `:extra_body` - Additional request body fields, merged last. A `"tools"`
+    key here replaces every tool Alloy generates; use `:server_tools` to add
+    tools instead.
+  - `:server_tools` - Raw tool maps sent after Alloy's own tools, for
+    Anthropic-run tools such as web search, web fetch, tool search or an
+    `mcp_toolset` (default: `[]`). For example
+    `[%{"type" => "web_search_20260209", "name" => "web_search"}]`. Add any
+    request fields or beta headers they need through `:extra_body` and
+    `:extra_headers`.
   - `:req_options` - Additional options passed to Req (useful for testing)
   - `:extended_thinking` - Enable extended thinking. Pass a keyword list with
     `:budget_tokens` (e.g., `[budget_tokens: 5000]`). Thinking blocks are
@@ -89,6 +97,7 @@ defmodule Alloy.Provider.Anthropic do
           optional(:api_version) => String.t(),
           optional(:extra_headers) => [{String.t(), String.t()}],
           optional(:extra_body) => map(),
+          optional(:server_tools) => [map()],
           optional(:req_options) => keyword(),
           optional(:extended_thinking) => keyword(),
           optional(:on_event) => (term() -> :ok),
@@ -311,21 +320,17 @@ defmodule Alloy.Provider.Anthropic do
           Map.put(body, "system", prompt)
       end
 
-    body =
-      case tool_defs do
-        [] ->
-          body
+    client_tools =
+      tool_defs
+      |> Enum.map(&format_tool_def/1)
+      |> maybe_add_cache_to_last_tool(cache?)
 
-        defs ->
-          tools = Enum.map(defs, &format_tool_def/1)
-          tools = maybe_add_cache_to_last_tool(tools, cache?)
-          Map.put(body, "tools", tools)
-      end
+    tools =
+      client_tools ++ code_execution_tools(config) ++ memory_tools(config) ++ server_tools(config)
 
     body =
       body
-      |> maybe_add_code_execution(config)
-      |> maybe_add_memory_tool(config)
+      |> maybe_put_tools(tools)
       |> maybe_put_container(config)
 
     body =
@@ -360,31 +365,22 @@ defmodule Alloy.Provider.Anthropic do
 
   defp stringify_extra_body(_), do: %{}
 
-  defp maybe_add_code_execution(body, config) do
-    if Map.get(config, :code_execution, false) do
-      code_exec_tool = %{
-        "type" => @code_execution_tool_type,
-        "name" => "code_execution"
-      }
+  defp maybe_put_tools(body, []), do: body
+  defp maybe_put_tools(body, tools), do: Map.put(body, "tools", tools)
 
-      existing_tools = Map.get(body, "tools", [])
-      Map.put(body, "tools", existing_tools ++ [code_exec_tool])
-    else
-      body
-    end
-  end
+  defp code_execution_tools(%{code_execution: true}),
+    do: [%{"type" => @code_execution_tool_type, "name" => "code_execution"}]
 
-  defp maybe_add_memory_tool(body, config) do
-    case Map.get(config, :memory) do
-      nil ->
-        body
+  defp code_execution_tools(_config), do: []
 
-      {_module, _store} ->
-        memory_tool = %{"type" => @memory_tool_type, "name" => "memory"}
-        existing_tools = Map.get(body, "tools", [])
-        Map.put(body, "tools", existing_tools ++ [memory_tool])
-    end
-  end
+  defp memory_tools(%{memory: {_module, _store}}),
+    do: [%{"type" => @memory_tool_type, "name" => "memory"}]
+
+  defp memory_tools(_config), do: []
+
+  # Anthropic runs these tools itself, so they are sent exactly as given.
+  defp server_tools(config),
+    do: config |> Map.get(:server_tools, []) |> Alloy.Provider.stringify_keys()
 
   # Reusing the container keeps code execution state between turns, and the
   # API rejects a continuation of a pending programmatic tool call without it.
