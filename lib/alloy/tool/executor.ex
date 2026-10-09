@@ -69,7 +69,7 @@ defmodule Alloy.Tool.Executor do
 
   defp concurrent?({:execute, call}, tool_fns) do
     case Map.fetch(tool_fns, call[:name]) do
-      {:ok, tool} -> not tool_sequential?(tool)
+      {:ok, tool} -> Registry.to_inline(tool).concurrent? != false
       :error -> true
     end
   end
@@ -156,13 +156,13 @@ defmodule Alloy.Tool.Executor do
 
   defp invoke({:execute, call}, run) do
     case Map.fetch(run.tool_fns, call[:name]) do
-      {:ok, tool} -> execute_tool(tool, call, run.context)
+      {:ok, tool} -> execute_tool(Registry.to_inline(tool), call, run.context)
       :error -> {:error, "Unknown tool: #{call[:name]}", nil}
     end
   end
 
-  defp execute_tool(tool, call, context) do
-    case tool_execute(tool, call[:input] || %{}, context) do
+  defp execute_tool(%Inline{execute: execute} = tool, call, context) do
+    case execute.(call[:input] || %{}, context) do
       {:ok, text, data} when is_map(data) -> {:ok, maybe_truncate(text, tool), data}
       {:ok, text} -> {:ok, maybe_truncate(text, tool), nil}
       {:error, reason} -> {:error, reason, nil}
@@ -279,25 +279,8 @@ defmodule Alloy.Tool.Executor do
 
   defp random_id, do: "run_" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
 
-  # ── Tool dispatch (module or Alloy.Tool.Inline) ──────────────────────────
-
-  defp tool_execute(%Inline{execute: fun}, input, ctx), do: fun.(input, ctx)
-  defp tool_execute(mod, input, ctx), do: mod.execute(input, ctx)
-
-  defp tool_max_result_chars(%Inline{max_result_chars: max}), do: max
-
-  defp tool_max_result_chars(mod) do
-    if function_exported?(mod, :max_result_chars, 0), do: mod.max_result_chars()
-  end
-
-  defp tool_sequential?(%Inline{concurrent?: concurrent?}), do: concurrent? == false
-
-  defp tool_sequential?(mod) do
-    function_exported?(mod, :concurrent?, 0) and mod.concurrent?() == false
-  end
-
-  defp maybe_truncate(text, tool) when is_binary(text) do
-    case tool_max_result_chars(tool) do
+  defp maybe_truncate(text, %Inline{max_result_chars: max_result_chars}) when is_binary(text) do
+    case max_result_chars do
       max when is_integer(max) and max > 0 ->
         len = String.length(text)
 

@@ -175,6 +175,21 @@ defmodule Alloy.Tool.RegistryTest do
                "OpenAI strict mode also requires every property to be listed in required."
     end
 
+    test "a module tool and the equivalent inline tool build the same definition" do
+      inline =
+        Alloy.Tool.inline(
+          name: "advanced",
+          description: "An advanced tool",
+          input_schema: %{type: "object", properties: %{query: %{type: "string"}}},
+          execute: fn _input, _ctx -> {:ok, "ok"} end,
+          input_examples: [%{query: "release notes"}],
+          defer_loading: true
+        )
+
+      assert {[module_def], %{"advanced" => AdvancedTool}} = Registry.build([AdvancedTool])
+      assert {[^module_def], %{"advanced" => ^inline}} = Registry.build([inline])
+    end
+
     test "advanced tool metadata is included only when present" do
       {defs, _fns} = Registry.build([AdvancedTool, BasicTool])
 

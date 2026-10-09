@@ -22,10 +22,39 @@ defmodule Alloy.Tool.Registry do
   """
   @spec build([tool()]) :: {[map()], %{String.t() => tool()}}
   def build(tools) when is_list(tools) do
-    tools = Enum.map(tools, &validate!/1)
-    tool_defs = Enum.map(tools, &tool_def/1)
-    tool_fns = Map.new(tools, fn tool -> {tool_name(tool), tool} end)
+    specs = Enum.map(tools, &(&1 |> validate!() |> to_inline()))
+    tool_defs = Enum.map(specs, &tool_def/1)
+    tool_fns = tools |> Enum.zip(specs) |> Map.new(fn {tool, spec} -> {spec.name, tool} end)
     {tool_defs, tool_fns}
+  end
+
+  @doc false
+  # One shape for both kinds of tool, so the definition builder and the
+  # executor handle modules and inline tools with the same code. A module's
+  # missing optional callbacks become the inline defaults.
+  @spec to_inline(tool()) :: Inline.t()
+  def to_inline(%Inline{} = tool), do: tool
+
+  def to_inline(mod) when is_atom(mod) do
+    name = mod.name()
+
+    %Inline{
+      name: name,
+      description: mod.description(),
+      input_schema: mod.input_schema(),
+      execute: &mod.execute/2,
+      concurrent?: optional(mod, :concurrent?, true),
+      max_result_chars: optional(mod, :max_result_chars, nil),
+      allowed_callers: optional(mod, :allowed_callers, nil),
+      result_type: optional(mod, :result_type, nil),
+      strict: optional(mod, :strict?, false),
+      input_examples: optional(mod, :input_examples, []),
+      defer_loading: optional(mod, :defer_loading?, false)
+    }
+  end
+
+  defp optional(mod, callback, default) do
+    if function_exported?(mod, callback, 0), do: apply(mod, callback, []), else: default
   end
 
   defp validate!(%Inline{} = tool), do: Inline.validate!(tool)
@@ -36,9 +65,6 @@ defmodule Alloy.Tool.Registry do
           "tools must be modules implementing Alloy.Tool or Alloy.Tool.Inline " <>
             "structs (see Alloy.Tool.inline/1). Got: #{inspect(other)}"
   end
-
-  defp tool_name(%Inline{name: name}), do: name
-  defp tool_name(mod), do: mod.name()
 
   defp tool_def(%Inline{} = tool) do
     def_map = %{
@@ -52,34 +78,13 @@ defmodule Alloy.Tool.Registry do
     def_map
     |> maybe_put(:allowed_callers, tool.allowed_callers)
     |> maybe_put(:result_type, tool.result_type)
-    |> maybe_put_strict(tool.strict)
+    |> maybe_put_true(:strict, tool.strict)
     |> maybe_put_non_empty(:input_examples, tool.input_examples)
     |> maybe_put_true(:defer_loading, tool.defer_loading)
   end
 
-  defp tool_def(mod) do
-    def_map = %{
-      name: mod.name(),
-      description: mod.description(),
-      input_schema: mod.input_schema()
-    }
-
-    strict = optional_callback(mod, :strict?, 0, false)
-    validate_strict_schema!(def_map, strict)
-
-    def_map
-    |> maybe_put_optional(mod, :allowed_callers, 0)
-    |> maybe_put_optional(mod, :result_type, 0)
-    |> maybe_put_strict(strict)
-    |> maybe_put_optional_non_empty(mod, :input_examples, 0)
-    |> maybe_put_optional_true(mod, :defer_loading?, 0, :defer_loading)
-  end
-
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
-  defp maybe_put_strict(map, true), do: Map.put(map, :strict, true)
-  defp maybe_put_strict(map, _strict), do: map
 
   defp maybe_put_non_empty(map, _key, nil), do: map
   defp maybe_put_non_empty(map, _key, []), do: map
@@ -87,38 +92,6 @@ defmodule Alloy.Tool.Registry do
 
   defp maybe_put_true(map, key, true), do: Map.put(map, key, true)
   defp maybe_put_true(map, _key, _value), do: map
-
-  defp maybe_put_optional(map, mod, callback, arity) do
-    if function_exported?(mod, callback, arity) do
-      Map.put(map, callback, apply(mod, callback, []))
-    else
-      map
-    end
-  end
-
-  defp optional_callback(mod, callback, arity, default) do
-    if function_exported?(mod, callback, arity) do
-      apply(mod, callback, [])
-    else
-      default
-    end
-  end
-
-  defp maybe_put_optional_non_empty(map, mod, callback, arity) do
-    if function_exported?(mod, callback, arity) do
-      maybe_put_non_empty(map, callback, apply(mod, callback, []))
-    else
-      map
-    end
-  end
-
-  defp maybe_put_optional_true(map, mod, callback, arity, key) do
-    if function_exported?(mod, callback, arity) do
-      maybe_put_true(map, key, apply(mod, callback, []))
-    else
-      map
-    end
-  end
 
   defp validate_strict_schema!(_def_map, false), do: :ok
   defp validate_strict_schema!(_def_map, nil), do: :ok
