@@ -40,35 +40,13 @@ defmodule Alloy.Tool.Executor do
 
       {:ok, tagged} ->
         {sequential, concurrent} = partition_by_concurrency(tagged, tool_fns)
+        run = &run_tagged(&1, tool_fns, context, on_event, seq_ref, corr_id, turn)
+        crash = &crashed(call_from(&1), &2, tool_timeout, on_event, seq_ref, corr_id, turn)
 
-        # Phase 1: Non-concurrent tools run sequentially
-        seq_results =
-          Enum.map(sequential, fn tag ->
-            run_tagged(tag, tool_fns, context, on_event, seq_ref, corr_id, turn)
-          end)
+        seq_results = run_supervised(sequential, run, crash, tool_timeout, 1)
 
-        # Phase 2: Concurrent tools run in parallel
         par_results =
-          if concurrent == [] do
-            []
-          else
-            Task.Supervisor.async_stream(
-              Alloy.TaskSupervisor,
-              concurrent,
-              &run_tagged(&1, tool_fns, context, on_event, seq_ref, corr_id, turn),
-              timeout: tool_timeout,
-              ordered: true,
-              on_timeout: :kill_task
-            )
-            |> Enum.zip(concurrent)
-            |> Enum.map(fn
-              {{:ok, pair}, _} ->
-                pair
-
-              {{:exit, reason}, tag} ->
-                crashed(call_from(tag), reason, tool_timeout, on_event, seq_ref, corr_id, turn)
-            end)
-          end
+          run_supervised(concurrent, run, crash, tool_timeout, System.schedulers_online())
 
         # Reassemble in original call order
         all = reassemble_ordered(tagged, sequential, seq_results, concurrent, par_results)
@@ -76,6 +54,26 @@ defmodule Alloy.Tool.Executor do
 
         {:ok, Message.tool_results(results), meta}
     end
+  end
+
+  # Every tool runs in an unlinked, supervised task: a tool that raises,
+  # exits or throws, or overruns :tool_timeout, becomes an error result
+  # instead of taking down the agent process that called the executor.
+  defp run_supervised([], _run, _crash, _timeout, _max_concurrency), do: []
+
+  defp run_supervised(tags, run, crash, timeout, max_concurrency) do
+    Alloy.TaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(tags, run,
+      timeout: timeout,
+      on_timeout: :kill_task,
+      max_concurrency: max_concurrency,
+      ordered: true
+    )
+    |> Enum.zip(tags)
+    |> Enum.map(fn
+      {{:ok, pair}, _tag} -> pair
+      {{:exit, reason}, tag} -> crash.(tag, reason)
+    end)
   end
 
   defp tag_tool_calls(state, calls) do
@@ -179,7 +177,7 @@ defmodule Alloy.Tool.Executor do
             "Try a smaller input or raise :tool_timeout."
 
         _ ->
-          "Tool #{call[:name]} crashed during execution: #{inspect(reason)}. " <>
+          "Tool #{call[:name]} crashed during execution: #{inspect(exit_reason(reason))}. " <>
             "Check the input and try again."
       end
 
@@ -196,6 +194,10 @@ defmodule Alloy.Tool.Executor do
     {Message.tool_result_block(call[:id], error, true),
      Map.merge(meta, %{correlation_id: corr_id, start_event_seq: nil, end_event_seq: eseq})}
   end
+
+  # The model sees the reason without the stacktrace a throw carries.
+  defp exit_reason({reason, [{_mod, _fun, _arity, _location} | _]}), do: reason
+  defp exit_reason(reason), do: reason
 
   defp call_from({:execute, c}), do: c
   defp call_from({:blocked, c, _}), do: c

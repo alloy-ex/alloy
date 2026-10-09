@@ -190,6 +190,63 @@ defmodule Alloy.Tool.ExecutorTest do
       end
     end
 
+    for concurrent? <- [true, false], {kind, crash} <- [exit: :exit, throw: :throw] do
+      @tag capture_log: true
+      test "#{kind} in a #{if concurrent?, do: "concurrent", else: "sequential"} tool becomes an error result" do
+        crash =
+          case unquote(crash) do
+            :exit -> fn _input, _ctx -> exit(:boom) end
+            :throw -> fn _input, _ctx -> throw(:boom) end
+          end
+
+        tool =
+          Alloy.Tool.inline(
+            name: "crash",
+            description: "crashes",
+            input_schema: %{type: "object", properties: %{}},
+            concurrent?: unquote(concurrent?),
+            execute: crash
+          )
+
+        state = build_state([tool])
+        call = %{id: "c_crash", name: "crash", type: "tool_use", input: %{}}
+
+        assert %Message{content: [block]} = Executor.execute_all([call], state.tool_fns, state)
+        assert block.tool_use_id == "c_crash"
+        assert block.is_error == true
+        assert block.content =~ "Tool crash crashed"
+        assert block.content =~ ":boom"
+      end
+    end
+
+    test "tool_timeout applies to sequential tools" do
+      tool =
+        Alloy.Tool.inline(
+          name: "slow_seq",
+          description: "sleeps",
+          input_schema: %{type: "object", properties: %{}},
+          concurrent?: false,
+          execute: fn _input, _ctx ->
+            Process.sleep(2_000)
+            {:ok, "finished"}
+          end
+        )
+
+      state = build_state([tool], tool_timeout: 50)
+      call = %{id: "c_slow_seq", name: "slow_seq", type: "tool_use", input: %{}}
+
+      {elapsed_us, result} =
+        :timer.tc(fn -> Executor.execute_all([call], state.tool_fns, state) end)
+
+      assert %Message{content: [block]} = result
+      assert block.is_error == true
+
+      assert block.content ==
+               "Tool slow_seq timed out after 50ms. Try a smaller input or raise :tool_timeout."
+
+      assert elapsed_us < 1_000_000
+    end
+
     test "tool returning {:error, reason} produces is_error block" do
       state = build_state([ErrorTool])
       tool_call = %{id: "call_err", name: "error_tool", type: "tool_use", input: %{}}
