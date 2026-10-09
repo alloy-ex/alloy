@@ -93,10 +93,15 @@ defmodule Alloy.Testing do
 
   Takes a tool name and input map, generates a tool call block with
   a unique ID.
+
+  The input goes through a JSON round trip, so the tool receives string
+  keys exactly as it would from a real provider: `%{location: "Sydney"}`
+  arrives as `%{"location" => "Sydney"}`.
   """
   @spec tool_response(String.t(), map()) :: {:ok, map()}
-  def tool_response(tool_name, input) do
+  def tool_response(tool_name, input) when is_map(input) do
     call_id = "call_#{:crypto.strong_rand_bytes(4) |> Base.url_encode64(padding: false)}"
+    input = input |> Jason.encode!() |> Jason.decode!()
 
     TestProvider.tool_use_response([
       %{type: "tool_use", id: call_id, name: tool_name, input: input}
@@ -202,9 +207,10 @@ defmodule Alloy.Testing do
         Enum.filter(calls, fn call ->
           call.name == name &&
             Enum.all?(expected, fn {k, v} ->
-              # Match both atom and string keys — rescue if atom doesn't exist
+              # Match both atom and string keys. Fully qualified so the
+              # macro also works when the caller only `require`s us.
               Map.get(call.input, k) == v || Map.get(call.input, to_string(k)) == v ||
-                (is_binary(k) && safe_atom_get(call.input, k) == v)
+                (is_binary(k) && Alloy.Testing.safe_atom_get(call.input, k) == v)
             end)
         end)
 

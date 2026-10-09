@@ -17,7 +17,7 @@ defmodule Alloy.TestingTest do
     test "runs agent with tool use then text response" do
       result =
         run_with_responses("Use echo", [
-          tool_response("echo", %{message: "test"}),
+          tool_response("echo", %{text: "test"}),
           text_response("Done!")
         ])
 
@@ -69,11 +69,35 @@ defmodule Alloy.TestingTest do
     end
   end
 
+  describe "tool_response/2" do
+    test "delivers string keys, as providers do, so string-key tools work" do
+      # The moduledoc's weather example: atom keys in the script, a tool
+      # that matches on string keys.
+      weather =
+        Alloy.Tool.inline(
+          name: "get_weather",
+          description: "Weather",
+          input_schema: %{type: "object", properties: %{location: %{type: "string"}}},
+          execute: fn %{"location" => loc}, _ctx -> {:ok, "22°C in " <> loc} end
+        )
+
+      result =
+        run_with_responses(
+          "What's the weather?",
+          [tool_response("get_weather", %{location: "Sydney"}), text_response("Sunny")],
+          tools: [weather]
+        )
+
+      assert [%{name: "get_weather", error: nil}] = result.tool_calls
+      assert [%{input: %{"location" => "Sydney"}}] = tool_calls(result)
+    end
+  end
+
   describe "assert_tool_called/2" do
     test "passes when the tool was called" do
       result =
         run_with_responses("Use echo", [
-          tool_response("echo", %{message: "hello"}),
+          tool_response("echo", %{text: "hello"}),
           text_response("Done")
         ])
 
@@ -96,22 +120,22 @@ defmodule Alloy.TestingTest do
     test "passes when tool was called with matching input" do
       result =
         run_with_responses("Echo hello", [
-          tool_response("echo", %{message: "hello"}),
+          tool_response("echo", %{text: "hello"}),
           text_response("Done")
         ])
 
-      assert_tool_called(result, "echo", %{"message" => "hello"})
+      assert_tool_called(result, "echo", %{"text" => "hello"})
     end
 
     test "raises when input doesn't match" do
       result =
         run_with_responses("Echo hello", [
-          tool_response("echo", %{message: "hello"}),
+          tool_response("echo", %{text: "hello"}),
           text_response("Done")
         ])
 
       assert_raise ExUnit.AssertionError, fn ->
-        assert_tool_called(result, "echo", %{"message" => "wrong"})
+        assert_tool_called(result, "echo", %{"text" => "wrong"})
       end
     end
   end
@@ -129,7 +153,7 @@ defmodule Alloy.TestingTest do
     test "raises when the tool was called" do
       result =
         run_with_responses("Use echo", [
-          tool_response("echo", %{message: "test"}),
+          tool_response("echo", %{text: "test"}),
           text_response("Done")
         ])
 
@@ -158,8 +182,8 @@ defmodule Alloy.TestingTest do
     test "extracts all tool calls from conversation" do
       result =
         run_with_responses("Do both", [
-          tool_response("echo", %{message: "first"}),
-          tool_response("echo", %{message: "second"}),
+          tool_response("echo", %{text: "first"}),
+          tool_response("echo", %{text: "second"}),
           text_response("Done")
         ])
 
