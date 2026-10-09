@@ -1514,6 +1514,25 @@ defmodule Alloy.Provider.AnthropicTest do
       assert %{"type" => "enabled", "budget_tokens" => 5_000} = decoded["thinking"]
     end
 
+    test "the documented replacement sends adaptive thinking and effort through extra_body" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:extended_thinking, budget_tokens: 5_000)
+        |> Map.put(:extra_body, %{
+          "thinking" => %{"type" => "adaptive", "display" => "summarized"},
+          "output_config" => %{"effort" => "high"}
+        })
+
+      Anthropic.complete([Message.user("Think hard")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      # extra_body is merged last, so it wins over a leftover :extended_thinking.
+      assert decoded["thinking"] == %{"type" => "adaptive", "display" => "summarized"}
+      assert decoded["output_config"] == %{"effort" => "high"}
+    end
+
     test "raises ArgumentError when extended_thinking is set without budget_tokens" do
       config =
         config_that_captures_request()

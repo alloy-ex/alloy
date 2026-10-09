@@ -31,10 +31,14 @@ defmodule Alloy.Provider.Anthropic do
     request fields or beta headers they need through `:extra_body` and
     `:extra_headers`.
   - `:req_options` - Additional options passed to Req (useful for testing)
-  - `:extended_thinking` - Enable extended thinking. Pass a keyword list with
-    `:budget_tokens` (e.g., `[budget_tokens: 5000]`). Thinking blocks are
-    returned in the message content and must be round-tripped verbatim in
-    subsequent turns (Anthropic requires the `signature` field).
+  - `:extended_thinking` - *Deprecated; configure thinking through
+    `:extra_body` instead (see "Thinking" below).* A keyword list with a
+    positive `:budget_tokens` (e.g., `[budget_tokens: 5000]`) sends
+    `"thinking": {"type": "enabled", "budget_tokens": ...}`. It still works on
+    the models that accept manual budgets (Claude Opus 4.5, Sonnet 4.5,
+    Haiku 4.5, and Opus 4.6 and Sonnet 4.6, where Anthropic deprecates it),
+    but Claude Opus 4.7 and later and every Claude 5.x model reject it with
+    HTTP 400.
   - `:on_event` - Streaming event callback `(event -> :ok)`. Called for each
     streaming delta. When used via `Server.stream_chat/4`, `event` is a
     normalized envelope map:
@@ -45,6 +49,26 @@ defmodule Alloy.Provider.Anthropic do
     receive provider-native tuples (for example `{:thinking_delta, text}`).
   - `:code_execution` - `true` adds the server-side code execution tool
     (`code_execution_20260521`)
+
+  ## Thinking
+
+  Claude 5.x models think by default (adaptive thinking); Claude Opus 4.6 to
+  4.8 and Sonnet 4.6 think once asked. Configure thinking with `:extra_body`:
+
+      extra_body: %{
+        "thinking" => %{"type" => "adaptive", "display" => "summarized"},
+        "output_config" => %{"effort" => "high"}
+      }
+
+  `"display" => "summarized"` returns the thinking text; most current models
+  default to `"omitted"`, which returns thinking blocks with an empty
+  `thinking` field and only the signature. `output_config.effort` (`"low"`,
+  `"medium"`, `"high"`, and on some models `"xhigh"` or `"max"`) sets how
+  much the model thinks. Thinking counts toward `:max_tokens`. Thinking
+  blocks come back in the message content and are sent back verbatim on
+  later turns, as the API requires. See
+  <https://platform.claude.com/docs/en/build-with-claude/thinking> and
+  <https://platform.claude.com/docs/en/build-with-claude/effort>.
 
   ## Programmatic tool calling
 
