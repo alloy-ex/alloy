@@ -376,17 +376,17 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp handle_stream_chunk(acc, %{"candidates" => [candidate | _]} = resp) do
-    {blocks, text_deltas} =
+    blocks =
       candidate
       |> get_in(["content", "parts"])
       |> List.wrap()
-      |> parse_stream_parts()
+      |> Enum.map(&parse_content_part/1)
 
-    Enum.each(text_deltas, acc.on_chunk)
+    Enum.each(blocks, &emit_text_delta(&1, acc.on_chunk))
 
     %{
       acc
-      | content_blocks: acc.content_blocks ++ blocks,
+      | content_blocks: Enum.reduce(blocks, acc.content_blocks, &merge_stream_block/2),
         usage: merge_usage(acc.usage, resp["usageMetadata"] || %{}),
         finish_reason: candidate["finishReason"] || acc.finish_reason
     }
@@ -398,22 +398,31 @@ defmodule Alloy.Provider.Gemini do
 
   defp handle_stream_chunk(acc, _other), do: acc
 
-  defp parse_stream_parts(parts) do
-    {blocks, deltas} =
-      Enum.reduce(parts, {[], []}, fn part, {blocks, deltas} ->
-        block = parse_content_part(part)
+  defp emit_text_delta(%{type: "text", text: text}, on_chunk) when text != "", do: on_chunk.(text)
+  defp emit_text_delta(_block, _on_chunk), do: :ok
 
-        deltas =
-          case block do
-            %{type: "text", text: text} -> [text | deltas]
-            _ -> deltas
-          end
+  # Gemini streams one logical part as many pieces. Kept apart, they become
+  # separate blocks that Message.text/1 joins with newlines, so consecutive
+  # text (or thought) pieces are merged back, newest block first. A thought
+  # signature belongs to the part it arrived on (often a trailing empty
+  # text piece), so it is kept on the merged block, and a signed block is
+  # never extended: two signatures never share a block. Function calls
+  # arrive whole and are never merged into.
+  defp merge_stream_block(
+         %{type: "text", text: text} = block,
+         [%{type: "text", text: previous} = last | rest]
+       )
+       when not is_map_key(last, :signature),
+       do: [%{block | text: previous <> text} | rest]
 
-        {[block | blocks], deltas}
-      end)
+  defp merge_stream_block(
+         %{type: "thinking", thinking: text} = block,
+         [%{type: "thinking", thinking: previous} = last | rest]
+       )
+       when not is_map_key(last, :signature),
+       do: [%{block | thinking: previous <> text} | rest]
 
-    {Enum.reverse(blocks), Enum.reverse(deltas)}
-  end
+  defp merge_stream_block(block, blocks), do: [block | blocks]
 
   defp merge_usage(existing, new) do
     Map.merge(existing, new, fn _key, _old, latest -> latest end)
@@ -421,11 +430,12 @@ defmodule Alloy.Provider.Gemini do
 
   defp build_stream_response(acc) do
     usage = parse_usage(acc.usage)
+    content_blocks = Enum.reverse(acc.content_blocks)
 
     {:ok,
      %{
-       stop_reason: parse_stop_reason(acc.finish_reason, acc.content_blocks),
-       messages: [%Message{role: :assistant, content: acc.content_blocks}],
+       stop_reason: parse_stop_reason(acc.finish_reason, content_blocks),
+       messages: [%Message{role: :assistant, content: content_blocks}],
        usage: usage
      }}
   end

@@ -231,9 +231,94 @@ defmodule Alloy.Provider.GeminiTest do
       assert_received {:chunk, "Hello"}
       assert_received {:chunk, " world"}
       assert result.stop_reason == :end_turn
-      assert Message.text(hd(result.messages)) == "Hello\n world"
+      assert [%Message{content: [%{type: "text", text: "Hello world"}]}] = result.messages
+      assert Message.text(hd(result.messages)) == "Hello world"
       assert result.usage.input_tokens == 10
       assert result.usage.output_tokens == 5
+    end
+
+    test "merges streamed thought and text pieces and keeps the trailing signature" do
+      config =
+        config_with_sse_stream([
+          sse_chunk(gemini_response([%{"text" => "Let me ", "thought" => true}], nil)),
+          sse_chunk(gemini_response([%{"text" => "think.", "thought" => true}], nil)),
+          sse_chunk(gemini_response([%{"text" => "The answer"}], nil)),
+          sse_chunk(gemini_response([%{"text" => " is 4."}], nil)),
+          sse_chunk(gemini_response([%{"text" => "", "thoughtSignature" => "sig_final"}]))
+        ])
+
+      test_pid = self()
+      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
+
+      assert {:ok, result} = Gemini.stream([Message.user("2+2?")], [], config, on_chunk)
+
+      assert [
+               %Message{
+                 content: [
+                   %{type: "thinking", thinking: "Let me think."} = thinking,
+                   %{type: "text", text: "The answer is 4.", signature: "sig_final"}
+                 ]
+               }
+             ] = result.messages
+
+      refute Map.has_key?(thinking, :signature)
+      refute_received {:chunk, ""}
+    end
+
+    test "never merges across a function call and keeps call signatures on the call" do
+      config =
+        config_with_sse_stream([
+          sse_chunk(gemini_response([%{"text" => "Reading "}], nil)),
+          sse_chunk(gemini_response([%{"text" => "both."}], nil)),
+          sse_chunk(
+            gemini_response(
+              [
+                %{
+                  "functionCall" => %{"id" => "c1", "name" => "read", "args" => %{"p" => "a"}},
+                  "thoughtSignature" => "sig_call"
+                },
+                %{"functionCall" => %{"id" => "c2", "name" => "read", "args" => %{"p" => "b"}}}
+              ],
+              nil
+            )
+          ),
+          sse_chunk(gemini_response([%{"text" => "Done."}]))
+        ])
+
+      assert {:ok, result} = Gemini.stream([Message.user("Read")], [], config, fn _ -> :ok end)
+
+      assert [
+               %Message{
+                 content: [
+                   %{type: "text", text: "Reading both."} = text,
+                   %{type: "tool_use", id: "c1", signature: "sig_call"},
+                   %{type: "tool_use", id: "c2"} = second_call,
+                   %{type: "text", text: "Done."}
+                 ]
+               }
+             ] = result.messages
+
+      refute Map.has_key?(text, :signature)
+      refute Map.has_key?(second_call, :signature)
+    end
+
+    test "never puts two signatures in one block" do
+      config =
+        config_with_sse_stream([
+          sse_chunk(gemini_response([%{"text" => "One.", "thoughtSignature" => "sig_1"}], nil)),
+          sse_chunk(gemini_response([%{"text" => "Two.", "thoughtSignature" => "sig_2"}]))
+        ])
+
+      assert {:ok, result} = Gemini.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert [
+               %Message{
+                 content: [
+                   %{type: "text", text: "One.", signature: "sig_1"},
+                   %{type: "text", text: "Two.", signature: "sig_2"}
+                 ]
+               }
+             ] = result.messages
     end
 
     test "returns tool_use blocks from streamed function calls" do
@@ -283,16 +368,15 @@ defmodule Alloy.Provider.GeminiTest do
     end
   end
 
+  # A nil finish reason builds an intermediate stream chunk.
   defp gemini_response(parts, finish_reason \\ "STOP", usage \\ %{}) do
-    %{
-      "candidates" => [
-        %{
-          "content" => %{"role" => "model", "parts" => parts},
-          "finishReason" => finish_reason
-        }
-      ],
-      "usageMetadata" => usage
-    }
+    candidate =
+      case finish_reason do
+        nil -> %{"content" => %{"role" => "model", "parts" => parts}}
+        reason -> %{"content" => %{"role" => "model", "parts" => parts}, "finishReason" => reason}
+      end
+
+    %{"candidates" => [candidate], "usageMetadata" => usage}
   end
 
   defp sse_chunk(data) when is_map(data), do: "data: #{Jason.encode!(data)}\n\n"
