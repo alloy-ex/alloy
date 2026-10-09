@@ -20,6 +20,7 @@ defmodule Alloy.Context.Compactor do
 
   alias Alloy.Agent.State
   alias Alloy.Message
+  alias Alloy.Provider.Retry
 
   require Logger
 
@@ -105,11 +106,13 @@ defmodule Alloy.Context.Compactor do
   The token estimate is not trusted here, because the provider has just
   rejected a prompt the estimate allowed: clearing old tool results is
   always followed by summarization (or truncation).
+
+  Accepts the same options as `maybe_compact/2`.
   """
-  @spec force_compact(State.t()) :: State.t()
-  def force_compact(%State{} = state) do
-    {_fits_estimate, messages} = maybe_clear_tool_results(State.messages(state), state, [])
-    summarize_or_fallback(state, messages)
+  @spec force_compact(State.t(), keyword()) :: State.t()
+  def force_compact(%State{} = state, opts \\ []) do
+    {_fits_estimate, messages} = maybe_clear_tool_results(State.messages(state), state, opts)
+    summarize_or_fallback(state, messages, opts)
   end
 
   @doc """
@@ -118,6 +121,17 @@ defmodule Alloy.Context.Compactor do
 
   The estimate counts the system prompt, the tool definitions and every
   message at roughly four bytes per token.
+
+  The summary is requested through `Alloy.Provider.Retry` (retries,
+  backoff and fallback providers), and its token usage is added to
+  `state.usage`.
+
+  ## Options
+
+    * `:turn` - turn number reported in compaction telemetry
+      (default: `state.turn + 1`)
+    * `:deadline` - monotonic time in milliseconds by which the summary
+      request must finish (default: now plus `config.timeout_ms`)
 
   Returns `{:compacted, state}` when compaction occurred, or
   `{:unchanged, state}` when already within budget.
@@ -149,7 +163,7 @@ defmodule Alloy.Context.Compactor do
         %{state | messages: cleared_messages, messages_new: []}
 
       {:continue, messages} ->
-        summarize_or_fallback(state, messages)
+        summarize_or_fallback(state, messages, opts)
     end
   end
 
@@ -195,14 +209,16 @@ defmodule Alloy.Context.Compactor do
 
   defp maybe_clear_tool_results(messages, _state, _opts), do: {:continue, messages}
 
-  defp summarize_or_fallback(%State{} = state, messages) do
+  defp summarize_or_fallback(%State{} = state, messages, opts) do
     keep_recent_tokens = state.config.compaction.keep_recent_tokens
 
     case prepare_summary_compaction(messages, keep_recent_tokens) do
       {:ok, prepared} ->
         fire_on_compaction(prepared.messages_to_summarize, state)
+        {result, usage} = summarize_compaction(prepared, state, opts)
+        state = State.merge_usage(state, usage)
 
-        case summarize_compaction(prepared, state) do
+        case result do
           {:ok, summary_text} ->
             compacted = [prepared.first, build_summary_message(summary_text) | prepared.recent]
             %{state | messages: compacted, messages_new: []}
@@ -394,9 +410,9 @@ defmodule Alloy.Context.Compactor do
 
   defp pop_existing_summary([]), do: {nil, []}
 
-  defp summarize_compaction(prepared, %State{} = state) do
-    provider = state.config.provider
-
+  # Returns {result, usage}: the summary call is billed even when its output
+  # is unusable, so its usage is reported either way.
+  defp summarize_compaction(prepared, %State{} = state, opts) do
     config =
       state.config.provider_config
       |> Map.delete(:provider_state)
@@ -417,12 +433,28 @@ defmodule Alloy.Context.Compactor do
         Map.get(state.config.compaction, :summary_prompt, default_summary_prompt())
       )
 
-    with {:ok, response} <- provider.complete([Message.user(prompt)], [], config),
-         {:ok, summary_text} <- extract_summary_text(response) do
-      {:ok, summary_text}
-    else
-      {:error, reason} -> {:error, reason}
-      other -> {:error, other}
+    # The summary goes through Retry like any turn request, so it gets the
+    # same retries, fallback providers and receive timeout, bounded by the
+    # caller's deadline.
+    summary_state = %{state | messages: [Message.user(prompt)], messages_new: [], tool_defs: []}
+
+    deadline =
+      Keyword.get_lazy(opts, :deadline, fn ->
+        System.monotonic_time(:millisecond) + state.config.timeout_ms
+      end)
+
+    no_chunks = fn _chunk -> :ok end
+
+    case Retry.call_with_retry(
+           summary_state,
+           state.config.provider,
+           config,
+           false,
+           no_chunks,
+           deadline
+         ) do
+      {:ok, response} -> {extract_summary_text(response), Map.get(response, :usage, %{})}
+      {:error, reason} -> {{:error, reason}, %{}}
     end
   end
 

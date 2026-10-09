@@ -117,7 +117,7 @@ defmodule Alloy.Agent.Turn do
 
     :telemetry.span([:alloy, :turn], %{turn: turn}, fn ->
       step =
-        with {:continue, state} <- compact(state, turn) do
+        with {:continue, state} <- compact(state, turn, deadline) do
           complete(state, opts, deadline, false)
         end
 
@@ -128,10 +128,10 @@ defmodule Alloy.Agent.Turn do
   defp step_status({:continue, %State{}}), do: :running
   defp step_status({:halt, %State{status: status}}), do: status
 
-  defp compact(%State{} = state, turn) do
+  defp compact(%State{} = state, turn, deadline) do
     messages_before = length(State.messages(state))
 
-    case Compactor.maybe_compact(state, turn: turn) do
+    case Compactor.maybe_compact(state, turn: turn, deadline: deadline) do
       {:unchanged, state} ->
         {:continue, state}
 
@@ -288,7 +288,7 @@ defmodule Alloy.Agent.Turn do
 
       {next, state} =
         state
-        |> Compactor.force_compact()
+        |> Compactor.force_compact(turn: state.turn + 1, deadline: deadline)
         |> complete(opts, deadline, true)
 
       {next, State.merge_run_metadata(state, %{prompt_too_long_recovery: true})}

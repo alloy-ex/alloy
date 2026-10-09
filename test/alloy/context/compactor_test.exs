@@ -40,7 +40,8 @@ defmodule Alloy.Context.CompactorTest do
         max_tokens: max_tokens,
         compaction: compaction,
         on_compaction: on_compaction,
-        system_prompt: Keyword.get(opts, :system_prompt)
+        system_prompt: Keyword.get(opts, :system_prompt),
+        retry_backoff_ms: Keyword.get(opts, :retry_backoff_ms, 1_000)
       )
 
     %State{
@@ -612,6 +613,77 @@ defmodule Alloy.Context.CompactorTest do
         end)
 
       assert log =~ "summary compaction failed, falling back to truncation"
+    end
+  end
+
+  describe "summary request" do
+    defp summary_state(provider_pid, opts \\ []) do
+      messages = [
+        Message.user("original request"),
+        Message.assistant(String.duplicate("a", 900)),
+        Message.user("latest")
+      ]
+
+      state =
+        build_state(
+          messages,
+          Keyword.merge(
+            [
+              max_tokens: 250,
+              compaction: [reserve_tokens: 25, keep_recent_tokens: 20],
+              provider: TestProvider,
+              provider_config: %{agent_pid: provider_pid},
+              retry_backoff_ms: 1
+            ],
+            opts
+          )
+        )
+
+      %{state | usage: %Alloy.Usage{input_tokens: 100, output_tokens: 50}}
+    end
+
+    test "adds the summary call's usage to the run's usage" do
+      pid = start_scripted_provider([TestProvider.text_response(summary_text("Counted"))])
+
+      {:compacted, compacted} = Compactor.maybe_compact(summary_state(pid))
+
+      assert Enum.any?(compacted.messages, &summary_message?/1)
+      assert compacted.usage.input_tokens == 110
+      assert compacted.usage.output_tokens == 55
+    end
+
+    test "retries a transient provider error instead of falling back to truncation" do
+      pid =
+        start_scripted_provider([
+          TestProvider.error_response("HTTP 429: rate limited"),
+          TestProvider.error_response("HTTP 503: unavailable"),
+          TestProvider.text_response(summary_text("Retried"))
+        ])
+
+      {:compacted, compacted} = Compactor.maybe_compact(summary_state(pid))
+
+      assert Enum.any?(compacted.messages, &(summary_message?(&1) and &1.content =~ "Retried"))
+    end
+
+    test "bounds the summary request by the caller's deadline" do
+      state =
+        build_state(
+          [
+            Message.user("original request"),
+            Message.assistant(String.duplicate("a", 900)),
+            Message.user("latest")
+          ],
+          max_tokens: 250,
+          compaction: [reserve_tokens: 25, keep_recent_tokens: 20],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("Bounded")}, test_pid: self()}
+        )
+
+      deadline = System.monotonic_time(:millisecond) + 30_000
+      {:compacted, _compacted} = Compactor.maybe_compact(state, deadline: deadline)
+
+      assert_received {:summary_request, _messages, [], config}
+      assert config.req_options[:receive_timeout] in 25_000..30_000
     end
   end
 
