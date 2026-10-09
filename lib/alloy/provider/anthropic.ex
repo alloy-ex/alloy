@@ -470,28 +470,29 @@ defmodule Alloy.Provider.Anthropic do
 
   defp add_cache_to_message_tail(%{"content" => blocks} = message)
        when is_list(blocks) and blocks != [] do
-    Map.put(message, "content", add_cache_to_last_cacheable_block(blocks))
+    Map.put(message, "content", put_cache_on_last(blocks, &cacheable_message_block?/1))
   end
 
   defp add_cache_to_message_tail(message), do: message
 
-  defp add_cache_to_last_cacheable_block(blocks) do
-    {blocks, _added?} =
-      blocks
+  # Marks the last item that may carry a breakpoint; none if no item may.
+  defp put_cache_on_last(items, cacheable?) do
+    {items, _added?} =
+      items
       |> Enum.reverse()
       |> Enum.map_reduce(false, fn
-        block, false ->
-          if cacheable_message_block?(block) do
-            {Map.put(block, "cache_control", %{"type" => "ephemeral"}), true}
+        item, false ->
+          if cacheable?.(item) do
+            {Map.put(item, "cache_control", %{"type" => "ephemeral"}), true}
           else
-            {block, false}
+            {item, false}
           end
 
-        block, true ->
-          {block, true}
+        item, true ->
+          {item, true}
       end)
 
-    Enum.reverse(blocks)
+    Enum.reverse(items)
   end
 
   defp cacheable_message_block?(%{"type" => type}) when type in ["thinking", "redacted_thinking"],
@@ -574,13 +575,12 @@ defmodule Alloy.Provider.Anthropic do
     Map.new(block, fn {k, v} -> {to_string(k), v} end)
   end
 
-  defp maybe_add_cache_to_last_tool([], _cache?), do: []
   defp maybe_add_cache_to_last_tool(tools, false), do: tools
+  defp maybe_add_cache_to_last_tool(tools, true), do: put_cache_on_last(tools, &cacheable_tool?/1)
 
-  defp maybe_add_cache_to_last_tool(tools, true) do
-    {init, [last]} = Enum.split(tools, -1)
-    init ++ [Map.put(last, "cache_control", %{"type" => "ephemeral"})]
-  end
+  # The API rejects cache_control on a tool with defer_loading: true.
+  defp cacheable_tool?(%{"defer_loading" => true}), do: false
+  defp cacheable_tool?(_tool), do: true
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do
     base =

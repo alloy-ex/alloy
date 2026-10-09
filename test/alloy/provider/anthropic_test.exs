@@ -793,6 +793,42 @@ defmodule Alloy.Provider.AnthropicTest do
       assert List.last(tools)["cache_control"] == %{"type" => "ephemeral"}
     end
 
+    test "cache_control goes on the last tool that is not deferred" do
+      # A deferred tool with cache_control is a 400:
+      # https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
+      config = Map.put(config_that_captures_request(), :cache, true)
+
+      tool_defs = [
+        %{name: "read", description: "Read", input_schema: %{}},
+        %{name: "write", description: "Write", input_schema: %{}},
+        %{name: "search", description: "Search", input_schema: %{}, defer_loading: true}
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+
+      assert Map.new(Jason.decode!(body)["tools"], &{&1["name"], &1["cache_control"]}) == %{
+               "read" => nil,
+               "write" => %{"type" => "ephemeral"},
+               "search" => nil
+             }
+    end
+
+    test "no tool gets cache_control when every tool is deferred" do
+      config = Map.put(config_that_captures_request(), :cache, true)
+
+      tool_defs = [
+        %{name: "search", description: "Search", input_schema: %{}, defer_loading: true}
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      assert [tool] = Jason.decode!(body)["tools"]
+      refute Map.has_key?(tool, "cache_control")
+    end
+
     test "last message string content gets cache_control when cache: true" do
       config =
         config_that_captures_request()
