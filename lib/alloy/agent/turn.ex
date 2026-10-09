@@ -308,17 +308,16 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp execute_tools(%State{} = state, tool_calls, opts) do
-    {memory_calls, regular_calls} = Enum.split_with(tool_calls, &MemoryRouter.memory_call?/1)
+    {memory_calls, regular_calls} = split_memory_calls(tool_calls, state.config.memory)
     on_event = fn raw_event -> Events.emit(opts, state.turn, raw_event) end
     event_seq_ref = Keyword.get(opts, :event_seq_ref)
     event_correlation_id = Keyword.get(opts, :event_correlation_id)
     event_turn = state.turn
 
     memory_results =
-      case {memory_calls, state.config.memory} do
-        {[], _} -> []
-        {_calls, nil} -> []
-        {calls, memory} -> MemoryRouter.dispatch_all(calls, memory)
+      case memory_calls do
+        [] -> []
+        calls -> MemoryRouter.dispatch_all(calls, state.config.memory)
       end
 
     regular_result =
@@ -349,6 +348,13 @@ defmodule Alloy.Agent.Turn do
         |> then(&run_middleware(:after_tool_execution, &1))
     end
   end
+
+  # Without a :memory store, "memory" is an ordinary tool name: the executor
+  # runs the user's tool of that name or reports it as unknown.
+  defp split_memory_calls(tool_calls, nil), do: {[], tool_calls}
+
+  defp split_memory_calls(tool_calls, _memory),
+    do: Enum.split_with(tool_calls, &MemoryRouter.memory_call?/1)
 
   defp result_blocks(%Message{content: blocks}) when is_list(blocks), do: blocks
   defp result_blocks(nil), do: []

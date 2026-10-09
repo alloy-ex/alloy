@@ -7,6 +7,7 @@ defmodule Alloy.Agent.Config do
   """
 
   alias Alloy.Context.Compactor
+  alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.ModelMetadata
 
   # The summary prompts are optional because a bare `%Config{}` omits them;
@@ -29,7 +30,8 @@ defmodule Alloy.Agent.Config do
   through verbatim.
 
   As of 0.12.0, memory is Anthropic-only. `Alloy.run/2` raises if
-  `:memory` is set with any other provider.
+  `:memory` is set with any other provider, or if `:tools` also contains a
+  tool named `"memory"` (the name the memory tool reserves).
   """
   @type memory :: {module(), term()} | nil
 
@@ -133,11 +135,12 @@ defmodule Alloy.Agent.Config do
       )
 
     {compaction, compaction_explicit} = resolve_compaction(opts[:compaction], max_tokens)
+    tools = Keyword.get(opts, :tools, [])
 
     %__MODULE__{
       provider: provider_mod,
       provider_config: provider_config,
-      tools: Keyword.get(opts, :tools, []),
+      tools: tools,
       system_prompt: Keyword.get(opts, :system_prompt),
       max_turns: Keyword.get(opts, :max_turns, 25),
       max_tokens: max_tokens,
@@ -165,29 +168,43 @@ defmodule Alloy.Agent.Config do
       model_catalog: model_catalog,
       max_budget_cents: Keyword.get(opts, :max_budget_cents),
       until_tool: Keyword.get(opts, :until_tool),
-      memory: validate_memory(Keyword.get(opts, :memory), provider_mod)
+      memory: validate_memory(Keyword.get(opts, :memory), provider_mod, tools)
     }
   end
 
-  defp validate_memory(nil, _provider), do: nil
+  defp validate_memory(nil, _provider, _tools), do: nil
 
-  defp validate_memory({module, _store} = memory, provider)
+  defp validate_memory({module, _store} = memory, provider, tools)
        when is_atom(module) do
-    if provider == Alloy.Provider.Anthropic do
-      memory
-    else
-      raise ArgumentError,
-            "Alloy.Memory is Anthropic-only in 0.12.0. Got provider #{inspect(provider)} " <>
-              "with memory store module #{inspect(module)}. " <>
-              "Use Alloy.Provider.Anthropic or omit :memory."
+    cond do
+      provider != Alloy.Provider.Anthropic ->
+        raise ArgumentError,
+              "Alloy.Memory is Anthropic-only in 0.12.0. Got provider #{inspect(provider)} " <>
+                "with memory store module #{inspect(module)}. " <>
+                "Use Alloy.Provider.Anthropic or omit :memory."
+
+      # With :memory set, every "memory" call goes to the store, so a user
+      # tool of that name would never run.
+      Enum.any?(tools, &(tool_name(&1) == MemoryRouter.tool_name())) ->
+        raise ArgumentError,
+              ~s(:memory reserves the tool name "memory", but a tool named "memory" ) <>
+                "is also configured in :tools. Rename that tool or omit :memory."
+
+      true ->
+        memory
     end
   end
 
-  defp validate_memory(bad, _provider) do
+  defp validate_memory(bad, _provider, _tools) do
     raise ArgumentError,
           ":memory must be a {module, store_opts} tuple where module implements " <>
             "Alloy.Memory. Got: #{inspect(bad)}"
   end
+
+  # Matches Alloy.Tool.Inline structs as plain maps so Config does not
+  # compile-depend on the tool modules.
+  defp tool_name(%{name: name}), do: name
+  defp tool_name(module) when is_atom(module), do: module.name()
 
   @doc """
   Returns an updated config with a new provider while preserving unrelated options.

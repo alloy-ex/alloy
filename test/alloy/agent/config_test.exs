@@ -52,6 +52,39 @@ defmodule Alloy.Agent.ConfigTest do
     end
   end
 
+  describe "memory option" do
+    @anthropic {Alloy.Provider.Anthropic, api_key: "sk-test", model: "claude-sonnet-4-6"}
+
+    test "raises when a configured tool is also named memory" do
+      user_memory_tool =
+        Alloy.Tool.inline(
+          name: "memory",
+          description: "The app's own memory tool",
+          input_schema: %{type: "object"},
+          execute: fn _input, _context -> {:ok, "ok"} end
+        )
+
+      assert_raise ArgumentError, ~r/tool named "memory"/, fn ->
+        Config.from_opts(
+          provider: @anthropic,
+          memory: {Alloy.Test.MemoryStore, self()},
+          tools: [Alloy.Test.EchoTool, user_memory_tool]
+        )
+      end
+    end
+
+    test "accepts memory alongside tools with other names" do
+      config =
+        Config.from_opts(
+          provider: @anthropic,
+          memory: {Alloy.Test.MemoryStore, self()},
+          tools: [Alloy.Test.EchoTool]
+        )
+
+      assert config.memory == {Alloy.Test.MemoryStore, self()}
+    end
+  end
+
   describe "code_execution option" do
     test "defaults to false when not specified" do
       config = Config.from_opts(provider: {Alloy.Provider.Test, []})

@@ -276,6 +276,55 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  describe "run_loop/1 with a tool named memory and no :memory store" do
+    test "runs the user's own memory tool" do
+      memory_tool =
+        Alloy.Tool.inline(
+          name: "memory",
+          description: "The app's own memory tool",
+          input_schema: %{type: "object"},
+          execute: fn _input, _context -> {:ok, "remembered"} end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "m1", name: "memory", input: %{}}]),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [memory_tool]
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Remember this")]))
+
+      assert result.status == :completed
+      assert [%{name: "memory", error: nil}] = result.tool_calls
+
+      assert %{type: "tool_result", tool_use_id: "m1", content: "remembered"} =
+               result.messages |> Enum.at(2) |> Map.fetch!(:content) |> hd()
+    end
+
+    test "answers an unregistered memory call as an unknown tool" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "m1", name: "memory", input: %{}}]),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{provider: TestProvider, provider_config: %{agent_pid: pid}}
+
+      result = Turn.run_loop(State.init(config, [Message.user("Remember this")]))
+
+      assert result.status == :completed
+
+      assert %{tool_use_id: "m1", content: "Unknown tool: memory", is_error: true} =
+               result.messages |> Enum.at(2) |> Map.fetch!(:content) |> hd()
+    end
+  end
+
   describe "run_loop/1 with server-executed tools" do
     test "answers only client tool_use blocks when a response mixes in server_tool_use" do
       responses = [
