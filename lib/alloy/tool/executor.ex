@@ -34,28 +34,24 @@ defmodule Alloy.Tool.Executor do
   @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t(), keyword()) ::
           {:ok, Message.t(), [map()]} | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
-    context = build_context(state)
-    tool_timeout = state.config.tool_timeout
-    on_event = Keyword.get(opts, :on_event, fn _ -> :ok end)
-    seq_ref = Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false))
-    corr_id = Keyword.get(opts, :event_correlation_id, random_id())
-    turn = Keyword.get(opts, :event_turn, state.turn)
+    run = %{
+      tool_fns: tool_fns,
+      context: build_context(state),
+      timeout: state.config.tool_timeout,
+      on_event: Keyword.get(opts, :on_event, fn _ -> :ok end),
+      seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
+      corr_id: Keyword.get(opts, :event_correlation_id, random_id()),
+      turn: Keyword.get(opts, :event_turn, state.turn)
+    }
 
-    case tag_tool_calls(state, tool_calls) do
-      {:halted, _} = h ->
-        h
+    with {:ok, tagged} <- tag_tool_calls(state, tool_calls) do
+      {results, meta} =
+        tagged
+        |> batches(tool_fns)
+        |> Enum.flat_map(&run_batch(&1, run))
+        |> Enum.unzip()
 
-      {:ok, tagged} ->
-        run = &run_tagged(&1, tool_fns, context, on_event, seq_ref, corr_id, turn)
-        crash = &crashed(call_from(&1), &2, tool_timeout, on_event, seq_ref, corr_id, turn)
-
-        {results, meta} =
-          tagged
-          |> batches(tool_fns)
-          |> Enum.flat_map(&run_batch(&1, run, crash, tool_timeout))
-          |> Enum.unzip()
-
-        {:ok, Message.tool_results(results), meta}
+      {:ok, Message.tool_results(results), meta}
     end
   end
 
@@ -83,19 +79,27 @@ defmodule Alloy.Tool.Executor do
   # Every tool runs in an unlinked, supervised task: a tool that raises,
   # exits or throws, or overruns :tool_timeout, becomes an error result
   # instead of taking down the agent process that called the executor.
-  defp run_batch(batch, run, crash, timeout) do
+  #
+  # tool_start is emitted here, before the task exists, and tool_end after
+  # it finishes, so the pair matches with a real duration even when the
+  # task is killed on timeout.
+  defp run_batch(batch, run) do
+    started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
+
     Alloy.TaskSupervisor
-    |> Task.Supervisor.async_stream_nolink(batch, run,
-      timeout: timeout,
+    |> Task.Supervisor.async_stream_nolink(started, &{&1, invoke(&1.tag, run)},
+      timeout: run.timeout,
       on_timeout: :kill_task,
       max_concurrency: length(batch),
-      ordered: true
+      ordered: false,
+      zip_input_on_exit: true
     )
-    |> Enum.zip(batch)
     |> Enum.map(fn
-      {{:ok, pair}, _tag} -> pair
-      {{:exit, reason}, tag} -> crash.(tag, reason)
+      {:ok, {started, outcome}} -> finish(started, outcome, run)
+      {:exit, {started, reason}} -> finish(started, exit_outcome(started.call, reason, run), run)
     end)
+    |> Enum.sort_by(fn {index, _pair} -> index end)
+    |> Enum.map(fn {_index, pair} -> pair end)
   end
 
   defp tag_tool_calls(state, calls) do
@@ -115,111 +119,139 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
-  defp run_tagged({:execute, call}, fns, ctx, on_event, seq_ref, corr_id, turn) do
-    t0 = System.monotonic_time(:millisecond)
-    sseq = emit_start(on_event, call, seq_ref, corr_id, turn)
+  defp start({tag, index}, run) do
+    call = call_from(tag)
+    seq = :atomics.add_get(run.seq_ref, 1, 1)
 
-    {result, error, structured_data} =
-      case Map.fetch(fns, call[:name]) do
-        {:ok, tool} ->
-          try do
-            case tool_execute(tool, call[:input] || %{}, ctx) do
-              {:ok, text, data} when is_map(data) ->
-                {Message.tool_result_block(call[:id], maybe_truncate(text, tool), false), nil,
-                 data}
+    run.on_event.(
+      {:tool_start,
+       %{
+         id: call[:id],
+         name: call[:name],
+         input: call[:input] || %{},
+         event_seq: seq,
+         correlation_id: run.corr_id
+       }}
+    )
 
-              {:ok, r} ->
-                {Message.tool_result_block(call[:id], maybe_truncate(r, tool), false), nil, nil}
+    :telemetry.execute([:alloy, :tool, :start], %{event_seq: seq}, %{
+      correlation_id: run.corr_id,
+      turn: run.turn,
+      tool_id: call[:id],
+      tool_name: call[:name]
+    })
 
-              {:error, r} ->
-                {Message.tool_result_block(call[:id], r, true), r, nil}
-            end
-          rescue
-            e ->
-              stacktrace = __STACKTRACE__
-              visible_error = tool_crash_message(call[:name], e, stacktrace)
-              diagnostic_error = Exception.format(:error, e, stacktrace)
-
-              Logger.error(
-                "Tool #{call[:name]} crashed: #{Exception.message(e)}\n#{Exception.format_stacktrace(stacktrace)}"
-              )
-
-              {Message.tool_result_block(call[:id], visible_error, true), diagnostic_error, nil}
-          end
-
-        :error ->
-          err = "Unknown tool: #{call[:name]}"
-          {Message.tool_result_block(call[:id], err, true), err, nil}
-      end
-
-    ms = max(System.monotonic_time(:millisecond) - t0, 0)
-
-    meta =
-      %{
-        id: call[:id],
-        name: call[:name],
-        input: call[:input] || %{},
-        duration_ms: ms,
-        error: error
-      }
-
-    eseq = emit_end(on_event, meta, seq_ref, corr_id, turn, sseq)
-
-    meta =
-      meta
-      |> Map.merge(%{correlation_id: corr_id, start_event_seq: sseq, end_event_seq: eseq})
-      |> maybe_put_structured_data(structured_data)
-
-    {result, meta}
+    %{
+      index: index,
+      tag: tag,
+      call: call,
+      start_seq: seq,
+      started_at: System.monotonic_time(:millisecond)
+    }
   end
 
-  defp run_tagged({:blocked, call, reason}, _, _, on_event, seq_ref, corr_id, turn) do
-    sseq = emit_start(on_event, call, seq_ref, corr_id, turn)
-    error = "Blocked: #{reason}"
+  # Runs inside the task. Returns {:ok, text, structured_data | nil} or
+  # {:error, model_visible_message, diagnostic_message}.
+  defp invoke({:blocked, _call, reason}, _run), do: {:error, "Blocked: #{reason}", nil}
 
-    meta = %{
-      id: call[:id],
-      name: call[:name],
-      input: call[:input] || %{},
-      duration_ms: 0,
-      error: error
-    }
-
-    eseq = emit_end(on_event, meta, seq_ref, corr_id, turn, sseq)
-
-    {Message.tool_result_block(call[:id], error, true),
-     Map.merge(meta, %{correlation_id: corr_id, start_event_seq: sseq, end_event_seq: eseq})}
+  defp invoke({:execute, call}, run) do
+    case Map.fetch(run.tool_fns, call[:name]) do
+      {:ok, tool} -> execute_tool(tool, call, run.context)
+      :error -> {:error, "Unknown tool: #{call[:name]}", nil}
+    end
   end
 
-  defp crashed(call, reason, tool_timeout, on_event, seq_ref, corr_id, turn) do
-    error =
-      case reason do
-        :timeout ->
-          "Tool #{call[:name]} timed out after #{tool_timeout}ms. " <>
-            "Try a smaller input or raise :tool_timeout."
+  defp execute_tool(tool, call, context) do
+    case tool_execute(tool, call[:input] || %{}, context) do
+      {:ok, text, data} when is_map(data) -> {:ok, maybe_truncate(text, tool), data}
+      {:ok, text} -> {:ok, maybe_truncate(text, tool), nil}
+      {:error, reason} -> {:error, reason, nil}
+    end
+  rescue
+    e ->
+      stacktrace = __STACKTRACE__
 
-        _ ->
-          "Tool #{call[:name]} crashed during execution: #{inspect(exit_reason(reason))}. " <>
-            "Check the input and try again."
-      end
+      Logger.error(
+        "Tool #{call[:name]} crashed: #{Exception.message(e)}\n#{Exception.format_stacktrace(stacktrace)}"
+      )
 
-    meta = %{
-      id: call[:id],
-      name: call[:name],
-      input: call[:input] || %{},
-      duration_ms: 0,
-      error: error
-    }
+      {:error, tool_crash_message(call[:name], e, stacktrace),
+       Exception.format(:error, e, stacktrace)}
+  end
 
-    eseq = emit_end(on_event, meta, seq_ref, corr_id, turn, nil)
+  defp exit_outcome(call, :timeout, run) do
+    {:error,
+     "Tool #{call[:name]} timed out after #{run.timeout}ms. " <>
+       "Try a smaller input or raise :tool_timeout.", nil}
+  end
 
-    {Message.tool_result_block(call[:id], error, true),
-     Map.merge(meta, %{correlation_id: corr_id, start_event_seq: nil, end_event_seq: eseq})}
+  defp exit_outcome(call, reason, _run) do
+    {:error,
+     "Tool #{call[:name]} crashed during execution: #{inspect(exit_reason(reason))}. " <>
+       "Check the input and try again.", nil}
   end
 
   # The model sees the reason without the stacktrace a throw carries.
   defp exit_reason({reason, [{_mod, _fun, _arity, _location} | _]}), do: reason
   defp exit_reason(reason), do: reason
+
+  defp finish(started, outcome, run) do
+    %{call: call, start_seq: start_seq} = started
+
+    {block, error, structured_data} =
+      case outcome do
+        {:ok, text, data} ->
+          {Message.tool_result_block(call[:id], text, false), nil, data}
+
+        {:error, visible, diagnostic} ->
+          {Message.tool_result_block(call[:id], visible, true), diagnostic || visible, nil}
+      end
+
+    meta = %{
+      id: call[:id],
+      name: call[:name],
+      input: call[:input] || %{},
+      duration_ms: max(System.monotonic_time(:millisecond) - started.started_at, 0),
+      error: error
+    }
+
+    end_seq = emit_end(meta, start_seq, run)
+
+    meta =
+      meta
+      |> Map.merge(%{
+        correlation_id: run.corr_id,
+        start_event_seq: start_seq,
+        end_event_seq: end_seq
+      })
+      |> maybe_put_structured_data(structured_data)
+
+    {started.index, {block, meta}}
+  end
+
+  defp emit_end(meta, start_seq, run) do
+    seq = :atomics.add_get(run.seq_ref, 1, 1)
+
+    event =
+      Map.merge(meta, %{event_seq: seq, correlation_id: run.corr_id, start_event_seq: start_seq})
+
+    run.on_event.({:tool_end, event})
+
+    :telemetry.execute(
+      [:alloy, :tool, :stop],
+      %{event_seq: seq, duration_ms: meta.duration_ms},
+      %{
+        correlation_id: run.corr_id,
+        turn: run.turn,
+        tool_id: meta.id,
+        tool_name: meta.name,
+        error: meta.error,
+        start_event_seq: start_seq
+      }
+    )
+
+    seq
+  end
 
   defp call_from({:execute, c}), do: c
   defp call_from({:blocked, c, _}), do: c
@@ -241,58 +273,6 @@ defmodule Alloy.Tool.Executor do
 
   defp stack_arity(arity) when is_integer(arity), do: arity
   defp stack_arity(args) when is_list(args), do: length(args)
-
-  defp emit_start(on_event, call, seq_ref, corr_id, turn) do
-    seq = :atomics.add_get(seq_ref, 1, 1)
-
-    on_event.(
-      {:tool_start,
-       %{
-         id: call[:id],
-         name: call[:name],
-         input: call[:input] || %{},
-         event_seq: seq,
-         correlation_id: corr_id
-       }}
-    )
-
-    :telemetry.execute([:alloy, :tool, :start], %{event_seq: seq}, %{
-      correlation_id: corr_id,
-      turn: turn,
-      tool_id: call[:id],
-      tool_name: call[:name]
-    })
-
-    seq
-  end
-
-  defp emit_end(on_event, meta, seq_ref, corr_id, turn, start_seq) do
-    seq = :atomics.add_get(seq_ref, 1, 1)
-
-    on_event.(
-      {:tool_end,
-       Map.merge(meta, %{
-         event_seq: seq,
-         correlation_id: corr_id,
-         start_event_seq: start_seq
-       })}
-    )
-
-    :telemetry.execute(
-      [:alloy, :tool, :stop],
-      %{event_seq: seq, duration_ms: meta.duration_ms},
-      %{
-        correlation_id: corr_id,
-        turn: turn,
-        tool_id: meta.id,
-        tool_name: meta.name,
-        error: meta.error,
-        start_event_seq: start_seq
-      }
-    )
-
-    seq
-  end
 
   defp maybe_put_structured_data(meta, nil), do: meta
   defp maybe_put_structured_data(meta, data), do: Map.put(meta, :structured_data, data)

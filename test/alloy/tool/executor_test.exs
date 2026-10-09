@@ -581,6 +581,52 @@ defmodule Alloy.Tool.ExecutorTest do
                         }}}
     end
 
+    test "a timed-out tool's tool_end pairs with its tool_start and carries the real duration" do
+      state = build_state([Alloy.Test.SlowEchoTool], tool_timeout: 50)
+
+      call = %{
+        id: "c_slow",
+        name: "slow_echo",
+        type: "tool_use",
+        input: %{"text" => "hi", "sleep_ms" => 1_000}
+      }
+
+      test_pid = self()
+      handler_id = "tool-timeout-telemetry-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        handler_id,
+        [:alloy, :tool, :stop],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:tool_stop, measurements, metadata})
+        end,
+        nil
+      )
+
+      try do
+        assert {:ok, %Message{content: [%{is_error: true}]}, [meta]} =
+                 Executor.execute_all([call], state.tool_fns, state,
+                   on_event: fn event -> send(test_pid, {:event, event}) end
+                 )
+
+        assert_received {:event, {:tool_start, %{id: "c_slow", event_seq: start_seq}}}
+
+        assert_received {:event,
+                         {:tool_end, %{id: "c_slow", start_event_seq: ^start_seq} = tool_end}}
+
+        assert tool_end.duration_ms >= 50
+        assert meta.start_event_seq == start_seq
+        assert meta.duration_ms >= 50
+
+        assert_received {:tool_stop, %{duration_ms: duration_ms},
+                         %{tool_id: "c_slow", start_event_seq: ^start_seq}}
+
+        assert duration_ms >= 50
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "emits telemetry envelope with correlation and ordered sequence" do
       state = build_state([SuccessTool])
       call = %{id: "call_telemetry", name: "success", type: "tool_use", input: %{}}
