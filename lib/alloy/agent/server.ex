@@ -53,12 +53,24 @@ defmodule Alloy.Agent.Server do
   """
 
   use GenServer
-  require Logger
 
   alias Alloy.Agent.{Config, State, Turn}
   alias Alloy.{Message, Middleware, Result, Session, Usage}
 
+  require Logger
+
+  # :phoenix_pubsub is an optional dependency; calls are guarded at runtime
+  # by Code.ensure_loaded?/1, so a missing module must not warn at compile time.
+  @compile {:no_warn_undefined, Phoenix.PubSub}
+
   @type result :: Result.t()
+
+  # A synchronous chat may still be finishing its last tool round or
+  # building its result after the loop's provider deadline, so callers wait
+  # a little longer than :timeout_ms before giving up.
+  @call_timeout_margin_ms 10_000
+  @default_call_timeout_ms %Config{provider: nil, provider_config: %{}}.timeout_ms +
+                             @call_timeout_margin_ms
 
   # ── Client API ────────────────────────────────────────────────────────────
 
@@ -77,14 +89,41 @@ defmodule Alloy.Agent.Server do
   Blocks until the model reaches `end_turn` (including all tool calls).
   Conversation history is preserved for subsequent calls.
 
+  The result is tagged like `Alloy.run/2` (see `Alloy.Result.wrap/1`):
+  `{:ok, result}` for `:completed` and `:max_turns`, `{:error, result}`
+  otherwise. Before 0.12.5 a `:budget_exceeded` run returned `{:ok, result}`.
+
+  The loop runs inside the server process, so every other call to this
+  agent, including `health/1` and `cancel_request/2`, waits until it
+  finishes. Use `send_message/3` when the agent must stay responsive.
+
   ## Options
 
-    - `:timeout` - GenServer call timeout in milliseconds (default: `30_000`).
+    - `:timeout` - GenServer call timeout in milliseconds (default: the
+      agent's `:timeout_ms` plus #{div(@call_timeout_margin_ms, 1_000)} seconds; see
+      `default_call_timeout/1`). A caller that gives up earlier does not
+      stop the run, which still commits its messages to the history.
   """
   @spec chat(GenServer.server(), String.t(), keyword()) :: {:ok, result()} | {:error, result()}
   def chat(server, message, opts \\ []) when is_binary(message) do
-    timeout = Keyword.get(opts, :timeout, 30_000)
+    timeout = Keyword.get_lazy(opts, :timeout, fn -> default_call_timeout(server) end)
     GenServer.call(server, {:chat, message}, timeout)
+  end
+
+  @doc """
+  The call timeout `chat/3` and `stream_chat/4` use when `:timeout` is not
+  given: the agent's `:timeout_ms` plus a #{div(@call_timeout_margin_ms, 1_000)}-second margin.
+
+  Until 0.12.5 the default was 30 seconds, shorter than the 120-second
+  default `:timeout_ms`, so callers gave up on turns that were still
+  running and committing to the history.
+
+  Waits for a `chat/3` already running on this agent, for at most the
+  default agent's timeout plus the margin.
+  """
+  @spec default_call_timeout(GenServer.server()) :: pos_integer()
+  def default_call_timeout(server) do
+    GenServer.call(server, :default_call_timeout, @default_call_timeout_ms)
   end
 
   @doc """
@@ -142,13 +181,14 @@ defmodule Alloy.Agent.Server do
 
   ## Options
 
-    - `:timeout` - GenServer call timeout in milliseconds (default: `30_000`).
+    - `:timeout` - GenServer call timeout in milliseconds (default: the
+      agent's `:timeout_ms` plus a margin, as for `chat/3`).
   """
   @spec stream_chat(GenServer.server(), String.t(), (String.t() -> :ok), keyword()) ::
           {:ok, result()} | {:error, result()}
   def stream_chat(server, message, on_chunk, opts \\ [])
       when is_binary(message) and is_function(on_chunk, 1) do
-    timeout = Keyword.get(opts, :timeout, 30_000)
+    timeout = Keyword.get_lazy(opts, :timeout, fn -> default_call_timeout(server) end)
     stream_opts = Keyword.drop(opts, [:timeout])
 
     case Keyword.get(stream_opts, :on_event) do
@@ -218,6 +258,10 @@ defmodule Alloy.Agent.Server do
 
   When cancelled, the server broadcasts an `{:agent_response, result}` payload
   with `status: :error`, `error: :cancelled`, and the matching `:request_id`.
+
+  Only `send_message/3` requests can be cancelled. A synchronous `chat/3`
+  or `stream_chat/4` runs inside the server process, so this call waits
+  until it finishes.
   """
   @spec cancel_request(GenServer.server(), binary()) :: :ok | {:error, :not_found}
   def cancel_request(server, request_id) when is_binary(request_id) do
@@ -245,6 +289,10 @@ defmodule Alloy.Agent.Server do
 
   @doc """
   Returns a health summary map for the agent process.
+
+  Answers immediately while an async `send_message/3` turn runs, but waits
+  behind a synchronous `chat/3` or `stream_chat/4`, which run inside the
+  server process; it exits if that takes longer than 5 seconds.
   """
   @spec health(GenServer.server()) :: map()
   def health(server) do
@@ -267,7 +315,7 @@ defmodule Alloy.Agent.Server do
         # Subscribe to PubSub topics if configured.
         # Use state.config (post-middleware) so session_start middleware can update
         # pubsub/subscribe fields and have them reflected in actual subscriptions.
-        maybe_subscribe_pubsub(state)
+        :ok = maybe_subscribe_pubsub(state)
         {:ok, state}
     end
   end
@@ -275,13 +323,7 @@ defmodule Alloy.Agent.Server do
   @impl GenServer
   def terminate(_reason, state) do
     # Kill any running async Turn task — prevents orphaned tasks after shutdown.
-    if state.current_task do
-      {_ref, task_pid, _request_id} = state.current_task
-      # terminate_child/2 may return {:error, :not_found} if the Task already
-      # finished between the GenServer receiving :stop and terminate/2 running.
-      # This is safe to ignore — the Task is gone either way.
-      Task.Supervisor.terminate_child(Alloy.TaskSupervisor, task_pid)
-    end
+    :ok = stop_current_task(state.current_task)
 
     state =
       case Middleware.run(:session_end, state) do
@@ -315,9 +357,6 @@ defmodule Alloy.Agent.Server do
       end
     end
 
-    # Cleanup last — after all consumers (middleware, callbacks) are done.
-    State.cleanup(state)
-
     :ok
   end
 
@@ -338,15 +377,8 @@ defmodule Alloy.Agent.Server do
 
     final_state = Turn.run_loop(state)
 
-    result = build_result(final_state)
-
     # Keep messages but reset loop counters for next chat/2 call
-    new_state = reset_for_new_run(final_state)
-
-    case final_state.status do
-      status when status in [:error, :halted] -> {:reply, {:error, result}, new_state}
-      _ -> {:reply, {:ok, result}, new_state}
-    end
+    {:reply, final_state |> build_result() |> Result.wrap(), reset_for_new_run(final_state)}
   end
 
   # Reject synchronous stream_chat while an async Turn is in flight.
@@ -370,13 +402,12 @@ defmodule Alloy.Agent.Server do
     turn_opts = Keyword.merge(stream_opts, streaming: true, on_chunk: on_chunk)
     final_state = Turn.run_loop(state, turn_opts)
 
-    result = build_result(final_state)
-    new_state = reset_for_new_run(final_state)
+    {:reply, final_state |> build_result() |> Result.wrap(), reset_for_new_run(final_state)}
+  end
 
-    case final_state.status do
-      status when status in [:error, :halted] -> {:reply, {:error, result}, new_state}
-      _ -> {:reply, {:ok, result}, new_state}
-    end
+  @impl GenServer
+  def handle_call(:default_call_timeout, _from, state) do
+    {:reply, state.config.timeout_ms + @call_timeout_margin_ms, state}
   end
 
   @impl GenServer
@@ -594,8 +625,7 @@ defmodule Alloy.Agent.Server do
   # ── Private ───────────────────────────────────────────────────────────────
 
   defp broadcast(pubsub, topic, message) do
-    # credo:disable-for-next-line Credo.Check.Refactor.Apply
-    case apply(pubsub_module(), :broadcast, [pubsub, topic, message]) do
+    case Phoenix.PubSub.broadcast(pubsub, topic, message) do
       :ok ->
         :ok
 
@@ -611,15 +641,14 @@ defmodule Alloy.Agent.Server do
   defp maybe_subscribe_pubsub(%State{config: %{pubsub: nil}}), do: :ok
 
   defp maybe_subscribe_pubsub(%State{config: config}) do
-    unless Code.ensure_loaded?(pubsub_module()) do
+    unless Code.ensure_loaded?(Phoenix.PubSub) do
       raise ArgumentError,
             "Alloy: pubsub: is configured but :phoenix_pubsub is not available. " <>
               "Add {:phoenix_pubsub, \"~> 2.1\"} to your mix.exs dependencies."
     end
 
-    for topic <- config.subscribe do
-      # credo:disable-for-next-line Credo.Check.Refactor.Apply
-      case apply(pubsub_module(), :subscribe, [config.pubsub, topic]) do
+    Enum.each(config.subscribe, fn topic ->
+      case Phoenix.PubSub.subscribe(config.pubsub, topic) do
         :ok ->
           :ok
 
@@ -628,11 +657,17 @@ defmodule Alloy.Agent.Server do
             "Alloy: failed to subscribe to PubSub topic #{inspect(topic)}: #{inspect(reason)}"
           )
       end
-    end
+    end)
   end
 
-  defp pubsub_module do
-    Module.concat(Phoenix, PubSub)
+  defp stop_current_task(nil), do: :ok
+
+  defp stop_current_task({_ref, task_pid, _request_id}) do
+    # terminate_child/2 may return {:error, :not_found} if the Task already
+    # finished between the GenServer receiving :stop and terminate/2 running.
+    # This is safe to ignore — the Task is gone either way.
+    _ = Task.Supervisor.terminate_child(Alloy.TaskSupervisor, task_pid)
+    :ok
   end
 
   defp set_running(state) do

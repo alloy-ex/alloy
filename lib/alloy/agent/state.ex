@@ -19,6 +19,7 @@ defmodule Alloy.Agent.State do
           usage: Usage.t(),
           status: status(),
           error: term() | nil,
+          stop_reason: Alloy.Provider.stop_reason() | nil,
           tool_calls: [map()],
           tool_defs: [map()],
           tool_fns: %{String.t() => Alloy.Tool.Registry.tool()},
@@ -35,7 +36,11 @@ defmodule Alloy.Agent.State do
   defstruct [
     :config,
     :error,
+    :stop_reason,
     messages: [],
+    # Deprecated: always [] since 0.12.5 (state.messages is the full
+    # history). Kept so code that builds or resets the struct still
+    # compiles; removed in 0.13.
     messages_new: [],
     turn: 0,
     usage: %Usage{},
@@ -76,19 +81,17 @@ defmodule Alloy.Agent.State do
   @doc """
   Append messages to the conversation history.
 
-  Uses an internal accumulator for O(1) append. Call `messages/1` to
-  retrieve the full list in chronological order.
+  `state.messages` always holds the full history in chronological order,
+  so middleware can read it directly. Messages a caller left in the
+  deprecated `messages_new` accumulator are folded in first.
   """
   @spec append_messages(t(), [Message.t()] | Message.t()) :: t()
   def append_messages(%__MODULE__{} = state, messages) when is_list(messages) do
-    # Prepend new messages (reversed) onto the accumulator for O(1) per message.
-    new_acc = Enum.reduce(messages, state.messages_new, fn msg, acc -> [msg | acc] end)
-    %{state | messages_new: new_acc}
+    %{state | messages: messages(state) ++ messages, messages_new: []}
   end
 
-  def append_messages(%__MODULE__{} = state, %Message{} = message) do
-    %{state | messages_new: [message | state.messages_new]}
-  end
+  def append_messages(%__MODULE__{} = state, %Message{} = message),
+    do: append_messages(state, [message])
 
   @doc """
   Append tool execution metadata for the current run.
@@ -131,7 +134,8 @@ defmodule Alloy.Agent.State do
   @doc """
   Return messages in chronological order.
 
-  Flushes the internal accumulator and returns the full message list.
+  Equal to `state.messages`, plus anything left in the deprecated
+  `messages_new` accumulator by code written for Alloy 0.12.4 or earlier.
   """
   @spec messages(t()) :: [Message.t()]
   def messages(%__MODULE__{messages: base, messages_new: []}) do
@@ -142,12 +146,12 @@ defmodule Alloy.Agent.State do
     base ++ Enum.reverse(new)
   end
 
+  @doc deprecated: "state.messages is always complete; read it or call messages/1."
   @doc """
-  Flush the accumulator into the messages field.
+  Fold the deprecated `messages_new` accumulator into `state.messages`.
 
-  After this call, `state.messages` contains the full chronological
-  list and `state.messages_new` is empty. Call at process boundaries
-  where code reads `state.messages` directly.
+  Alloy no longer fills the accumulator, so this only matters for a state
+  built by hand with a non-empty `messages_new`. Removed in 0.13.
   """
   @spec materialize(t()) :: t()
   def materialize(%__MODULE__{messages_new: []} = state), do: state
@@ -174,64 +178,40 @@ defmodule Alloy.Agent.State do
 
   @doc """
   Extract the text from the last assistant message.
+
+  Returns `""` when that message has no text blocks and `nil` when there is
+  no assistant message.
   """
   @spec last_assistant_text(t()) :: String.t() | nil
-  def last_assistant_text(%__MODULE__{} = state) do
-    # Check the accumulator (newest messages) first, then fall back to base.
-    find_assistant_text(state.messages_new) ||
-      find_assistant_text_reversed(state.messages)
-  end
+  def last_assistant_text(%__MODULE__{} = state),
+    do: find_last_assistant(state, &Message.text/1)
 
   @doc """
   Extract the thinking/reasoning text from the most recent assistant message
   that carries any. Returns `nil` when no assistant message has thinking.
   """
   @spec last_assistant_thinking(t()) :: String.t() | nil
-  def last_assistant_thinking(%__MODULE__{} = state) do
-    # Check the accumulator (newest messages) first, then fall back to base.
-    find_assistant_thinking(state.messages_new) ||
-      find_assistant_thinking_reversed(state.messages)
-  end
+  def last_assistant_thinking(%__MODULE__{} = state),
+    do: find_last_assistant(state, &Message.thinking/1)
 
+  @doc deprecated: "A state owns no resources; drop the call. Removed in 0.13."
   @doc """
-  Clean up resources owned by this state. No-op currently; reserved
-  for future resource management.
+  Does nothing and returns `:ok`. A state owns no resources to release;
+  kept only so existing callers compile during 0.12.x.
   """
   @spec cleanup(t()) :: :ok
   def cleanup(%__MODULE__{}), do: :ok
 
-  # Search newest-first in the accumulator (already reversed / newest-first).
-  defp find_assistant_text(messages_new) do
-    Enum.find_value(messages_new, fn
-      %Message{role: :assistant} = msg -> Message.text(msg)
-      _ -> nil
-    end)
-  end
-
-  # Search newest-first in the base messages (chronological, so reverse).
-  defp find_assistant_text_reversed(messages) do
-    messages
+  # Newest first, the first assistant message for which `extract` returns a
+  # value. Message.text/1 returns "" rather than nil, so text stops at the
+  # last assistant message while thinking keeps looking further back.
+  defp find_last_assistant(%__MODULE__{} = state, extract) do
+    state
+    |> messages()
     |> Enum.reverse()
     |> Enum.find_value(fn
-      %Message{role: :assistant} = msg -> Message.text(msg)
-      _ -> nil
-    end)
-  end
-
-  # Thinking counterparts — same newest-first search, extracting thinking blocks.
-  defp find_assistant_thinking(messages_new) do
-    Enum.find_value(messages_new, fn
-      %Message{role: :assistant} = msg -> Message.thinking(msg)
-      _ -> nil
-    end)
-  end
-
-  defp find_assistant_thinking_reversed(messages) do
-    messages
-    |> Enum.reverse()
-    |> Enum.find_value(fn
-      %Message{role: :assistant} = msg -> Message.thinking(msg)
-      _ -> nil
+      %Message{role: :assistant} = message -> extract.(message)
+      _message -> nil
     end)
   end
 

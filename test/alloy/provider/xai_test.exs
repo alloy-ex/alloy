@@ -45,6 +45,50 @@ defmodule Alloy.Provider.XAITest do
       assert path == "/v1/responses"
     end
 
+    test "chains only on an explicit previous_response_id, not on provider_state" do
+      test_pid = self()
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, Jason.decode!(body)})
+
+        body =
+          Jason.encode!(%{
+            id: "resp_next",
+            output: [
+              %{
+                type: "message",
+                role: "assistant",
+                content: [%{type: "output_text", text: "ok"}]
+              }
+            ]
+          })
+
+        Plug.Conn.send_resp(conn, 200, body)
+      end)
+
+      config = %{
+        api_key: "xai-test-key",
+        model: "grok-4.3",
+        provider_state: %{response_id: "resp_prev"},
+        req_options: [plug: {Req.Test, __MODULE__}]
+      }
+
+      assert {:ok, %{provider_state: %{response_id: "resp_next"}}} =
+               XAI.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, implicit}
+      refute Map.has_key?(implicit, "previous_response_id")
+      assert implicit["include"] == ["reasoning.encrypted_content"]
+
+      chained = Map.put(config, :previous_response_id, "resp_prev")
+      assert {:ok, _} = XAI.complete([Message.user("And then?")], [], chained)
+
+      assert_received {:request_body, explicit}
+      assert explicit["previous_response_id"] == "resp_prev"
+      assert explicit["input"] == [%{"role" => "user", "content" => "And then?"}]
+    end
+
     test "preserves explicit api_url if provided" do
       test_pid = self()
 

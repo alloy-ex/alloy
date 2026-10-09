@@ -56,34 +56,26 @@ defmodule Alloy.MessageTest do
   end
 
   describe "tool_calls/1 with server_tool_use" do
-    test "tool_calls returns both tool_use and server_tool_use blocks" do
+    # The provider already executed server tools (code execution, web search,
+    # tool search). Answering them client-side makes the API reject the turn.
+    test "ignores server_tool_use blocks; only client tool_use blocks are calls" do
       msg =
         Message.assistant_blocks([
           %{type: "text", text: "Running code..."},
-          %{type: "tool_use", id: "toolu_01", name: "read", input: %{}},
-          %{
-            type: "server_tool_use",
-            id: "srvtoolu_01",
-            name: "write",
-            input: %{"path" => "a.txt"}
-          }
+          %{type: "server_tool_use", id: "srvtoolu_01", name: "code_execution", input: %{}},
+          %{type: "tool_use", id: "toolu_01", name: "read", input: %{}}
         ])
 
-      calls = Message.tool_calls(msg)
-      assert length(calls) == 2
-      assert Enum.any?(calls, &(&1.type == "tool_use"))
-      assert Enum.any?(calls, &(&1.type == "server_tool_use"))
+      assert [%{type: "tool_use", id: "toolu_01"}] = Message.tool_calls(msg)
     end
 
-    test "tool_calls returns only server_tool_use when no regular tool_use" do
+    test "returns no calls when the message only has server tool use" do
       msg =
         Message.assistant_blocks([
-          %{type: "server_tool_use", id: "srvtoolu_01", name: "read", input: %{}}
+          %{type: "server_tool_use", id: "srvtoolu_01", name: "web_search", input: %{}}
         ])
 
-      calls = Message.tool_calls(msg)
-      assert length(calls) == 1
-      assert hd(calls).type == "server_tool_use"
+      assert Message.tool_calls(msg) == []
     end
   end
 

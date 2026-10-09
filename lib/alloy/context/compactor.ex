@@ -7,6 +7,16 @@ defmodule Alloy.Context.Compactor do
   replaces older context with a structured handoff summary. If summary
   generation fails, Alloy falls back to deterministic truncation.
 
+  Compaction never splits a tool round: a kept tool result always keeps the
+  assistant tool call before it, and truncation keeps the turn in progress
+  whole. Because compaction edits earlier history, it removes every
+  `thinking` and `redacted_thinking` block it keeps, including the turn in
+  progress (signed thinking is bound to the history it was produced after);
+  under manual thinking the turn in progress keeps its thinking, which that
+  mode requires. If the compacted request is still
+  over budget, the largest retained tool results are shortened, keeping
+  their beginning and a `[tool result truncated: ...]` marker.
+
   Compaction options live under `compaction:`:
 
     * `:clear_tool_results` - clear old bulky tool-result content before
@@ -18,15 +28,22 @@ defmodule Alloy.Context.Compactor do
       serialized conversation
   """
 
-  require Logger
-
   alias Alloy.Agent.State
   alias Alloy.Message
+  alias Alloy.Provider.Retry
+
+  require Logger
 
   @default_keep_recent 10
   @truncate_length 200
 
   @summary_prefix "Previous analysis summary (from earlier in this session):"
+  @cleared_prefix "[tool result cleared: "
+
+  # A shrunk tool result keeps at least this much of its beginning; the
+  # marker appended after it is about this long.
+  @min_kept_result_bytes 2_000
+  @truncation_marker_bytes 64
 
   @summary_system_prompt """
   You are performing CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
@@ -100,14 +117,37 @@ defmodule Alloy.Context.Compactor do
   @doc """
   Forces compaction regardless of reserve budget.
   Used when the provider rejects the prompt as too long.
+
+  The token estimate is not trusted here, because the provider has just
+  rejected a prompt the estimate allowed: clearing old tool results is
+  always followed by summarization (or truncation).
+
+  Accepts the same options as `maybe_compact/2`.
   """
-  @spec force_compact(State.t()) :: State.t()
-  def force_compact(%State{} = state) do
-    compact_messages_in_state(state, State.messages(state))
+  @spec force_compact(State.t(), keyword()) :: State.t()
+  def force_compact(%State{} = state, opts \\ []) do
+    {_fits_estimate, messages} = maybe_clear_tool_results(State.messages(state), state, opts)
+    {state, compacted} = summarize_or_fallback(state, messages, opts)
+    finalize(state, compacted)
   end
 
   @doc """
-  Compacts state messages when they exceed `max_tokens - reserve_tokens`.
+  Compacts state messages when the estimated prompt exceeds
+  `max_tokens - reserve_tokens`.
+
+  The estimate counts the system prompt, the tool definitions and every
+  message at roughly four bytes per token.
+
+  The summary is requested through `Alloy.Provider.Retry` (retries,
+  backoff and fallback providers), and its token usage is added to
+  `state.usage`.
+
+  ## Options
+
+    * `:turn` - turn number reported in compaction telemetry
+      (default: `state.turn + 1`)
+    * `:deadline` - monotonic time in milliseconds by which the summary
+      request must finish (default: now plus `config.timeout_ms`)
 
   Returns `{:compacted, state}` when compaction occurred, or
   `{:unchanged, state}` when already within budget.
@@ -115,9 +155,8 @@ defmodule Alloy.Context.Compactor do
   @spec maybe_compact(State.t(), keyword()) :: {:compacted | :unchanged, State.t()}
   def maybe_compact(%State{} = state, opts \\ []) do
     messages = State.messages(state)
-    reserve_tokens = state.config.compaction.reserve_tokens
 
-    if within_reserve?(messages, state.config.max_tokens, reserve_tokens) do
+    if within_reserve?(messages, state) do
       {:unchanged, state}
     else
       {:compacted, compact_messages_in_state(state, messages, opts)}
@@ -126,21 +165,180 @@ defmodule Alloy.Context.Compactor do
 
   # Splits messages into {first, middle, recent} for truncation compaction.
   # The middle slice is what gets compacted; first and recent are preserved.
-  defp split_messages(messages, keep_recent) do
-    [first | rest] = messages
-    rest_len = length(rest)
-    recent_count = min(keep_recent, rest_len)
-    {middle, recent} = Enum.split(rest, rest_len - recent_count)
+  defp split_messages([first | rest], keep_recent) do
+    {middle, recent} = Enum.split(rest, max(length(rest) - keep_recent, 0))
+    {middle, recent} = extend_to_round_start(middle, recent)
     {first, middle, recent}
   end
 
-  defp compact_messages_in_state(%State{} = state, messages, opts \\ []) do
-    case maybe_clear_tool_results(messages, state, opts) do
-      {:done, cleared_messages} ->
-        %{state | messages: cleared_messages, messages_new: []}
+  # A kept tool result needs the assistant tool call before it, so the kept
+  # window never starts in the middle of a tool round.
+  defp extend_to_round_start(middle, [head | _] = recent) when middle != [] do
+    if tool_result_message?(head) do
+      {earlier, [call]} = Enum.split(middle, -1)
+      extend_to_round_start(earlier, [call | recent])
+    else
+      {middle, recent}
+    end
+  end
 
-      {:continue, messages} ->
-        summarize_or_fallback(state, messages)
+  defp extend_to_round_start(middle, recent), do: {middle, recent}
+
+  defp compact_messages_in_state(%State{} = state, messages, opts) do
+    {state, compacted} =
+      case maybe_clear_tool_results(messages, state, opts) do
+        {:done, cleared_messages} -> {state, cleared_messages}
+        {:continue, messages} -> summarize_or_fallback(state, messages, opts)
+      end
+
+    finalize(state, compacted)
+  end
+
+  # Every compaction path edits earlier history, so signed thinking kept
+  # after the edit no longer matches the history it was produced after, and
+  # Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 reject it for
+  # accounts created on or after 2026-08-31. That includes the turn in
+  # progress. Removing all of it is a documented valid change, and those
+  # models think adaptively, which does not require the turn in progress to
+  # start with thinking. Manual thinking (a budget) does require it, and the
+  # models that accept manual thinking do not check the history, so there
+  # the turn in progress keeps its thinking. See
+  # https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+  defp finalize(%State{} = state, messages) do
+    messages =
+      messages
+      |> strip_thinking(manual_thinking?(state))
+      |> fit_tool_results(state)
+
+    %{state | messages: messages, messages_new: []}
+  end
+
+  defp strip_thinking(messages, false = _manual?), do: Enum.flat_map(messages, &drop_thinking/1)
+
+  defp strip_thinking(messages, true = _manual?) do
+    {settled, in_flight} = Enum.split(messages, in_flight_start(messages))
+    Enum.flat_map(settled, &drop_thinking/1) ++ in_flight
+  end
+
+  # Manual thinking is the deprecated :extended_thinking option or an
+  # extra_body thinking of type "enabled" (keys in either form, since
+  # extra_body is stringified when merged into the request).
+  defp manual_thinking?(%State{config: %{provider_config: %{extended_thinking: opts}}})
+       when is_list(opts),
+       do: true
+
+  defp manual_thinking?(%State{config: %{provider_config: provider_config}}) do
+    case Map.get(provider_config, :extra_body) do
+      %{"thinking" => thinking} -> manual_type?(thinking)
+      %{thinking: thinking} -> manual_type?(thinking)
+      _extra_body -> false
+    end
+  end
+
+  defp manual_type?(%{"type" => "enabled"}), do: true
+  defp manual_type?(%{type: "enabled"}), do: true
+  defp manual_type?(_thinking), do: false
+
+  # The turn in progress is everything after the last real user message; a
+  # conversation that ends with one has no turn in progress.
+  defp in_flight_start(messages) do
+    messages
+    |> Enum.with_index(1)
+    |> Enum.reduce(0, fn {message, next_index}, start ->
+      if real_user_message?(message), do: next_index, else: start
+    end)
+  end
+
+  # A message left with no content would be rejected, and a message holding
+  # only thinking says nothing once the thinking is gone.
+  defp drop_thinking(%Message{content: blocks} = message) when is_list(blocks) do
+    case Enum.reject(blocks, &thinking_block?/1) do
+      ^blocks -> [message]
+      [] -> []
+      kept -> [%{message | content: kept}]
+    end
+  end
+
+  defp drop_thinking(message), do: [message]
+
+  defp thinking_block?(%{type: type}) when type in ["thinking", "redacted_thinking"], do: true
+  defp thinking_block?(%{"type" => type}) when type in ["thinking", "redacted_thinking"], do: true
+  defp thinking_block?(_block), do: false
+
+  # Last resort when the compacted request is still over budget, typically
+  # one huge result in the round in progress: shrink the largest retained
+  # tool results, keeping their beginning and a marker, until it fits.
+  defp fit_tool_results(messages, %State{} = state) do
+    case request_tokens(messages, state) - budget_tokens(state) do
+      overflow when overflow > 0 -> shrink_tool_results(messages, overflow * 4)
+      _fits -> messages
+    end
+  end
+
+  defp shrink_tool_results(messages, excess_bytes) do
+    {targets, _remaining} =
+      messages
+      |> shrinkable_results()
+      |> Enum.sort_by(fn {_position, bytes} -> bytes end, :desc)
+      |> Enum.reduce_while({%{}, excess_bytes}, fn {position, bytes}, {targets, remaining} ->
+        keep = max(@min_kept_result_bytes, bytes - remaining - @truncation_marker_bytes)
+        targets = Map.put(targets, position, keep)
+        remaining = remaining - (bytes - keep - @truncation_marker_bytes)
+        if remaining > 0, do: {:cont, {targets, remaining}}, else: {:halt, {targets, remaining}}
+      end)
+
+    messages
+    |> Enum.with_index()
+    |> Enum.map(fn {message, message_index} ->
+      shrink_results_in_message(message, message_index, targets)
+    end)
+  end
+
+  defp shrinkable_results(messages) do
+    for {%Message{content: blocks}, message_index} when is_list(blocks) <-
+          Enum.with_index(messages),
+        {%{type: type, content: content}, block_index} <- Enum.with_index(blocks),
+        type in ["tool_result", "server_tool_result"],
+        is_binary(content),
+        byte_size(content) > @min_kept_result_bytes + @truncation_marker_bytes do
+      {{message_index, block_index}, byte_size(content)}
+    end
+  end
+
+  defp shrink_results_in_message(%Message{content: blocks} = message, message_index, targets)
+       when is_list(blocks) do
+    blocks =
+      blocks
+      |> Enum.with_index()
+      |> Enum.map(fn {block, block_index} ->
+        case Map.fetch(targets, {message_index, block_index}) do
+          {:ok, keep} -> %{block | content: truncate_result(block.content, keep)}
+          :error -> block
+        end
+      end)
+
+    %{message | content: blocks}
+  end
+
+  defp shrink_results_in_message(message, _message_index, _targets), do: message
+
+  defp truncate_result(content, keep_bytes) do
+    head = content |> binary_part(0, keep_bytes) |> trim_partial_codepoint(3)
+
+    head <>
+      "\n\n[tool result truncated: kept #{byte_size(head)} of #{byte_size(content)} bytes]"
+  end
+
+  # A byte cut can split a multi-byte UTF-8 character; drop its leading bytes.
+  defp trim_partial_codepoint(binary, 0), do: binary
+
+  defp trim_partial_codepoint(binary, attempts) do
+    if String.valid?(binary) do
+      binary
+    else
+      binary
+      |> binary_part(0, byte_size(binary) - 1)
+      |> trim_partial_codepoint(attempts - 1)
     end
   end
 
@@ -149,15 +347,13 @@ defmodule Alloy.Context.Compactor do
          %State{
            turn: turn,
            config: %{
-             max_tokens: max_tokens,
              compaction:
                %{
                  clear_tool_results: true,
-                 keep_recent_tokens: keep_recent_tokens,
-                 reserve_tokens: reserve_tokens
+                 keep_recent_tokens: keep_recent_tokens
                } = compaction
            }
-         },
+         } = state,
          opts
        ) do
     keep_recent_tool_results = Map.get(compaction, :keep_recent_tool_results, 3)
@@ -176,7 +372,7 @@ defmodule Alloy.Context.Compactor do
         %{turn: telemetry_turn}
       )
 
-      if within_reserve?(cleared_messages, max_tokens, reserve_tokens) do
+      if within_reserve?(cleared_messages, state) do
         {:done, cleared_messages}
       else
         {:continue, cleared_messages}
@@ -188,28 +384,29 @@ defmodule Alloy.Context.Compactor do
 
   defp maybe_clear_tool_results(messages, _state, _opts), do: {:continue, messages}
 
-  defp summarize_or_fallback(%State{} = state, messages) do
+  defp summarize_or_fallback(%State{} = state, messages, opts) do
     keep_recent_tokens = state.config.compaction.keep_recent_tokens
 
     case prepare_summary_compaction(messages, keep_recent_tokens) do
       {:ok, prepared} ->
         fire_on_compaction(prepared.messages_to_summarize, state)
+        {result, usage} = summarize_compaction(prepared, state, opts)
+        state = State.merge_usage(state, usage)
 
-        case summarize_compaction(prepared, state) do
+        case result do
           {:ok, summary_text} ->
-            compacted = [prepared.first, build_summary_message(summary_text) | prepared.recent]
-            %{state | messages: compacted, messages_new: []}
+            {state, [prepared.first, build_summary_message(summary_text) | prepared.recent]}
 
           {:error, reason} ->
             Logger.warning(
               "summary compaction failed, falling back to truncation: #{inspect(reason)}"
             )
 
-            fallback_compact_state(state, messages)
+            {state, fallback_compact(state, messages)}
         end
 
       :noop ->
-        fallback_compact_state(state, messages)
+        {state, fallback_compact(state, messages)}
     end
   end
 
@@ -308,6 +505,11 @@ defmodule Alloy.Context.Compactor do
       blocks
       |> Enum.with_index()
       |> Enum.map_reduce(acc, fn
+        # Clearing it again would replace the original size with the size of
+        # the marker and change bytes the provider has already cached.
+        {%{content: @cleared_prefix <> _} = block, _block_index}, acc ->
+          {block, acc}
+
         {%{type: type} = block, block_index}, acc
         when type in ["tool_result", "server_tool_result"] ->
           position = {message_index, block_index}
@@ -318,7 +520,7 @@ defmodule Alloy.Context.Compactor do
             bytes = content_bytes(block)
 
             {
-              %{block | content: "[tool result cleared: #{bytes} bytes]"},
+              %{block | content: "#{@cleared_prefix}#{bytes} bytes]"},
               %{
                 results_cleared: acc.results_cleared + 1,
                 bytes_cleared: acc.bytes_cleared + bytes
@@ -340,14 +542,14 @@ defmodule Alloy.Context.Compactor do
   defp content_bytes(%{content: content}), do: content |> inspect() |> byte_size()
   defp content_bytes(_block), do: 0
 
-  defp fallback_compact_state(%State{} = state, messages) do
-    case state.config.compaction.fallback do
-      :truncate ->
-        msg_count = length(messages)
-        keep_recent = min(@default_keep_recent, max(1, msg_count - 2))
-        compacted = compact_messages(messages, keep_recent: keep_recent)
-        %{state | messages: compacted, messages_new: []}
-    end
+  # The turn in progress is always kept whole, so its tool calls and results
+  # stay together. If it is too large on its own, fit_tool_results/2 shrinks
+  # its biggest results afterwards.
+  defp fallback_compact(%State{config: %{compaction: %{fallback: :truncate}}}, messages) do
+    count = length(messages)
+    in_flight_count = count - in_flight_start(messages)
+    keep_recent = max(min(@default_keep_recent, max(1, count - 2)), in_flight_count)
+    compact_messages(messages, keep_recent: keep_recent)
   end
 
   defp prepare_summary_compaction([first | rest], keep_recent_tokens) do
@@ -382,9 +584,9 @@ defmodule Alloy.Context.Compactor do
 
   defp pop_existing_summary([]), do: {nil, []}
 
-  defp summarize_compaction(prepared, %State{} = state) do
-    provider = state.config.provider
-
+  # Returns {result, usage}: the summary call is billed even when its output
+  # is unusable, so its usage is reported either way.
+  defp summarize_compaction(prepared, %State{} = state, opts) do
     config =
       state.config.provider_config
       |> Map.delete(:provider_state)
@@ -405,12 +607,28 @@ defmodule Alloy.Context.Compactor do
         Map.get(state.config.compaction, :summary_prompt, default_summary_prompt())
       )
 
-    with {:ok, response} <- provider.complete([Message.user(prompt)], [], config),
-         {:ok, summary_text} <- extract_summary_text(response) do
-      {:ok, summary_text}
-    else
-      {:error, reason} -> {:error, reason}
-      other -> {:error, other}
+    # The summary goes through Retry like any turn request, so it gets the
+    # same retries, fallback providers and receive timeout, bounded by the
+    # caller's deadline.
+    summary_state = %{state | messages: [Message.user(prompt)], messages_new: [], tool_defs: []}
+
+    deadline =
+      Keyword.get_lazy(opts, :deadline, fn ->
+        System.monotonic_time(:millisecond) + state.config.timeout_ms
+      end)
+
+    no_chunks = fn _chunk -> :ok end
+
+    case Retry.call_with_retry(
+           summary_state,
+           state.config.provider,
+           config,
+           false,
+           no_chunks,
+           deadline
+         ) do
+      {:ok, response} -> {extract_summary_text(response), Map.get(response, :usage, %{})}
+      {:error, reason} -> {{:error, reason}, %{}}
     end
   end
 
@@ -621,8 +839,11 @@ defmodule Alloy.Context.Compactor do
   This helper intentionally stays deterministic and provider-free so it can serve
   as the fallback truncation strategy.
 
+  The preserved window never starts with a tool result: it is extended back to
+  the assistant message that made the call, so it may hold more than N messages.
+
   ## Options
-    * `:keep_recent` - number of recent messages to preserve (default #{@default_keep_recent})
+    * `:keep_recent` - minimum number of recent messages to preserve (default #{@default_keep_recent})
   """
   @spec compact_messages([Message.t()], keyword()) :: [Message.t()]
   def compact_messages(messages, opts \\ []) do
@@ -647,6 +868,9 @@ defmodule Alloy.Context.Compactor do
         %{type: "thinking", signature: signature} when is_binary(signature) ->
           nil
 
+        %{type: "redacted_thinking"} ->
+          nil
+
         %{type: "thinking", thinking: text} = block when byte_size(text) > @truncate_length ->
           %{block | thinking: String.slice(text, 0, @truncate_length) <> "..."}
 
@@ -668,16 +892,18 @@ defmodule Alloy.Context.Compactor do
 
   defp compact_message(msg), do: msg
 
-  # --- Token estimation (inlined from TokenCounter) ---
-  # Chars/4 heuristic — good enough for budget decisions, not billing.
+  # --- Token estimation ---
+  # Bytes/4: good enough for budget decisions, not billing. Bytes rather than
+  # characters, because a CJK character is three bytes and at least one token.
 
-  # Fixed heuristics for media types. Intentionally conservative rough estimates.
+  # Fixed heuristics for media types, whose payload size says little about
+  # their token cost. Intentionally conservative rough estimates.
   @image_tokens 1_000
   @audio_tokens 500
   @video_tokens 2_000
   @document_tokens 3_000
 
-  defp estimate_tokens(text) when is_binary(text), do: div(String.length(text), 4)
+  defp estimate_tokens(text) when is_binary(text), do: div(byte_size(text), 4)
 
   defp estimate_tokens(messages) when is_list(messages) do
     Enum.reduce(messages, 0, fn msg, acc -> acc + estimate_message_tokens(msg) end)
@@ -695,50 +921,53 @@ defmodule Alloy.Context.Compactor do
     estimate_tokens(text)
   end
 
-  defp estimate_block_tokens(%{type: "tool_use", name: name, input: input}) do
-    name_tokens = estimate_tokens(to_string(name))
-
-    input_str =
-      case Jason.encode(input) do
-        {:ok, json} -> json
-        {:error, _} -> inspect(input)
-      end
-
-    name_tokens + estimate_tokens(input_str)
+  defp estimate_block_tokens(%{type: type, name: name, input: input})
+       when type in ["tool_use", "server_tool_use"] do
+    estimate_tokens(to_string(name)) + estimate_json_tokens(input)
   end
 
-  defp estimate_block_tokens(%{type: "tool_result", content: content}) when is_binary(content) do
+  defp estimate_block_tokens(%{type: type, content: content})
+       when type in ["tool_result", "server_tool_result"] and is_binary(content) do
     estimate_tokens(content)
   end
 
-  defp estimate_block_tokens(%{type: "thinking", thinking: text}) when is_binary(text) do
-    estimate_tokens(text)
-  end
-
-  defp estimate_block_tokens(%{type: "server_tool_use", name: name, input: input}) do
-    name_tokens = estimate_tokens(to_string(name))
-
-    input_str =
-      case Jason.encode(input) do
-        {:ok, json} -> json
-        {:error, _} -> inspect(input)
-      end
-
-    name_tokens + estimate_tokens(input_str)
-  end
-
-  defp estimate_block_tokens(%{type: "server_tool_result", content: content})
-       when is_binary(content) do
-    estimate_tokens(content)
+  # With display "omitted" the thinking text is empty and the signature
+  # carries the full encrypted reasoning the provider replays as input.
+  defp estimate_block_tokens(%{type: "thinking", thinking: text} = block) when is_binary(text) do
+    estimate_tokens(text) + estimate_tokens(Map.get(block, :signature) || "")
   end
 
   defp estimate_block_tokens(%{type: "image"}), do: @image_tokens
   defp estimate_block_tokens(%{type: "audio"}), do: @audio_tokens
   defp estimate_block_tokens(%{type: "video"}), do: @video_tokens
   defp estimate_block_tokens(%{type: "document"}), do: @document_tokens
-  defp estimate_block_tokens(_block), do: 0
 
-  defp within_reserve?(messages, max_tokens, reserve_tokens) do
-    estimate_tokens(messages) <= max(max_tokens - reserve_tokens, 0)
+  # String-keyed blocks, list content and block types this module does not
+  # know are still sent to the provider, so they cost roughly their JSON size.
+  defp estimate_block_tokens(block), do: estimate_json_tokens(block)
+
+  defp estimate_json_tokens(term) do
+    case Jason.encode(term) do
+      {:ok, json} -> estimate_tokens(json)
+      {:error, _reason} -> term |> inspect() |> estimate_tokens()
+    end
   end
+
+  # The system prompt and tool definitions are sent with every request and
+  # count against the same context window as the messages.
+  defp request_overhead_tokens(%State{config: config, tool_defs: tool_defs}) do
+    system_prompt_tokens(config.system_prompt) + estimate_json_tokens(tool_defs)
+  end
+
+  defp system_prompt_tokens(nil), do: 0
+  defp system_prompt_tokens(prompt) when is_binary(prompt), do: estimate_tokens(prompt)
+
+  defp request_tokens(messages, %State{} = state),
+    do: request_overhead_tokens(state) + estimate_tokens(messages)
+
+  defp budget_tokens(%State{config: config}),
+    do: max(config.max_tokens - config.compaction.reserve_tokens, 0)
+
+  defp within_reserve?(messages, %State{} = state),
+    do: request_tokens(messages, state) <= budget_tokens(state)
 end

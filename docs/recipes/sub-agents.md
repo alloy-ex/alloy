@@ -58,8 +58,7 @@ defmodule MyApp.Tools.Delegate do
            provider: Map.fetch!(context, :delegate_provider),
            tools: [Alloy.Tool.Core.Read],
            max_turns: 8,
-           timeout_ms: 60_000,
-           max_budget_cents: 25
+           timeout_ms: 60_000
          ) do
       {:ok, result} ->
         {:ok, result.text || ""}
@@ -79,11 +78,11 @@ faster model than the parent's:
 ```elixir
 {:ok, result} =
   Alloy.run("Compare the error handling in lib/foo.ex and lib/bar.ex",
-    provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-opus-4-6"},
+    provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-opus-5-5"},
     tools: [MyApp.Tools.Delegate, Alloy.Tool.Core.Read],
     context: %{
       delegate_provider:
-        {Alloy.Provider.Anthropic, api_key: key, model: "claude-haiku-4-5"}
+        {Alloy.Provider.Anthropic, api_key: key, model: "claude-haiku-5-5"}
     }
   )
 ```
@@ -96,10 +95,11 @@ delegation should reduce capability, not forward it.
 
 **Cap everything explicitly.** The child run knows nothing about its parent —
 parent budget, deadline, and correlation IDs do **not** propagate. Treat
-`max_turns`, `timeout_ms`, and `max_budget_cents` on the child as mandatory,
-and remember the parent's own `max_budget_cents` cannot see tokens spent
-inside the child. If you need combined accounting, return `result.usage` in a
-structured tool result and sum in your application.
+`max_turns` and `timeout_ms` on the child as mandatory, and to cap spend give
+the child its own budget middleware (see "Budget limits" in the README).
+A budget check in the parent cannot see tokens spent inside the child; if you
+need combined accounting, return `result.usage` in a structured tool result
+and sum in your application.
 
 **Recursion.** If you give the sub-agent the `delegate` tool too, you have
 unbounded recursion at the model's discretion. Don't — or thread a depth

@@ -2,7 +2,7 @@ defmodule Alloy.Provider.AnthropicTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
-  alias Alloy.Provider.Anthropic
+  alias Alloy.Provider.{Anthropic, Error}
 
   # We test by intercepting the HTTP call via a custom Req adapter
   # that returns canned responses.
@@ -73,6 +73,73 @@ defmodule Alloy.Provider.AnthropicTest do
     end
   end
 
+  describe "stop reasons" do
+    # https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+    for {wire, expected} <- [
+          {"end_turn", :end_turn},
+          {"stop_sequence", :end_turn},
+          {"tool_use", :tool_use},
+          {"max_tokens", :max_tokens},
+          {"model_context_window_exceeded", :max_tokens},
+          {"pause_turn", :pause_turn},
+          {"refusal", :refusal}
+        ] do
+      test "complete/3 maps #{wire} to #{inspect(expected)}" do
+        config = config_with_response(%{status: 200, body: message_json(unquote(wire))})
+
+        assert {:ok, %{stop_reason: unquote(expected)}} =
+                 Anthropic.complete([Message.user("Hi")], [], config)
+      end
+
+      test "stream/4 maps #{wire} to #{inspect(expected)}" do
+        config = config_with_sse_stream(text_stream("ok", %{"stop_reason" => unquote(wire)}))
+
+        assert {:ok, %{stop_reason: unquote(expected)}} =
+                 Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+      end
+    end
+
+    test "complete/3 puts refusal stop_details in response_metadata" do
+      details = %{"type" => "refusal", "category" => "cyber", "explanation" => "Declined."}
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body: message_json("refusal", %{"content" => [], "stop_details" => details})
+        })
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Hi")], [], config)
+      assert result.stop_reason == :refusal
+      assert result.response_metadata == %{stop_details: details}
+    end
+
+    test "stream/4 puts refusal stop_details from message_delta in response_metadata" do
+      details = %{"type" => "refusal", "category" => nil, "explanation" => nil}
+
+      config =
+        config_with_sse_stream(
+          text_stream("partial", %{"stop_reason" => "refusal", "stop_details" => details})
+        )
+
+      assert {:ok, result} =
+               Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert result.stop_reason == :refusal
+      assert result.response_metadata == %{stop_details: details}
+    end
+
+    test "omits response_metadata when stop_details is null" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body: message_json("end_turn", %{"stop_details" => nil})
+        })
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Hi")], [], config)
+      refute Map.has_key?(result, :response_metadata)
+    end
+  end
+
   describe "complete/3 message formatting" do
     test "formats user messages correctly" do
       config = config_that_captures_request()
@@ -93,6 +160,26 @@ defmodule Alloy.Provider.AnthropicTest do
       assert length(decoded["messages"]) == 3
       assert hd(decoded["messages"])["role"] == "user"
       assert hd(decoded["messages"])["content"] == "Hello"
+    end
+
+    test "defaults max_tokens to 16_000 so thinking leaves room for the answer" do
+      # The docs' adaptive thinking examples use max_tokens: 16000:
+      # https://platform.claude.com/docs/en/build-with-claude/thinking
+      config = Map.delete(config_that_captures_request(), :max_tokens)
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["max_tokens"] == 16_000
+    end
+
+    test "sends an explicit max_tokens unchanged" do
+      config = Map.put(config_that_captures_request(), :max_tokens, 1024)
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["max_tokens"] == 1024
     end
 
     test "includes system prompt in request" do
@@ -153,7 +240,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
       assert [tool] = decoded["tools"]
       assert tool["name"] == "list_agents"
-      assert tool["allowed_callers"] == ["human", "code_execution"]
+      assert tool["allowed_callers"] == ["direct", "code_execution_20260120"]
     end
 
     test "includes strict true on strict tools" do
@@ -247,6 +334,57 @@ defmodule Alloy.Provider.AnthropicTest do
     end
   end
 
+  describe "server_tools" do
+    test "appends server tools after the generated tools" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:code_execution, true)
+        |> Map.put(:server_tools, [
+          %{"type" => "web_search_20260209", "name" => "web_search", "max_uses" => 3},
+          %{type: "web_fetch_20260209", name: "web_fetch"}
+        ])
+
+      tool_defs = [%{name: "read", description: "Read", input_schema: %{}}]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+
+      assert [
+               %{"name" => "read"},
+               %{"name" => "code_execution"},
+               %{"type" => "web_search_20260209", "name" => "web_search", "max_uses" => 3},
+               %{"type" => "web_fetch_20260209", "name" => "web_fetch"}
+             ] = Jason.decode!(body)["tools"]
+    end
+
+    test "sends server tools when there are no local tools" do
+      config =
+        Map.put(config_that_captures_request(), :server_tools, [
+          %{"type" => "web_search_20260209", "name" => "web_search"}
+        ])
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert [%{"name" => "web_search"}] = Jason.decode!(body)["tools"]
+    end
+
+    test "extra_body tools still replace every tool" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:server_tools, [%{"type" => "web_search_20260209", "name" => "web_search"}])
+        |> Map.put(:extra_body, %{"tools" => [%{"type" => "bash_20250124", "name" => "bash"}]})
+
+      tool_defs = [%{name: "read", description: "Read", input_schema: %{}}]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      assert [%{"name" => "bash"}] = Jason.decode!(body)["tools"]
+    end
+  end
+
   describe "code_execution support" do
     test "includes code_execution tool in request when code_execution is configured" do
       config =
@@ -269,39 +407,19 @@ defmodule Alloy.Provider.AnthropicTest do
       tools = decoded["tools"]
       assert length(tools) == 2
 
-      code_exec_tool = Enum.find(tools, &(&1["type"] == "code_execution_20250825"))
+      code_exec_tool = Enum.find(tools, &(&1["type"] == "code_execution_20260521"))
       assert code_exec_tool != nil
       assert code_exec_tool["name"] == "code_execution"
     end
 
-    test "adds anthropic-beta header for code_execution and merges extra beta headers" do
+    test "GA features send their fields without a beta header" do
+      # Code execution, memory, tool search (defer_loading) and tool use
+      # examples need no beta header since February 17, 2026:
+      # https://platform.claude.com/docs/en/release-notes/overview
       config =
         config_that_captures_request()
         |> Map.put(:code_execution, true)
-        |> Map.put(:extra_headers, [{"anthropic-beta", "context-1m-2025-08-07"}])
-
-      Anthropic.complete([Message.user("Hi")], [], config)
-
-      assert_received {:request_headers, headers}
-
-      anthropic_beta_values =
-        headers
-        |> Enum.filter(fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
-        |> Enum.map(fn {_name, value} -> value end)
-
-      assert [merged_beta_header] = anthropic_beta_values
-
-      merged_beta_values =
-        merged_beta_header
-        |> String.split(",", trim: true)
-        |> Enum.map(&String.trim/1)
-        |> Enum.sort()
-
-      assert merged_beta_values == ["code-execution-2025-08-25", "context-1m-2025-08-07"]
-    end
-
-    test "emits advanced tool-use fields and beta header when used" do
-      config = config_that_captures_request()
+        |> Map.put(:memory, {Alloy.Test.MemoryStore, %{}})
 
       tool_defs = [
         %{
@@ -318,50 +436,50 @@ defmodule Alloy.Provider.AnthropicTest do
       assert_received {:request_body, body}
       assert_received {:request_headers, headers}
 
-      decoded = Jason.decode!(body)
-      assert [tool] = decoded["tools"]
-      assert tool["input_examples"] == [%{"query" => "release notes"}]
-      assert tool["defer_loading"] == true
+      assert [search, %{"name" => "code_execution"}, %{"name" => "memory"}] =
+               Jason.decode!(body)["tools"]
 
-      assert beta_values(headers) == ["advanced-tool-use-2025-11-20"]
+      assert search["input_examples"] == [%{"query" => "release notes"}]
+      assert search["defer_loading"] == true
+      assert beta_headers(headers) == []
     end
 
-    test "advanced tool-use beta merges with memory beta" do
+    test "user-supplied betas pass through merged into one anthropic-beta header" do
+      config =
+        Map.put(config_that_captures_request(), :extra_headers, [
+          {"anthropic-beta", "context-1m-2025-08-07"},
+          {"x-request-tag", "alloy"},
+          {"Anthropic-Beta", "files-api-2025-04-14, context-1m-2025-08-07"}
+        ])
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_headers, headers}
+
+      assert [_one] = beta_headers(headers)
+      assert beta_values(headers) == ["context-1m-2025-08-07", "files-api-2025-04-14"]
+      assert {"x-request-tag", "alloy"} in headers
+    end
+
+    test "context editing in extra_body adds its beta, merged with the user's" do
+      # Context editing is still in beta:
+      # https://platform.claude.com/docs/en/build-with-claude/context-editing
       config =
         config_that_captures_request()
         |> Map.put(:memory, {Alloy.Test.MemoryStore, %{}})
+        |> Map.put(:extra_headers, [{"anthropic-beta", "context-1m-2025-08-07"}])
+        |> Map.put(:extra_body, %{
+          context_management: %{edits: [%{type: "clear_tool_uses_20250919"}]}
+        })
 
-      tool_defs = [
-        %{
-          name: "search",
-          description: "Search",
-          input_schema: %{type: "object", properties: %{}},
-          input_examples: [%{}]
-        }
-      ]
-
-      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+      Anthropic.complete([Message.user("Hi")], [], config)
 
       assert_received {:request_headers, headers}
 
       assert beta_values(headers) == [
-               "advanced-tool-use-2025-11-20",
+               "context-1m-2025-08-07",
                "context-management-2025-06-27"
              ]
-    end
-
-    test "does not add advanced tool-use beta when advanced fields are absent" do
-      config = config_that_captures_request()
-
-      tool_defs = [
-        %{name: "read", description: "Read", input_schema: %{type: "object", properties: %{}}}
-      ]
-
-      Anthropic.complete([Message.user("Hi")], tool_defs, config)
-
-      assert_received {:request_headers, headers}
-
-      refute "advanced-tool-use-2025-11-20" in beta_values(headers)
     end
 
     test "does not include code_execution tool when code_execution is false" do
@@ -382,7 +500,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
       tools = decoded["tools"]
       assert length(tools) == 1
-      refute Enum.any?(tools, &(&1["type"] == "code_execution_20250825"))
+      refute Enum.any?(tools, &String.starts_with?(&1["type"] || "", "code_execution"))
     end
 
     test "parses server_tool_use response blocks" do
@@ -418,21 +536,41 @@ defmodule Alloy.Provider.AnthropicTest do
       assert server_call.input == %{"file_path" => "mix.exs"}
     end
 
-    test "formats server_tool_result blocks for round-trip" do
+    # A transcript started on OpenAI Responses (e.g. via fallback_providers)
+    # carries opaque items only that API understands.
+    test "drops OpenAI-only reasoning and output_item blocks from history" do
       config = config_that_captures_request()
 
       messages = [
-        Message.user("Read mix.exs"),
+        Message.user("Hi"),
         Message.assistant_blocks([
-          %{
-            type: "server_tool_use",
-            id: "srvtoolu_01",
-            name: "read",
-            input: %{"file_path" => "mix.exs"}
-          }
+          %{type: "reasoning", raw: %{"type" => "reasoning", "id" => "rs_1"}},
+          %{type: "output_item", raw: %{"type" => "web_search_call", "id" => "ws_1"}},
+          %{type: "text", text: "Hello"}
+        ]),
+        Message.user("Again")
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      [_user, assistant, _again] = Jason.decode!(body)["messages"]
+      assert assistant["content"] == [%{"type" => "text", "text" => "Hello"}]
+    end
+
+    test "keeps server_tool_use in history and drops legacy server_tool_result blocks" do
+      config = config_that_captures_request()
+
+      # Shape written by Alloy <= 0.12.4, which answered server tools itself.
+      messages = [
+        Message.user("Run it"),
+        Message.assistant_blocks([
+          %{type: "server_tool_use", id: "srvtoolu_01", name: "code_execution", input: %{}},
+          %{type: "tool_use", id: "toolu_01", name: "read", input: %{"file_path" => "a"}}
         ]),
         Message.tool_results([
-          %{type: "server_tool_result", tool_use_id: "srvtoolu_01", content: "file contents here"}
+          %{type: "server_tool_result", tool_use_id: "srvtoolu_01", content: "stale"},
+          %{type: "tool_result", tool_use_id: "toolu_01", content: "file contents"}
         ])
       ]
 
@@ -441,17 +579,218 @@ defmodule Alloy.Provider.AnthropicTest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      # server_tool_use should be preserved in assistant message
-      assistant_msg = Enum.find(decoded["messages"], &(&1["role"] == "assistant"))
-      server_block = hd(assistant_msg["content"])
-      assert server_block["type"] == "server_tool_use"
-      assert server_block["id"] == "srvtoolu_01"
+      [_user, assistant, results] = decoded["messages"]
+      assert Enum.map(assistant["content"], & &1["type"]) == ["server_tool_use", "tool_use"]
+      assert [%{"type" => "tool_result", "tool_use_id" => "toolu_01"}] = results["content"]
+    end
+  end
 
-      # server_tool_result should be preserved in user message
-      result_msg = List.last(decoded["messages"])
-      result_block = hd(result_msg["content"])
-      assert result_block["type"] == "server_tool_result"
-      assert result_block["tool_use_id"] == "srvtoolu_01"
+  describe "programmatic tool calling" do
+    # https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling
+    @caller %{"type" => "code_execution_20260120", "tool_id" => "srvtoolu_abc123"}
+
+    test "translates allowed_callers to the API's caller names" do
+      config = config_that_captures_request()
+
+      tool_defs =
+        for {name, callers} <- [
+              {"legacy", [:human, :code_execution]},
+              {"direct", [:direct]},
+              {"raw", ["code_execution_20260521"]}
+            ] do
+          %{name: name, description: name, input_schema: %{}, allowed_callers: callers}
+        end
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+
+      assert Map.new(Jason.decode!(body)["tools"], &{&1["name"], &1["allowed_callers"]}) == %{
+               "legacy" => ["direct", "code_execution_20260120"],
+               "direct" => ["direct"],
+               "raw" => ["code_execution_20260521"]
+             }
+    end
+
+    test "complete/3 keeps the tool_use caller and stores the container in provider_state" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body: Jason.encode!(programmatic_call_message())
+        })
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Top customers?")], [], config)
+      assert result.stop_reason == :tool_use
+
+      assert result.provider_state == %{
+               container_id: "container_xyz789",
+               container_expires_at: "2099-01-01T00:00:00Z"
+             }
+
+      assert [%{type: "tool_use", id: "toolu_def456", caller: @caller}] =
+               Message.tool_calls(hd(result.messages))
+    end
+
+    test "stream/4 keeps the tool_use caller and stores the container in provider_state" do
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 1}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{
+              "type" => "tool_use",
+              "id" => "toolu_def456",
+              "name" => "query_database",
+              "input" => %{},
+              "caller" => @caller
+            }
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => ~s({"sql": "<sql>"})}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{
+              "stop_reason" => "tool_use",
+              "container" => %{"id" => "container_xyz789", "expires_at" => "2099-01-01T00:00:00Z"}
+            },
+            "usage" => %{"output_tokens" => 9}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      assert {:ok, result} =
+               Anthropic.stream([Message.user("Top customers?")], [], config, fn _ -> :ok end)
+
+      assert result.provider_state == %{
+               container_id: "container_xyz789",
+               container_expires_at: "2099-01-01T00:00:00Z"
+             }
+
+      assert [%{id: "toolu_def456", input: %{"sql" => "<sql>"}, caller: @caller}] =
+               Message.tool_calls(hd(result.messages))
+    end
+
+    test "omits provider_state when the response has no container" do
+      config = config_with_response(%{status: 200, body: message_json("end_turn")})
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Hi")], [], config)
+      refute Map.has_key?(result, :provider_state)
+    end
+
+    # Idle containers are reclaimed after about 5 minutes; a session that
+    # resumes later must start a fresh container rather than fail.
+    test "does not send a stored container whose expires_at has passed" do
+      expired = DateTime.utc_now() |> DateTime.add(-60) |> DateTime.to_iso8601()
+
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{
+          container_id: "container_old",
+          container_expires_at: expired
+        })
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "container")
+    end
+
+    test "sends a stored container that has not expired" do
+      live = DateTime.utc_now() |> DateTime.add(240) |> DateTime.to_iso8601()
+
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{container_id: "container_live", container_expires_at: live})
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["container"] == "container_live"
+    end
+
+    test "sends the stored container and the tool_use caller on the next request" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{container_id: "container_xyz789"})
+
+      messages = [
+        Message.user("Top customers?"),
+        Message.assistant_blocks([
+          %{type: "tool_use", id: "toolu_def456", name: "q", input: %{}, caller: @caller}
+        ]),
+        Message.tool_results([Message.tool_result_block("toolu_def456", "[]")])
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert decoded["container"] == "container_xyz789"
+      assert [%{"caller" => @caller}] = Enum.at(decoded["messages"], 1)["content"]
+    end
+
+    test "sends no container before one exists" do
+      config = config_that_captures_request()
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "container")
+    end
+
+    test "Alloy.run/2 continues a paused programmatic call in the same container" do
+      test_pid = self()
+      calls = :counters.new(1, [])
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, Jason.decode!(body)})
+        :counters.add(calls, 1, 1)
+
+        response =
+          case :counters.get(calls, 1) do
+            1 -> programmatic_call_message()
+            _ -> Jason.decode!(message_json("end_turn"))
+          end
+
+        Req.Test.json(conn, response)
+      end)
+
+      query_database =
+        Alloy.Tool.inline(
+          name: "query_database",
+          description: "Run SQL",
+          input_schema: %{type: "object", properties: %{sql: %{type: "string"}}},
+          allowed_callers: [:code_execution],
+          execute: fn _input, _context -> {:ok, "[]"} end
+        )
+
+      assert {:ok, result} =
+               Alloy.run("Top customers?",
+                 provider:
+                   {Anthropic,
+                    api_key: "sk-ant-test-key",
+                    model: "claude-sonnet-4-6",
+                    code_execution: true,
+                    req_options: [plug: {Req.Test, __MODULE__}]},
+                 tools: [query_database]
+               )
+
+      assert result.status == :completed
+      assert_received {:request_body, first}
+      assert_received {:request_body, second}
+
+      refute Map.has_key?(first, "container")
+      assert second["container"] == "container_xyz789"
+
+      [_user, assistant, results] = second["messages"]
+      assert Enum.find(assistant["content"], &(&1["type"] == "tool_use"))["caller"] == @caller
+      assert [%{"type" => "tool_result", "tool_use_id" => "toolu_def456"}] = results["content"]
     end
   end
 
@@ -476,8 +815,27 @@ defmodule Alloy.Provider.AnthropicTest do
             })
         })
 
-      assert {:error, reason} = Anthropic.complete([Message.user("Hi")], [], config)
-      assert reason =~ "invalid_request_error"
+      assert {:error, %Error{kind: :invalid_request} = reason} =
+               Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "invalid_request_error"
+    end
+
+    test "an error body on a 200 response becomes a classified error" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "type" => "error",
+              "error" => %{"type" => "overloaded_error", "message" => "Overloaded"}
+            })
+        })
+
+      assert {:error, %Error{kind: :overloaded} = error} =
+               Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) == "overloaded_error: Overloaded"
     end
 
     test "returns error on overloaded response" do
@@ -491,8 +849,10 @@ defmodule Alloy.Provider.AnthropicTest do
             })
         })
 
-      assert {:error, reason} = Anthropic.complete([Message.user("Hi")], [], config)
-      assert reason =~ "overloaded"
+      assert {:error, %Error{kind: :overloaded} = reason} =
+               Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "overloaded"
     end
   end
 
@@ -559,6 +919,42 @@ defmodule Alloy.Provider.AnthropicTest do
       # Only the LAST tool should have cache_control
       refute Map.has_key?(hd(tools), "cache_control")
       assert List.last(tools)["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "cache_control goes on the last tool that is not deferred" do
+      # A deferred tool with cache_control is a 400:
+      # https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
+      config = Map.put(config_that_captures_request(), :cache, true)
+
+      tool_defs = [
+        %{name: "read", description: "Read", input_schema: %{}},
+        %{name: "write", description: "Write", input_schema: %{}},
+        %{name: "search", description: "Search", input_schema: %{}, defer_loading: true}
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+
+      assert Map.new(Jason.decode!(body)["tools"], &{&1["name"], &1["cache_control"]}) == %{
+               "read" => nil,
+               "write" => %{"type" => "ephemeral"},
+               "search" => nil
+             }
+    end
+
+    test "no tool gets cache_control when every tool is deferred" do
+      config = Map.put(config_that_captures_request(), :cache, true)
+
+      tool_defs = [
+        %{name: "search", description: "Search", input_schema: %{}, defer_loading: true}
+      ]
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+      assert [tool] = Jason.decode!(body)["tools"]
+      refute Map.has_key?(tool, "cache_control")
     end
 
     test "last message string content gets cache_control when cache: true" do
@@ -820,6 +1216,53 @@ defmodule Alloy.Provider.AnthropicTest do
       refute_received {:chunk, _}
     end
 
+    test "takes cumulative message_delta usage instead of adding it to message_start" do
+      # Numbers from the web search example in
+      # https://platform.claude.com/docs/en/build-with-claude/streaming
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{
+              "usage" => %{
+                "input_tokens" => 2679,
+                "cache_creation_input_tokens" => 0,
+                "cache_read_input_tokens" => 0,
+                "output_tokens" => 3
+              }
+            }
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "Answer."}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil},
+            "usage" => %{
+              "input_tokens" => 10_682,
+              "cache_creation_input_tokens" => 0,
+              "cache_read_input_tokens" => nil,
+              "output_tokens" => 510,
+              "server_tool_use" => %{"web_search_requests" => 1}
+            }
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      assert {:ok, result} = Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert result.usage == %{
+               input_tokens: 10_682,
+               output_tokens: 510,
+               cache_creation_input_tokens: 0,
+               cache_read_input_tokens: 0
+             }
+    end
+
     test "accumulates tool call input_json_delta without emitting chunks" do
       config =
         config_with_sse_stream([
@@ -969,8 +1412,102 @@ defmodule Alloy.Provider.AnthropicTest do
       assert {:error, reason} =
                Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      assert reason =~ "invalid_request_error"
-      assert reason =~ "max_tokens"
+      assert Exception.message(reason) =~ "invalid_request_error"
+      assert Exception.message(reason) =~ "max_tokens"
+    end
+
+    test "returns a classified error for an in-band error event" do
+      # https://platform.claude.com/docs/en/build-with-claude/streaming#error-events
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 1}}
+          }),
+          ant_event("error", %{
+            "type" => "error",
+            "error" => %{"type" => "overloaded_error", "message" => "Overloaded"}
+          })
+        ])
+
+      assert {:error, %Error{kind: :overloaded, type: "overloaded_error"} = error} =
+               Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert Error.retryable?(error)
+      assert Exception.message(error) == "overloaded_error: Overloaded"
+    end
+
+    test "an error event after partial output still fails the stream" do
+      chunks =
+        "partial"
+        |> text_stream(%{"stop_reason" => "end_turn"})
+        |> Enum.take(4)
+        |> Kernel.++([
+          ant_event("error", %{
+            "type" => "error",
+            "error" => %{"type" => "api_error", "message" => "Internal server error"}
+          })
+        ])
+
+      assert {:error, %Error{kind: :server_error}} =
+               Anthropic.stream([Message.user("Hi")], [], config_with_sse_stream(chunks), fn _ ->
+                 :ok
+               end)
+    end
+
+    test "returns an error when the stream ends without a stop_reason" do
+      truncated = "cut off" |> text_stream(%{"stop_reason" => "end_turn"}) |> Enum.take(3)
+
+      assert {:error, %Error{kind: :network} = error} =
+               Anthropic.stream(
+                 [Message.user("Hi")],
+                 [],
+                 config_with_sse_stream(truncated),
+                 fn _ -> :ok end
+               )
+
+      assert Error.retryable?(error)
+      assert Exception.message(error) =~ "stop_reason"
+    end
+
+    test "Alloy.stream/3 retries an in-band overloaded error that arrived before any output" do
+      attempts = :counters.new(1, [])
+
+      overloaded =
+        ant_event("error", %{
+          "type" => "error",
+          "error" => %{"type" => "overloaded_error", "message" => "Overloaded"}
+        })
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        :counters.add(attempts, 1, 1)
+
+        chunks =
+          case :counters.get(attempts, 1) do
+            1 -> [overloaded]
+            _ -> text_stream("Recovered", %{"stop_reason" => "end_turn"})
+          end
+
+        Enum.reduce(chunks, Plug.Conn.send_chunked(conn, 200), fn chunk, conn ->
+          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
+          conn
+        end)
+      end)
+
+      provider_config = [
+        api_key: "sk-ant-test-key",
+        model: "claude-sonnet-4-6",
+        req_options: [plug: {Req.Test, __MODULE__}]
+      ]
+
+      assert {:ok, result} =
+               Alloy.stream("Hi", fn _ -> :ok end,
+                 provider: {Anthropic, provider_config},
+                 max_retries: 1,
+                 retry_backoff_ms: 1
+               )
+
+      assert result.text == "Recovered"
+      assert :counters.get(attempts, 1) == 2
     end
 
     test "returns raw body when stream error is not JSON" do
@@ -979,8 +1516,8 @@ defmodule Alloy.Provider.AnthropicTest do
       assert {:error, reason} =
                Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      assert reason =~ "502"
-      assert reason =~ "Bad Gateway"
+      assert %Error{kind: :server_error} = reason
+      assert Exception.message(reason) == "HTTP 502: Bad Gateway"
     end
   end
 
@@ -1032,6 +1569,25 @@ defmodule Alloy.Provider.AnthropicTest do
       decoded = Jason.decode!(body)
 
       assert %{"type" => "enabled", "budget_tokens" => 5_000} = decoded["thinking"]
+    end
+
+    test "the documented replacement sends adaptive thinking and effort through extra_body" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:extended_thinking, budget_tokens: 5_000)
+        |> Map.put(:extra_body, %{
+          "thinking" => %{"type" => "adaptive", "display" => "summarized"},
+          "output_config" => %{"effort" => "high"}
+        })
+
+      Anthropic.complete([Message.user("Think hard")], [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      # extra_body is merged last, so it wins over a leftover :extended_thinking.
+      assert decoded["thinking"] == %{"type" => "adaptive", "display" => "summarized"}
+      assert decoded["output_config"] == %{"effort" => "high"}
     end
 
     test "raises ArgumentError when extended_thinking is set without budget_tokens" do
@@ -1301,8 +1857,10 @@ defmodule Alloy.Provider.AnthropicTest do
         req_options: [plug: {Req.Test, __MODULE__}]
       }
 
-      assert {:error, "HTTP 429: Too Many Requests"} =
+      assert {:error, %Error{kind: :rate_limited} = error} =
                Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) == "HTTP 429: Too Many Requests"
     end
 
     test "req_options cannot re-enable Req retry (retry: false is enforced)" do
@@ -1326,8 +1884,10 @@ defmodule Alloy.Provider.AnthropicTest do
         ]
       }
 
-      assert {:error, "HTTP 429: Too Many Requests"} =
+      assert {:error, %Error{kind: :rate_limited} = error} =
                Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) == "HTTP 429: Too Many Requests"
 
       # Must have been called exactly once — no Req retry
       assert :counters.get(calls, 1) == 1,
@@ -1354,11 +1914,72 @@ defmodule Alloy.Provider.AnthropicTest do
     end)
   end
 
+  # Step 2 of the programmatic tool calling workflow in
+  # https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling
+  defp programmatic_call_message do
+    %{
+      "id" => "msg_ptc",
+      "type" => "message",
+      "role" => "assistant",
+      "content" => [
+        %{
+          "type" => "server_tool_use",
+          "id" => "srvtoolu_abc123",
+          "name" => "code_execution",
+          "input" => %{"code" => "rows = await query_database({'sql': '<sql>'})"}
+        },
+        %{
+          "type" => "tool_use",
+          "id" => "toolu_def456",
+          "name" => "query_database",
+          "input" => %{"sql" => "<sql>"},
+          "caller" => %{"type" => "code_execution_20260120", "tool_id" => "srvtoolu_abc123"}
+        }
+      ],
+      "container" => %{"id" => "container_xyz789", "expires_at" => "2099-01-01T00:00:00Z"},
+      "stop_reason" => "tool_use",
+      "usage" => %{"input_tokens" => 10, "output_tokens" => 20}
+    }
+  end
+
+  defp message_json(stop_reason, overrides \\ %{}) do
+    %{
+      "id" => "msg_stop",
+      "type" => "message",
+      "role" => "assistant",
+      "content" => [%{"type" => "text", "text" => "ok"}],
+      "stop_reason" => stop_reason,
+      "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+    }
+    |> Map.merge(overrides)
+    |> Jason.encode!()
+  end
+
   # --- SSE Streaming Helpers ---
 
   # Build an Anthropic-format SSE event string: "event: <type>\ndata: <json>\n\n"
   defp ant_event(type, data) do
     "event: #{type}\ndata: #{Jason.encode!(data)}\n\n"
+  end
+
+  # A complete one-text-block stream whose message_delta carries `delta`.
+  defp text_stream(text, delta) do
+    [
+      ant_event("message_start", %{
+        "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 1}}
+      }),
+      ant_event("content_block_start", %{
+        "index" => 0,
+        "content_block" => %{"type" => "text", "text" => ""}
+      }),
+      ant_event("content_block_delta", %{
+        "index" => 0,
+        "delta" => %{"type" => "text_delta", "text" => text}
+      }),
+      ant_event("content_block_stop", %{"index" => 0}),
+      ant_event("message_delta", %{"delta" => delta, "usage" => %{"output_tokens" => 2}}),
+      ant_event("message_stop", %{})
+    ]
   end
 
   defp config_with_sse_stream(chunks) do
@@ -1390,16 +2011,10 @@ defmodule Alloy.Provider.AnthropicTest do
       req_options: [plug: {Req.Test, __MODULE__}, retry: false]
     }
     |> tap(fn _ ->
-      Req.Test.stub(__MODULE__, fn conn ->
-        {:ok, body, conn} = Plug.Conn.read_body(conn)
-        send(test_pid, {:request_body, body})
-        conn = Plug.Conn.send_chunked(conn, 200)
-
-        Enum.reduce(chunks, conn, fn chunk, conn ->
-          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
-          conn
-        end)
-      end)
+      Req.Test.stub(
+        __MODULE__,
+        Alloy.StreamTestHelpers.sse_chunks_capturing_plug(test_pid, chunks)
+      )
     end)
   end
 
@@ -1471,9 +2086,13 @@ defmodule Alloy.Provider.AnthropicTest do
 
   defp count_cache_controls(_value), do: 0
 
+  defp beta_headers(headers) do
+    Enum.filter(headers, fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
+  end
+
   defp beta_values(headers) do
     headers
-    |> Enum.filter(fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
+    |> beta_headers()
     |> Enum.flat_map(fn {_name, value} -> String.split(value, ",", trim: true) end)
     |> Enum.map(&String.trim/1)
     |> Enum.sort()

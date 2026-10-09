@@ -57,6 +57,47 @@ defmodule AlloyTest do
     end
   end
 
+  describe "Alloy.run/2 with code_execution: true" do
+    test "enables the Anthropic code execution tool" do
+      parent = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:captured, conn.req_headers, Jason.decode!(body)})
+
+        response = %{
+          "type" => "message",
+          "role" => "assistant",
+          "stop_reason" => "end_turn",
+          "content" => [%{"type" => "text", "text" => "55"}],
+          "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+        }
+
+        conn
+        |> Plug.Conn.put_resp_header("content-type", "application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(response))
+      end
+
+      assert {:ok, _result} =
+               Alloy.run("What is fib(10)?",
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: "sk-test", model: "claude-sonnet-4-6", req_options: [plug: plug]},
+                 code_execution: true
+               )
+
+      assert_receive {:captured, headers, body}
+
+      assert Enum.any?(
+               body["tools"] || [],
+               &(&1["name"] == "code_execution" and &1["type"] =~ "code_execution_")
+             )
+
+      # Code execution is GA (2026-02-17): no beta header is needed.
+      refute List.keyfind(headers, "anthropic-beta", 0)
+    end
+  end
+
   describe "Alloy.stream/3" do
     test "streams text for a one-shot conversation" do
       {:ok, pid} =
@@ -139,6 +180,34 @@ defmodule AlloyTest do
       assert result.text == "The uppercase is: HELLO"
       assert result.turns == 2
       assert result.status == :completed
+    end
+
+    test "forwards on_event callbacks for tool events" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t1", name: "uppercase", input: %{"text" => "hello"}}
+          ]),
+          TestProvider.text_response("HELLO")
+        ])
+
+      test_pid = self()
+
+      assert {:ok, _result} =
+               Alloy.run("Uppercase hello",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [UpperTool],
+                 on_event: fn event -> send(test_pid, {:event, event}) end
+               )
+
+      assert_received {:event, %{v: 1, event: :tool_start, payload: %{name: "uppercase"}}}
+      assert_received {:event, %{v: 1, event: :tool_end, payload: %{name: "uppercase"}}}
+    end
+
+    test "raises when on_event is not a function" do
+      assert_raise ArgumentError, ~r/on_event must be a 1-arity function/, fn ->
+        Alloy.run("Hi", provider: {TestProvider, agent_pid: self()}, on_event: :invalid)
+      end
     end
 
     test "handles multi-turn tool usage" do
@@ -271,6 +340,52 @@ defmodule AlloyTest do
 
       assert_received {:hook, :before_completion}
       assert_received {:hook, :after_completion}
+    end
+  end
+
+  describe "the budget middleware recipe in the Alloy docs" do
+    defmodule BudgetGuard do
+      @behaviour Alloy.Middleware
+
+      @input_per_m 3.0
+      @output_per_m 15.0
+
+      @impl true
+      def call(:before_completion, state) do
+        limit = Map.fetch!(state.config.context, :max_budget_cents)
+        usage = Alloy.Usage.estimate_cost(state.usage, @input_per_m, @output_per_m)
+
+        if usage.estimated_cost_cents >= limit do
+          {:halt, "budget of #{limit} cents reached"}
+        else
+          state
+        end
+      end
+
+      def call(_hook, state), do: state
+    end
+
+    test "halts before the request that would exceed the budget" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t1", name: "uppercase", input: %{"text" => "hi"}}
+          ]),
+          TestProvider.text_response("Should not reach")
+        ])
+
+      # The first response (10 in, 5 out) costs 0.0105 cents at $3/$15 per M.
+      assert {:error, result} =
+               Alloy.run("Uppercase hi",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [UpperTool],
+                 middleware: [BudgetGuard],
+                 context: %{max_budget_cents: 0.01}
+               )
+
+      assert result.status == :halted
+      assert result.error == "Halted by middleware: budget of 0.01 cents reached"
+      assert result.turns == 1
     end
   end
 

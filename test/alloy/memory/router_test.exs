@@ -132,6 +132,52 @@ defmodule Alloy.Memory.RouterTest do
       assert result.content =~ "invalid memory tool input"
     end
 
+    test "refuses to delete or rename the /memories root", %{store: {_, pid} = store} do
+      MemoryStore.create(pid, "/memories/keep.md", "keep")
+
+      results =
+        dispatch(store, [
+          %{"command" => "delete", "path" => "/memories"},
+          %{"command" => "delete", "path" => "/memories/"},
+          %{"command" => "rename", "old_path" => "/memories", "new_path" => "/memories/x"},
+          %{"command" => "rename", "old_path" => "/memories/keep.md", "new_path" => "/memories"}
+        ])
+
+      assert Enum.all?(results, & &1.is_error)
+      assert Enum.all?(results, &(&1.content =~ "/memories directory itself"))
+      assert MemoryStore.contents(pid) == %{"/memories/keep.md" => "keep"}
+    end
+
+    test "str_replace without new_str deletes old_str", %{store: {_, pid} = store} do
+      MemoryStore.create(pid, "/memories/note.md", "keep this, drop this")
+
+      [result] =
+        dispatch(store, [
+          %{"command" => "str_replace", "path" => "/memories/note.md", "old_str" => ", drop this"}
+        ])
+
+      refute result.is_error
+      assert MemoryStore.contents(pid)["/memories/note.md"] == "keep this"
+    end
+
+    test "view honours view_range", %{store: {_, pid} = store} do
+      MemoryStore.create(pid, "/memories/lines.md", "one\ntwo\nthree\nfour\n")
+
+      view = fn range ->
+        %{"command" => "view", "path" => "/memories/lines.md", "view_range" => range}
+      end
+
+      [middle, to_end, past_end, bad] =
+        dispatch(store, [view.([2, 3]), view.([3, -1]), view.([9, -1]), view.([0, 2])])
+
+      assert middle.content == "two\nthree"
+      assert to_end.content == "three\nfour"
+      assert past_end.is_error
+      assert past_end.content =~ "4 lines"
+      assert bad.is_error
+      assert bad.content =~ "view_range"
+    end
+
     test "preserves call order across dispatch", %{store: store} do
       calls =
         for i <- 1..5 do
@@ -150,5 +196,14 @@ defmodule Alloy.Memory.RouterTest do
       results = Router.dispatch_all(calls, store)
       assert Enum.map(results, & &1.tool_use_id) == Enum.map(calls, & &1.id)
     end
+  end
+
+  defp dispatch(store, inputs) do
+    inputs
+    |> Enum.with_index()
+    |> Enum.map(fn {input, i} ->
+      %{type: "tool_use", id: "m#{i}", name: "memory", input: input}
+    end)
+    |> Router.dispatch_all(store)
   end
 end

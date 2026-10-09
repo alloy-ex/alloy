@@ -9,6 +9,9 @@ defmodule Alloy.Provider.Retry do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Provider.Error
+
+  require Logger
 
   @doc """
   Call a provider with retry, backoff, and fallback logic.
@@ -49,8 +52,10 @@ defmodule Alloy.Provider.Retry do
 
   @doc false
   @spec retryable?(term()) :: boolean()
+  def retryable?(%Error{} = error), do: Error.retryable?(error)
 
-  # HTTP status errors — providers return strings via parse_error/2.
+  # String errors from custom providers (built-in providers return
+  # %Alloy.Provider.Error{}). The generic format is "HTTP <status>: <body>".
   # The generic fallback format is "HTTP <status>: <body>".
   # Retryable: 408 (request timeout), 429 (rate limit), and 5xx server errors.
   def retryable?("HTTP 408:" <> _), do: true
@@ -178,8 +183,9 @@ defmodule Alloy.Provider.Retry do
           attempt = state.config.max_retries - retries_left + 1
           base = round(state.config.retry_backoff_ms * :math.pow(2, attempt - 1))
           # Full jitter: uniform random in [0, 2*base) — prevents thundering herd
-          # when multiple agents hit the same rate limit simultaneously.
-          backoff = :rand.uniform(base * 2)
+          # when multiple agents hit the same rate limit simultaneously. Never
+          # retry sooner than the provider's Retry-After.
+          backoff = max(:rand.uniform(base * 2), retry_after_ms(reason))
           remaining = deadline - System.monotonic_time(:millisecond)
 
           if remaining < backoff do
@@ -208,6 +214,9 @@ defmodule Alloy.Provider.Retry do
     end
   end
 
+  defp retry_after_ms(%Error{retry_after_ms: ms}) when is_integer(ms), do: ms
+  defp retry_after_ms(_reason), do: 0
+
   # Calls the provider and returns {result, chunks_emitted?}.
   # For streaming calls, wraps on_chunk to detect whether any chunks were
   # delivered before the call returned. This prevents retrying mid-stream
@@ -219,13 +228,13 @@ defmodule Alloy.Provider.Retry do
 
     wrapped_chunk = fn chunk ->
       :atomics.put(ref, 1, 1)
-      on_chunk.(chunk)
-      original_on_event.({:text_delta, chunk})
+      notify(:on_chunk, on_chunk, chunk)
+      notify(:on_event, original_on_event, {:text_delta, chunk})
     end
 
     wrapped_on_event = fn event ->
       :atomics.put(ref, 1, 1)
-      original_on_event.(event)
+      notify(:on_event, original_on_event, event)
     end
 
     provider_config = Map.put(provider_config, :on_event, wrapped_on_event)
@@ -238,6 +247,22 @@ defmodule Alloy.Provider.Retry do
   defp call_provider(provider, state, provider_config, false = _streaming?, _on_chunk) do
     messages = State.messages(state)
     {provider.complete(messages, state.tool_defs, provider_config), false}
+  end
+
+  # The caller's streaming callbacks run inside the provider's stream
+  # handler. If one raises there, the handler loses the delta it was
+  # accumulating, so the stored message silently misses text. A raising (so
+  # buggy) UI callback is logged and the stream carries on. A throw or exit
+  # is deliberate control flow and still stops the stream, as it always has.
+  defp notify(name, callback, payload) do
+    callback.(payload)
+    :ok
+  rescue
+    exception ->
+      Logger.warning(
+        "[Alloy] #{name} callback failed; the stream continues.\n" <>
+          Exception.format(:error, exception, __STACKTRACE__)
+      )
   end
 
   # Sets receive_timeout in the provider's req_options based on remaining deadline.

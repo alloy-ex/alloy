@@ -18,33 +18,35 @@ defmodule Alloy.Provider.SSE do
   @doc """
   Process a raw chunk of bytes against a buffer.
 
-  Returns `{complete_events, remaining_buffer}` where each event
-  is a map with `:event` (may be nil) and `:data` keys.
+  `buffer` is the `remaining_buffer` returned by the previous call (`""` for
+  the first chunk). Returns `{complete_events, remaining_buffer}` where each
+  event is a map with `:event` (may be nil) and `:data` keys.
   """
   @spec process_chunk(String.t(), String.t()) :: {[sse_event()], String.t()}
   def process_chunk(buffer, chunk) do
-    # Normalize CRLF to LF so split_events works correctly with any
-    # server or proxy line-ending style. Normalize only the incoming
-    # chunk (not the entire buffer) to avoid rescanning accumulated
-    # bytes on every chunk, keeping total CRLF-scan work O(stream size).
-    #
-    # Cross-chunk boundary: if the buffer ends with \r and the chunk
-    # starts with \n, the \r\n pair is split — strip the dangling \r
-    # so the boundary becomes a clean \n after concatenation.
-    buffer =
-      if String.ends_with?(buffer, "\r") and String.starts_with?(chunk, "\n"),
-        do: binary_part(buffer, 0, byte_size(buffer) - 1),
-        else: buffer
-
+    # Normalize CRLF to LF so event boundaries are found with any server or
+    # proxy line-ending style. Only the incoming chunk is normalized, after
+    # dropping a \r left dangling at the end of the buffer when the chunk
+    # starts with the \n of the same pair.
+    buffer = drop_split_carriage_return(buffer, chunk)
     combined = buffer <> String.replace(chunk, "\r\n", "\n")
-    {raw_events, remaining} = split_events(combined)
 
-    events =
-      raw_events
-      |> Enum.map(&parse_event/1)
-      |> Enum.reject(&is_nil/1)
+    # The buffer never holds a complete event, so a boundary can only end
+    # in the new bytes. Scanning from one byte before them (a boundary may
+    # straddle the two) keeps the work per chunk proportional to the chunk,
+    # not to the event being accumulated.
+    scan_from = max(byte_size(buffer) - 1, 0)
 
-    {events, remaining}
+    case :binary.match(combined, "\n\n", scope: {scan_from, byte_size(combined) - scan_from}) do
+      :nomatch ->
+        {[], combined}
+
+      {boundary, 2} ->
+        first = binary_part(combined, 0, boundary)
+        rest = binary_part(combined, boundary + 2, byte_size(combined) - boundary - 2)
+        {raw_events, remaining} = split_events(rest)
+        {parse_events([first | raw_events]), remaining}
+    end
   end
 
   @doc """
@@ -84,6 +86,21 @@ defmodule Alloy.Provider.SSE do
   end
 
   # ── Private ──────────────────────────────────────────────────────────
+
+  defp drop_split_carriage_return(buffer, "\n" <> _chunk) when byte_size(buffer) > 0 do
+    case :binary.last(buffer) do
+      ?\r -> binary_part(buffer, 0, byte_size(buffer) - 1)
+      _other -> buffer
+    end
+  end
+
+  defp drop_split_carriage_return(buffer, _chunk), do: buffer
+
+  defp parse_events(raw_events) do
+    raw_events
+    |> Enum.map(&parse_event/1)
+    |> Enum.reject(&is_nil/1)
+  end
 
   # Split on double-newline SSE event boundaries.
   # Returns {complete_event_strings, remaining_buffer}.

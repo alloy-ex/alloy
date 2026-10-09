@@ -5,6 +5,402 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.12.5] - 2026-10-09
+
+### Security
+
+- **`:allowed_paths` is enforced on a directory boundary.** It was a string
+  prefix match, so allowing `/proj` also admitted `/proj-secrets/key.txt`. The
+  path that was checked (symlinks resolved) is now the path that is opened,
+  and a symlink loop returns an error instead of hanging the tool. Custom
+  tools calling `Alloy.Tool.resolve_path/2` with `:allowed_paths` set get
+  that resolved path (for example `/private/var/...` on macOS).
+- **The bash tool no longer passes secrets to commands.** Variables whose
+  names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or `CREDENTIAL` are
+  removed from the command's environment by default, so a prompt-injected
+  `printenv` can't read your API keys. Pass `:bash_env` in the tool context
+  (a map of the variables to set, or `:inherit` for the previous behaviour)
+  if a command needs one.
+- **Bash timeouts kill the command.** A timeout stopped only the Elixir task,
+  so the command kept running; the whole process group (including background
+  jobs) is now killed. Output is capped while it streams (the first 8 KB and
+  last 20 KB are kept), so a command printing hundreds of megabytes no longer
+  exhausts memory, and the model-requested timeout is capped (10 minutes, or
+  `:bash_max_timeout`).
+- **Memory tool paths are validated strictly.** `/memories_evil/...`,
+  `/memories..` and percent-encoded `..` were accepted, and the model could
+  delete or rename the `/memories` root.
+- **Codex no longer copies `auth.json` into temp directories**, and the temp
+  directory holding the prompt (the whole conversation) is created `0700`
+  instead of the default mode, which left it readable on a shared `/tmp`.
+- **Mint is now constrained to `~> 1.11`** (and through it HPAX `~> 1.1`).
+  Mint 1.9 and earlier carry several advisories on the HTTP/1 client path
+  every Alloy provider uses by default, including memory-exhaustion DoS from
+  unbounded response headers and chunked bodies (CVE-2026-58229,
+  CVE-2026-56810, CVE-2026-82728) and response smuggling on pooled
+  connections (CVE-2026-82672, CVE-2026-94194, CVE-2026-59249), plus HTTP/2
+  issues (CVE-2026-91043, CVE-2026-92103, CVE-2026-59246). HPAX before 1.0.4
+  has an HPACK decoding DoS (CVE-2026-58226). These matter because Alloy talks
+  to user-configured, possibly untrusted, OpenAI-compatible endpoints. If your
+  application pins Mint below 1.11, run `mix deps.update mint hpax`.
+- Req is required at `>= 0.6.1 and < 0.8.0` (tested on 0.7.5).
+
+### Changed
+
+- **Built-in providers return `{:error, %Alloy.Provider.Error{}}`** instead of
+  a string when called directly. `Alloy.run/2` and `Alloy.Agent.Server` are
+  unaffected: `result.error` is still the same string
+  (`Exception.message/1` of the struct), and the struct is added at
+  `result.metadata.run.provider_error`. The struct implements `String.Chars`,
+  so interpolating it still works; code that applies `=~` or binary
+  patterns to a provider's raw error should use `Exception.message/1`.
+  Messages keep their `"<type>: <message>"` shape when the error body has a
+  type; untyped bodies now read `"HTTP <status>: <message>"` (OpenAICompat
+  produced `": message"`, Gemini `"429: message"`), and a blocked Gemini
+  prompt is a `:refusal` instead of an error. `Alloy.Provider.OpenAIStream.stream/5`
+  returns the struct too.
+- **Turn telemetry fires in order.** Each `[:alloy, :turn, :stop]` is
+  emitted when that turn ends; previously the loop recursed first, so stops
+  arrived in reverse and turn 1's stop carried the run's final status. A
+  turn the loop continues past now reports `status: :running`. Dashboards
+  that read a turn's stop status as the run outcome should use
+  `[:alloy, :run, :stop]`.
+- **`Alloy.Agent.Server.chat/3` and `stream_chat/4` return `{:error, result}`
+  for `:budget_exceeded`**, as `Alloy.run/2` always did (it returned
+  `{:ok, result}`), and its default call timeout is the agent's
+  `timeout_ms` plus 10 seconds instead of 30 seconds, so a caller no longer
+  gives up while the turn is still running.
+- **Compaction strips stale reasoning.** Claude Fable 5.1, Opus 5.5,
+  Sonnet 5.5 and Haiku 5.5 reject signed thinking whose earlier history
+  changed, for accounts created on or after 2026-08-31. After any
+  compaction, every thinking block is removed, including the turn in
+  progress, which was produced before the rewrite. This is the documented
+  valid change, and those models think adaptively, which doesn't require the
+  turn to start with thinking. Under manual thinking (`:extended_thinking`,
+  or `"type" => "enabled"` in `:extra_body`), which does require it and
+  whose models don't check history, the turn in progress keeps its
+  thinking. Truncation never splits a tool round, and oversized retained
+  tool results are shortened with a marker.
+- `Alloy.Context.Compactor`: in `compact_messages/2`, `:keep_recent` is a
+  minimum (whole tool rounds are kept) and `redacted_thinking` blocks are
+  dropped with other earlier-turn thinking; `force_compact/1` always
+  summarizes, which costs a provider call.
+- A limit-only `model_metadata_overrides` entry for a catalog model now also
+  covers its dated snapshots (`-2026-03-05`, `-20251001`, `-0309-...`) but
+  not other suffixes such as `-fast`; give `suffix_patterns` for those.
+- `Alloy.run/2` raises `ArgumentError` for an `:on_event` that is not a
+  1-arity function, as `Alloy.stream/3` already did.
+- **The compaction estimate counts the whole request** — system prompt, tool
+  definitions and every block type, by bytes rather than characters (CJK text
+  was undercounted about 3x) — so compaction fires earlier and more
+  accurately.
+- **A tool is not called when the model omits a `required` key** (or sends
+  non-object input); the model gets an error result naming the missing keys
+  instead of a `FunctionClauseError` it can't act on. If a tool supplies a
+  default for a key, remove that key from `required`. Types are not checked
+  or coerced.
+- **Every tool call runs in a supervised, unlinked task** (previously
+  sequential tools ran in the agent process). `self()` and the process
+  dictionary inside a tool differ for sequential tools; Ecto's SQL sandbox
+  still works through `$callers`. Event and telemetry handlers for tool
+  start/end now run in the agent process.
+- `Alloy.Testing.tool_response/2` gives tools input as real providers do: a
+  map goes through a JSON round trip, so keys are strings and atom values
+  become strings (`%{unit: :celsius}` arrives as `%{"unit" => "celsius"}`;
+  expect `"celsius"` in `assert_tool_called/3`). Tests that relied on atom
+  keys were passing for the wrong reason; update the tool or the test.
+- **Codex runs against your real `CODEX_HOME`** (or `:codex_home`) with
+  `--ignore-user-config --ignore-rules`, and requires Codex CLI 0.122.0 or
+  later. Your `$CODEX_HOME/AGENTS.md` and skills now reach Alloy runs; for
+  full isolation, and to keep agents from refreshing the same token as your
+  interactive Codex, log in to a dedicated home
+  (`CODEX_HOME=~/.codex-alloy codex login`) and pass it as `:codex_home`.
+  Codex failures return `%Alloy.Provider.Error{}`; timeouts are retried
+  within the turn deadline. `response_metadata.command_output` is now the
+  JSONL event stream.
+- **OpenAI, xAI and OpenAI-compatible providers no longer send a default
+  output cap** (`max_output_tokens`/`max_tokens` were 4,096). Reasoning
+  tokens count against the cap on current models, so responses came back
+  incomplete or empty. Set `:max_tokens` to cap output; some
+  OpenAI-compatible servers have small defaults of their own.
+- **`usage.input_tokens` means uncached input for every built-in provider.**
+  OpenAI-family and Gemini usage now reports cache reads in
+  `cache_read_input_tokens` (and writes in `cache_creation_input_tokens`)
+  instead of inside `input_tokens`, matching Anthropic. Total prompt tokens
+  are the sum of the three. Reported `input_tokens` — and with them
+  `Alloy.Usage.total/1` and `Alloy.Usage.estimate_cost/3` — drop by the
+  cached amount.
+- `Alloy.Provider.SSE.process_chunk/2` scans only the new bytes for event
+  boundaries (a large event went from 663 ms to 8 ms), so `buffer` must be
+  the remainder returned by the previous call, as in normal use.
+- **Anthropic default `max_tokens` is 16,000** (was 4,096). Adaptive
+  thinking is on by default on Claude 5.x and counts toward `max_tokens`, so
+  the old default truncated answers. Set `:max_tokens` to keep a lower cap.
+- **Anthropic code execution uses `code_execution_20260521`** (required for
+  programmatic tool calling), and Alloy no longer adds beta headers for
+  features that went GA on 2026-02-17 (memory, tool search, input examples,
+  code execution). `context-management-2025-06-27` is still added when the
+  body uses context editing; user-supplied `anthropic-beta` values are merged
+  into one header.
+- **OpenAI context limits are the documented maximum input**, not the
+  advertised window (which includes output): `gpt-5.4`/`gpt-5.5` and the
+  GPT-6 family budget 922,000 tokens, `gpt-5`/`5.1`/`5.2` 272,000. Compaction
+  now fires before the API rejects the request instead of after.
+- **Long-tail OpenAI-compatible models** (Kimi, Qwen, GLM, Mistral, Gemma)
+  are no longer in the built-in catalog, because their limits could not be
+  verified; they use the 200,000-token default. Set
+  `model_metadata_overrides` or a `:model_catalog` for them. Compaction may
+  fire earlier than before, which is the safe direction.
+- Restrict test-only Plug to patched 1.19/1.20 versions.
+- Pin the contributor toolchain to Elixir 1.20.4 / OTP 28.5.0.7, add OTP 29
+  coverage, dependency audits, weekly CI, and explicit read-only CI permissions.
+- **Stricter quality gates.** `mix ci` runs every gate CI enforces: format,
+  unused-lock check, `hex.audit` (advisories), warnings-as-errors compile,
+  compile-time cycle check, strict Credo with opt-in correctness checks,
+  tests with a coverage floor, and Dialyzer with `:unmatched_returns`,
+  `:missing_return`, `:extra_return` and `:error_handling`. Docs must build
+  without warnings.
+
+### Added
+
+- **More provider stop reasons.** `Alloy.Provider.stop_reason/0` adds
+  `:max_tokens`, `:refusal` and `:pause_turn`, and `Alloy.Result` gains a
+  `:stop_reason` field. The loop now:
+  - completes a truncated answer (`:max_tokens`) with
+    `result.stop_reason == :max_tokens`, so callers can detect truncation
+    instead of receiving it silently;
+  - fails the run when `:max_tokens` cuts off a tool call (its arguments are
+    incomplete). The orphaned call gets an error result, so the transcript
+    stays valid for a follow-up request;
+  - fails on `:refusal` and discards the refused partial output;
+  - resends the conversation unchanged on `:pause_turn`.
+
+  Custom providers that only return `:tool_use`/`:end_turn` are unaffected.
+  A provider returning an unknown stop reason now fails the run with a clear
+  error instead of crashing the loop.
+- **Codex reports token usage** from `codex exec --json` `turn.completed`
+  events (it reported zero), and a `:config_overrides` option passes `-c`
+  settings to the CLI.
+- `Alloy.Result.wrap/1` (the status → `{:ok, _}`/`{:error, _}` mapping shared
+  by `Alloy.run/2` and `Alloy.Agent.Server`), `Alloy.Agent.Server.default_call_timeout/1`
+  and `Alloy.Context.Compactor.force_compact/2`.
+- **Telemetry:** `[:alloy, :turn, :exception]` and `[:alloy, :run, :exception]`
+  (with `kind`, `reason`, `stacktrace`); turn start gains `monotonic_time`,
+  turn stop gains `duration` and `monotonic_time`, and turn metadata gains
+  `telemetry_span_context`. The compaction summary request emits
+  `[:alloy, :provider, :request]`.
+- **Read pages large files**: output ends with
+  `[Showing lines X-Y of N. Use offset=Z to continue.]` when cut, and binary
+  files are refused.
+- `Alloy.Provider.Error.from_body/1` for errors a provider reports inside a
+  200 response (mid-stream `error` events, failed responses).
+- **OpenAI Responses replay keeps every output item.** Assistant `phase`
+  (which gpt-5.3-codex and later expect back) and items such as built-in tool
+  calls and compaction items are preserved as `%{type: "output_item", raw:
+  item}` blocks instead of being dropped.
+- **Anthropic `:server_tools`** — raw server tool definitions (web search,
+  web fetch, `mcp_toolset`, tool search) appended after the generated tools,
+  so local and server tools can be combined. Previously the only route was
+  `extra_body["tools"]`, which replaces every generated tool.
+- **Anthropic programmatic tool calling works.** `allowed_callers` atoms are
+  translated to the API's values (`:code_execution` →
+  `"code_execution_20260120"`, `:human`/`:direct` → `"direct"`), the
+  `caller` field is kept on `tool_use` blocks, and the code-execution
+  container is reused across turns via `provider_state` (skipped once its
+  `expires_at` has passed, so a resumed session gets a fresh container).
+- **Model catalog: current models.** Claude Opus 4.7, Opus 5/5.5, Sonnet
+  5/5.5, Haiku 5.5, Fable 5.1 and Mythos (1M); GPT-6 Astra/Sol/Luna, GPT-6.1
+  Sol and GPT-5.6 Sol/Terra/Luna; Gemini 3.1 Flash-Lite, 3.5–3.8 Flash and
+  3.5 Flash-Lite; Grok 4.5–4.7 and Build 0.1. Every limit was checked against
+  the vendor's model pages on 2026-10-09 and the source is cited in the code.
+- **`Alloy.Provider.Error`** — structured provider failures with a `:kind`
+  (`:rate_limited`, `:overloaded`, `:server_error`, `:timeout`, `:network`,
+  `:context_overflow`, `:quota`, `:auth`, `:invalid_request`, `:unknown`),
+  plus `:status`, `:type`, `:code` and `:retry_after_ms`. Custom providers
+  may return it; string errors keep working.
+
+### Deprecated
+
+- **`:max_budget_cents`** (removed in 0.13). It stops a run only when the
+  provider reports `usage.estimated_cost_cents`, which no built-in provider
+  does, so with them it never fired. A warning is logged once per node when
+  it is set. The `Alloy` module docs have a "Budget limits" recipe: a
+  `:before_completion` middleware that prices `state.usage` with
+  `Alloy.Usage.estimate_cost/3`.
+- `Alloy.Agent.State.materialize/1`, `Alloy.Agent.State.cleanup/1` and the
+  `messages_new` field (removed in 0.13): the history now lives in
+  `state.messages`.
+- Codex `:auth_path` (removed in 0.13; a warning is logged once per node).
+  Use `:codex_home`. An `auth.json` path uses its directory as `CODEX_HOME`;
+  a file with another name is still copied into a private per-call home, as
+  in 0.12.4.
+- Anthropic `:extended_thinking` (removed in 0.13). It sends manual thinking
+  (`type: "enabled"` with `budget_tokens`), which Claude 4.7 and later
+  reject. It keeps working for older models; for current ones pass
+  `extra_body: %{"thinking" => %{"type" => "adaptive"}}` (see the provider
+  docs for effort and `display`).
+- `Alloy.ModelMetadata.catalog/0`. The built-in catalog is now a short list of
+  family patterns; the function keeps its entry shape (one entry per family,
+  empty `:name`, full-id pattern as the suffix pattern) and will be removed
+  in 0.13. Use `context_window/1`.
+- `Alloy.Message.server_tool_result_block/3`. No provider accepts the block
+  it builds; it will be removed in 0.13.
+
+### Fixed
+
+- **A streamed tool call keeps its id when later chunks repeat it as
+  `null`.** Some OpenAI-compatible hosts (DeepInfra, serving DeepSeek and GLM)
+  send `"id": null` on every chunk after the first, which overwrote the real
+  id; the next request then echoed a null `tool_call_id` and was rejected.
+  Chunks carrying `"tool_calls": null` are also accepted. Thanks @johns10
+  (#50).
+- **`until_tool` requires a successful call.** A failed, blocked or unknown
+  call to the target tool used to satisfy it.
+- **A middleware halt no longer leaves an unanswered tool call.** Halting in
+  `:before_tool_call` or `:after_tool_request` left the assistant's
+  `tool_use` without a result, so the next request in that session failed
+  with HTTP 400; each call now gets an error result first.
+- **A tool named `memory` works when `:memory` is not configured** (the turn
+  crashed with a `KeyError`); configuring both `:memory` and a tool named
+  `memory` raises at startup instead of silently shadowing the tool.
+- **The compaction summary call** goes through retries and the turn
+  deadline, and its token usage is counted. Results that compaction already
+  cleared are not cleared again (which lost their original size and
+  invalidated the prompt cache).
+- **A stream callback that raises no longer corrupts history.** Text from a
+  delta whose `on_chunk`/`on_event` raised was missing from the stored
+  message, so the UI and the transcript disagreed. A raised exception is now
+  logged and the stream continues; a `throw` or `exit` from a callback still
+  stops the stream, as before.
+- `Alloy.run/2` passes `:on_event` through (it was silently ignored), and the
+  documented top-level `code_execution: true` now reaches the provider.
+- `Alloy.Usage.estimate_cost/3` no longer rounds per-million rates to whole
+  cents ($0.075/M priced as 8¢).
+- **A tool that calls `exit/1` or `throw/1` no longer kills the agent**, and
+  `:tool_timeout` now applies to `concurrent?: false` tools too (they had no
+  time limit; they are now stopped after `:tool_timeout`, 120 s by
+  default). Cancelling a turn
+  (`Alloy.Agent.Server.cancel_request/2`) still stops its in-flight tools: a
+  supervised watcher kills them when the turn is killed.
+- **Tools run in the order the model called them.** Sequential tools used to
+  run before every concurrent one, so `[read f, edit f]` read the file after
+  editing it. Consecutive concurrency-safe calls still run in parallel (at
+  most `System.schedulers_online/0` at once, as before).
+- **Invalid UTF-8 in a tool result no longer breaks the session.** Reading a
+  binary file put bytes in the transcript that failed JSON encoding on every
+  later request; results are now sanitised.
+- **Tool start/end events and telemetry pair up** when a tool times out or
+  crashes (the end event had no start sequence and a zero duration).
+- **Edit** rejects an empty `old_string` (with `replace_all` it inserted the
+  replacement between every character) and no-op edits, matches LF text in
+  CRLF files and keeps their line endings and BOM.
+- **Read** validates `offset`/`limit` (an `offset` of 0 dropped the last
+  line; a negative `limit` returned the file's tail) and reports the line
+  count when the offset is past the end.
+- **Memory tool:** `view_range` is honoured and `new_str` is optional, as
+  the tool contract specifies.
+- `Alloy.Testing.assert_tool_called/3` works with `require` as well as `use`.
+- **Codex keeps your login.** Each call copied `auth.json` into a temp
+  `CODEX_HOME` and deleted it afterwards, discarding refreshed tokens; since
+  Codex CLI 0.136.0 a reused refresh token forces a re-login. Keyring
+  credentials and `:profile` (broken since CLI 0.134.0) now work too.
+- Codex: an explicit `timeout_ms: nil` no longer raises `Enum.EmptyError`, a
+  missing `:workdir` is reported by name instead of as "exit status 2", and
+  every Codex failure is an `%Alloy.Provider.Error{}` (malformed responses
+  were plain strings).
+- **Cancelled or timed-out Codex turns no longer leak** the `codex` process,
+  its children or temp files: a supervised owner process monitors the caller
+  and stops the whole process group.
+- **OpenAI Responses (and xAI) no longer chain responses on their own.**
+  Every response's id was fed back as `previous_response_id` while the full
+  history was still sent, so from the second request of a run the server
+  replayed the conversation twice — duplicated context and billing — and
+  with `store: false` the request pointed at a response that was never
+  stored. The stateless encrypted-reasoning echo was also switched off after
+  the first request. Chaining is now explicit: pass `:previous_response_id`
+  and send only the new messages. If you continued a stored response by
+  passing `provider_state: %{response_id: id}`, pass
+  `previous_response_id: id` instead — that state is no longer sent.
+- **OpenAI family:**
+  - `response.failed`, `response.incomplete`, `error` events and cut-off
+    streams are errors or `:max_tokens`/`:refusal` instead of partial
+    successes; Chat Completions `length` maps to `:max_tokens` and
+    `content_filter` to `:refusal`;
+  - OpenAICompat sends `reasoning_content` back on assistant messages, which
+    DeepSeek's thinking mode requires during tool calls (it returned HTTP 400
+    on the second request of every tool loop);
+  - atom keys in OpenAICompat `extra_body` now override generated fields
+    (they produced duplicate JSON keys and were ignored).
+- **Opaque OpenAI items no longer break other providers.** When a transcript
+  moves from OpenAI Responses to Anthropic or Gemini (for example through
+  `fallback_providers`), `reasoning` and `output_item` blocks are dropped
+  instead of being sent as invalid blocks (Anthropic) or placeholder text
+  (Gemini).
+- **Anthropic:**
+  - every stop reason is mapped (`max_tokens`,
+    `model_context_window_exceeded`, `refusal` with its `stop_details`,
+    `pause_turn`) instead of collapsing to `:end_turn`;
+  - streamed usage is no longer double-counted (`message_delta` usage is
+    cumulative; the docs' example reported 13,361 input tokens instead of
+    10,682);
+  - mid-stream `error` events, streams that end without a stop reason and
+    error bodies on a 200 response are errors, not partial successes; an
+    overload before any output is retried;
+  - with `cache: true`, `cache_control` is never put on a `defer_loading`
+    tool (HTTP 400).
+- **Gemini:**
+  - streamed text no longer gains a newline between chunks
+    (`"Hello\n world"`); consecutive text and thought pieces are merged and
+    thought signatures stay on the block they arrived with;
+  - `output_tokens` now includes thinking tokens (billed as output), and
+    `input_tokens` excludes cache reads (reported as
+    `cache_read_input_tokens`, matching Anthropic) and includes tool-use
+    prompt tokens;
+  - `maxOutputTokens` is sent only when `:max_tokens` is set; the old 4096
+    default also had to fit thinking, so 3.x responses were cut short;
+  - `finishReason` maps to `:max_tokens`/`:refusal` (details in
+    `response_metadata.stop_details`), blocked prompts are a `:refusal`,
+    and malformed or unexpected function calls are retryable errors;
+  - mid-stream error chunks and streams cut off before a `finishReason`
+    are errors instead of partial successes.
+- **Overstated context windows.** Grok 4.20 was listed at 2M (documented 1M)
+  and retired Grok slugs at up to 2M, so compaction never fired before the
+  API rejected the request. Claude Opus/Sonnet 4.6 were listed at 200k (now
+  1M), and `claude-fable-5-1` fell through to the default.
+- **Retries are classified on HTTP status and error code, not message
+  text.** Previously not retried: Anthropic `api_error` (500) and
+  `timeout_error` (504), OpenAI 503 `server_is_overloaded` and 429s whose
+  type was not `rate_limit_error`. Quota and spend-limit 429s
+  (`insufficient_quota`, `*_spend_limit_exceeded`) are no longer retried.
+  `Retry-After` / `retry-after-ms` is honoured, within the turn deadline.
+- **Context-overflow recovery now works for Gemini and OpenAI Responses.**
+  Their overflow errors ("exceeds the maximum number of tokens", "exceeds
+  the context window") were not recognised, so the one-shot compaction retry
+  never ran.
+- **A `:tool_use` response with no client tool calls** (only server-executed
+  tools) now completes instead of sending an empty tool-results message.
+- **Anthropic server tools are no longer answered by the client.** When a
+  response mixed a server tool (`code_execution`, `web_search`, tool search)
+  with a local tool call, Alloy also "executed" the `server_tool_use` block
+  and sent back a `server_tool_result`, a block type the API rejects, so
+  the next request failed with HTTP 400. `Alloy.Message.tool_calls/1` now
+  returns only client `tool_use` blocks. Transcripts persisted by earlier
+  versions still work: the Anthropic provider drops stale
+  `server_tool_result` blocks when it builds a request.
+- OpenAI-compatible Gemini streams preserve opaque thought signatures on
+  tool calls, including late signatures and parallel calls, for the next request.
+- OpenAICompat's `stream_options: false` now omits the field from streaming
+  requests. Explicit `extra_body` stream option maps are preserved.
+- Codex process timeouts use an absolute monotonic deadline, so progress output
+  cannot extend `:timeout_ms` or the turn's `:receive_timeout` cap.
+- **The Codex provider now honours the turn deadline in real runs.** The
+  0.12.4 note claimed this, but the retry loop passes the deadline as
+  `req_options: [receive_timeout: ms]` and Codex only read a top-level
+  `:receive_timeout`, so production runs always waited the full
+  `:timeout_ms`. All three caps are now respected; the smallest wins.
+
 ## [0.12.4] - 2026-07-03
 
 ### Fixed

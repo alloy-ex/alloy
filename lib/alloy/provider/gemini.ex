@@ -9,25 +9,49 @@ defmodule Alloy.Provider.Gemini do
 
   Required:
   - `:api_key` - Gemini API key
-  - `:model` - Model name (for example `"gemini-2.5-flash"`)
+  - `:model` - Model name, for example `"gemini-3.8-flash"` or
+    `"gemini-3.5-flash-lite"`. Gemini 2.5 models are open only to projects
+    that already used them.
 
   Optional:
-  - `:max_tokens` - Max output tokens (default: `4096`)
+  - `:max_tokens` - Max output tokens, sent as `maxOutputTokens`. Thinking
+    tokens count against it. When unset, the model's own output limit
+    applies (Alloy 0.12.4 and earlier sent `4096`)
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: `"https://generativelanguage.googleapis.com"`)
   - `:api_version` - API version path (default: `"v1beta"`)
-  - `:generation_config` - Raw Gemini `generationConfig` fields
+  - `:generation_config` - Raw Gemini `generationConfig` fields (see Thinking)
   - `:tool_config` - Raw Gemini `toolConfig`
   - `:safety_settings` - Raw Gemini `safetySettings`
   - `:extra_headers` - Additional headers as `[{name, value}]`
   - `:req_options` - Additional options passed to Req
+
+  ## Thinking
+
+  Gemini 3 models think by default. Set the depth with `thinkingLevel`
+  (`"MINIMAL"`, `"LOW"`, `"MEDIUM"` or `"HIGH"`; each model accepts a
+  subset) under `thinkingConfig`. `thinkingBudget`, a token count, is the
+  older control: Gemini 2.5 models need it, and Gemini 3 still accepts it.
+  Never send both; the API rejects the request. Thinking tokens are billed
+  as output and count against `:max_tokens`, so lower `thinkingLevel`
+  rather than `:max_tokens` to save cost. Set `includeThoughts: true` to
+  get thought summaries back as `"thinking"` blocks.
+
+  ## Stop reasons
+
+  `MAX_TOKENS` maps to `:max_tokens`. Safety, recitation and other content
+  filters, and blocked prompts, map to `:refusal`, with the reason in
+  `response_metadata.stop_details`. A malformed or unexpected function call
+  returns `{:error, %Alloy.Provider.Error{}}`, which the loop retries
+  unless output was already streamed.
 
   ## Example
 
       Alloy.run("Summarize this code.",
         provider: {Alloy.Provider.Gemini,
           api_key: System.get_env("GEMINI_API_KEY"),
-          model: "gemini-2.5-flash"
+          model: "gemini-3.8-flash",
+          generation_config: %{thinkingConfig: %{thinkingLevel: "LOW"}}
         }
       )
   """
@@ -35,11 +59,20 @@ defmodule Alloy.Provider.Gemini do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.SSE
+  alias Alloy.Provider.{Error, HTTP}
 
   @default_api_url "https://generativelanguage.googleapis.com"
   @default_api_version "v1beta"
-  @default_max_tokens 4096
+
+  # finishReason values, from ai.google.dev/api/generate-content#FinishReason.
+  # Content filters and policy blocks: the output must not be used.
+  @refusal_reasons ~w(SAFETY RECITATION LANGUAGE BLOCKLIST PROHIBITED_CONTENT SPII
+                      IMAGE_SAFETY IMAGE_PROHIBITED_CONTENT IMAGE_RECITATION IMAGE_OTHER
+                      ESCALATION PUP_LIMITED_DISABLED)
+  # The model produced output that cannot be used; sampling again usually
+  # succeeds, so these are retried like a server error.
+  @generation_errors ~w(MALFORMED_FUNCTION_CALL MALFORMED_RESPONSE UNEXPECTED_TOOL_CALL
+                        TOO_MANY_TOOL_CALLS NO_IMAGE)
 
   @typedoc """
   Configuration for the Gemini provider. See the module doc for field
@@ -65,24 +98,14 @@ defmodule Alloy.Provider.Gemini do
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
-    req_opts =
-      ([
-         url: request_url(config, "generateContent"),
-         method: :post,
-         headers: build_headers(config),
-         body: Jason.encode!(body)
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200, body: resp_body}} ->
-        parse_response(resp_body)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, parse_error(status, resp_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, resp_body} <-
+           HTTP.post_json(
+             request_url(config, "generateContent"),
+             build_headers(config),
+             body,
+             Map.get(config, :req_options, [])
+           ) do
+      parse_response(resp_body)
     end
   end
 
@@ -92,38 +115,26 @@ defmodule Alloy.Provider.Gemini do
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     body = build_request_body(messages, tool_defs, config)
 
+    # content_blocks is newest first. response and candidate hold the latest
+    # top-level and candidate fields (usage, finishReason, promptFeedback).
     initial_acc = %{
       buffer: "",
       content_blocks: [],
-      usage: %{},
-      finish_reason: nil,
+      response: %{},
+      candidate: %{},
       on_chunk: on_chunk
     }
 
-    stream_handler = SSE.req_stream_handler(initial_acc, &handle_sse_event/2)
-
-    req_opts =
-      ([
-         url: request_url(config, "streamGenerateContent"),
-         method: :post,
-         headers: build_headers(config),
-         params: [alt: "sse"],
-         body: Jason.encode!(body),
-         into: stream_handler
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200} = resp} ->
-        acc = Map.get(resp.private, :sse_acc, initial_acc)
-        build_stream_response(acc)
-
-      {:ok, %{status: status} = resp} ->
-        error_body = streaming_error_body(resp, initial_acc)
-        {:error, parse_error(status, error_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, acc} <-
+           HTTP.stream_sse(
+             request_url(config, "streamGenerateContent"),
+             build_headers(config),
+             body,
+             initial_acc,
+             &handle_sse_event/2,
+             [params: [alt: "sse"]] ++ Map.get(config, :req_options, [])
+           ) do
+      build_stream_response(acc)
     end
   end
 
@@ -158,12 +169,14 @@ defmodule Alloy.Provider.Gemini do
           body
       end
 
+    # No default maxOutputTokens: the budget includes thinking, so a fixed
+    # default truncates thinking models; each model's own limit is larger.
     generation_config =
       Map.get(config, :generation_config, %{})
       |> Alloy.Provider.stringify_keys()
-      |> Map.put_new("maxOutputTokens", Map.get(config, :max_tokens, @default_max_tokens))
+      |> maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
 
-    body = Map.put(body, "generationConfig", generation_config)
+    body = maybe_put(body, "generationConfig", generation_config)
 
     body =
       case tool_defs do
@@ -243,20 +256,6 @@ defmodule Alloy.Provider.Gemini do
     }
   end
 
-  defp format_content_block(
-         %{type: "server_tool_result", tool_use_id: id, content: content} = block,
-         messages
-       ) do
-    %{
-      "functionResponse" => %{
-        "id" => id,
-        "name" => lookup_tool_name(messages, id) || "unknown_tool",
-        "response" =>
-          normalize_function_response_payload(content, Map.get(block, :is_error, false))
-      }
-    }
-  end
-
   defp format_content_block(%{type: "image", mime_type: mime_type, data: data}, _messages) do
     %{"inlineData" => %{"mimeType" => mime_type, "data" => data}}
   end
@@ -269,6 +268,12 @@ defmodule Alloy.Provider.Gemini do
   defp format_content_block(%{type: "document", mime_type: mime_type, uri: uri}, _messages) do
     %{"fileData" => %{"mimeType" => mime_type, "fileUri" => uri}}
   end
+
+  # Opaque OpenAI Responses items in a transcript that switched provider;
+  # they mean nothing to Gemini, so they are dropped rather than turned
+  # into placeholder text the model would read.
+  defp format_content_block(%{type: type}, _messages) when type in ["reasoning", "output_item"],
+    do: nil
 
   defp format_content_block(block, _messages) when is_map(block) do
     %{
@@ -284,7 +289,6 @@ defmodule Alloy.Provider.Gemini do
       %Message{role: :assistant, content: blocks} when is_list(blocks) ->
         Enum.find_value(blocks, fn
           %{type: "tool_use", id: ^tool_use_id, name: name} -> name
-          %{type: "server_tool_use", id: ^tool_use_id, name: name} -> name
           _ -> nil
         end)
 
@@ -315,38 +319,77 @@ defmodule Alloy.Provider.Gemini do
   defp parse_response(body) when is_binary(body) do
     case Alloy.Provider.decode_body(body) do
       {:ok, decoded} -> parse_response(decoded)
-      {:error, _} = err -> err
+      {:error, message} -> {:error, %Error{kind: :unknown, message: message}}
     end
   end
 
   defp parse_response(%{"candidates" => [candidate | _]} = resp) do
-    content_blocks =
-      candidate
-      |> get_in(["content", "parts"])
-      |> List.wrap()
-      |> parse_content_parts()
+    candidate
+    |> get_in(["content", "parts"])
+    |> List.wrap()
+    |> Enum.map(&parse_content_part/1)
+    |> respond(candidate, resp)
+  end
 
-    usage = parse_usage(resp["usageMetadata"] || %{})
+  defp parse_response(%{"promptFeedback" => %{"blockReason" => _}} = resp),
+    do: prompt_blocked(resp)
 
+  defp parse_response(%{"error" => error}), do: {:error, in_band_error(error)}
+
+  defp parse_response(other) do
+    {:error,
+     %Error{kind: :unknown, message: "Unexpected Gemini response payload: #{inspect(other)}"}}
+  end
+
+  # Errors can also arrive in a 200 body: as an SSE chunk mid-stream, or
+  # from a proxy. Google's error object carries the HTTP status it stands
+  # for in "code"; without one the error is classified by its "status"
+  # label alone and keeps no HTTP status.
+  defp in_band_error(%{"code" => status} = error) when is_integer(status) and status >= 400,
+    do: Error.from_response(status, [], %{"error" => error})
+
+  defp in_band_error(error), do: Error.from_body(%{"error" => error})
+
+  defp respond(_blocks, %{"finishReason" => reason} = candidate, _resp)
+       when reason in @generation_errors,
+       do: {:error, generation_error(:server_error, reason, candidate)}
+
+  defp respond(
+         _blocks,
+         %{"finishReason" => "MISSING_THOUGHT_SIGNATURE" = reason} = candidate,
+         _resp
+       ),
+       do: {:error, generation_error(:invalid_request, reason, candidate)}
+
+  defp respond(blocks, candidate, resp) do
     {:ok,
      %{
-       stop_reason: parse_stop_reason(candidate["finishReason"], content_blocks),
-       messages: [%Message{role: :assistant, content: content_blocks}],
-       usage: usage,
+       stop_reason: stop_reason(candidate["finishReason"], blocks),
+       messages: [%Message{role: :assistant, content: blocks}],
+       usage: parse_usage(resp["usageMetadata"] || %{}),
        response_metadata: build_response_metadata(resp, candidate)
      }}
   end
 
-  defp parse_response(%{"promptFeedback" => prompt_feedback}) do
-    {:error, "Gemini prompt blocked: #{inspect(prompt_feedback)}"}
+  # The API returns no candidates only when the prompt itself was blocked.
+  defp prompt_blocked(%{"promptFeedback" => %{"blockReason" => _} = feedback} = resp) do
+    stop_details = Map.take(feedback, ["blockReason", "safetyRatings"])
+
+    {:ok,
+     %{
+       stop_reason: :refusal,
+       messages: [],
+       usage: parse_usage(resp["usageMetadata"] || %{}),
+       response_metadata: Map.put(build_response_metadata(resp, %{}), :stop_details, stop_details)
+     }}
   end
 
-  defp parse_response(other) do
-    {:error, "Unexpected Gemini response payload: #{inspect(other)}"}
-  end
-
-  defp parse_content_parts(parts) do
-    Enum.map(parts, &parse_content_part/1)
+  defp generation_error(kind, reason, candidate) do
+    %Error{
+      kind: kind,
+      type: reason,
+      message: candidate["finishMessage"] || "Gemini stopped without a usable response"
+    }
   end
 
   defp parse_content_part(%{"text" => text, "thought" => true} = part) do
@@ -389,35 +432,43 @@ defmodule Alloy.Provider.Gemini do
     |> maybe_put(:finish_message, candidate["finishMessage"])
     |> maybe_put(:prompt_feedback, resp["promptFeedback"])
     |> maybe_put(:grounding_metadata, candidate["groundingMetadata"] || resp["groundingMetadata"])
+    |> maybe_put(:stop_details, refusal_details(candidate))
   end
 
-  defp parse_stop_reason(_finish_reason, content_blocks)
-       when is_list(content_blocks) do
-    if Enum.any?(content_blocks, &(&1[:type] == "tool_use")), do: :tool_use, else: :end_turn
+  # Like every provider, the API's own fields with its own (string) keys.
+  defp refusal_details(%{"finishReason" => reason} = candidate) when reason in @refusal_reasons,
+    do: Map.take(candidate, ["finishReason", "finishMessage", "safetyRatings"])
+
+  defp refusal_details(_candidate), do: nil
+
+  # A truncated tool call stays :max_tokens: the loop must not run it.
+  defp stop_reason("MAX_TOKENS", _blocks), do: :max_tokens
+  defp stop_reason(reason, _blocks) when reason in @refusal_reasons, do: :refusal
+
+  defp stop_reason(_reason, blocks) do
+    if Enum.any?(blocks, &match?(%{type: "tool_use"}, &1)), do: :tool_use, else: :end_turn
   end
 
+  # Alloy follows Anthropic's usage semantics, where input_tokens excludes
+  # cache reads, so input + cache reads + output is everything billed.
+  # Gemini's promptTokenCount already includes cachedContentTokenCount, so
+  # the cached part is moved out of input. toolUsePromptTokenCount (results
+  # of built-in tools such as URL context or code execution, fed back to the
+  # model) is reported apart from the prompt but billed as input. Thinking
+  # tokens are billed as output, yet candidatesTokenCount leaves them out.
   defp parse_usage(usage) do
+    cached = Map.get(usage, "cachedContentTokenCount", 0)
+
     %{
-      input_tokens: Map.get(usage, "promptTokenCount", 0),
-      output_tokens: Map.get(usage, "candidatesTokenCount", 0),
+      input_tokens:
+        max(Map.get(usage, "promptTokenCount", 0) - cached, 0) +
+          Map.get(usage, "toolUsePromptTokenCount", 0),
+      output_tokens:
+        Map.get(usage, "candidatesTokenCount", 0) + Map.get(usage, "thoughtsTokenCount", 0),
       cache_creation_input_tokens: 0,
-      cache_read_input_tokens: Map.get(usage, "cachedContentTokenCount", 0)
+      cache_read_input_tokens: cached
     }
   end
-
-  defp parse_error(status, body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, decoded} -> parse_error(status, decoded)
-      {:error, _} -> "HTTP #{status}: #{body}"
-    end
-  end
-
-  defp parse_error(status, %{"error" => %{"message" => message} = error}) do
-    code = error["status"] || error["code"] || status
-    "#{code}: #{message}"
-  end
-
-  defp parse_error(status, body), do: "HTTP #{status}: #{inspect(body)}"
 
   defp handle_sse_event(acc, %{data: "[DONE]"}), do: acc
 
@@ -428,72 +479,80 @@ defmodule Alloy.Provider.Gemini do
     end
   end
 
-  defp handle_stream_chunk(acc, %{"candidates" => [candidate | _]} = resp) do
-    {blocks, text_deltas} =
+  defp handle_stream_chunk(acc, %{"candidates" => [candidate | _]} = chunk) do
+    blocks =
       candidate
       |> get_in(["content", "parts"])
       |> List.wrap()
-      |> parse_stream_parts()
+      |> Enum.map(&parse_content_part/1)
 
-    Enum.each(text_deltas, acc.on_chunk)
+    Enum.each(blocks, &emit_text_delta(&1, acc.on_chunk))
 
     %{
-      acc
-      | content_blocks: acc.content_blocks ++ blocks,
-        usage: merge_usage(acc.usage, resp["usageMetadata"] || %{}),
-        finish_reason: candidate["finishReason"] || acc.finish_reason
+      merge_response_fields(acc, chunk)
+      | content_blocks: Enum.reduce(blocks, acc.content_blocks, &merge_stream_block/2),
+        candidate: Map.merge(acc.candidate, Map.delete(candidate, "content"))
     }
   end
 
-  defp handle_stream_chunk(acc, %{"usageMetadata" => usage}) do
-    %{acc | usage: merge_usage(acc.usage, usage)}
-  end
+  defp handle_stream_chunk(acc, %{} = chunk), do: merge_response_fields(acc, chunk)
 
-  defp handle_stream_chunk(acc, _other), do: acc
+  # Usage counts are running totals: a later chunk's count replaces the
+  # earlier one, and a count it leaves out keeps its last value.
+  defp merge_response_fields(acc, chunk) do
+    fields = Map.delete(chunk, "candidates")
 
-  defp parse_stream_parts(parts) do
-    {blocks, deltas} =
-      Enum.reduce(parts, {[], []}, fn part, {blocks, deltas} ->
-        block = parse_content_part(part)
-
-        deltas =
-          case block do
-            %{type: "text", text: text} -> [text | deltas]
-            _ -> deltas
-          end
-
-        {[block | blocks], deltas}
+    response =
+      Map.merge(acc.response, fields, fn
+        "usageMetadata", previous, latest -> Map.merge(previous, latest)
+        _key, _previous, latest -> latest
       end)
 
-    {Enum.reverse(blocks), Enum.reverse(deltas)}
+    %{acc | response: response}
   end
 
-  defp merge_usage(existing, new) do
-    Map.merge(existing, new, fn _key, _old, latest -> latest end)
-  end
+  defp emit_text_delta(%{type: "text", text: text}, on_chunk) when text != "", do: on_chunk.(text)
+  defp emit_text_delta(_block, _on_chunk), do: :ok
 
-  defp build_stream_response(acc) do
-    usage = parse_usage(acc.usage)
+  # Gemini streams one logical part as many pieces. Kept apart, they become
+  # separate blocks that Message.text/1 joins with newlines, so consecutive
+  # text (or thought) pieces are merged back, newest block first. A thought
+  # signature belongs to the part it arrived on (often a trailing empty
+  # text piece), so it is kept on the merged block, and a signed block is
+  # never extended: two signatures never share a block. Function calls
+  # arrive whole and are never merged into.
+  defp merge_stream_block(
+         %{type: "text", text: text} = block,
+         [%{type: "text", text: previous} = last | rest]
+       )
+       when not is_map_key(last, :signature),
+       do: [%{block | text: previous <> text} | rest]
 
-    {:ok,
-     %{
-       stop_reason: parse_stop_reason(acc.finish_reason, acc.content_blocks),
-       messages: [%Message{role: :assistant, content: acc.content_blocks}],
-       usage: usage
-     }}
-  end
+  defp merge_stream_block(
+         %{type: "thinking", thinking: text} = block,
+         [%{type: "thinking", thinking: previous} = last | rest]
+       )
+       when not is_map_key(last, :signature),
+       do: [%{block | thinking: previous <> text} | rest]
 
-  defp streaming_error_body(resp, initial_acc) do
-    case resp.body do
-      "" ->
-        resp.private
-        |> Map.get(:sse_acc, initial_acc)
-        |> Map.get(:buffer, "")
+  defp merge_stream_block(block, blocks), do: [block | blocks]
 
-      body ->
-        body
-    end
-  end
+  defp build_stream_response(%{response: %{"error" => error}}), do: {:error, in_band_error(error)}
+
+  defp build_stream_response(%{
+         content_blocks: [],
+         response: %{"promptFeedback" => %{"blockReason" => _}} = resp
+       }),
+       do: prompt_blocked(resp)
+
+  # A finished stream always ends with a finishReason; without one the
+  # connection was cut and the output is incomplete.
+  defp build_stream_response(%{candidate: candidate})
+       when not is_map_key(candidate, "finishReason"),
+       do: {:error, %Error{kind: :network, message: "Gemini stream ended before a finishReason"}}
+
+  defp build_stream_response(acc),
+    do: acc.content_blocks |> Enum.reverse() |> respond(acc.candidate, acc.response)
 
   defp generated_tool_call_id(name) do
     "gemini_call_#{name || "tool"}_#{System.unique_integer([:positive])}"
@@ -502,4 +561,7 @@ defmodule Alloy.Provider.Gemini do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, _key, value) when value == %{}, do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp maybe_put_new(map, _key, nil), do: map
+  defp maybe_put_new(map, key, value), do: Map.put_new(map, key, value)
 end

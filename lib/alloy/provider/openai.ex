@@ -3,36 +3,59 @@ defmodule Alloy.Provider.OpenAI do
   Provider for OpenAI's Responses API.
 
   Normalizes OpenAI's response output items (assistant messages + function
-  calls) to Alloy's content-block format.
+  calls) to Alloy's content-block format. Use this provider, not
+  `Alloy.Provider.OpenAICompat`, for OpenAI models: starting with GPT-5.4,
+  Chat Completions does not support tool calling with reasoning enabled.
 
   ## Config
 
   Required:
   - `:api_key` - OpenAI API key
-  - `:model` - Model name (e.g., "gpt-5.4", "gpt-5.1", "o3-pro")
+  - `:model` - Model name (e.g., "gpt-6-astra", "gpt-6.1-sol", "gpt-5.4")
 
   Optional:
-  - `:max_tokens` - Max output tokens (default: 4096)
+  - `:max_tokens` - Max output tokens, reasoning tokens included. Omitted
+    unless set, so the model's own limit applies: a small cap can leave a
+    reasoning model with no tokens for its answer
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.openai.com"). Can point to
-    compatible Responses APIs such as xAI's "https://api.x.ai"
+    compatible Responses APIs; for xAI use `Alloy.Provider.XAI`
   - `:provider_state` - opaque provider-owned state carried across turns.
-    For Responses APIs Alloy uses `%{response_id: "..."}`
+    Each response's ID is recorded as `%{response_id: "..."}`; it is
+    informational and never sent back automatically
   - `:store` - Persist the response server-side when supported
   - `:include` - Additional response fields to include
   - `:tool_choice` - Provider-native tool selection mode
   - `:parallel_tool_calls` - Whether the provider may issue tool calls in parallel
-  - `:previous_response_id` - Explicit Responses continuation ID. Overrides
-    `provider_state.response_id` when both are present
+  - `:previous_response_id` - Continue a stored response (see "Chaining
+    responses" below)
   - `:built_in_tools` - provider-native tool definitions to append to custom
     function tools
   - `:web_search` - `true` or a config map to append a `web_search` tool
   - `:x_search` - `true` or a config map to append an `x_search` tool
   - `:req_options` - Additional options passed to Req
 
-  In stateless mode (`store` not `true` with no previous response ID), Alloy
-  automatically requests encrypted reasoning content and round-trips opaque
-  reasoning output items between tool calls.
+  ## Conversation state
+
+  By default every request carries the full conversation, like every other
+  Alloy provider. In this stateless mode (`store` not `true` and no
+  `:previous_response_id`), Alloy requests encrypted reasoning content and
+  replays every output item: reasoning items are kept as
+  `%{type: "reasoning", raw: item}` blocks and other non-message items
+  (built-in tool calls, compaction items) as `%{type: "output_item", raw:
+  item}` blocks. An assistant message's `phase` is kept on its text blocks
+  and always sent back.
+
+  ## Chaining responses
+
+  To continue a response stored server-side instead, pass its ID as
+  `:previous_response_id` together with only the messages added since that
+  response. The server prepends the stored conversation, so sending the full
+  history as well would duplicate it (and bill it twice). The ID of the
+  latest response is in `result.metadata.provider_state.response_id`. A
+  chained response must have been created with `store` enabled (the API's
+  default). Tool-loop turns within one run keep the same
+  `:previous_response_id`, so they still send only the run's new messages.
 
   ## Example
 
@@ -43,22 +66,15 @@ defmodule Alloy.Provider.OpenAI do
         }
       )
 
-      Alloy.run("Review this repo",
-        provider: {Alloy.Provider.OpenAI,
-          api_key: System.get_env("XAI_API_KEY"),
-          api_url: "https://api.x.ai",
-          model: "grok-4"
-        }
-      )
   """
 
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.SSE
+  alias Alloy.Provider.{Error, HTTP}
 
   @default_api_url "https://api.openai.com"
-  @default_max_tokens 4096
+  @terminal_events ["response.completed", "response.incomplete", "response.failed"]
 
   @typedoc """
   Configuration for the OpenAI provider. See the module doc for field
@@ -88,27 +104,14 @@ defmodule Alloy.Provider.OpenAI do
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
-    req_opts =
-      ([
-         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/responses",
-         method: :post,
-         headers: [
-           {"authorization", "Bearer #{config.api_key}"},
-           {"content-type", "application/json"}
-         ],
-         body: Jason.encode!(body)
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200, body: resp_body}} ->
-        parse_response(resp_body)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, parse_error(status, resp_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, resp_body} <-
+           HTTP.post_json(
+             responses_url(config),
+             headers(config),
+             body,
+             Map.get(config, :req_options, [])
+           ) do
+      parse_response(resp_body)
     end
   end
 
@@ -121,45 +124,30 @@ defmodule Alloy.Provider.OpenAI do
       |> build_request_body(tool_defs, config)
       |> Map.put("stream", true)
 
-    url = "#{Map.get(config, :api_url, @default_api_url)}/v1/responses"
-
-    headers = [
-      {"authorization", "Bearer #{config.api_key}"},
-      {"content-type", "application/json"}
-    ]
-
     initial_acc = %{
       buffer: "",
-      content: "",
       response: nil,
       stream_error: nil,
       on_chunk: on_chunk
     }
 
-    stream_handler = SSE.req_stream_handler(initial_acc, &handle_stream_event/2)
-
-    req_opts =
-      ([
-         url: url,
-         method: :post,
-         headers: headers,
-         body: Jason.encode!(body),
-         into: stream_handler
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200} = resp} ->
-        acc = Map.get(resp.private, :sse_acc, initial_acc)
-        build_stream_response(acc)
-
-      {:ok, %{status: status} = resp} ->
-        error_body = streaming_error_body(resp, initial_acc)
-        {:error, parse_error(status, error_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, acc} <-
+           HTTP.stream_sse(
+             responses_url(config),
+             headers(config),
+             body,
+             initial_acc,
+             &handle_stream_event/2,
+             Map.get(config, :req_options, [])
+           ) do
+      build_stream_response(acc)
     end
+  end
+
+  defp responses_url(config), do: "#{Map.get(config, :api_url, @default_api_url)}/v1/responses"
+
+  defp headers(config) do
+    [{"authorization", "Bearer #{config.api_key}"}, {"content-type", "application/json"}]
   end
 
   # --- Request Building ---
@@ -168,12 +156,12 @@ defmodule Alloy.Provider.OpenAI do
     input_items = build_input_items(messages, config)
 
     body =
-      %{
-        "model" => config.model,
-        "max_output_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
-        "input" => input_items
-      }
-      |> maybe_put_previous_response_id(config)
+      %{"model" => config.model, "input" => input_items}
+      |> maybe_put_optional_request_field("max_output_tokens", Map.get(config, :max_tokens))
+      |> maybe_put_optional_request_field(
+        "previous_response_id",
+        Map.get(config, :previous_response_id)
+      )
       |> maybe_put_optional_request_field("store", Map.get(config, :store))
       |> maybe_put_optional_request_field("include", Map.get(config, :include))
       |> maybe_put_reasoning_include(config)
@@ -204,15 +192,6 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp stringify_extra_body(_), do: %{}
-
-  defp maybe_put_previous_response_id(body, config) do
-    maybe_put_optional_request_field(body, "previous_response_id", previous_response_id(config))
-  end
-
-  defp previous_response_id(config) do
-    Map.get(config, :previous_response_id) ||
-      get_in(config, [:provider_state, :response_id])
-  end
 
   defp maybe_put_optional_request_field(body, _key, nil), do: body
   defp maybe_put_optional_request_field(body, _key, value) when value == [], do: body
@@ -279,7 +258,7 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp stateless_reasoning_echo?(config) do
-    Map.get(config, :store) != true and is_nil(previous_response_id(config))
+    Map.get(config, :store) != true and is_nil(Map.get(config, :previous_response_id))
   end
 
   defp format_input_item(%Message{role: :user, content: content}, _stateless?)
@@ -341,16 +320,23 @@ defmodule Alloy.Provider.OpenAI do
 
   defp format_user_content_block(_block), do: nil
 
-  defp format_assistant_block(%{type: "text", text: text}, _stateless?)
+  defp format_assistant_block(%{type: "text", text: text} = block, _stateless?)
        when is_binary(text) and text != "" do
-    [%{"role" => "assistant", "content" => text}]
+    [
+      maybe_put_optional_request_field(
+        %{"role" => "assistant", "content" => text},
+        "phase",
+        block[:phase]
+      )
+    ]
   end
 
   defp format_assistant_block(%{type: "tool_use"} = block, _stateless?) do
     [format_assistant_function_call_item(block)]
   end
 
-  defp format_assistant_block(%{type: "reasoning", raw: raw}, true) when is_map(raw) do
+  defp format_assistant_block(%{type: type, raw: raw}, true)
+       when type in ["reasoning", "output_item"] and is_map(raw) do
     [raw]
   end
 
@@ -385,19 +371,6 @@ defmodule Alloy.Provider.OpenAI do
 
   # --- Streaming ---
 
-  # When streaming (into: handler), a non-200 body can be consumed by the SSE
-  # callback and resp.body may be "". Recover it from the SSE buffer.
-  defp streaming_error_body(resp, initial_acc) do
-    case resp.body do
-      "" ->
-        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
-        sse_acc.buffer
-
-      body ->
-        body
-    end
-  end
-
   defp handle_stream_event(acc, %{data: "[DONE]"}), do: acc
 
   defp handle_stream_event(acc, %{event: event_name, data: data}) do
@@ -414,47 +387,38 @@ defmodule Alloy.Provider.OpenAI do
   defp process_stream_event(acc, "response.output_text.delta", %{"delta" => delta})
        when is_binary(delta) and delta != "" do
     acc.on_chunk.(delta)
-    %{acc | content: acc.content <> delta}
+    acc
   end
 
-  defp process_stream_event(acc, "response.completed", %{"response" => response})
-       when is_map(response) do
+  # Every terminal event carries the whole response, and parse_response/1
+  # reads its status, so completed, incomplete and failed share one path.
+  defp process_stream_event(acc, event_type, %{"response" => response})
+       when event_type in @terminal_events and is_map(response) do
     %{acc | response: response}
   end
 
-  defp process_stream_event(acc, "response.failed", payload) do
-    %{acc | stream_error: parse_stream_event_error(payload)}
+  # The documented event is flat ({"type": "error", "code", "message"});
+  # some compatible servers nest the details under "error".
+  defp process_stream_event(acc, "error", %{"error" => %{}} = payload) do
+    %{acc | stream_error: Error.from_body(payload)}
   end
 
   defp process_stream_event(acc, "error", payload) do
-    %{acc | stream_error: parse_stream_event_error(payload)}
+    %{acc | stream_error: Error.from_body(%{"error" => payload})}
   end
 
   defp process_stream_event(acc, _event_type, _payload), do: acc
 
-  defp build_stream_response(%{stream_error: error}) when is_binary(error) do
-    {:error, error}
-  end
+  defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
 
-  defp build_stream_response(%{response: response}) when is_map(response) do
-    parse_response(response)
-  end
+  defp build_stream_response(%{response: response}) when is_map(response),
+    do: parse_response(response)
 
-  defp build_stream_response(%{content: content}) do
-    content_blocks = if content == "", do: [], else: [%{type: "text", text: content}]
-
-    {:ok,
-     %{
-       stop_reason: :end_turn,
-       messages: [%Message{role: :assistant, content: content_blocks}],
-       usage: %{input_tokens: 0, output_tokens: 0}
-     }}
-  end
-
-  defp parse_stream_event_error(payload) do
-    payload
-    |> Map.get("error", payload)
-    |> format_error_payload()
+  # Without a terminal event the connection was cut mid-response; returning
+  # the text received so far would pass off a fragment as a complete answer.
+  defp build_stream_response(_acc) do
+    {:error,
+     %Error{kind: :network, message: "Responses stream ended before the response completed"}}
   end
 
   # --- Response Parsing ---
@@ -466,13 +430,14 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
+  defp parse_response(%{"status" => "failed"} = resp), do: {:error, Error.from_body(resp)}
+
   defp parse_response(%{"output" => output} = resp) when is_list(output) do
-    usage = resp["usage"] || %{}
     provider_state = provider_state_from_response(resp)
 
     case parse_output_to_blocks(output) do
       {:ok, content_blocks} ->
-        stop_reason = parse_stop_reason(content_blocks)
+        stop_reason = parse_stop_reason(resp, content_blocks)
 
         alloy_msg = %Message{
           role: :assistant,
@@ -483,10 +448,7 @@ defmodule Alloy.Provider.OpenAI do
          %{
            stop_reason: stop_reason,
            messages: [alloy_msg],
-           usage: %{
-             input_tokens: Map.get(usage, "input_tokens", 0),
-             output_tokens: Map.get(usage, "output_tokens", 0)
-           },
+           usage: parse_usage(resp["usage"]),
            provider_state: provider_state,
            response_metadata: response_metadata_from_response(resp)
          }}
@@ -497,7 +459,6 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp parse_response(%{"output_text" => text} = resp) when is_binary(text) do
-    usage = resp["usage"] || %{}
     provider_state = provider_state_from_response(resp)
 
     content_blocks =
@@ -510,21 +471,18 @@ defmodule Alloy.Provider.OpenAI do
      %{
        stop_reason: :end_turn,
        messages: [%Message{role: :assistant, content: content_blocks}],
-       usage: %{
-         input_tokens: Map.get(usage, "input_tokens", 0),
-         output_tokens: Map.get(usage, "output_tokens", 0)
-       },
+       usage: parse_usage(resp["usage"]),
        provider_state: provider_state,
        response_metadata: response_metadata_from_response(resp)
      }}
   end
 
-  defp parse_response(%{"error" => error}) do
-    {:error, format_error_payload(error)}
+  defp parse_response(%{"error" => error} = resp) when is_map(error) or is_binary(error) do
+    {:error, Error.from_body(resp)}
   end
 
   defp parse_response(resp) do
-    {:error, "Unexpected OpenAI response payload: #{inspect(resp)}"}
+    {:error, %Error{message: "Unexpected OpenAI response payload: #{inspect(resp)}"}}
   end
 
   defp parse_output_to_blocks(output) do
@@ -542,20 +500,11 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp parse_output_item(%{"type" => "message", "role" => "assistant", "content" => content})
-       when is_list(content) do
-    {:ok, parse_assistant_content(content)}
-  end
-
-  defp parse_output_item(%{"type" => "message", "role" => "assistant", "content" => text})
-       when is_binary(text) do
-    blocks =
-      case text do
-        "" -> []
-        _ -> [%{type: "text", text: text}]
-      end
-
-    {:ok, blocks}
+  defp parse_output_item(
+         %{"type" => "message", "role" => "assistant", "content" => content} = item
+       )
+       when is_list(content) or is_binary(content) do
+    {:ok, content |> parse_assistant_content() |> Enum.map(&put_phase(&1, item["phase"]))}
   end
 
   defp parse_output_item(%{"type" => "function_call", "name" => name} = call) do
@@ -572,7 +521,16 @@ defmodule Alloy.Provider.OpenAI do
     {:ok, [%{type: "reasoning", raw: item}]}
   end
 
+  # Built-in tool calls (web search, code interpreter, MCP), compaction items
+  # and types added later are kept whole, so a stateless replay sends the
+  # complete output back as the API expects.
+  defp parse_output_item(%{"type" => _type} = item),
+    do: {:ok, [%{type: "output_item", raw: item}]}
+
   defp parse_output_item(_item), do: {:ok, []}
+
+  defp parse_assistant_content(""), do: []
+  defp parse_assistant_content(text) when is_binary(text), do: [%{type: "text", text: text}]
 
   defp parse_assistant_content(content) when is_list(content) do
     content
@@ -591,7 +549,17 @@ defmodule Alloy.Provider.OpenAI do
     end)
   end
 
-  defp parse_stop_reason(content_blocks) do
+  defp parse_stop_reason(
+         %{"status" => "incomplete", "incomplete_details" => %{"reason" => "content_filter"}},
+         _content_blocks
+       ),
+       do: :refusal
+
+  # Every other incomplete reason (max_output_tokens, max_messages) means the
+  # output was cut short.
+  defp parse_stop_reason(%{"status" => "incomplete"}, _content_blocks), do: :max_tokens
+
+  defp parse_stop_reason(_resp, content_blocks) do
     if Enum.any?(content_blocks, &(&1.type == "tool_use")), do: :tool_use, else: :end_turn
   end
 
@@ -616,30 +584,23 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp parse_error(status, body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, %{"error" => error}} ->
-        format_error_payload(error)
+  # Alloy.Usage follows Anthropic: input_tokens excludes cache reads and
+  # writes, which have their own fields. OpenAI counts both inside
+  # input_tokens, so they are taken out here.
+  defp parse_usage(%{} = usage) do
+    details = usage["input_tokens_details"] || %{}
+    cache_read = details["cached_tokens"] || 0
+    cache_write = details["cache_write_tokens"] || 0
 
-      _ ->
-        "HTTP #{status}: #{body}"
-    end
+    %{
+      input_tokens: max((usage["input_tokens"] || 0) - cache_read - cache_write, 0),
+      output_tokens: usage["output_tokens"] || 0,
+      cache_read_input_tokens: cache_read,
+      cache_creation_input_tokens: cache_write
+    }
   end
 
-  defp parse_error(status, body) when is_map(body) do
-    case body do
-      %{"error" => error} -> format_error_payload(error)
-      _ -> "HTTP #{status}: #{inspect(body)}"
-    end
-  end
-
-  defp format_error_payload(error) when is_map(error) do
-    type = Map.get(error, "type", "error")
-    message = Map.get(error, "message", inspect(error))
-    "#{type}: #{message}"
-  end
-
-  defp format_error_payload(error), do: inspect(error)
+  defp parse_usage(nil), do: parse_usage(%{})
 
   defp provider_state_from_response(%{"id" => id}) when is_binary(id) and id != "" do
     %{response_id: id}
@@ -654,7 +615,11 @@ defmodule Alloy.Provider.OpenAI do
       :server_side_tool_usage,
       Map.get(resp, "server_side_tool_usage")
     )
+    |> maybe_put_response_metadata(:stop_details, stop_details(resp))
   end
+
+  defp stop_details(%{"status" => "incomplete"} = resp), do: resp["incomplete_details"]
+  defp stop_details(_resp), do: nil
 
   defp maybe_put_response_metadata(metadata, _key, nil), do: metadata
   defp maybe_put_response_metadata(metadata, _key, value) when value == [], do: metadata
@@ -666,4 +631,9 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp maybe_put_annotations(block, _annotations), do: block
+
+  # gpt-5.3-codex and later label assistant messages as "commentary" or
+  # "final_answer" and need the label back on every replayed message.
+  defp put_phase(block, phase) when is_binary(phase), do: Map.put(block, :phase, phase)
+  defp put_phase(block, _phase), do: block
 end

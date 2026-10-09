@@ -7,16 +7,33 @@ defmodule Alloy.Agent.Config do
   """
 
   alias Alloy.Context.Compactor
+  alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.ModelMetadata
 
+  require Logger
+
+  # The summary prompts are optional because a bare `%Config{}` omits them;
+  # `from_opts/1` always fills them and the Compactor falls back to its
+  # defaults when they are absent.
+  @compaction_keys [
+    :reserve_tokens,
+    :keep_recent_tokens,
+    :fallback,
+    :clear_tool_results,
+    :keep_recent_tool_results,
+    :summary_system_prompt,
+    :summary_prompt
+  ]
+  @compaction_keys_by_name Map.new(@compaction_keys, &{Atom.to_string(&1), &1})
+
   @type compaction :: %{
+          optional(:summary_system_prompt) => String.t(),
+          optional(:summary_prompt) => String.t(),
           reserve_tokens: pos_integer(),
           keep_recent_tokens: pos_integer(),
           fallback: :truncate,
           clear_tool_results: boolean(),
-          keep_recent_tool_results: non_neg_integer(),
-          summary_system_prompt: String.t(),
-          summary_prompt: String.t()
+          keep_recent_tool_results: non_neg_integer()
         }
 
   @typedoc """
@@ -26,7 +43,8 @@ defmodule Alloy.Agent.Config do
   through verbatim.
 
   As of 0.12.0, memory is Anthropic-only. `Alloy.run/2` raises if
-  `:memory` is set with any other provider.
+  `:memory` is set with any other provider, or if `:tools` also contains a
+  tool named `"memory"` (the name the memory tool reserves).
   """
   @type memory :: {module(), term()} | nil
 
@@ -85,9 +103,9 @@ defmodule Alloy.Agent.Config do
       keep_recent_tokens: 20_000,
       fallback: :truncate,
       clear_tool_results: true,
-      keep_recent_tool_results: 3,
-      summary_system_prompt: Compactor.default_summary_system_prompt(),
-      summary_prompt: Compactor.default_summary_prompt()
+      # Summary prompts are filled in at runtime by `resolve_compaction/2`;
+      # calling Compactor here would make Config compile-depend on it.
+      keep_recent_tool_results: 3
     },
     compaction_explicit: %{reserve_tokens: false, keep_recent_tokens: false},
     working_directory: ".",
@@ -130,11 +148,12 @@ defmodule Alloy.Agent.Config do
       )
 
     {compaction, compaction_explicit} = resolve_compaction(opts[:compaction], max_tokens)
+    tools = Keyword.get(opts, :tools, [])
 
     %__MODULE__{
       provider: provider_mod,
       provider_config: provider_config,
-      tools: Keyword.get(opts, :tools, []),
+      tools: tools,
       system_prompt: Keyword.get(opts, :system_prompt),
       max_turns: Keyword.get(opts, :max_turns, 25),
       max_tokens: max_tokens,
@@ -160,31 +179,69 @@ defmodule Alloy.Agent.Config do
       code_execution: Keyword.get(opts, :code_execution, false),
       model_metadata_overrides: model_metadata_overrides,
       model_catalog: model_catalog,
-      max_budget_cents: Keyword.get(opts, :max_budget_cents),
+      max_budget_cents: opts |> Keyword.get(:max_budget_cents) |> warn_max_budget_cents(),
       until_tool: Keyword.get(opts, :until_tool),
-      memory: validate_memory(Keyword.get(opts, :memory), provider_mod)
+      memory: validate_memory(Keyword.get(opts, :memory), provider_mod, tools)
     }
   end
 
-  defp validate_memory(nil, _provider), do: nil
+  defp validate_memory(nil, _provider, _tools), do: nil
 
-  defp validate_memory({module, _store} = memory, provider)
+  defp validate_memory({module, _store} = memory, provider, tools)
        when is_atom(module) do
-    if provider == Alloy.Provider.Anthropic do
-      memory
-    else
-      raise ArgumentError,
-            "Alloy.Memory is Anthropic-only in 0.12.0. Got provider #{inspect(provider)} " <>
-              "with memory store module #{inspect(module)}. " <>
-              "Use Alloy.Provider.Anthropic or omit :memory."
+    cond do
+      provider != Alloy.Provider.Anthropic ->
+        raise ArgumentError,
+              "Alloy.Memory is Anthropic-only in 0.12.0. Got provider #{inspect(provider)} " <>
+                "with memory store module #{inspect(module)}. " <>
+                "Use Alloy.Provider.Anthropic or omit :memory."
+
+      # With :memory set, every "memory" call goes to the store, so a user
+      # tool of that name would never run.
+      Enum.any?(tools, &(tool_name(&1) == MemoryRouter.tool_name())) ->
+        raise ArgumentError,
+              ~s(:memory reserves the tool name "memory", but a tool named "memory" ) <>
+                "is also configured in :tools. Rename that tool or omit :memory."
+
+      true ->
+        memory
     end
   end
 
-  defp validate_memory(bad, _provider) do
+  defp validate_memory(bad, _provider, _tools) do
     raise ArgumentError,
           ":memory must be a {module, store_opts} tuple where module implements " <>
             "Alloy.Memory. Got: #{inspect(bad)}"
   end
+
+  defp warn_max_budget_cents(nil), do: nil
+
+  # Once per node: agents are started per request in many apps, and a
+  # warning per run would flood their logs.
+  defp warn_max_budget_cents(max_budget_cents) do
+    if :persistent_term.get({__MODULE__, :max_budget_cents_warned}, false) do
+      max_budget_cents
+    else
+      :persistent_term.put({__MODULE__, :max_budget_cents_warned}, true)
+      log_max_budget_cents_deprecation(max_budget_cents)
+    end
+  end
+
+  defp log_max_budget_cents_deprecation(max_budget_cents) do
+    Logger.warning(
+      ":max_budget_cents is deprecated and will be removed in Alloy 0.13. " <>
+        "It only stops a run when the provider reports usage.estimated_cost_cents, " <>
+        "which none of the built-in providers do. Enforce a budget with " <>
+        ":before_completion middleware instead (see the Alloy module docs)."
+    )
+
+    max_budget_cents
+  end
+
+  # Matches Alloy.Tool.Inline structs as plain maps so Config does not
+  # compile-depend on the tool modules.
+  defp tool_name(%{name: name}), do: name
+  defp tool_name(module) when is_atom(module), do: module.name()
 
   @doc """
   Returns an updated config with a new provider while preserving unrelated options.
@@ -364,52 +421,18 @@ defmodule Alloy.Agent.Config do
   end
 
   defp normalize_compaction_map(map) do
-    Enum.reduce(map, %{}, fn
-      {:reserve_tokens, value}, acc ->
-        Map.put(acc, :reserve_tokens, value)
+    Map.new(map, fn {key, value} -> {compaction_key!(key), value} end)
+  end
 
-      {"reserve_tokens", value}, acc ->
-        Map.put(acc, :reserve_tokens, value)
+  # String keys are matched against the whitelist instead of converted, so
+  # untrusted config cannot create atoms.
+  defp compaction_key!(key) when key in @compaction_keys, do: key
 
-      {:keep_recent_tokens, value}, acc ->
-        Map.put(acc, :keep_recent_tokens, value)
-
-      {"keep_recent_tokens", value}, acc ->
-        Map.put(acc, :keep_recent_tokens, value)
-
-      {:fallback, value}, acc ->
-        Map.put(acc, :fallback, value)
-
-      {"fallback", value}, acc ->
-        Map.put(acc, :fallback, value)
-
-      {:clear_tool_results, value}, acc ->
-        Map.put(acc, :clear_tool_results, value)
-
-      {"clear_tool_results", value}, acc ->
-        Map.put(acc, :clear_tool_results, value)
-
-      {:keep_recent_tool_results, value}, acc ->
-        Map.put(acc, :keep_recent_tool_results, value)
-
-      {"keep_recent_tool_results", value}, acc ->
-        Map.put(acc, :keep_recent_tool_results, value)
-
-      {:summary_system_prompt, value}, acc ->
-        Map.put(acc, :summary_system_prompt, value)
-
-      {"summary_system_prompt", value}, acc ->
-        Map.put(acc, :summary_system_prompt, value)
-
-      {:summary_prompt, value}, acc ->
-        Map.put(acc, :summary_prompt, value)
-
-      {"summary_prompt", value}, acc ->
-        Map.put(acc, :summary_prompt, value)
-
-      {key, _value}, _acc ->
-        raise ArgumentError, "unsupported compaction option: #{inspect(key)}"
-    end)
+  defp compaction_key!(key) do
+    case Map.fetch(@compaction_keys_by_name, key) do
+      {:ok, known} -> known
+      :error -> raise ArgumentError, "unsupported compaction option: #{inspect(key)}"
+    end
   end
 
   defp resolve_compaction_field(current_value, true, _default_value), do: current_value

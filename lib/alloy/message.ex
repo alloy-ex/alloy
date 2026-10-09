@@ -68,7 +68,9 @@ defmodule Alloy.Message do
 
   @doc """
   Extracts plain text from a message, ignoring tool blocks.
-  Returns nil if no text content exists.
+
+  Joins the message's text blocks with newlines. Returns `""` (never `nil`)
+  when the message has no text blocks, for example when it only calls tools.
   """
   @spec text(t()) :: String.t()
   def text(%__MODULE__{content: content}) when is_binary(content), do: content
@@ -100,7 +102,9 @@ defmodule Alloy.Message do
   """
   @spec tool_calls(t()) :: [content_block()]
   def tool_calls(%__MODULE__{content: blocks}) when is_list(blocks) do
-    Enum.filter(blocks, &(is_map(&1) && &1[:type] in ["tool_use", "server_tool_use"]))
+    # server_tool_use blocks were already executed by the provider (code
+    # execution, web search, tool search); the client must not answer them.
+    Enum.filter(blocks, &(is_map(&1) && &1[:type] == "tool_use"))
   end
 
   def tool_calls(%__MODULE__{}), do: []
@@ -114,8 +118,14 @@ defmodule Alloy.Message do
     if is_error, do: Map.put(result, :is_error, true), else: result
   end
 
+  @doc deprecated:
+         "Server tools are executed by the provider and never answered by the " <>
+           "client; Alloy no longer produces this block. Removed in 0.13."
   @doc """
-  Builds a server_tool_result content block (for code_execution server tool calls).
+  Builds a `server_tool_result` content block.
+
+  No provider accepts this block type. It is kept only so existing callers
+  compile during 0.12.x.
   """
   @spec server_tool_result_block(String.t(), String.t(), boolean()) :: content_block()
   def server_tool_result_block(tool_use_id, content, is_error \\ false) do

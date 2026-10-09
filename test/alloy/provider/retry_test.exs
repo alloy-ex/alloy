@@ -3,7 +3,21 @@ defmodule Alloy.Provider.RetryTest do
 
   alias Alloy.Agent.State
   alias Alloy.Message
-  alias Alloy.Provider.Retry
+  alias Alloy.Provider.{Error, Retry}
+
+  describe "retryable?/1 with Alloy.Provider.Error" do
+    test "retries transient kinds" do
+      for kind <- [:rate_limited, :overloaded, :server_error, :timeout, :network] do
+        assert Retry.retryable?(%Error{kind: kind, message: "x"})
+      end
+    end
+
+    test "does not retry quota, auth, overflow or invalid requests" do
+      for kind <- [:quota, :auth, :context_overflow, :invalid_request, :unknown] do
+        refute Retry.retryable?(%Error{kind: kind, message: "x"})
+      end
+    end
+  end
 
   describe "retryable?/1" do
     # HTTP status errors
@@ -170,7 +184,138 @@ defmodule Alloy.Provider.RetryTest do
     end
   end
 
+  describe "call_with_retry/6 with structured errors" do
+    test "waits at least retry_after_ms before retrying" do
+      rate_limited = %Error{kind: :rate_limited, message: "slow", retry_after_ms: 150}
+      provider = scripted_provider([{:error, rate_limited}, :ok])
+      state = build_state(retry_config(max_retries: 1, retry_backoff_ms: 1))
+      deadline = System.monotonic_time(:millisecond) + 10_000
+
+      started = System.monotonic_time(:millisecond)
+      result = Retry.call_with_retry(state, provider, %{}, false, fn _ -> :ok end, deadline)
+
+      assert {:ok, _} = result
+      assert System.monotonic_time(:millisecond) - started >= 150
+    end
+
+    test "gives up at once when retry_after_ms would overshoot the deadline" do
+      rate_limited = %Error{kind: :rate_limited, message: "slow", retry_after_ms: 60_000}
+      provider = scripted_provider([{:error, rate_limited}, :ok])
+      state = build_state(retry_config(max_retries: 3, retry_backoff_ms: 1))
+      deadline = System.monotonic_time(:millisecond) + 2_000
+
+      started = System.monotonic_time(:millisecond)
+      result = Retry.call_with_retry(state, provider, %{}, false, fn _ -> :ok end, deadline)
+
+      assert {:error, %Error{kind: :rate_limited}} = result
+      assert System.monotonic_time(:millisecond) - started < 1_000
+    end
+
+    test "does not retry a quota error" do
+      quota = %Error{kind: :quota, status: 429, message: "insufficient_quota"}
+      provider = scripted_provider([{:error, quota}, :ok])
+      state = build_state(retry_config(max_retries: 3, retry_backoff_ms: 1))
+      deadline = System.monotonic_time(:millisecond) + 10_000
+
+      assert {:error, ^quota} =
+               Retry.call_with_retry(state, provider, %{}, false, fn _ -> :ok end, deadline)
+    end
+  end
+
+  describe "streaming callbacks that raise" do
+    import ExUnit.CaptureLog
+    import Alloy.StreamTestHelpers
+
+    setup do
+      Req.Test.stub(
+        __MODULE__,
+        sse_chunks_plug([
+          sse_text_delta("A"),
+          sse_text_delta("B"),
+          sse_text_delta("C"),
+          sse_finish("stop"),
+          "data: [DONE]\n\n"
+        ])
+      )
+
+      provider =
+        {Alloy.Provider.OpenAICompat,
+         api_url: "http://localhost",
+         model: "test-model",
+         req_options: [plug: {Req.Test, __MODULE__}, retry: false]}
+
+      %{provider: provider}
+    end
+
+    test "a raising on_chunk is logged and the full text is kept", %{provider: provider} do
+      on_chunk = fn
+        "B" -> raise "UI went away"
+        _chunk -> :ok
+      end
+
+      log =
+        capture_log(fn ->
+          send(self(), {:result, Alloy.stream("hi", on_chunk, provider: provider)})
+        end)
+
+      assert_received {:result, {:ok, result}}
+      assert result.text == "ABC"
+      assert log =~ "on_chunk callback failed"
+      assert log =~ "UI went away"
+    end
+
+    test "a raising on_event is logged and the full text is kept", %{provider: provider} do
+      on_event = fn
+        %{event: :text_delta, payload: "B"} -> raise "liveview_down"
+        _envelope -> :ok
+      end
+
+      log =
+        capture_log(fn ->
+          send(
+            self(),
+            {:result, Alloy.stream("hi", fn _ -> :ok end, provider: provider, on_event: on_event)}
+          )
+        end)
+
+      assert_received {:result, {:ok, result}}
+      assert result.text == "ABC"
+      assert log =~ "on_event callback failed"
+      assert log =~ "liveview_down"
+    end
+
+    # Only raised exceptions (a bug in the UI callback) are absorbed. A throw
+    # or exit is deliberate control flow and stops the stream, as in 0.12.4.
+    test "a throw from on_chunk still aborts the stream", %{provider: provider} do
+      on_chunk = fn
+        "B" -> throw(:user_cancelled)
+        _chunk -> :ok
+      end
+
+      assert catch_throw(Alloy.stream("hi", on_chunk, provider: provider)) == :user_cancelled
+    end
+  end
+
   # ── Helpers ───────────────────────────────────────────────────────────────
+
+  # A provider that returns `responses` in order; `:ok` is a plain success.
+  defp scripted_provider(responses) do
+    {:ok, agent} = Agent.start_link(fn -> responses end)
+
+    Module.create(
+      :"Elixir.Alloy.Provider.RetryTest.ScriptedProvider#{System.unique_integer([:positive])}",
+      quote do
+        def complete(_messages, _tools, _config) do
+          case Agent.get_and_update(unquote(agent), fn [next | rest] -> {next, rest} end) do
+            :ok -> {:ok, %{stop_reason: :end_turn, messages: [], usage: %{}}}
+            error -> error
+          end
+        end
+      end,
+      Macro.Env.location(__ENV__)
+    )
+    |> elem(1)
+  end
 
   defp retry_config(overrides \\ []) do
     defaults = [

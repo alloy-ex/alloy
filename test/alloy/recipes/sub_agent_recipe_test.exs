@@ -49,8 +49,7 @@ defmodule Alloy.Recipes.SubAgentTest do
              provider: Map.fetch!(context, :delegate_provider),
              tools: [Alloy.Tool.Core.Read],
              max_turns: 8,
-             timeout_ms: 60_000,
-             max_budget_cents: 25
+             timeout_ms: 60_000
            ) do
         {:ok, result} ->
           {:ok, result.text || ""}

@@ -9,7 +9,7 @@
 
 Alloy is the completion-tool-call loop and nothing else. Send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. No opinions on sessions, persistence, memory, scheduling, or UI — those belong in your application, where OTP already gives you the runtime.
 
-Alloy is a harness, not a framework. Three runtime dependencies, ~9,000 lines — small enough to read in an afternoon, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
+Alloy is a harness, not a framework. Four runtime dependencies, ~11,000 lines — small enough to read in a day, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and tell me the version",
@@ -17,7 +17,7 @@ Alloy is a harness, not a framework. Three runtime dependencies, ~9,000 lines �
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.12.0"
+result.text #=> "The version is 0.12.5"
 ```
 
 ## Why Alloy?
@@ -62,20 +62,20 @@ application layer. The library stays small so those choices remain yours.
 - **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
 - **4 built-in tools** — read, write, edit, bash — plus inline tools defined as data with `Alloy.Tool.inline/1`
 - **GenServer agents** — supervised, stateful, message-passing (moving to the optional `alloy_agent` runtime package in 0.13)
-- **Streaming** — token-by-token from any provider, unified interface
+- **Streaming** — incremental HTTP provider output; Codex replays final text through the same interface
 - **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
 - **Middleware** — custom hooks, tool blocking, argument editing
 - **Context compaction** — tool-result clearing plus summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
 - **Memory primitive** — `Alloy.Memory` behaviour for Anthropic's `memory_20250818` tool. Alloy owns the wire format and path validation; you own the store (in-memory, disk, Postgres — whatever fits)
 - **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
-- **Reasoning blocks** — DeepSeek/xAI `reasoning_content` parsed as first-class thinking blocks
+- **Reasoning blocks** — OpenAI encrypted reasoning, Anthropic and Gemini signed thinking, and DeepSeek/Kimi/GLM `reasoning_content` are kept as blocks and sent back the way each API requires
 - **Tool guardrails** — `concurrent?/0` controls parallel execution, `max_result_chars/0` caps output, prompt-too-long auto-recovery. Note: the bash tool's restricted mode is a guardrail, not a sandbox — see [Built-in tools](#built-in-tools)
 - **Structured output** — `until_tool` forces the loop to continue until a specific tool is called
 - **Provider passthrough** — `extra_body` injects arbitrary provider-specific params (response_format, temperature, reasoning_effort)
 - **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
-- **Cost guard** — `max_budget_cents` halts the loop before overspending
+- **Budget limits** — a small `:before_completion` middleware [recipe](#budget-limits) prices usage and halts the run
 - **Pluggable model catalog** — `Alloy.ModelCatalog` behaviour; bring your own context-window source (e.g., an `llm_db` adapter)
-- **~9,000 lines** — small enough to read, understand, and extend
+- **~11,000 lines** — small enough to read, understand, and extend
 
 ## Installation
 
@@ -103,7 +103,7 @@ Prefer a runnable version? [![Run in Livebook](https://livebook.dev/badge/v1/blu
 
 ```elixir
 {:ok, result} = Alloy.run("What is 2+2?",
-  provider: {Alloy.Provider.Anthropic, api_key: "sk-ant-...", model: "claude-sonnet-4-6"}
+  provider: {Alloy.Provider.Anthropic, api_key: "sk-ant-...", model: "claude-sonnet-5-5"}
 )
 
 result.text #=> "4"
@@ -114,15 +114,17 @@ result.text #=> "4"
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and summarize the dependencies",
   provider: {Alloy.Provider.Gemini,
-    api_key: "...", model: "gemini-2.5-flash-lite"},
+    api_key: "...", model: "gemini-3.5-flash"},
   tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Bash],
   max_turns: 10
 )
 ```
 
-Gemini model IDs Alloy now budgets for include `gemini-2.5-pro`,
-`gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-pro-preview`, and
-`gemini-3-flash-preview`.
+For new Gemini integrations, Google recommends `gemini-3.8-flash` or
+`gemini-3.5-flash-lite`; 2.5 access is restricted to prior active users. The
+built-in catalog budgets context for Gemini 2.5 Pro/Flash/Flash-Lite,
+`gemini-3.1-pro-preview`, 3.1 and 3.5 Flash-Lite, and 3.5–3.8 Flash. See
+[provider compatibility](docs/provider-compatibility.md).
 
 ### Swap providers in one line
 
@@ -131,21 +133,21 @@ Gemini model IDs Alloy now budgets for include `gemini-2.5-pro`,
 opts = [tools: [Alloy.Tool.Core.Read], max_turns: 10]
 
 # Anthropic
-Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"}} | opts])
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-5-5"}} | opts])
 
-# OpenAI
-Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"}} | opts])
+# OpenAI (Responses API)
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-6.1-sol"}} | opts])
 
 # Gemini
-Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Gemini, api_key: "...", model: "gemini-2.5-flash"}} | opts])
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.Gemini, api_key: "...", model: "gemini-3.8-flash"}} | opts])
 
-# xAI via Responses-compatible API
-Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAI, api_key: "...", api_url: "https://api.x.ai", model: "grok-4.20-0309-reasoning"}} | opts])
+# xAI (Responses API; its Chat Completions API is legacy and returns no reasoning)
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.XAI, api_key: "...", model: "grok-4.7"}} | opts])
 
-# xAI via chat completions (reasoning models, extra_body)
-Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAICompat, api_key: "...", api_url: "https://api.x.ai", model: "grok-4.1-fast-reasoning"}} | opts])
+# DeepSeek (thinking mode; reasoning_content is sent back as the API requires)
+Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAICompat, api_key: "...", api_url: "https://api.deepseek.com", model: "deepseek-v4-pro"}} | opts])
 
-# Any OpenAI-compatible API (Ollama, OpenRouter, DeepSeek, Mistral, Groq, etc.)
+# Any OpenAI-compatible API (Ollama, OpenRouter, Mistral, Groq, etc.)
 Alloy.run("Read mix.exs", [{:provider, {Alloy.Provider.OpenAICompat, api_url: "http://localhost:11434", model: "llama4"}} | opts])
 ```
 
@@ -175,7 +177,7 @@ For a persistent agent process with conversation state, use `Alloy.Agent.Server.
 end)
 ```
 
-All providers support streaming. If a custom provider doesn't implement
+HTTP providers stream incrementally; Codex emulates streaming by replaying final text. If a custom provider doesn't implement
 `stream/4`, the turn loop falls back to `complete/3` automatically.
 
 `Alloy.run/2` remains the buffered convenience API. Use `Alloy.stream/3`
@@ -183,48 +185,47 @@ when you want the same one-shot flow with token streaming.
 
 ### Provider-owned state
 
-Some provider APIs expose server-side state such as stored response IDs.
-That transport concern lives in Alloy; your app decides whether and how to
-persist it.
+Some provider APIs keep state on their side, such as stored OpenAI/xAI
+response IDs or an Anthropic code-execution container. That transport
+concern lives in Alloy; your app decides whether and how to persist it.
 
-Results expose provider-owned state in `result.metadata.provider_state`:
-
-```elixir
-{:ok, result} =
-  Alloy.run("Read the repo",
-    provider: {Alloy.Provider.OpenAI,
-      api_key: System.get_env("XAI_API_KEY"),
-      api_url: "https://api.x.ai",
-      model: "grok-4.20-0309-reasoning",
-      store: true
-    }
-  )
-
-provider_state = result.metadata.provider_state
-```
-
-Pass that state back to the same provider on the next turn to continue a
-provider-native conversation:
+Results expose provider-owned state in `result.metadata.provider_state`.
+Pass it back with the conversation when you continue a run, and the provider
+reuses what it needs (for example the code-execution container):
 
 ```elixir
 {:ok, next_result} =
   Alloy.run("Keep going",
     messages: result.messages,
-    provider: {Alloy.Provider.OpenAI,
-      api_key: System.get_env("XAI_API_KEY"),
-      api_url: "https://api.x.ai",
-      model: "grok-4.20-0309-reasoning",
-      provider_state: provider_state
+    provider: {Alloy.Provider.Anthropic,
+      api_key: System.get_env("ANTHROPIC_API_KEY"),
+      model: "claude-sonnet-5-5",
+      provider_state: result.metadata.provider_state
     }
   )
 ```
 
-For native OpenAI Responses, Alloy automatically preserves opaque reasoning
-items across stateless tool-call turns. When `store` is not `true` and no
-`previous_response_id` / `provider_state.response_id` is present, the request
-adds `include: ["reasoning.encrypted_content"]` and echoes returned reasoning
-items back verbatim before their related function calls; `result.text` ignores
-those opaque blocks.
+By default every request carries the full conversation. To continue an
+OpenAI or xAI response stored server-side instead, pass its ID as
+`previous_response_id:` together with **only the new messages**: the server
+prepends the stored conversation, so sending the full history too would
+duplicate it and bill it twice.
+
+```elixir
+{:ok, next_result} =
+  Alloy.run("Keep going",
+    provider: {Alloy.Provider.XAI,
+      api_key: System.get_env("XAI_API_KEY"),
+      model: "grok-4.7",
+      previous_response_id: result.metadata.provider_state.response_id
+    }
+  )
+```
+
+Without `previous_response_id` (and with `store` not `true`), the OpenAI and
+xAI providers run stateless: they request encrypted reasoning and send
+returned reasoning items back verbatim before their related function calls;
+`result.text` ignores those opaque blocks.
 
 ### Provider-native tools and citations
 
@@ -236,10 +237,9 @@ For xAI search tools:
 ```elixir
 {:ok, result} =
   Alloy.run("Summarise the latest xAI docs updates",
-    provider: {Alloy.Provider.OpenAI,
+    provider: {Alloy.Provider.XAI,
       api_key: System.get_env("XAI_API_KEY"),
-      api_url: "https://api.x.ai",
-      model: "grok-4.20-0309-reasoning",
+      model: "grok-4.7",
       web_search: %{allowed_domains: ["docs.x.ai"]},
       include: ["inline_citations"]
     }
@@ -318,44 +318,74 @@ compacts older context:
 )
 ```
 
-Alloy first clears old `tool_result` and `server_tool_result` content in one
-batch, preserving the newest `keep_recent_tool_results` results, then only
-calls the summarizer if the run is still over budget. Batched clearing matters
-with prompt caching: clearing invalidates cached prefixes, so Alloy amortizes
-that cost instead of dripping changes across turns.
+Alloy first clears old `tool_result` content in one batch, preserving the
+newest `keep_recent_tool_results` results, then only calls the summarizer if
+the run is still over budget. Batched clearing matters with prompt caching:
+clearing invalidates cached prefixes, so Alloy amortizes that cost instead of
+dripping changes across turns. The estimate counts the system prompt, tool
+definitions and every message block.
+
+Whenever compaction changes history, every thinking block is removed,
+including the turn in progress: Claude 5.x rejects signed thinking whose
+earlier history changed, and removing all of it is the documented way to
+keep the transcript valid. Under manual thinking, which requires the turn in
+progress to start with thinking, that turn keeps it. Compaction never splits
+a tool call from its result.
 
 Set `summary_system_prompt:` and `summary_prompt:` inside `compaction:` when
 your application needs to own the handoff format. Both values must be strings;
 omitting them uses Alloy's default summary prompts.
 
-### Cost guard
+### Budget limits
 
-Cap how much an agent run can spend:
+Price the accumulated usage in `:before_completion` middleware, which runs
+before every provider request, and halt when the run reaches its limit:
 
 ```elixir
-{:ok, result} = Alloy.run("Research this codebase thoroughly",
-  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"},
-  tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Bash],
-  max_budget_cents: 50
-)
+defmodule MyApp.BudgetGuard do
+  @behaviour Alloy.Middleware
 
-case result.status do
-  :completed -> IO.puts(result.text)
-  :budget_exceeded -> IO.puts("Stopped: spent #{result.usage.estimated_cost_cents}¢")
+  # USD per million tokens for the model you run.
+  @input_per_m 3.0
+  @output_per_m 15.0
+
+  @impl true
+  def call(:before_completion, state) do
+    limit = Map.fetch!(state.config.context, :max_budget_cents)
+    usage = Alloy.Usage.estimate_cost(state.usage, @input_per_m, @output_per_m)
+
+    if usage.estimated_cost_cents >= limit,
+      do: {:halt, "budget of #{limit} cents reached"},
+      else: state
+  end
+
+  def call(_hook, state), do: state
 end
+
+Alloy.run(prompt,
+  provider: provider,
+  middleware: [MyApp.BudgetGuard],
+  context: %{max_budget_cents: 50}
+)
 ```
 
-Set `max_budget_cents: nil` (default) for no limit.
+A halted run returns `{:error, result}` with `status: :halted`.
+`estimate_cost/3` prices input and output tokens only; `usage.input_tokens`
+is uncached input, so add your provider's cache read and write prices
+(`cache_read_input_tokens`, `cache_creation_input_tokens`) if you use prompt
+caching. The `max_budget_cents:` option is deprecated and will be removed in
+0.13: no built-in provider reports a cost, so it never fired with them.
 
 ### Anthropic prompt caching
 
 Enable prompt caching to save 60-90% on input tokens. Alloy automatically adds
-`cache_control` breakpoints to the system prompt and last tool definition:
+`cache_control` breakpoints to the system prompt, the last tool definition
+that is not `defer_loading`, and the end of the conversation:
 
 ```elixir
 {:ok, result} = Alloy.run("Explain this codebase",
   provider: {Alloy.Provider.Anthropic,
-    api_key: "...", model: "claude-sonnet-4-6",
+    api_key: "...", model: "claude-sonnet-5-5",
     cache: true
   },
   tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Bash],
@@ -393,15 +423,17 @@ defmodule MyApp.Memory.Disk do
 end
 
 {:ok, result} = Alloy.run("Remember the user prefers SI units",
-  provider: {Alloy.Provider.Anthropic, api_key: "sk-ant-...", model: "claude-sonnet-4-6"},
+  provider: {Alloy.Provider.Anthropic, api_key: "sk-ant-...", model: "claude-sonnet-5-5"},
   memory: {MyApp.Memory.Disk, root: "/var/agent/memories"}
 )
 ```
 
 When `:memory` is set, Alloy injects the `memory_20250818` tool into the
-Anthropic request and adds the `context-management-2025-06-27` beta
-header. Memory tool calls are routed through `Alloy.Memory.Router`
-(not the general tool executor) so the typed-tool contract stays clean.
+Anthropic request (the memory tool is generally available; no beta header is
+needed). Memory tool calls are routed through `Alloy.Memory.Router`, which
+validates every path against the `/memories` root, so the typed-tool
+contract stays clean. Configuring `:memory` together with your own tool named
+`memory` raises at startup.
 
 The store term (second element of `{module, opts}`) is opaque — pass a
 keyword list, a map, a `pid()`, or a struct, whichever your store needs.
@@ -413,16 +445,17 @@ As of 0.12.0, memory is Anthropic-only — configuring `:memory` with any
 other provider raises at `Alloy.run/2` entry. Other providers will be
 wired as they ship their own memory primitives.
 
-### Reasoning model support (DeepSeek, xAI)
+### Reasoning model support (DeepSeek, Kimi, GLM)
 
-OpenAI-compatible reasoning models that return `reasoning_content` (DeepSeek-R1,
-xAI Grok reasoning variants) are automatically parsed into thinking blocks:
+OpenAI-compatible reasoning models that return `reasoning_content` are parsed
+into thinking blocks, and the reasoning is sent back on later assistant
+messages, which DeepSeek's thinking mode requires during tool calls:
 
 ```elixir
 {:ok, result} = Alloy.run("Solve this step by step",
   provider: {Alloy.Provider.OpenAICompat,
-    api_url: "https://api.x.ai",
-    api_key: "...", model: "grok-4.1-fast-reasoning"
+    api_url: "https://api.deepseek.com",
+    api_key: "...", model: "deepseek-v4-pro"
   }
 )
 
@@ -443,7 +476,7 @@ so it can override any default field:
 {:ok, result} = Alloy.run("Return JSON",
   provider: {Alloy.Provider.OpenAICompat,
     api_url: "https://api.deepseek.com",
-    api_key: "...", model: "deepseek-chat",
+    api_key: "...", model: "deepseek-v4-pro",
     extra_body: %{
       "response_format" => %{"type" => "json_object"},
       "temperature" => 0.3
@@ -464,8 +497,10 @@ logging, or custom metrics:
 :telemetry.attach_many("my-handler", [
   [:alloy, :run, :start],
   [:alloy, :run, :stop],
+  [:alloy, :run, :exception],
   [:alloy, :turn, :start],
   [:alloy, :turn, :stop],
+  [:alloy, :turn, :exception],
   [:alloy, :provider, :request],
   [:alloy, :compaction, :cleared],
   [:alloy, :compaction, :done],
@@ -479,13 +514,18 @@ logging, or custom metrics:
 |-------|-------------|----------|
 | `[:alloy, :run, :start]` | `system_time` | `model` |
 | `[:alloy, :run, :stop]` | `duration_ms` | `status`, `turns`, `model` |
-| `[:alloy, :turn, :start]` | `system_time` | `turn` |
-| `[:alloy, :turn, :stop]` | — | `turn`, `status` |
+| `[:alloy, :run, :exception]` | `duration_ms` | `kind`, `reason`, `stacktrace`, `model` |
+| `[:alloy, :turn, :start]` | `system_time`, `monotonic_time` | `turn`, `telemetry_span_context` |
+| `[:alloy, :turn, :stop]` | `duration`, `monotonic_time` | `turn`, `status`, `telemetry_span_context` |
+| `[:alloy, :turn, :exception]` | `duration`, `monotonic_time` | `turn`, `kind`, `reason`, `stacktrace` |
 | `[:alloy, :provider, :request]` | `duration_ms` | `provider`, `model`, `streaming`, `attempt`, `result` |
 | `[:alloy, :compaction, :cleared]` | `results_cleared`, `bytes_cleared` | `turn` |
 | `[:alloy, :compaction, :done]` | `messages_before`, `messages_after` | `turn` |
 | `[:alloy, :tool, :start]` | — | tool identity, correlation |
 | `[:alloy, :tool, :stop]` | `duration_ms` | tool identity, result |
+
+Each turn's stop fires when that turn ends. A turn the loop continues past
+reports `status: :running`; the run's outcome is on `[:alloy, :run, :stop]`.
 
 ### Structured output with `until_tool`
 
@@ -508,11 +548,14 @@ defmodule SubmitAnswer do
 end
 
 {:ok, result} = Alloy.run("What is the capital of France?",
-  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"},
+  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-5-5"},
   tools: [SubmitAnswer],
   until_tool: "submit_answer"
 )
 ```
+
+The target tool's call has to succeed: a call that errors, is blocked by
+middleware, or names an unknown tool does not satisfy `until_tool`.
 
 ### Middleware: editing tool arguments
 
@@ -573,35 +616,78 @@ end
 
 | Vendor | Recommended Module | Example Models |
 |--------|---------------------|----------------|
-| Anthropic | `Alloy.Provider.Anthropic` | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
-| Gemini | `Alloy.Provider.Gemini` | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-3-pro-preview`, `gemma-4-26b-a4b-it` (open-weight) |
-| OpenAI | `Alloy.Provider.OpenAI` | `gpt-5.4` |
-| xAI | `Alloy.Provider.OpenAI` with `api_url: "https://api.x.ai"` | `grok-4.20-0309-reasoning`, `grok-4.20-multi-agent-0309`, `grok-4.1-fast-reasoning`, `grok-code-fast-1` |
-| Other OpenAI-compatible APIs | `Alloy.Provider.OpenAICompat` | `kimi-k2.6` (Moonshot), `qwen3-coder-plus` (1M ctx), `glm-4.6`, `mistral-large-2512`, plus Ollama, OpenRouter, DeepSeek, Groq, Together |
+| Anthropic | `Alloy.Provider.Anthropic` | `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` |
+| Gemini | `Alloy.Provider.Gemini` | `gemini-3.8-flash`, `gemini-3.5-flash-lite` |
+| OpenAI | `Alloy.Provider.OpenAI` | `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-luna` |
+| xAI | `Alloy.Provider.XAI` | `grok-4.7`, `grok-4.3` |
+| Codex CLI (ChatGPT subscription) | `Alloy.Provider.Codex` | any model your Codex login can use |
+| Other OpenAI-compatible APIs | `Alloy.Provider.OpenAICompat` | DeepSeek `deepseek-v4-pro`, Moonshot `kimi-k2.6`, plus Ollama, OpenRouter, Mistral, Groq, Together |
 
-Use `Alloy.Provider.OpenAI` for native Responses APIs like OpenAI and xAI.
-Use `Alloy.Provider.Gemini` for Gemini's native GenerateContent API.
-Use `Alloy.Provider.OpenAICompat` for chat-completions compatible APIs and local runtimes.
+The table lists current example IDs, not a built-in catalog or a live-tested
+model allowlist. Models outside the built-in catalog use a 200,000-token
+compaction budget; set `model_metadata_overrides` or a `model_catalog` for
+them. Check [provider compatibility](docs/provider-compatibility.md) for
+context overrides, adaptive thinking, and MCP version constraints.
 
-`OpenAICompat` works with any API that implements the OpenAI chat completions format.
-Just set `api_url`, `model`, and optionally `api_key` and `chat_path`.
+Use `Alloy.Provider.OpenAI` for OpenAI Responses and `Alloy.Provider.XAI` for
+xAI Responses. Current OpenAI models (GPT-5.4 and later) only call tools with
+reasoning on through the Responses API, so use `Alloy.Provider.OpenAI` rather
+than `OpenAICompat` for them. Use `Alloy.Provider.Gemini` for Gemini's native
+GenerateContent API, and `Alloy.Provider.OpenAICompat` for chat-completions
+compatible APIs and local runtimes: set `api_url`, `model`, and optionally
+`api_key` and `chat_path`.
+
+No built-in provider sends a default output cap except Anthropic, whose API
+requires one (16,000 tokens by default). Reasoning counts against the cap on
+current models, so set `:max_tokens` only when you want a hard limit; a
+truncated answer completes with `result.stop_reason == :max_tokens`.
+
+**Anthropic thinking.** Claude 4.7 and later reject the manual
+`extended_thinking: [budget_tokens: ...]` option, which is deprecated; use
+adaptive thinking through `extra_body`:
+
+```elixir
+{Alloy.Provider.Anthropic,
+ api_key: "...",
+ model: "claude-sonnet-5-5",
+ extra_body: %{"thinking" => %{"type" => "adaptive", "display" => "summarized"}}}
+```
+
+**Codex.** `Alloy.Provider.Codex` drives the `codex` CLI (0.122.0 or later)
+with your ChatGPT login and reports token usage. It uses your `CODEX_HOME`,
+including its `AGENTS.md` and skills. For agents, log in to a dedicated home
+(`CODEX_HOME=~/.codex-alloy codex login`) and pass `codex_home:` — that also
+keeps concurrent agents from refreshing the same token as your interactive
+Codex.
 
 ## Built-in Tools
 
 | Tool | Module | Description |
 |------|--------|-------------|
-| **read** | `Alloy.Tool.Core.Read` | Read files from disk |
+| **read** | `Alloy.Tool.Core.Read` | Read text files, paged with `offset`/`limit`; refuses binary files |
 | **write** | `Alloy.Tool.Core.Write` | Write files to disk |
-| **edit** | `Alloy.Tool.Core.Edit` | Search-and-replace editing |
+| **edit** | `Alloy.Tool.Core.Edit` | Exact search-and-replace; keeps CRLF line endings and BOMs |
 | **bash** | `Alloy.Tool.Core.Bash` | Execute shell commands (restricted shell by default) |
 
+Tool calls run in the order the model made them; consecutive calls to
+concurrency-safe tools run in parallel. Input that is not a map, or is
+missing a schema's `required` keys, is returned to the model as an error
+before `execute/2` runs.
+
 > **Bash is a guardrail, not a sandbox.** Restricted mode (`bash -r`) blocks
-> `cd`, `PATH` changes, and redirection — but any interpreter on `PATH`
-> (`python3 -c`, `perl -e`) gives full capability, so treat it as a speed
-> bump against accidents, not an isolation boundary. For real isolation,
+> `cd`, `PATH` changes, and redirection in the top-level shell only — a
+> nested `bash -c` or any interpreter on `PATH` (`python3 -c`, `perl -e`)
+> gives full capability, so treat it as a speed bump against accidents, not
+> an isolation boundary. What bash does guarantee: on timeout it kills the
+> command's whole process group; output is capped while it streams; and
+> variables whose names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or
+> `CREDENTIAL` are not passed to commands (set `:bash_env` in context to
+> choose the environment, or `:inherit` for all of it). For real isolation,
 > supply your own `:bash_executor` in context (container, jail, firejail, or
-> a remote runner) and restrict file tools with `:allowed_paths`. Treat the
-> agent's shell access as you would a contractor's laptop on your network.
+> a remote runner). `:allowed_paths` restricts the read, write and edit
+> tools to those directories (symlinks resolved); it does not restrict bash.
+> Treat the agent's shell access as you would a contractor's laptop on your
+> network.
 
 ### Custom tools
 
@@ -685,9 +771,23 @@ Enable Anthropic's server-side code execution sandbox:
 
 ```elixir
 {:ok, result} = Alloy.run("Calculate the first 20 Fibonacci numbers",
-  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"},
+  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-5-5"},
   code_execution: true
 )
+```
+
+Anthropic runs server tools itself, so Alloy never answers their calls. To let
+Claude call one of your tools from inside code execution (programmatic tool
+calling), set `allowed_callers: [:code_execution]` on the tool; Alloy keeps
+the code-execution container across turns in `provider_state`. Add other
+server tools — web search, web fetch, `mcp_toolset`, tool search — with the
+provider's `:server_tools` option, alongside your own tools:
+
+```elixir
+{Alloy.Provider.Anthropic,
+ api_key: "...",
+ model: "claude-sonnet-5-5",
+ server_tools: [%{type: "web_search_20260209", name: "web_search", max_uses: 5}]}
 ```
 
 ## Architecture
@@ -713,4 +813,8 @@ MIT — see [LICENSE](LICENSE).
 ## Releases
 
 Hex.pm publishing is handled by GitHub Actions on `v*` tags.
-Successful publishes also dispatch the landing-site version sync workflow.
+When `ALLOY_WEBSITE_SYNC_TOKEN` is configured, successful publishes also
+dispatch the landing-site version sync workflow. The token needs Contents:
+write on `alloy-ex/alloy-ex.github.io`; without it the dispatch is skipped
+with a warning. GitHub Release entries are separate from Hex publishing.
+Check [Hex](https://hex.pm/packages/alloy) for published package versions.

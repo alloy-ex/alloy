@@ -5,7 +5,11 @@ defmodule Alloy.Tool.Core.Edit do
   Finds `old_string` in the file and replaces it with `new_string`.
   By default, the match must be unique (appears exactly once). Set
   `replace_all: true` to replace all occurrences. Returns an error
-  if no match is found or if the match is ambiguous.
+  if no match is found, if the match is ambiguous, if `old_string` is
+  empty, or if the edit would change nothing.
+
+  Matching ignores the difference between CRLF and LF, and the file keeps
+  its line endings and any UTF-8 byte order mark.
 
   ## Usage
 
@@ -46,24 +50,38 @@ defmodule Alloy.Tool.Core.Edit do
 
   @impl true
   def execute(input, context) do
-    case Alloy.Tool.resolve_path(input["file_path"], context) do
-      {:error, reason} ->
-        {:error, reason}
+    replace_all = input["replace_all"] || false
 
-      {:ok, path} ->
-        old_string = input["old_string"]
-        new_string = input["new_string"]
-        replace_all = input["replace_all"] || false
+    with {:ok, old_string, new_string} <- strings(input["old_string"], input["new_string"]),
+         {:ok, path} <- Alloy.Tool.resolve_path(input["file_path"], context),
+         {:ok, raw} <- read_file(path) do
+      # The model works from `read` output and writes LF without a BOM, so
+      # match on LF text and put the file's BOM and line endings back.
+      {bom, content} = split_bom(raw)
+      ending = line_ending(content)
 
-        with {:ok, content} <- read_file(path),
-             {:ok, new_content} <- do_replace(content, old_string, new_string, replace_all) do
-          case File.write(path, new_content) do
-            :ok -> {:ok, "Successfully edited #{path}"}
-            {:error, reason} -> {:error, "Failed to write #{path}: #{reason}"}
-          end
-        end
+      with {:ok, edited} <- do_replace(to_lf(content), old_string, new_string, replace_all) do
+        write_file(path, bom <> from_lf(edited, ending))
+      end
     end
   end
+
+  defp strings(old_string, new_string) when is_binary(old_string) and is_binary(new_string) do
+    case {to_lf(old_string), to_lf(new_string)} do
+      {"", _new} ->
+        {:error,
+         "old_string must not be empty. Use the write tool to create or overwrite a file."}
+
+      {same, same} ->
+        {:error, "old_string and new_string are identical; the edit would change nothing."}
+
+      {old, new} ->
+        {:ok, old, new}
+    end
+  end
+
+  defp strings(_old_string, _new_string),
+    do: {:error, "old_string and new_string must be strings."}
 
   defp read_file(path) do
     case File.read(path) do
@@ -71,6 +89,29 @@ defmodule Alloy.Tool.Core.Edit do
       {:error, reason} -> {:error, "Cannot read #{path}: #{reason}"}
     end
   end
+
+  defp write_file(path, content) do
+    case File.write(path, content) do
+      :ok -> {:ok, "Successfully edited #{path}"}
+      {:error, reason} -> {:error, "Failed to write #{path}: #{reason}"}
+    end
+  end
+
+  defp split_bom(<<0xEF, 0xBB, 0xBF, rest::binary>>), do: {<<0xEF, 0xBB, 0xBF>>, rest}
+  defp split_bom(content), do: {"", content}
+
+  # The first line ending decides, as in pi and most editors.
+  defp line_ending(content) do
+    case :binary.match(content, "\n") do
+      {pos, _} when pos > 0 and binary_part(content, pos - 1, 1) == "\r" -> "\r\n"
+      _lf_or_single_line -> "\n"
+    end
+  end
+
+  defp to_lf(text), do: String.replace(text, "\r\n", "\n")
+
+  defp from_lf(text, "\r\n"), do: String.replace(text, "\n", "\r\n")
+  defp from_lf(text, "\n"), do: text
 
   defp do_replace(content, old_string, new_string, replace_all) do
     count = count_occurrences(content, old_string)

@@ -66,6 +66,17 @@ defmodule Alloy.Tool.ExecutorTest do
     def result_type, do: :structured
   end
 
+  defmodule StrictEchoTool do
+    @behaviour Alloy.Tool
+    def name, do: "strict_echo"
+    def description, do: "Echoes text"
+
+    def input_schema,
+      do: %{type: "object", properties: %{text: %{type: "string"}}, required: ["text"]}
+
+    def execute(%{"text" => text}, _ctx), do: {:ok, "echo #{text}"}
+  end
+
   defmodule BlockingMiddleware do
     @behaviour Alloy.Middleware
 
@@ -190,6 +201,105 @@ defmodule Alloy.Tool.ExecutorTest do
       end
     end
 
+    for concurrent? <- [true, false], {kind, crash} <- [exit: :exit, throw: :throw] do
+      @tag capture_log: true
+      test "#{kind} in a #{if concurrent?, do: "concurrent", else: "sequential"} tool becomes an error result" do
+        crash =
+          case unquote(crash) do
+            :exit -> fn _input, _ctx -> exit(:boom) end
+            :throw -> fn _input, _ctx -> throw(:boom) end
+          end
+
+        tool =
+          Alloy.Tool.inline(
+            name: "crash",
+            description: "crashes",
+            input_schema: %{type: "object", properties: %{}},
+            concurrent?: unquote(concurrent?),
+            execute: crash
+          )
+
+        state = build_state([tool])
+        call = %{id: "c_crash", name: "crash", type: "tool_use", input: %{}}
+
+        assert %Message{content: [block]} = Executor.execute_all([call], state.tool_fns, state)
+        assert block.tool_use_id == "c_crash"
+        assert block.is_error == true
+        assert block.content =~ "Tool crash crashed"
+        assert block.content =~ ":boom"
+      end
+    end
+
+    test "tool_timeout applies to sequential tools" do
+      tool =
+        Alloy.Tool.inline(
+          name: "slow_seq",
+          description: "sleeps",
+          input_schema: %{type: "object", properties: %{}},
+          concurrent?: false,
+          execute: fn _input, _ctx ->
+            Process.sleep(2_000)
+            {:ok, "finished"}
+          end
+        )
+
+      state = build_state([tool], tool_timeout: 50)
+      call = %{id: "c_slow_seq", name: "slow_seq", type: "tool_use", input: %{}}
+
+      {elapsed_us, result} =
+        :timer.tc(fn -> Executor.execute_all([call], state.tool_fns, state) end)
+
+      assert %Message{content: [block]} = result
+      assert block.is_error == true
+
+      assert block.content ==
+               "Tool slow_seq timed out after 50ms. Try a smaller input or raise :tool_timeout."
+
+      assert elapsed_us < 1_000_000
+    end
+
+    test "invalid UTF-8 in a result is replaced so the transcript stays encodable" do
+      bytes = <<"ok ", 0xFF, 0xFE, " end">>
+
+      tools =
+        for {name, result} <- [{"bad_ok", {:ok, bytes}}, {"bad_err", {:error, bytes}}] do
+          Alloy.Tool.inline(
+            name: name,
+            description: name,
+            input_schema: %{type: "object", properties: %{}},
+            execute: fn _input, _ctx -> result end
+          )
+        end
+
+      state = build_state(tools)
+
+      calls = [
+        %{id: "c_ok", name: "bad_ok", type: "tool_use", input: %{}},
+        %{id: "c_err", name: "bad_err", type: "tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{content: [ok, err]} = msg, [_ok_meta, err_meta]} =
+               Executor.execute_all(calls, state.tool_fns, state, [])
+
+      assert ok.content == "ok �� end"
+      assert err.content == "ok �� end"
+      assert err.is_error
+      assert String.valid?(err_meta.error)
+      assert {:ok, _json} = Jason.encode(msg.content)
+    end
+
+    @tag :tmp_dir
+    test "reading a non-UTF-8 text file does not poison the transcript", %{tmp_dir: tmp_dir} do
+      path = Path.join(tmp_dir, "latin1.txt")
+      File.write!(path, <<"caf", 0xE9, "\n">>)
+      state = build_state([Alloy.Tool.Core.Read])
+      call = %{id: "c_read", name: "read", type: "tool_use", input: %{"file_path" => path}}
+
+      assert %Message{content: [block]} = Executor.execute_all([call], state.tool_fns, state)
+      assert block.content =~ "caf�"
+      assert {:ok, _json} = Jason.encode(block)
+    end
+
     test "tool returning {:error, reason} produces is_error block" do
       state = build_state([ErrorTool])
       tool_call = %{id: "call_err", name: "error_tool", type: "tool_use", input: %{}}
@@ -199,6 +309,51 @@ defmodule Alloy.Tool.ExecutorTest do
       assert %Message{role: :user, content: [block]} = result
       assert block.content == "something went wrong"
       assert block.is_error == true
+    end
+  end
+
+  describe "execute_all/3 — input validation" do
+    test "missing required keys are an error result naming them, not a crash" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {block, meta} = run_one(StrictEchoTool, %{"other" => 1})
+
+          assert block.is_error
+          assert block.content =~ "Missing required parameter"
+          assert block.content =~ "text"
+          assert meta.error == block.content
+        end)
+
+      refute log =~ "FunctionClauseError"
+    end
+
+    test "required keys may be atoms or strings in the schema, and in the input" do
+      atom_schema = inline_with_schema(%{type: "object", required: [:a, "b"]})
+      string_schema = inline_with_schema(%{"type" => "object", "required" => ["a", "b"]})
+
+      for tool <- [atom_schema, string_schema] do
+        assert {%{is_error: true, content: content}, _} = run_one(tool, %{"a" => 1})
+        assert content =~ ": b."
+
+        for input <- [%{"a" => 1, "b" => 2}, %{"a" => 1, b: 2}] do
+          assert {block, %{error: nil}} = run_one(tool, input)
+          refute Map.has_key?(block, :is_error)
+        end
+      end
+    end
+
+    test "input that is not an object is an error result" do
+      {block, _meta} = run_one(StrictEchoTool, "just a string")
+
+      assert block.is_error
+      assert block.content =~ "must be a JSON object"
+    end
+
+    test "types are not checked, so loose schemas keep working" do
+      tool = inline_with_schema(%{type: "object", required: ["n"]})
+
+      assert {block, _} = run_one(tool, %{"n" => "not a number", "extra" => true})
+      refute Map.get(block, :is_error)
     end
   end
 
@@ -418,55 +573,6 @@ defmodule Alloy.Tool.ExecutorTest do
     end
   end
 
-  describe "execute_all/4 — server_tool_use (code_execution)" do
-    test "server_tool_use call produces server_tool_result block" do
-      state = build_state([SuccessTool])
-      call = %{id: "srvtoolu_01", name: "success", type: "server_tool_use", input: %{}}
-
-      assert {:ok, %Message{role: :user, content: [block]}, [meta]} =
-               Executor.execute_all([call], state.tool_fns, state, on_event: fn _ -> :ok end)
-
-      assert block.type == "server_tool_result"
-      assert block.tool_use_id == "srvtoolu_01"
-      assert block.content == "it worked"
-      refute Map.get(block, :is_error)
-
-      assert meta.id == "srvtoolu_01"
-      assert meta.name == "success"
-    end
-
-    test "server_tool_use error produces server_tool_result error block" do
-      state = build_state([ErrorTool])
-      call = %{id: "srvtoolu_02", name: "error_tool", type: "server_tool_use", input: %{}}
-
-      assert {:ok, %Message{role: :user, content: [block]}, [_meta]} =
-               Executor.execute_all([call], state.tool_fns, state, on_event: fn _ -> :ok end)
-
-      assert block.type == "server_tool_result"
-      assert block.tool_use_id == "srvtoolu_02"
-      assert block.content == "something went wrong"
-      assert block.is_error == true
-    end
-
-    test "mixed server_tool_use and tool_use in same batch produce correct result types" do
-      state = build_state([SuccessTool, ErrorTool])
-
-      calls = [
-        %{id: "toolu_01", name: "success", type: "tool_use", input: %{}},
-        %{id: "srvtoolu_01", name: "error_tool", type: "server_tool_use", input: %{}}
-      ]
-
-      assert {:ok, %Message{role: :user, content: blocks}, _metas} =
-               Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
-
-      regular = Enum.find(blocks, &(&1.tool_use_id == "toolu_01"))
-      server = Enum.find(blocks, &(&1.tool_use_id == "srvtoolu_01"))
-
-      assert regular.type == "tool_result"
-      assert server.type == "server_tool_result"
-    end
-  end
-
   describe "execute_all/4 — events and metadata" do
     test "emits tool_start/tool_end and returns tool metadata" do
       state = build_state([SuccessTool])
@@ -573,6 +679,52 @@ defmodule Alloy.Tool.ExecutorTest do
                         }}}
     end
 
+    test "a timed-out tool's tool_end pairs with its tool_start and carries the real duration" do
+      state = build_state([Alloy.Test.SlowEchoTool], tool_timeout: 50)
+
+      call = %{
+        id: "c_slow",
+        name: "slow_echo",
+        type: "tool_use",
+        input: %{"text" => "hi", "sleep_ms" => 1_000}
+      }
+
+      test_pid = self()
+      handler_id = "tool-timeout-telemetry-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        handler_id,
+        [:alloy, :tool, :stop],
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {:tool_stop, measurements, metadata})
+        end,
+        nil
+      )
+
+      try do
+        assert {:ok, %Message{content: [%{is_error: true}]}, [meta]} =
+                 Executor.execute_all([call], state.tool_fns, state,
+                   on_event: fn event -> send(test_pid, {:event, event}) end
+                 )
+
+        assert_received {:event, {:tool_start, %{id: "c_slow", event_seq: start_seq}}}
+
+        assert_received {:event,
+                         {:tool_end, %{id: "c_slow", start_event_seq: ^start_seq} = tool_end}}
+
+        assert tool_end.duration_ms >= 50
+        assert meta.start_event_seq == start_seq
+        assert meta.duration_ms >= 50
+
+        assert_received {:tool_stop, %{duration_ms: duration_ms},
+                         %{tool_id: "c_slow", start_event_seq: ^start_seq}}
+
+        assert duration_ms >= 50
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "emits telemetry envelope with correlation and ordered sequence" do
       state = build_state([SuccessTool])
       call = %{id: "call_telemetry", name: "success", type: "tool_use", input: %{}}
@@ -648,6 +800,64 @@ defmodule Alloy.Tool.ExecutorTest do
     }
 
     State.init(config)
+  end
+
+  defp inline_with_schema(schema) do
+    Alloy.Tool.inline(
+      name: "schema_tool",
+      description: "Returns its input",
+      input_schema: schema,
+      execute: fn input, _ctx -> {:ok, inspect(input)} end
+    )
+  end
+
+  defp run_one(%Alloy.Tool.Inline{name: name} = tool, input), do: run_one(tool, name, input)
+  defp run_one(tool, input), do: run_one(tool, tool.name(), input)
+
+  defp run_one(tool, name, input) do
+    state = build_state([tool])
+    call = %{id: "c1", name: name, input: input}
+
+    {:ok, %Message{content: [block]}, [meta]} =
+      Executor.execute_all([call], state.tool_fns, state, [])
+
+    {block, meta}
+  end
+
+  # Each call logs {:start, id} and {:done, id} so the tests can see what
+  # overlapped. A sequential tool must observe everything the model asked
+  # for before it, and nothing it asked for after it.
+  defp logging_tool(name, log, concurrent?) do
+    Alloy.Tool.inline(
+      name: name,
+      description: name,
+      input_schema: %{type: "object", properties: %{}},
+      concurrent?: concurrent?,
+      execute: fn %{"id" => id}, _ctx ->
+        Agent.update(log, &[{:start, id} | &1])
+        Process.sleep(30)
+        Agent.update(log, &[{:done, id} | &1])
+        {:ok, id}
+      end
+    )
+  end
+
+  defp run_logged(names) do
+    {:ok, log} = Agent.start_link(fn -> [] end)
+    state = build_state([logging_tool("par", log, true), logging_tool("seq", log, false)])
+
+    calls =
+      names
+      |> Enum.with_index(1)
+      |> Enum.map(fn {name, i} ->
+        id = "#{name}#{i}"
+        %{id: id, name: name, type: "tool_use", input: %{"id" => id}}
+      end)
+
+    %Message{content: blocks} = Executor.execute_all(calls, state.tool_fns, state)
+    assert Enum.map(blocks, & &1.tool_use_id) == Enum.map(calls, & &1.id)
+
+    log |> Agent.get(& &1) |> Enum.reverse()
   end
 
   # --- Test Tools for max_result_chars ---
@@ -732,28 +942,101 @@ defmodule Alloy.Tool.ExecutorTest do
     end
   end
 
-  describe "execute_all — concurrency safety partitioning" do
-    test "sequential tools complete before parallel tools start" do
-      state = build_state([SequentialTool, ParallelTool])
+  describe "execute_all — cancellation" do
+    # Server.cancel_request kills the turn outright; tool tasks are unlinked
+    # (so a crashing tool can't take the turn down) and must still stop.
+    test "killing the caller stops its in-flight tool tasks" do
+      test_pid = self()
 
-      calls = [
-        %{id: "c_seq", name: "sequential", type: "tool_use", input: %{}},
-        %{id: "c_par", name: "parallel", type: "tool_use", input: %{}}
-      ]
+      tool =
+        Alloy.Tool.inline(
+          name: "slow",
+          description: "Reports its pid, then blocks",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, _ctx ->
+            send(test_pid, {:tool_pid, self()})
+            Process.sleep(10_000)
+            {:ok, "too late"}
+          end
+        )
 
-      assert {:ok, %Message{role: :user, content: blocks}, _meta} =
+      state = build_state([tool])
+      calls = [%{id: "c1", name: "slow", input: %{}}, %{id: "c2", name: "slow", input: %{}}]
+
+      caller =
+        spawn(fn ->
+          Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
+        end)
+
+      assert_receive {:tool_pid, tool_a}, 1_000
+      assert_receive {:tool_pid, tool_b}, 1_000
+      refs = Enum.map([tool_a, tool_b], &Process.monitor/1)
+
+      Process.exit(caller, :kill)
+
+      for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _, _}, 2_000)
+    end
+  end
+
+  describe "execute_all — execution order" do
+    test "a sequential call runs after the concurrent calls the model made before it" do
+      # e.g. [read f, edit f] must read the file before editing it
+      assert run_logged(["par", "seq"]) ==
+               [{:start, "par1"}, {:done, "par1"}, {:start, "seq2"}, {:done, "seq2"}]
+    end
+
+    test "concurrent calls after a sequential call wait for it" do
+      log = run_logged(["par", "seq", "par"])
+
+      assert Enum.take(log, 2) == [{:start, "par1"}, {:done, "par1"}]
+      assert Enum.slice(log, 2, 2) == [{:start, "seq2"}, {:done, "seq2"}]
+      assert Enum.drop(log, 4) == [{:start, "par3"}, {:done, "par3"}]
+    end
+
+    test "consecutive concurrent calls still run in parallel" do
+      log = run_logged(["seq", "par", "par", "seq"])
+
+      assert Enum.take(log, 2) == [{:start, "seq1"}, {:done, "seq1"}]
+      assert log |> Enum.slice(2, 2) |> Enum.sort() == [{:start, "par2"}, {:start, "par3"}]
+      assert Enum.take(log, -2) == [{:start, "seq4"}, {:done, "seq4"}]
+    end
+
+    # 0.12.4 ran concurrent calls through async_stream's default cap; a model
+    # that fans out dozens of calls must not start them all at once.
+    test "a large concurrent batch runs at most schedulers_online at a time" do
+      cap = System.schedulers_online()
+      running = :atomics.new(2, signed: true)
+
+      tool =
+        Alloy.Tool.inline(
+          name: "counted",
+          description: "Tracks how many copies run at once",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, _ctx ->
+            now = :atomics.add_get(running, 1, 1)
+            # Record the peak with a compare-and-swap loop.
+            peak = fn peak ->
+              seen = :atomics.get(running, 2)
+
+              if now > seen and :atomics.compare_exchange(running, 2, seen, now) != :ok,
+                do: peak.(peak)
+            end
+
+            peak.(peak)
+            Process.sleep(30)
+            :atomics.sub(running, 1, 1)
+            {:ok, "done"}
+          end
+        )
+
+      state = build_state([tool])
+      calls = for i <- 1..(cap + 4), do: %{id: "c#{i}", name: "counted", input: %{}}
+
+      assert {:ok, %Message{content: blocks}, _meta} =
                Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
 
-      seq_block = Enum.find(blocks, &(&1.tool_use_id == "c_seq"))
-      par_block = Enum.find(blocks, &(&1.tool_use_id == "c_par"))
-
-      assert seq_block.content =~ "seq:"
-      assert par_block.content =~ "par:"
-
-      "seq:" <> seq_ts = seq_block.content
-      "par:" <> par_ts = par_block.content
-
-      assert String.to_integer(seq_ts) <= String.to_integer(par_ts)
+      assert length(blocks) == cap + 4
+      assert :atomics.get(running, 2) <= cap
     end
 
     test "result order matches original call order" do

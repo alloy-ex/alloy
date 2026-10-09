@@ -3,21 +3,37 @@ defmodule Alloy.Provider.OpenAICompat do
   Generic OpenAI-compatible provider.
 
   Works with any API that implements the OpenAI chat completions format:
-  DeepSeek, Mistral, xAI/Grok, Ollama, OpenRouter, Together, Groq, etc.
+  DeepSeek, Mistral, Kimi, GLM, Ollama, OpenRouter, Together, Groq, etc.
+
+  Reasoning returned as `reasoning_content` (DeepSeek, Kimi, GLM) becomes a
+  `"thinking"` block and is sent back on later assistant messages, which
+  DeepSeek's thinking mode requires during tool calls.
+
+  Two providers have better native options:
+
+  - OpenAI: use `Alloy.Provider.OpenAI`. Starting with GPT-5.4, Chat
+    Completions does not support tool calling with reasoning enabled.
+  - xAI: use `Alloy.Provider.XAI`. xAI's Chat Completions endpoint is
+    deprecated and returns no reasoning content.
 
   ## Config
 
   Required:
   - `:api_url` - Base URL (e.g., "https://api.deepseek.com",
-    "https://api.mistral.ai", "https://api.x.ai", "http://localhost:11434")
+    "https://api.mistral.ai", "http://localhost:11434")
   - `:model` - Model name
 
   Optional:
   - `:api_key` - API key (omit for local providers like Ollama)
-  - `:max_tokens` - Max output tokens (default: 4096)
+  - `:max_tokens` - Max output tokens. Omitted unless set, so the server's
+    default applies
   - `:system_prompt` - System prompt string
   - `:chat_path` - Path to completions endpoint (default: "/v1/chat/completions")
   - `:extra_headers` - Additional headers as `[{name, value}]`
+  - `:extra_body` - Additional body fields, merged last
+  - `:stream_options` - Set to `false` to omit usage-request options from
+    streaming requests. Custom option maps can be supplied through
+    `extra_body: %{"stream_options" => options}`.
   - `:req_options` - Additional options passed to Req
 
   ## Examples
@@ -27,7 +43,7 @@ defmodule Alloy.Provider.OpenAICompat do
         provider: {Alloy.Provider.OpenAICompat,
           api_key: System.get_env("DEEPSEEK_API_KEY"),
           api_url: "https://api.deepseek.com",
-          model: "deepseek-chat"
+          model: "deepseek-v4-pro"
         }
       )
 
@@ -36,15 +52,6 @@ defmodule Alloy.Provider.OpenAICompat do
         provider: {Alloy.Provider.OpenAICompat,
           api_url: "http://localhost:11434",
           model: "llama4"
-        }
-      )
-
-      # xAI chat completions compatibility
-      Alloy.run("Hello",
-        provider: {Alloy.Provider.OpenAICompat,
-          api_key: System.get_env("XAI_API_KEY"),
-          api_url: "https://api.x.ai",
-          model: "grok-code-fast-1"
         }
       )
 
@@ -62,9 +69,8 @@ defmodule Alloy.Provider.OpenAICompat do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.OpenAIStream
+  alias Alloy.Provider.{Error, HTTP, OpenAIStream}
 
-  @default_max_tokens 4096
   @default_chat_path "/v1/chat/completions"
 
   @typedoc """
@@ -80,6 +86,8 @@ defmodule Alloy.Provider.OpenAICompat do
           optional(:system_prompt) => String.t(),
           optional(:chat_path) => String.t(),
           optional(:extra_headers) => [{String.t(), String.t()}],
+          optional(:extra_body) => map(),
+          optional(:stream_options) => false,
           optional(:req_options) => keyword()
         }
 
@@ -88,26 +96,15 @@ defmodule Alloy.Provider.OpenAICompat do
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
-    url = "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
 
-    req_opts =
-      ([
-         url: url,
-         method: :post,
-         headers: build_headers(config),
-         body: Jason.encode!(body)
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200, body: resp_body}} ->
-        parse_response(resp_body)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, parse_error(status, resp_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, resp_body} <-
+           HTTP.post_json(
+             chat_url(config),
+             build_headers(config),
+             body,
+             Map.get(config, :req_options, [])
+           ) do
+      parse_response(resp_body)
     end
   end
 
@@ -116,16 +113,20 @@ defmodule Alloy.Provider.OpenAICompat do
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     body = build_request_body(messages, tool_defs, config)
-    url = "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
+
+    body =
+      if config[:stream_options] == false, do: Map.put(body, "stream_options", false), else: body
 
     OpenAIStream.stream(
-      url,
+      chat_url(config),
       build_headers(config),
       body,
       on_chunk,
       Map.get(config, :req_options, [])
     )
   end
+
+  defp chat_url(config), do: "#{config.api_url}#{Map.get(config, :chat_path, @default_chat_path)}"
 
   defp build_headers(config) do
     base = [{"content-type", "application/json"}]
@@ -144,11 +145,12 @@ defmodule Alloy.Provider.OpenAICompat do
   defp build_request_body(messages, tool_defs, config) do
     openai_messages = build_messages(messages, config)
 
-    body = %{
-      "model" => config.model,
-      "max_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
-      "messages" => openai_messages
-    }
+    body =
+      maybe_put(
+        %{"model" => config.model, "messages" => openai_messages},
+        "max_tokens",
+        Map.get(config, :max_tokens)
+      )
 
     body =
       case tool_defs do
@@ -156,9 +158,17 @@ defmodule Alloy.Provider.OpenAICompat do
         defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
       end
 
-    # Merge extra_body LAST so caller can override any field
-    Map.merge(body, Map.get(config, :extra_body, %{}))
+    # Merge extra_body LAST so caller can override any field. Keys are
+    # stringified first: an atom key would sit beside the string key it
+    # meant to replace and be encoded as a duplicate JSON key.
+    extra_body =
+      Map.new(Map.get(config, :extra_body, %{}), fn {key, value} -> {to_string(key), value} end)
+
+    Map.merge(body, extra_body)
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp build_messages(messages, config) do
     system_msgs =
@@ -179,7 +189,8 @@ defmodule Alloy.Provider.OpenAICompat do
     [%{"role" => "assistant", "content" => content}]
   end
 
-  defp format_message(%Message{role: :assistant, content: blocks}) when is_list(blocks) do
+  defp format_message(%Message{role: :assistant, content: blocks} = message)
+       when is_list(blocks) do
     tool_calls =
       blocks
       |> Enum.filter(&(&1[:type] == "tool_use"))
@@ -215,7 +226,10 @@ defmodule Alloy.Provider.OpenAICompat do
       )
 
     msg = if(tool_calls == [], do: msg, else: Map.put(msg, "tool_calls", tool_calls))
-    [msg]
+
+    # Thinking modes (DeepSeek, Kimi, GLM) need earlier reasoning back to
+    # keep continuity; DeepSeek rejects a tool loop without it (HTTP 400).
+    [maybe_put(msg, "reasoning_content", Message.thinking(message))]
   end
 
   defp format_message(%Message{role: :user, content: blocks}) when is_list(blocks) do
@@ -266,32 +280,23 @@ defmodule Alloy.Provider.OpenAICompat do
     end
   end
 
+  defp parse_response(%{"error" => error} = resp) when is_map(error) or is_binary(error) do
+    {:error, Error.from_body(resp)}
+  end
+
   defp parse_response(%{"choices" => [choice | _]} = resp) do
-    message = choice["message"]
-    finish_reason = choice["finish_reason"]
-    usage = resp["usage"] || %{}
-
-    case parse_message_to_blocks(message) do
+    case parse_message_to_blocks(choice["message"]) do
       {:ok, content_blocks} ->
-        stop_reason = parse_finish_reason(finish_reason)
-
-        {:ok,
-         %{
-           stop_reason: stop_reason,
-           messages: [%Message{role: :assistant, content: content_blocks}],
-           usage: %{
-             input_tokens: Map.get(usage, "prompt_tokens", 0),
-             output_tokens: Map.get(usage, "completion_tokens", 0)
-           }
-         }}
+        usage = resp["usage"] || %{}
+        {:ok, OpenAIStream.completion_response(content_blocks, choice["finish_reason"], usage)}
 
       {:error, _} = err ->
         err
     end
   end
 
-  defp parse_response(%{"error" => error}) do
-    {:error, "#{error["type"]}: #{error["message"]}"}
+  defp parse_response(resp) do
+    {:error, %Error{message: "Unexpected chat completion payload: #{inspect(resp)}"}}
   end
 
   defp parse_message_to_blocks(message) do
@@ -344,28 +349,4 @@ defmodule Alloy.Provider.OpenAICompat do
       sig -> Map.put(block, :thought_signature, sig)
     end
   end
-
-  defp parse_finish_reason("stop"), do: :end_turn
-  defp parse_finish_reason("tool_calls"), do: :tool_use
-  defp parse_finish_reason(_), do: :end_turn
-
-  # Gemini 3.x wraps errors in a list (PR #24)
-  defp parse_error(status, [item | _]) when is_map(item), do: parse_error(status, item)
-
-  defp parse_error(status, body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, %{"error" => error}} -> "#{error["type"]}: #{error["message"]}"
-      _ -> "HTTP #{status}: #{body}"
-    end
-  end
-
-  defp parse_error(status, body) when is_map(body) do
-    case body do
-      %{"error" => error} when is_map(error) -> "#{error["type"]}: #{error["message"]}"
-      %{"error" => error} when is_binary(error) -> "HTTP #{status}: #{error}"
-      _ -> "HTTP #{status}: #{inspect(body)}"
-    end
-  end
-
-  defp parse_error(status, body), do: "HTTP #{status}: #{inspect(body)}"
 end

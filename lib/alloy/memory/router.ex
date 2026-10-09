@@ -18,6 +18,7 @@ defmodule Alloy.Memory.Router do
   alias Alloy.Memory
 
   @memory_tool_name "memory"
+  @root "/memories"
 
   @doc """
   Returns the tool name that provider wiring uses for the
@@ -65,9 +66,11 @@ defmodule Alloy.Memory.Router do
     end
   end
 
-  defp execute(module, store, %{"command" => "view", "path" => path}) do
-    with {:ok, path} <- Memory.validate_path(path) do
-      module.view(store, path)
+  defp execute(module, store, %{"command" => "view", "path" => path} = input) do
+    with {:ok, path} <- Memory.validate_path(path),
+         {:ok, range} <- view_range(input["view_range"]),
+         {:ok, text} <- module.view(store, path) do
+      slice_lines(text, range)
     end
   end
 
@@ -81,6 +84,15 @@ defmodule Alloy.Memory.Router do
       module.create(store, path, file_text)
     end
   end
+
+  # new_str is optional in the memory tool contract; omitting it deletes
+  # old_str.
+  defp execute(module, store, %{"command" => "str_replace", "new_str" => nil} = input),
+    do: execute(module, store, %{input | "new_str" => ""})
+
+  defp execute(module, store, %{"command" => "str_replace"} = input)
+       when not is_map_key(input, "new_str"),
+       do: execute(module, store, Map.put(input, "new_str", ""))
 
   defp execute(module, store, %{
          "command" => "str_replace",
@@ -107,8 +119,10 @@ defmodule Alloy.Memory.Router do
   end
 
   defp execute(module, store, %{"command" => "delete", "path" => path}) do
-    with {:ok, path} <- Memory.validate_path(path) do
-      module.delete(store, path)
+    case Memory.validate_path(path) do
+      {:ok, @root} -> {:error, "Cannot delete the #{@root} directory itself."}
+      {:ok, path} -> module.delete(store, path)
+      {:error, _reason} = error -> error
     end
   end
 
@@ -119,12 +133,44 @@ defmodule Alloy.Memory.Router do
        }) do
     with {:ok, old_path} <- Memory.validate_path(old_path),
          {:ok, new_path} <- Memory.validate_path(new_path) do
-      module.rename(store, old_path, new_path)
+      rename(module, store, old_path, new_path)
     end
   end
 
   defp execute(_module, _store, input) do
     {:error, "invalid memory tool input: #{inspect(input)}"}
+  end
+
+  defp rename(_module, _store, old_path, new_path) when @root in [old_path, new_path],
+    do: {:error, "Cannot rename the #{@root} directory itself, or onto it."}
+
+  defp rename(module, store, old_path, new_path), do: module.rename(store, old_path, new_path)
+
+  defp view_range(nil), do: {:ok, nil}
+
+  defp view_range([first, last])
+       when is_integer(first) and first >= 1 and
+              (last == -1 or (is_integer(last) and last >= first)),
+       do: {:ok, {first, last}}
+
+  defp view_range(other) do
+    {:error,
+     "view_range must be [start_line, end_line] with start_line >= 1 and " <>
+       "end_line >= start_line, or -1 for the end of the file; got: #{inspect(other)}"}
+  end
+
+  defp slice_lines(text, nil), do: {:ok, text}
+
+  defp slice_lines(text, {first, last}) when is_binary(text) do
+    lines = text |> String.replace_suffix("\n", "") |> String.split("\n")
+    count = length(lines)
+    last = if last == -1, do: count, else: min(last, count)
+
+    if first > count do
+      {:error, "view_range starts at line #{first}, but the file has #{count} lines."}
+    else
+      {:ok, lines |> Enum.slice((first - 1)..(last - 1)//1) |> Enum.join("\n")}
+    end
   end
 
   defp format_error(reason) when is_binary(reason), do: reason

@@ -7,7 +7,9 @@ defmodule Alloy.Result do
 
   ## Fields
 
-    * `:text` — the final assistant text (or `nil` if the model returned no text)
+    * `:text` — the text of the last assistant message (see `Alloy.Message.text/1`):
+      `""` when that message has no text blocks (it only called tools, or the
+      output was cut off), `nil` only when the conversation has no assistant message
     * `:thinking` — the final assistant thinking/reasoning text (or `nil` if none),
       so callers need not dig it out of the last message's content blocks
     * `:messages` — full conversation history
@@ -15,6 +17,10 @@ defmodule Alloy.Result do
     * `:tool_calls` — list of tool execution metadata maps
     * `:metadata` — auxiliary result metadata such as provider-owned state
     * `:status` — final run status (`:completed`, `:max_turns`, `:budget_exceeded`, `:error`, `:halted`)
+    * `:stop_reason` — why the model stopped on the last provider response
+      (`:end_turn`, `:tool_use`, `:max_tokens`, `:refusal`, `:pause_turn`), or
+      `nil` if no response arrived. Check for `:max_tokens` to detect a
+      truncated answer on a `:completed` run.
     * `:turns` — number of agent loop iterations
     * `:error` — error term (or `nil` on success)
     * `:request_id` — correlation ID for async requests (or `nil` for sync)
@@ -33,6 +39,7 @@ defmodule Alloy.Result do
           tool_calls: [map()],
           metadata: map(),
           status: State.status(),
+          stop_reason: Alloy.Provider.stop_reason() | nil,
           turns: non_neg_integer(),
           error: term() | nil,
           request_id: binary() | nil
@@ -43,6 +50,7 @@ defmodule Alloy.Result do
     :thinking,
     :error,
     :request_id,
+    :stop_reason,
     messages: [],
     usage: %Usage{},
     tool_calls: [],
@@ -68,10 +76,25 @@ defmodule Alloy.Result do
       tool_calls: state.tool_calls,
       metadata: build_metadata(state),
       status: state.status,
+      stop_reason: state.stop_reason,
       turns: state.turn,
       error: state.error
     }
   end
+
+  @doc """
+  Tags a result the way `Alloy.run/2` and `Alloy.Agent.Server.chat/3`
+  return it.
+
+  `{:ok, result}` when the run completed or stopped at `:max_turns`;
+  `{:error, result}` for every other status (`:error`, `:halted`,
+  `:budget_exceeded`).
+  """
+  @spec wrap(t()) :: {:ok, t()} | {:error, t()}
+  def wrap(%__MODULE__{status: status} = result) when status in [:completed, :max_turns],
+    do: {:ok, result}
+
+  def wrap(%__MODULE__{} = result), do: {:error, result}
 
   # ── Access callbacks ─────────────────────────────────────────────────────
 

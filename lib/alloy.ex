@@ -52,7 +52,49 @@ defmodule Alloy do
   - `:max_pending` - max queued async `send_message/3` requests while one is running (default: `0`)
   - `:model_metadata_overrides` - overrides for model context windows used to derive `:max_tokens` when not set explicitly (default: `%{}`)
   - `:model_catalog` - module implementing `Alloy.ModelCatalog`, consulted for model context windows after `:model_metadata_overrides` (default: `Alloy.ModelMetadata`)
-  - `:until_tool` - tool name (string) that must be called before the loop completes. If the model signals `:end_turn` without calling this tool, the loop continues with a prompt to call it. Useful for structured output enforcement. (default: `nil`)
+  - `:code_execution` - `true` enables Anthropic's server-side code execution tool; the same as setting `code_execution: true` in the provider config (default: `false`)
+  - `:on_event` - 1-arity function called with each `Alloy.Events` envelope (tool events, plus text and thinking deltas when streaming) (default: `nil`)
+  - `:max_budget_cents` - **deprecated, removed in 0.13.** Stops the run with status `:budget_exceeded` once `usage.estimated_cost_cents` reaches this value. None of the built-in providers report `estimated_cost_cents`, so it only works with custom providers that do; Alloy logs a warning when it is set. Use a budget middleware instead (see "Budget limits" below). (default: `nil`)
+  - `:until_tool` - tool name (string) that must be called successfully before the loop completes. If the model signals `:end_turn` without a call to this tool that succeeded (a failed, blocked or unknown call does not count), the loop continues with a prompt to call it. Useful for structured output enforcement. (default: `nil`)
+
+  ## Budget limits
+
+  Price the accumulated usage yourself in `:before_completion` middleware,
+  which runs before every provider request, and halt when the run reaches
+  its limit:
+
+      defmodule MyApp.BudgetGuard do
+        @behaviour Alloy.Middleware
+
+        # USD per million tokens for the model you run.
+        @input_per_m 3.0
+        @output_per_m 15.0
+
+        @impl true
+        def call(:before_completion, state) do
+          limit = Map.fetch!(state.config.context, :max_budget_cents)
+          usage = Alloy.Usage.estimate_cost(state.usage, @input_per_m, @output_per_m)
+
+          if usage.estimated_cost_cents >= limit do
+            {:halt, "budget of \#{limit} cents reached"}
+          else
+            state
+          end
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      Alloy.run(prompt,
+        provider: provider,
+        middleware: [MyApp.BudgetGuard],
+        context: %{max_budget_cents: 50}
+      )
+
+  A halted run returns `{:error, result}` with `status: :halted` and
+  `error: "Halted by middleware: budget of 50 cents reached"`.
+  `Alloy.Usage.estimate_cost/3` prices input and output tokens only; add
+  your provider's cache read and write prices if you use prompt caching.
   """
 
   alias Alloy.Agent.{Config, Server, State, Turn}
@@ -84,11 +126,14 @@ defmodule Alloy do
   The first argument can be a string (converted to a user message)
   or ignored if `:messages` option provides conversation history.
 
+  Accepts `:on_event` like `stream/3`. Without streaming, the callback
+  receives the tool events (`:tool_start`, `:tool_end`) but no text deltas.
+
   Returns `{:ok, result}` on completion or `{:error, result}` on failure.
   """
   @spec run(String.t() | nil, keyword()) :: {:ok, result()} | {:error, result()}
   def run(message \\ nil, opts) do
-    do_run(message, opts, [])
+    do_run(message, opts, maybe_put([], :on_event, validate_on_event(opts[:on_event])))
   end
 
   @doc """
@@ -121,21 +166,11 @@ defmodule Alloy do
   defp do_run(message, opts, turn_opts) do
     config = Config.from_opts(opts)
     messages = build_messages(message, opts)
-    state = %{State.init(config, messages) | status: :running}
 
-    try do
-      final_state = Turn.run_loop(state, turn_opts)
-
-      result = Result.from_state(final_state)
-
-      case final_state.status do
-        :completed -> {:ok, result}
-        :max_turns -> {:ok, result}
-        _ -> {:error, result}
-      end
-    after
-      State.cleanup(state)
-    end
+    %{State.init(config, messages) | status: :running}
+    |> Turn.run_loop(turn_opts)
+    |> Result.from_state()
+    |> Result.wrap()
   end
 
   defp build_messages(nil, opts) do

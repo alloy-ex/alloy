@@ -62,6 +62,18 @@ defmodule Alloy.Agent.ServerTest do
       assert Enum.at(messages, 2).content == "Second message"
     end
 
+    @tag :capture_log
+    test "returns {:error, result} when the budget is exceeded, like Alloy.run/2" do
+      pid = start_provider([TestProvider.text_response("Should not reach")])
+      {:ok, agent} = Server.start_link(opts(pid, max_budget_cents: 0))
+
+      assert {:error, result} = Server.chat(agent, "Hello")
+      assert result.status == :budget_exceeded
+
+      assert {:error, %{status: :budget_exceeded}} =
+               Server.stream_chat(agent, "Hello", fn _chunk -> :ok end)
+    end
+
     test "returns :turns in result" do
       pid = start_provider([TestProvider.text_response("Done")])
       {:ok, agent} = Server.start_link(opts(pid))
@@ -135,6 +147,31 @@ defmodule Alloy.Agent.ServerTest do
       {:ok, agent} = Server.start_link(opts(pid))
       # With timeout: 0, GenServer.call will immediately timeout
       assert catch_exit(Server.chat(agent, "Hello", timeout: 0)) != nil
+    end
+  end
+
+  describe "default call timeout" do
+    test "covers the agent's own :timeout_ms plus a margin" do
+      pid = start_provider([])
+
+      {:ok, default_agent} = Server.start_link(opts(pid))
+      {:ok, slow_agent} = Server.start_link(opts(pid, timeout_ms: 300_000))
+
+      assert Server.default_call_timeout(default_agent) == 130_000
+      assert Server.default_call_timeout(slow_agent) == 310_000
+    end
+
+    test "chat and stream_chat without :timeout use it and complete" do
+      pid =
+        start_provider([
+          {:with_delay, 50, TestProvider.text_response("Late but fine")},
+          TestProvider.text_response("Streamed")
+        ])
+
+      {:ok, agent} = Server.start_link(opts(pid, timeout_ms: 300_000))
+
+      assert {:ok, %{text: "Late but fine"}} = Server.chat(agent, "Hello")
+      assert {:ok, %{text: "Streamed"}} = Server.stream_chat(agent, "Again", fn _ -> :ok end)
     end
   end
 
@@ -334,6 +371,7 @@ defmodule Alloy.Agent.ServerTest do
         )
 
       Process.unlink(agent)
+      ref = Process.monitor(agent)
 
       # Simulate BEAM delivering an {:EXIT, linked_pid, :shutdown} message to
       # the agent mailbox — this is exactly what happens when a process that
@@ -345,8 +383,10 @@ defmodule Alloy.Agent.ServerTest do
       # and NOT swallowed by a {:noreply, state} catch-all.
       assert_receive {:shutdown_ran, _session}, 1000
 
-      # The server must actually be dead — {:noreply, state} would leave it alive.
-      refute Process.alive?(agent)
+      # The server must actually stop — {:noreply, state} would leave it
+      # alive. on_shutdown runs inside terminate/2, before the process has
+      # exited, so wait for the DOWN rather than checking Process.alive?/1.
+      assert_receive {:DOWN, ^ref, :process, ^agent, :shutdown}, 1000
     end
 
     test "on_shutdown receives a valid Session with messages" do

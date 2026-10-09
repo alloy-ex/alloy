@@ -4,6 +4,7 @@ defmodule Alloy.Provider.OpenAITest do
   import Alloy.StreamTestHelpers
 
   alias Alloy.Message
+  alias Alloy.Provider.Error
   alias Alloy.Provider.OpenAI
 
   describe "complete/3 with text response" do
@@ -139,6 +140,82 @@ defmodule Alloy.Provider.OpenAITest do
 
       assert Enum.at(input, reasoning_index) == reasoning
       assert reasoning_index < function_index
+    end
+  end
+
+  describe "complete/3 replaying output items" do
+    test "assistant message phase is kept and re-sent" do
+      commentary = Map.put(assistant_text_item("Checking the file."), "phase", "commentary")
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(
+              response_payload([commentary, function_call_item("call_1", "read", "{}")])
+            )
+        })
+
+      assert {:ok, %{messages: [assistant]}} = OpenAI.complete([Message.user("Hi")], [], config)
+      assert [%{type: "text", phase: "commentary"}, %{type: "tool_use"}] = assistant.content
+
+      messages = [
+        Message.user("Hi"),
+        assistant,
+        Message.tool_results([Message.tool_result_block("call_1", "contents")]),
+        Message.assistant_blocks([%{type: "text", text: "No phase"}])
+      ]
+
+      OpenAI.complete(messages, [], config_that_captures_request())
+
+      assert_received {:request_body, body}
+      replayed = Enum.filter(Jason.decode!(body)["input"], &(&1["role"] == "assistant"))
+
+      assert [
+               %{"content" => "Checking the file.", "phase" => "commentary"},
+               %{"content" => "No phase"} = plain
+             ] = replayed
+
+      refute Map.has_key?(plain, "phase")
+    end
+
+    test "unknown output items are kept and replayed in place when stateless" do
+      search = %{
+        "id" => "ws_1",
+        "type" => "web_search_call",
+        "status" => "completed",
+        "action" => %{"type" => "search", "query" => "alloy elixir"}
+      }
+
+      reasoning = reasoning_item("rs_1", "encrypted-state")
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(response_payload([reasoning, search, assistant_text_item("Found it.")]))
+        })
+
+      assert {:ok, %{messages: [assistant]}} = OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert [%{type: "reasoning"}, %{type: "output_item", raw: ^search}, %{type: "text"}] =
+               assistant.content
+
+      assert Message.text(assistant) == "Found it."
+      assert Message.tool_calls(assistant) == []
+
+      OpenAI.complete([Message.user("Hi"), assistant], [], config_that_captures_request())
+      assert_received {:request_body, body}
+
+      assert [_user, ^reasoning, ^search, %{"role" => "assistant", "content" => "Found it."}] =
+               Jason.decode!(body)["input"]
+
+      stored = Map.put(config_that_captures_request(), :store, true)
+      OpenAI.complete([Message.user("Hi"), assistant], [], stored)
+      assert_received {:request_body, body}
+
+      assert [_user, %{"role" => "assistant", "content" => "Found it."}] =
+               Jason.decode!(body)["input"]
     end
   end
 
@@ -292,7 +369,7 @@ defmodule Alloy.Provider.OpenAITest do
     test "includes native Responses API controls in the request body" do
       config =
         config_that_captures_request()
-        |> Map.put(:provider_state, %{response_id: "resp_prev"})
+        |> Map.put(:previous_response_id, "resp_prev")
         |> Map.put(:store, true)
         |> Map.put(:include, ["inline_citations"])
         |> Map.put(:tool_choice, "required")
@@ -308,6 +385,19 @@ defmodule Alloy.Provider.OpenAITest do
       assert decoded["include"] == ["inline_citations"]
       assert decoded["tool_choice"] == "required"
       assert decoded["parallel_tool_calls"] == false
+    end
+
+    test "sends max_output_tokens only when :max_tokens is set" do
+      # Reasoning tokens count against max_output_tokens, so a default
+      # would truncate reasoning models before they write any text.
+      config = Map.delete(config_that_captures_request(), :max_tokens)
+      OpenAI.complete([Message.user("Hi")], [], config)
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "max_output_tokens")
+
+      OpenAI.complete([Message.user("Hi")], [], Map.put(config, :max_tokens, 2048))
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["max_output_tokens"] == 2048
     end
 
     test "stateless requests include encrypted reasoning content" do
@@ -372,7 +462,33 @@ defmodule Alloy.Provider.OpenAITest do
       assert Enum.any?(decoded["input"], &(&1["type"] == "function_call"))
     end
 
-    test "explicit previous_response_id overrides provider_state response_id" do
+    test "provider_state response_id does not chain the request" do
+      reasoning = reasoning_item("rs_prev", "encrypted-state")
+
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{response_id: "resp_prev"})
+
+      messages = [
+        Message.user("Read"),
+        Message.assistant_blocks([
+          %{type: "reasoning", raw: reasoning},
+          %{type: "tool_use", id: "call_1", name: "read", input: %{}}
+        ]),
+        Message.tool_results([Message.tool_result_block("call_1", "contents")])
+      ]
+
+      OpenAI.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      refute Map.has_key?(decoded, "previous_response_id")
+      assert decoded["include"] == ["reasoning.encrypted_content"]
+      assert reasoning in decoded["input"]
+    end
+
+    test "explicit previous_response_id is sent even when provider_state has another id" do
       config =
         config_that_captures_request()
         |> Map.put(:provider_state, %{response_id: "resp_prev"})
@@ -595,6 +711,31 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
+  describe "complete/3 usage" do
+    test "reports cache reads and writes apart from uncached input, like Anthropic" do
+      usage = %{
+        "input_tokens" => 100,
+        "input_tokens_details" => %{"cached_tokens" => 60, "cache_write_tokens" => 10},
+        "output_tokens" => 5
+      }
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body: Jason.encode!(response_payload([assistant_text_item("Hi")], usage))
+        })
+
+      assert {:ok, %{usage: result_usage}} = OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert result_usage == %{
+               input_tokens: 30,
+               output_tokens: 5,
+               cache_read_input_tokens: 60,
+               cache_creation_input_tokens: 10
+             }
+    end
+  end
+
   describe "complete/3 with missing usage field" do
     test "returns zero counts when usage is absent from response" do
       config =
@@ -680,6 +821,51 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
+  describe "complete/3 response status" do
+    test "a failed response is an error classified by its code" do
+      body =
+        [assistant_text_item("partial")]
+        |> response_payload()
+        |> Map.merge(%{
+          "status" => "failed",
+          "error" => %{"code" => "server_error", "message" => "The model failed."}
+        })
+
+      config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+      assert {:error, %Error{kind: :server_error, code: "server_error"} = error} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) == "The model failed."
+    end
+
+    test "max_output_tokens truncation maps to :max_tokens and keeps the output" do
+      body =
+        [
+          assistant_text_item("Let me check."),
+          function_call_item("call_1", "read", ~s({"file_path":"mix.exs"}))
+        ]
+        |> response_payload(%{"input_tokens" => 10, "output_tokens" => 64})
+        |> incomplete("max_output_tokens")
+
+      config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+      assert {:ok, result} = OpenAI.complete([Message.user("Hi")], [], config)
+      assert result.stop_reason == :max_tokens
+      assert result.provider_state == %{response_id: "resp_test"}
+      assert [%{type: "text"}, %{type: "tool_use", id: "call_1"}] = hd(result.messages).content
+    end
+
+    test "content_filter maps to :refusal with the details" do
+      body = [assistant_text_item("I can")] |> response_payload() |> incomplete("content_filter")
+      config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+      assert {:ok, result} = OpenAI.complete([Message.user("Hi")], [], config)
+      assert result.stop_reason == :refusal
+      assert result.response_metadata.stop_details == %{"reason" => "content_filter"}
+    end
+  end
+
   describe "complete/3 error handling" do
     test "returns error on HTTP failure" do
       config = config_with_response(%{status: 500, body: "Internal Server Error"})
@@ -700,8 +886,10 @@ defmodule Alloy.Provider.OpenAITest do
             })
         })
 
-      assert {:error, reason} = OpenAI.complete([Message.user("Hi")], [], config)
-      assert reason =~ "invalid_request_error"
+      assert {:error, %Error{kind: :invalid_request} = reason} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "invalid_request_error"
     end
 
     test "returns error on rate limit" do
@@ -717,8 +905,51 @@ defmodule Alloy.Provider.OpenAITest do
             })
         })
 
-      assert {:error, reason} = OpenAI.complete([Message.user("Hi")], [], config)
-      assert reason =~ "rate_limit"
+      assert {:error, %Error{kind: :rate_limited} = reason} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "rate_limit"
+    end
+  end
+
+  describe "in the agent loop" do
+    test "a tool loop resends the history statelessly instead of chaining" do
+      parent = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+        send(parent, {:request, request})
+
+        output =
+          if Enum.any?(request["input"], &(&1["type"] == "function_call_output")) do
+            [assistant_text_item("done")]
+          else
+            [
+              reasoning_item("rs_1", "encrypted-state"),
+              function_call_item("call_1", "echo", ~s({"text":"hi"}))
+            ]
+          end
+
+        Plug.Conn.send_resp(conn, 200, Jason.encode!(response_payload(output)))
+      end
+
+      assert {:ok, result} =
+               Alloy.run("Echo hi",
+                 provider:
+                   {OpenAI, api_key: "sk-test", model: "gpt-5.4", req_options: [plug: plug]},
+                 tools: [Alloy.Test.EchoTool]
+               )
+
+      assert result.text == "done"
+      assert result.metadata.provider_state == %{response_id: "resp_test"}
+
+      assert_received {:request, _first}
+      assert_received {:request, second}
+
+      refute Map.has_key?(second, "previous_response_id")
+      assert second["include"] == ["reasoning.encrypted_content"]
+      assert [%{"role" => "user"}, %{"type" => "reasoning"} | _] = second["input"]
     end
   end
 
@@ -782,8 +1013,88 @@ defmodule Alloy.Provider.OpenAITest do
       assert {:error, reason} =
                OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      assert reason =~ "invalid_request_error"
-      assert reason =~ "max_output_tokens"
+      assert Exception.message(reason) =~ "invalid_request_error"
+      assert Exception.message(reason) =~ "max_output_tokens"
+    end
+
+    test "response.failed is an error classified by its code" do
+      failed =
+        [] |> response_payload() |> Map.merge(%{"status" => "failed", "error" => server_error()})
+
+      config =
+        config_with_sse_stream([
+          sse_response_output_text_delta("Hel"),
+          sse_response_event("response.failed", %{
+            "type" => "response.failed",
+            "response" => failed
+          })
+        ])
+
+      assert {:error, %Error{kind: :server_error} = error} =
+               OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert Exception.message(error) == "The model failed to generate a response."
+    end
+
+    test "an error event is an error classified by its code" do
+      config =
+        config_with_sse_stream([
+          sse_response_output_text_delta("Hel"),
+          sse_response_event("error", %{
+            "type" => "error",
+            "code" => "rate_limit_exceeded",
+            "message" => "Slow down",
+            "param" => nil,
+            "sequence_number" => 2
+          })
+        ])
+
+      assert {:error, %Error{kind: :rate_limited, code: "rate_limit_exceeded"}} =
+               OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+    end
+
+    test "an error event with nested details is read too" do
+      config =
+        config_with_sse_stream([
+          sse_response_event("error", %{"type" => "error", "error" => server_error()})
+        ])
+
+      assert {:error, %Error{kind: :server_error}} =
+               OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+    end
+
+    test "response.incomplete keeps the output and maps the reason" do
+      truncated =
+        [
+          assistant_text_item("Let me read it."),
+          function_call_item("call_1", "read", ~s({"file_path":"mix.exs"}))
+        ]
+        |> response_payload(%{"input_tokens" => 10, "output_tokens" => 64})
+        |> incomplete("max_output_tokens")
+
+      config =
+        config_with_sse_stream([
+          sse_response_output_text_delta("Let me read it."),
+          sse_response_event("response.incomplete", %{
+            "type" => "response.incomplete",
+            "response" => truncated
+          })
+        ])
+
+      assert {:ok, result} = OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+      assert result.stop_reason == :max_tokens
+      assert result.provider_state == %{response_id: "resp_test"}
+      assert result.usage.output_tokens == 64
+      assert Enum.any?(hd(result.messages).content, &(&1.type == "tool_use"))
+    end
+
+    test "a stream that ends before a terminal event is an error, not partial success" do
+      config = config_with_sse_stream([sse_response_output_text_delta("Hel")])
+
+      assert {:error, %Error{kind: :network} = error} =
+               OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert Exception.message(error) =~ "ended before"
     end
 
     test "returns raw body when stream error response is not JSON" do
@@ -792,8 +1103,8 @@ defmodule Alloy.Provider.OpenAITest do
       assert {:error, reason} =
                OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      assert reason =~ "503"
-      assert reason =~ "Service Unavailable"
+      assert %Error{kind: :server_error} = reason
+      assert Exception.message(reason) == "HTTP 503: Service Unavailable"
     end
 
     test "request body includes stream: true" do
@@ -824,6 +1135,13 @@ defmodule Alloy.Provider.OpenAITest do
     }
 
     if usage == %{}, do: base, else: Map.put(base, "usage", usage)
+  end
+
+  defp server_error,
+    do: %{"code" => "server_error", "message" => "The model failed to generate a response."}
+
+  defp incomplete(response, reason) do
+    Map.merge(response, %{"status" => "incomplete", "incomplete_details" => %{"reason" => reason}})
   end
 
   defp assistant_text_item(text) do

@@ -276,6 +276,187 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  describe "run_loop/1 with a tool named memory and no :memory store" do
+    test "runs the user's own memory tool" do
+      memory_tool =
+        Alloy.Tool.inline(
+          name: "memory",
+          description: "The app's own memory tool",
+          input_schema: %{type: "object"},
+          execute: fn _input, _context -> {:ok, "remembered"} end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "m1", name: "memory", input: %{}}]),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [memory_tool]
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Remember this")]))
+
+      assert result.status == :completed
+      assert [%{name: "memory", error: nil}] = result.tool_calls
+
+      assert %{type: "tool_result", tool_use_id: "m1", content: "remembered"} =
+               result.messages |> Enum.at(2) |> Map.fetch!(:content) |> hd()
+    end
+
+    test "answers an unregistered memory call as an unknown tool" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "m1", name: "memory", input: %{}}]),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{provider: TestProvider, provider_config: %{agent_pid: pid}}
+
+      result = Turn.run_loop(State.init(config, [Message.user("Remember this")]))
+
+      assert result.status == :completed
+
+      assert %{tool_use_id: "m1", content: "Unknown tool: memory", is_error: true} =
+               result.messages |> Enum.at(2) |> Map.fetch!(:content) |> hd()
+    end
+  end
+
+  describe "run_loop/1 with server-executed tools" do
+    test "answers only client tool_use blocks when a response mixes in server_tool_use" do
+      responses = [
+        TestProvider.tool_use_response([
+          %{type: "server_tool_use", id: "srvtoolu_01", name: "code_execution", input: %{}},
+          %{type: "tool_use", id: "toolu_01", name: "echo", input: %{"text" => "hi"}}
+        ]),
+        TestProvider.text_response("done")
+      ]
+
+      state = Alloy.Testing.run_with_responses("go", responses)
+
+      assert state.status == :completed
+
+      results_message =
+        Enum.find(state.messages, fn msg ->
+          msg.role == :user and is_list(msg.content) and
+            Enum.any?(msg.content, &(&1[:type] == "tool_result"))
+        end)
+
+      assert [%{type: "tool_result", tool_use_id: "toolu_01"}] = results_message.content
+    end
+  end
+
+  describe "run_loop/1 stop reasons" do
+    defp scripted(stop_reason, blocks) do
+      {:ok,
+       %{
+         stop_reason: stop_reason,
+         messages: [Message.assistant_blocks(blocks)],
+         usage: %{input_tokens: 1, output_tokens: 1}
+       }}
+    end
+
+    test "records the provider stop reason on the result" do
+      state = Alloy.Testing.run_with_responses("hi", [TestProvider.text_response("done")])
+
+      assert state.status == :completed
+      assert Alloy.Result.from_state(state).stop_reason == :end_turn
+    end
+
+    test ":max_tokens without a tool call completes and exposes the truncation" do
+      responses = [scripted(:max_tokens, [%{type: "text", text: "partial ans"}])]
+
+      state = Alloy.Testing.run_with_responses("hi", responses)
+
+      assert state.status == :completed
+      result = Alloy.Result.from_state(state)
+      assert result.stop_reason == :max_tokens
+      assert result.text == "partial ans"
+    end
+
+    test ":max_tokens inside a tool call fails without running the tool and keeps the transcript valid" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "write",
+          description: "w",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, _ctx ->
+            send(test_pid, :tool_ran)
+            {:ok, "written"}
+          end
+        )
+
+      responses = [
+        scripted(:max_tokens, [%{type: "tool_use", id: "toolu_1", name: "write", input: %{}}])
+      ]
+
+      state = Alloy.Testing.run_with_responses("hi", responses, tools: [tool])
+
+      assert state.status == :error
+      assert state.error =~ "max_tokens"
+      refute_received :tool_ran
+
+      assert %Message{role: :user, content: [%{type: "tool_result", tool_use_id: "toolu_1"} = r]} =
+               List.last(state.messages)
+
+      assert r.is_error
+    end
+
+    test ":refusal fails the run and discards the refused output" do
+      responses = [scripted(:refusal, [%{type: "text", text: "Here is how to"}])]
+
+      state = Alloy.Testing.run_with_responses("hi", responses)
+
+      assert state.status == :error
+      assert state.error =~ "refus"
+      refute Enum.any?(state.messages, &(&1.role == :assistant))
+      assert Alloy.Result.from_state(state).stop_reason == :refusal
+    end
+
+    test ":pause_turn calls the provider again without adding a user message" do
+      responses = [
+        scripted(:pause_turn, [
+          %{type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: %{}}
+        ]),
+        TestProvider.text_response("finished")
+      ]
+
+      state = Alloy.Testing.run_with_responses("search", responses)
+
+      assert state.status == :completed
+      assert Enum.map(state.messages, & &1.role) == [:user, :assistant, :assistant]
+      assert Alloy.Result.from_state(state).text == "finished"
+    end
+
+    test ":tool_use with no client tool calls completes instead of sending empty results" do
+      responses = [
+        scripted(:tool_use, [
+          %{type: "server_tool_use", id: "srvtoolu_1", name: "code_execution", input: %{}},
+          %{type: "text", text: "ran it"}
+        ])
+      ]
+
+      state = Alloy.Testing.run_with_responses("go", responses)
+
+      assert state.status == :completed
+      assert Enum.map(state.messages, & &1.role) == [:user, :assistant]
+    end
+
+    test "an unknown stop reason from a custom provider fails with a clear error" do
+      responses = [scripted(:something_new, [%{type: "text", text: "?"}])]
+
+      state = Alloy.Testing.run_with_responses("hi", responses)
+
+      assert state.status == :error
+      assert state.error =~ "something_new"
+    end
+  end
+
   describe "run_loop/1 with max_turns" do
     test "stops at max_turns" do
       # Create responses that always ask for tools (infinite loop)
@@ -1170,6 +1351,69 @@ defmodule Alloy.Agent.TurnTest do
       assert result.status == :halted
       refute result.status == :error
       assert result.error =~ "tool policy"
+    end
+
+    test "a before_tool_call halt answers every tool call so the transcript stays valid" do
+      defmodule HaltSecondCallMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, state) do
+          case state.config.context[:current_tool_call] do
+            %{id: "t2"} -> {:halt, "second call refused"}
+            _call -> state
+          end
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t1", name: "echo", input: %{"text" => "one"}},
+            %{id: "t2", name: "echo", input: %{"text" => "two"}}
+          ])
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        middleware: [HaltSecondCallMiddleware]
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Echo twice")]))
+
+      assert result.status == :halted
+      assert_every_tool_call_answered(result.messages, ["t1", "t2"])
+    end
+
+    test "an after_tool_request halt answers every tool call so the transcript stays valid" do
+      defmodule HaltToolRequestMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:after_tool_request, _state), do: {:halt, "no tools today"}
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t1", name: "echo", input: %{"text" => "hi"}}
+          ])
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        middleware: [HaltToolRequestMiddleware]
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Echo hi")]))
+
+      assert result.status == :halted
+      assert result.error == "Halted by middleware: no tools today"
+      assert result.tool_calls == []
+      assert_every_tool_call_answered(result.messages, ["t1"])
     end
 
     test "before_tool_call halt is distinguishable from :error status" do
@@ -2077,6 +2321,71 @@ defmodule Alloy.Agent.TurnTest do
       assert_received {[:alloy, :turn, :stop], ^ref_stop, _m, %{turn: 2}}
     end
 
+    test "each turn stops before the next one starts, carrying its own status" do
+      handler_id = attach_loop_telemetry(self())
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "hi"}}
+          ]),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool]
+      }
+
+      try do
+        result = Turn.run_loop(State.init(config, [Message.user("Echo hi")]))
+        assert result.status == :completed
+
+        assert [
+                 {[:alloy, :run, :start], _},
+                 {[:alloy, :turn, :start], %{turn: 1}},
+                 {[:alloy, :turn, :stop], %{turn: 1, status: :running}},
+                 {[:alloy, :turn, :start], %{turn: 2}},
+                 {[:alloy, :turn, :stop], %{turn: 2, status: :completed}},
+                 {[:alloy, :run, :stop], %{status: :completed, turns: 2}}
+               ] = collect_loop_telemetry()
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
+    test "a raising turn emits turn and run exception events" do
+      defmodule RaisingMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_completion, _state), do: raise("middleware bug")
+        def call(_hook, state), do: state
+      end
+
+      handler_id = attach_loop_telemetry(self())
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: self()},
+        middleware: [RaisingMiddleware]
+      }
+
+      try do
+        assert_raise RuntimeError, "middleware bug", fn ->
+          Turn.run_loop(State.init(config, [Message.user("Hi")]))
+        end
+
+        assert [
+                 {[:alloy, :run, :start], _},
+                 {[:alloy, :turn, :start], %{turn: 1}},
+                 {[:alloy, :turn, :exception], %{turn: 1, kind: :error}},
+                 {[:alloy, :run, :exception], %{kind: :error, reason: %RuntimeError{}}}
+               ] = collect_loop_telemetry()
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "emits [:alloy, :compaction, :done] when compaction fires" do
       ref = :telemetry_test.attach_event_handlers(self(), [[:alloy, :compaction, :done]])
 
@@ -2224,6 +2533,44 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  describe "structured provider errors" do
+    test "a :context_overflow error triggers compaction and a retry" do
+      overflow = %Alloy.Provider.Error{
+        kind: :context_overflow,
+        status: 400,
+        type: "INVALID_ARGUMENT",
+        message: "The input token count (1200000) exceeds the maximum number of tokens allowed"
+      }
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          {:error, overflow},
+          TestProvider.text_response("Recovered after compaction")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        max_tokens: 200_000,
+        compaction: %{reserve_tokens: 1_000, keep_recent_tokens: 5_000, fallback: :truncate}
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Hello")]))
+
+      assert result.status == :completed
+      assert result.run_metadata == %{prompt_too_long_recovery: true}
+    end
+
+    test "the error stays a string; the struct is kept in run metadata" do
+      error = %Alloy.Provider.Error{kind: :auth, status: 401, message: "bad key"}
+      state = Alloy.Testing.run_with_responses("hi", [{:error, error}])
+
+      assert state.status == :error
+      assert state.error == "HTTP 401: bad key"
+      assert Alloy.Result.from_state(state).metadata.run.provider_error == error
+    end
+  end
+
   describe "run_loop/1 with until_tool" do
     test "continues loop when model ends turn without calling the target tool" do
       {:ok, pid} =
@@ -2241,7 +2588,7 @@ defmodule Alloy.Agent.TurnTest do
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
-        tools: [EchoTool],
+        tools: [EchoTool, submit_tool({:ok, "Received"})],
         until_tool: "submit"
       }
 
@@ -2250,6 +2597,57 @@ defmodule Alloy.Agent.TurnTest do
 
       assert result.status == :completed
       assert result.turn == 3
+    end
+
+    test "a failed call to the target tool does not satisfy until_tool" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tc_1", name: "submit", input: %{"answer" => "?"}}
+          ]),
+          TestProvider.text_response("I tried."),
+          TestProvider.text_response("Still done.")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [submit_tool({:error, "answer must be a number"})],
+        until_tool: "submit",
+        max_turns: 3
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Answer please")]))
+
+      assert result.status == :max_turns
+      assert [%{name: "submit", error: "answer must be a number"}] = result.tool_calls
+
+      assert Enum.any?(result.messages, fn message ->
+               message.content == "Continue. You must call the submit tool before finishing."
+             end)
+    end
+
+    test "a call to an unregistered target tool does not satisfy until_tool" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tc_1", name: "submit", input: %{"answer" => "42"}}
+          ]),
+          TestProvider.text_response("Done."),
+          TestProvider.text_response("Done again.")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        until_tool: "submit",
+        max_turns: 3
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Answer please")]))
+
+      assert result.status == :max_turns
     end
 
     test "completes immediately when target tool is called on first pass" do
@@ -2264,7 +2662,7 @@ defmodule Alloy.Agent.TurnTest do
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
-        tools: [EchoTool],
+        tools: [EchoTool, submit_tool({:ok, "Received"})],
         until_tool: "submit"
       }
 
@@ -2314,6 +2712,58 @@ defmodule Alloy.Agent.TurnTest do
 
       assert result.status == :completed
       assert result.turn == 1
+    end
+  end
+
+  # The last message must answer each call of the preceding assistant message
+  # with an error result, or the next request on this transcript is rejected.
+  defp assert_every_tool_call_answered(messages, ids) do
+    [%Message{role: :assistant} = calls_msg, %Message{role: :user, content: results}] =
+      Enum.take(messages, -2)
+
+    assert Enum.map(Message.tool_calls(calls_msg), & &1.id) == ids
+    assert Enum.map(results, & &1.tool_use_id) == ids
+    assert Enum.all?(results, &(&1.type == "tool_result" and &1.is_error == true))
+  end
+
+  defp submit_tool(result) do
+    Alloy.Tool.inline(
+      name: "submit",
+      description: "Submit the final answer",
+      input_schema: %{type: "object", properties: %{answer: %{type: "string"}}},
+      execute: fn _input, _context -> result end
+    )
+  end
+
+  @loop_events [
+    [:alloy, :run, :start],
+    [:alloy, :run, :stop],
+    [:alloy, :run, :exception],
+    [:alloy, :turn, :start],
+    [:alloy, :turn, :stop],
+    [:alloy, :turn, :exception]
+  ]
+
+  # Telemetry handlers are global and tests run async, so only events emitted
+  # by the test's own process (where run_loop runs) are forwarded.
+  defp attach_loop_telemetry(test_pid) do
+    handler_id = "loop-telemetry-#{inspect(make_ref())}"
+    :telemetry.attach_many(handler_id, @loop_events, &__MODULE__.forward_loop_event/4, test_pid)
+    handler_id
+  end
+
+  @doc false
+  def forward_loop_event(event, _measurements, metadata, test_pid) when test_pid == self() do
+    send(test_pid, {:loop_telemetry, event, metadata})
+  end
+
+  def forward_loop_event(_event, _measurements, _metadata, _test_pid), do: :ok
+
+  defp collect_loop_telemetry do
+    receive do
+      {:loop_telemetry, event, metadata} -> [{event, metadata} | collect_loop_telemetry()]
+    after
+      0 -> []
     end
   end
 end

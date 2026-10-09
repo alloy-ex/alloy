@@ -2,9 +2,16 @@ defmodule Alloy.Tool.Executor do
   @moduledoc """
   Executes tool calls and returns result messages.
 
-  Supports parallel execution via `Task.Supervisor.async_stream` -
-  multiple tool calls in a single assistant response are
-  executed concurrently under `Alloy.TaskSupervisor`.
+  Calls run in the order the model made them. Consecutive calls to tools
+  that are safe to run concurrently (the default; see
+  `c:Alloy.Tool.concurrent?/0`) run in parallel; a call to a tool that
+  returns `concurrent?: false` waits for everything before it and runs
+  alone.
+
+  Each call runs in an unlinked task under `Alloy.TaskSupervisor`, bounded
+  by the agent's `:tool_timeout`. A tool that raises, exits, throws or
+  times out produces an `is_error` tool result instead of crashing the
+  agent.
   """
 
   alias Alloy.Agent.State
@@ -27,55 +34,127 @@ defmodule Alloy.Tool.Executor do
   @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t(), keyword()) ::
           {:ok, Message.t(), [map()]} | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
-    context = build_context(state)
-    tool_timeout = state.config.tool_timeout
-    on_event = Keyword.get(opts, :on_event, fn _ -> :ok end)
-    seq_ref = Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false))
-    corr_id = Keyword.get(opts, :event_correlation_id, random_id())
-    turn = Keyword.get(opts, :event_turn, state.turn)
+    run = %{
+      tool_fns: tool_fns,
+      context: build_context(state),
+      timeout: state.config.tool_timeout,
+      on_event: Keyword.get(opts, :on_event, fn _ -> :ok end),
+      seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
+      corr_id: Keyword.get(opts, :event_correlation_id, random_id()),
+      turn: Keyword.get(opts, :event_turn, state.turn)
+    }
 
-    case tag_tool_calls(state, tool_calls) do
-      {:halted, _} = h ->
-        h
+    with {:ok, tagged} <- tag_tool_calls(state, tool_calls) do
+      {results, meta} =
+        tagged
+        |> batches(tool_fns)
+        |> Enum.flat_map(&run_batch(&1, run))
+        |> Enum.unzip()
 
-      {:ok, tagged} ->
-        {sequential, concurrent} = partition_by_concurrency(tagged, tool_fns)
-
-        # Phase 1: Non-concurrent tools run sequentially
-        seq_results =
-          Enum.map(sequential, fn tag ->
-            run_tagged(tag, tool_fns, context, on_event, seq_ref, corr_id, turn)
-          end)
-
-        # Phase 2: Concurrent tools run in parallel
-        par_results =
-          if concurrent == [] do
-            []
-          else
-            Task.Supervisor.async_stream(
-              Alloy.TaskSupervisor,
-              concurrent,
-              &run_tagged(&1, tool_fns, context, on_event, seq_ref, corr_id, turn),
-              timeout: tool_timeout,
-              ordered: true,
-              on_timeout: :kill_task
-            )
-            |> Enum.zip(concurrent)
-            |> Enum.map(fn
-              {{:ok, pair}, _} ->
-                pair
-
-              {{:exit, reason}, tag} ->
-                crashed(call_from(tag), reason, tool_timeout, on_event, seq_ref, corr_id, turn)
-            end)
-          end
-
-        # Reassemble in original call order
-        all = reassemble_ordered(tagged, sequential, seq_results, concurrent, par_results)
-        {results, meta} = Enum.unzip(all)
-
-        {:ok, Message.tool_results(results), meta}
+      {:ok, Message.tool_results(results), meta}
     end
+  end
+
+  # Calls run in the order the model made them, so a sequential call sees
+  # the effects of every call before it ([read f, edit f] reads first).
+  # Consecutive concurrency-safe calls share a parallel batch; each
+  # sequential call is a batch of its own.
+  defp batches(tagged, tool_fns) do
+    tagged
+    |> Enum.chunk_by(&concurrent?(&1, tool_fns))
+    |> Enum.flat_map(fn [first | _] = batch ->
+      if concurrent?(first, tool_fns), do: [batch], else: Enum.map(batch, &[&1])
+    end)
+  end
+
+  defp concurrent?({:execute, call}, tool_fns) do
+    case Map.fetch(tool_fns, call[:name]) do
+      {:ok, tool} -> Registry.to_inline(tool).concurrent? != false
+      :error -> true
+    end
+  end
+
+  defp concurrent?({:blocked, _call, _reason}, _tool_fns), do: true
+
+  # Every tool runs in an unlinked, supervised task: a tool that raises,
+  # exits or throws, or overruns :tool_timeout, becomes an error result
+  # instead of taking down the agent process that called the executor. If
+  # that process is killed (a cancelled turn), the tasks are killed too.
+  #
+  # tool_start is emitted here, before the task exists, and tool_end after
+  # it finishes, so the pair matches even when the task is killed on
+  # timeout. At most schedulers_online calls run at once (async_stream's
+  # default, which tools calling rate-limited APIs rely on); a queued call's
+  # duration includes its wait.
+  defp run_batch(batch, run) do
+    started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
+    watcher = watch_caller(self(), length(started))
+
+    results =
+      Alloy.TaskSupervisor
+      |> Task.Supervisor.async_stream_nolink(started, &{&1, invoke_watched(&1.tag, run, watcher)},
+        timeout: run.timeout,
+        on_timeout: :kill_task,
+        max_concurrency: min(length(batch), System.schedulers_online()),
+        ordered: false,
+        zip_input_on_exit: true
+      )
+      |> Enum.map(fn
+        {:ok, {started, outcome}} ->
+          finish(started, outcome, run)
+
+        {:exit, {started, reason}} ->
+          finish(started, exit_outcome(started.call, reason, run), run)
+      end)
+
+    send(watcher, :done)
+
+    results
+    |> Enum.sort_by(fn {index, _pair} -> index end)
+    |> Enum.map(fn {_index, pair} -> pair end)
+  end
+
+  # The tasks are unlinked, so a cancelled turn — killed outright, with no
+  # chance to clean up — would leave its tools running. This supervised
+  # watcher kills them when the caller dies. Each task registers itself as
+  # it starts; after the caller dies the watcher still waits briefly for
+  # tasks that started but had not registered yet.
+  defp watch_caller(caller, expected) do
+    {:ok, watcher} =
+      Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
+        ref = Process.monitor(caller)
+        watch(ref, [], expected)
+      end)
+
+    watcher
+  end
+
+  defp watch(ref, pids, expected) do
+    receive do
+      {:watch, pid} -> watch(ref, [pid | pids], expected)
+      :done -> Process.demonitor(ref, [:flush])
+      {:DOWN, ^ref, :process, _pid, _reason} -> kill_watched(pids, expected - length(pids))
+    end
+  end
+
+  defp kill_watched(pids, unregistered) do
+    Enum.each(pids, &Process.exit(&1, :kill))
+    kill_late_registrations(unregistered)
+  end
+
+  defp kill_late_registrations(0), do: :ok
+
+  defp kill_late_registrations(unregistered) do
+    receive do
+      {:watch, pid} -> kill_watched([pid], unregistered - 1)
+    after
+      1_000 -> :ok
+    end
+  end
+
+  defp invoke_watched(tag, run, watcher) do
+    send(watcher, {:watch, self()})
+    invoke(tag, run)
   end
 
   defp tag_tool_calls(state, calls) do
@@ -95,106 +174,181 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
-  defp run_tagged({:execute, call}, fns, ctx, on_event, seq_ref, corr_id, turn) do
-    t0 = System.monotonic_time(:millisecond)
-    sseq = emit_start(on_event, call, seq_ref, corr_id, turn)
-    block_fn = result_block_fn(call[:type])
+  defp start({tag, index}, run) do
+    call = call_from(tag)
+    seq = :atomics.add_get(run.seq_ref, 1, 1)
 
-    {result, error, structured_data} =
-      case Map.fetch(fns, call[:name]) do
-        {:ok, tool} ->
-          try do
-            case tool_execute(tool, call[:input] || %{}, ctx) do
-              {:ok, text, data} when is_map(data) ->
-                {block_fn.(call[:id], maybe_truncate(text, tool), false), nil, data}
+    run.on_event.(
+      {:tool_start,
+       %{
+         id: call[:id],
+         name: call[:name],
+         input: call[:input] || %{},
+         event_seq: seq,
+         correlation_id: run.corr_id
+       }}
+    )
 
-              {:ok, r} ->
-                {block_fn.(call[:id], maybe_truncate(r, tool), false), nil, nil}
+    :telemetry.execute([:alloy, :tool, :start], %{event_seq: seq}, %{
+      correlation_id: run.corr_id,
+      turn: run.turn,
+      tool_id: call[:id],
+      tool_name: call[:name]
+    })
 
-              {:error, r} ->
-                {block_fn.(call[:id], r, true), r, nil}
-            end
-          rescue
-            e ->
-              stacktrace = __STACKTRACE__
-              visible_error = tool_crash_message(call[:name], e, stacktrace)
-              diagnostic_error = Exception.format(:error, e, stacktrace)
+    %{
+      index: index,
+      tag: tag,
+      call: call,
+      start_seq: seq,
+      started_at: System.monotonic_time(:millisecond)
+    }
+  end
 
-              Logger.error(
-                "Tool #{call[:name]} crashed: #{Exception.message(e)}\n#{Exception.format_stacktrace(stacktrace)}"
-              )
+  # Runs inside the task. Returns {:ok, text, structured_data | nil} or
+  # {:error, model_visible_message, diagnostic_message}.
+  defp invoke({:blocked, _call, reason}, _run), do: {:error, "Blocked: #{reason}", nil}
 
-              {block_fn.(call[:id], visible_error, true), diagnostic_error, nil}
-          end
+  defp invoke({:execute, call}, run) do
+    with {:ok, tool} <- fetch_tool(run.tool_fns, call[:name]),
+         input = call[:input] || %{},
+         :ok <- check_input(input, tool) do
+      execute_tool(tool, input, call, run.context)
+    end
+  end
 
-        :error ->
-          err = "Unknown tool: #{call[:name]}"
-          {block_fn.(call[:id], err, true), err, nil}
+  defp fetch_tool(tool_fns, name) do
+    case Map.fetch(tool_fns, name) do
+      {:ok, tool} -> {:ok, Registry.to_inline(tool)}
+      :error -> {:error, "Unknown tool: #{name}", nil}
+    end
+  end
+
+  # Only the shape every tool's execute/2 relies on: an object holding the
+  # schema's required keys. Types are not checked or coerced; third-party
+  # schemas are too loose for that to be safe.
+  defp check_input(input, %Inline{name: name, input_schema: schema}) when is_map(input) do
+    present = MapSet.new(Map.keys(input), &to_string/1)
+
+    case Enum.reject(required_keys(schema), &(&1 in present)) do
+      [] ->
+        :ok
+
+      missing ->
+        {:error,
+         "Missing required parameter(s) for #{name}: #{Enum.join(missing, ", ")}. " <>
+           "Call the tool again with every required parameter.", nil}
+    end
+  end
+
+  defp check_input(input, %Inline{name: name}) do
+    {:error, "Input for #{name} must be a JSON object, got: #{inspect(input)}", nil}
+  end
+
+  defp required_keys(schema) do
+    case Map.get(schema, :required, Map.get(schema, "required")) do
+      keys when is_list(keys) -> Enum.map(keys, &to_string/1)
+      _none -> []
+    end
+  end
+
+  defp execute_tool(%Inline{execute: execute} = tool, input, call, context) do
+    case execute.(input, context) do
+      {:ok, text, data} when is_map(data) -> {:ok, maybe_truncate(text, tool), data}
+      {:ok, text} -> {:ok, maybe_truncate(text, tool), nil}
+      {:error, reason} -> {:error, reason, nil}
+    end
+  rescue
+    e ->
+      stacktrace = __STACKTRACE__
+
+      Logger.error(
+        "Tool #{call[:name]} crashed: #{Exception.message(e)}\n#{Exception.format_stacktrace(stacktrace)}"
+      )
+
+      {:error, tool_crash_message(call[:name], e, stacktrace),
+       Exception.format(:error, e, stacktrace)}
+  end
+
+  defp exit_outcome(call, :timeout, run) do
+    {:error,
+     "Tool #{call[:name]} timed out after #{run.timeout}ms. " <>
+       "Try a smaller input or raise :tool_timeout.", nil}
+  end
+
+  defp exit_outcome(call, reason, _run) do
+    {:error,
+     "Tool #{call[:name]} crashed during execution: #{inspect(exit_reason(reason))}. " <>
+       "Check the input and try again.", nil}
+  end
+
+  # The model sees the reason without the stacktrace a throw carries.
+  defp exit_reason({reason, [{_mod, _fun, _arity, _location} | _]}), do: reason
+  defp exit_reason(reason), do: reason
+
+  defp finish(started, outcome, run) do
+    %{call: call, start_seq: start_seq} = started
+
+    {block, error, structured_data} =
+      case outcome do
+        {:ok, text, data} ->
+          {Message.tool_result_block(call[:id], valid_text(text), false), nil, data}
+
+        {:error, visible, diagnostic} ->
+          {Message.tool_result_block(call[:id], valid_text(visible), true),
+           valid_text(diagnostic || visible), nil}
       end
 
-    ms = max(System.monotonic_time(:millisecond) - t0, 0)
+    meta = %{
+      id: call[:id],
+      name: call[:name],
+      input: call[:input] || %{},
+      duration_ms: max(System.monotonic_time(:millisecond) - started.started_at, 0),
+      error: error
+    }
 
-    meta =
-      %{
-        id: call[:id],
-        name: call[:name],
-        input: call[:input] || %{},
-        duration_ms: ms,
-        error: error
-      }
-
-    eseq = emit_end(on_event, meta, seq_ref, corr_id, turn, sseq)
+    end_seq = emit_end(meta, start_seq, run)
 
     meta =
       meta
-      |> Map.merge(%{correlation_id: corr_id, start_event_seq: sseq, end_event_seq: eseq})
+      |> Map.merge(%{
+        correlation_id: run.corr_id,
+        start_event_seq: start_seq,
+        end_event_seq: end_seq
+      })
       |> maybe_put_structured_data(structured_data)
 
-    {result, meta}
+    {started.index, {block, meta}}
   end
 
-  defp run_tagged({:blocked, call, reason}, _, _, on_event, seq_ref, corr_id, turn) do
-    sseq = emit_start(on_event, call, seq_ref, corr_id, turn)
-    error = "Blocked: #{reason}"
+  # Tool output is sent back to the provider as JSON on every later turn.
+  # One invalid byte (a binary file, `cat` of a latin-1 log) would make
+  # every request of the session fail to encode, so it is replaced here.
+  defp valid_text(text) when is_binary(text), do: String.replace_invalid(text)
+  defp valid_text(other), do: other
 
-    meta = %{
-      id: call[:id],
-      name: call[:name],
-      input: call[:input] || %{},
-      duration_ms: 0,
-      error: error
-    }
+  defp emit_end(meta, start_seq, run) do
+    seq = :atomics.add_get(run.seq_ref, 1, 1)
 
-    eseq = emit_end(on_event, meta, seq_ref, corr_id, turn, sseq)
+    event =
+      Map.merge(meta, %{event_seq: seq, correlation_id: run.corr_id, start_event_seq: start_seq})
 
-    {result_block_fn(call[:type]).(call[:id], error, true),
-     Map.merge(meta, %{correlation_id: corr_id, start_event_seq: sseq, end_event_seq: eseq})}
-  end
+    run.on_event.({:tool_end, event})
 
-  defp crashed(call, reason, tool_timeout, on_event, seq_ref, corr_id, turn) do
-    error =
-      case reason do
-        :timeout ->
-          "Tool #{call[:name]} timed out after #{tool_timeout}ms. " <>
-            "Try a smaller input or raise :tool_timeout."
+    :telemetry.execute(
+      [:alloy, :tool, :stop],
+      %{event_seq: seq, duration_ms: meta.duration_ms},
+      %{
+        correlation_id: run.corr_id,
+        turn: run.turn,
+        tool_id: meta.id,
+        tool_name: meta.name,
+        error: meta.error,
+        start_event_seq: start_seq
+      }
+    )
 
-        _ ->
-          "Tool #{call[:name]} crashed during execution: #{inspect(reason)}. " <>
-            "Check the input and try again."
-      end
-
-    meta = %{
-      id: call[:id],
-      name: call[:name],
-      input: call[:input] || %{},
-      duration_ms: 0,
-      error: error
-    }
-
-    eseq = emit_end(on_event, meta, seq_ref, corr_id, turn, nil)
-
-    {result_block_fn(call[:type]).(call[:id], error, true),
-     Map.merge(meta, %{correlation_id: corr_id, start_event_seq: nil, end_event_seq: eseq})}
+    seq
   end
 
   defp call_from({:execute, c}), do: c
@@ -218,85 +372,13 @@ defmodule Alloy.Tool.Executor do
   defp stack_arity(arity) when is_integer(arity), do: arity
   defp stack_arity(args) when is_list(args), do: length(args)
 
-  defp emit_start(on_event, call, seq_ref, corr_id, turn) do
-    seq = :atomics.add_get(seq_ref, 1, 1)
-
-    on_event.(
-      {:tool_start,
-       %{
-         id: call[:id],
-         name: call[:name],
-         input: call[:input] || %{},
-         event_seq: seq,
-         correlation_id: corr_id
-       }}
-    )
-
-    :telemetry.execute([:alloy, :tool, :start], %{event_seq: seq}, %{
-      correlation_id: corr_id,
-      turn: turn,
-      tool_id: call[:id],
-      tool_name: call[:name]
-    })
-
-    seq
-  end
-
-  defp emit_end(on_event, meta, seq_ref, corr_id, turn, start_seq) do
-    seq = :atomics.add_get(seq_ref, 1, 1)
-
-    on_event.(
-      {:tool_end,
-       Map.merge(meta, %{
-         event_seq: seq,
-         correlation_id: corr_id,
-         start_event_seq: start_seq
-       })}
-    )
-
-    :telemetry.execute(
-      [:alloy, :tool, :stop],
-      %{event_seq: seq, duration_ms: meta.duration_ms},
-      %{
-        correlation_id: corr_id,
-        turn: turn,
-        tool_id: meta.id,
-        tool_name: meta.name,
-        error: meta.error,
-        start_event_seq: start_seq
-      }
-    )
-
-    seq
-  end
-
-  defp result_block_fn("server_tool_use"), do: &Message.server_tool_result_block/3
-  defp result_block_fn(_), do: &Message.tool_result_block/3
-
   defp maybe_put_structured_data(meta, nil), do: meta
   defp maybe_put_structured_data(meta, data), do: Map.put(meta, :structured_data, data)
 
   defp random_id, do: "run_" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
 
-  # ── Tool dispatch (module or Alloy.Tool.Inline) ──────────────────────────
-
-  defp tool_execute(%Inline{execute: fun}, input, ctx), do: fun.(input, ctx)
-  defp tool_execute(mod, input, ctx), do: mod.execute(input, ctx)
-
-  defp tool_max_result_chars(%Inline{max_result_chars: max}), do: max
-
-  defp tool_max_result_chars(mod) do
-    if function_exported?(mod, :max_result_chars, 0), do: mod.max_result_chars()
-  end
-
-  defp tool_sequential?(%Inline{concurrent?: concurrent?}), do: concurrent? == false
-
-  defp tool_sequential?(mod) do
-    function_exported?(mod, :concurrent?, 0) and mod.concurrent?() == false
-  end
-
-  defp maybe_truncate(text, tool) when is_binary(text) do
-    case tool_max_result_chars(tool) do
+  defp maybe_truncate(text, %Inline{max_result_chars: max_result_chars}) when is_binary(text) do
+    case max_result_chars do
       max when is_integer(max) and max > 0 ->
         len = String.length(text)
 
@@ -321,25 +403,6 @@ defmodule Alloy.Tool.Executor do
   end
 
   defp maybe_truncate(text, _tool), do: text
-
-  defp partition_by_concurrency(tagged, tool_fns) do
-    Enum.split_with(tagged, fn
-      {:execute, call} ->
-        case Map.fetch(tool_fns, call[:name]) do
-          {:ok, tool} -> tool_sequential?(tool)
-          :error -> false
-        end
-
-      {:blocked, _, _} ->
-        false
-    end)
-  end
-
-  defp reassemble_ordered(tagged, seq_tags, seq_results, par_tags, par_results) do
-    seq_map = Map.new(Enum.zip(seq_tags, seq_results))
-    par_map = Map.new(Enum.zip(par_tags, par_results))
-    Enum.map(tagged, fn tag -> Map.get(seq_map, tag) || Map.get(par_map, tag) end)
-  end
 
   defp build_context(%State{} = state) do
     Map.merge(state.config.context, %{

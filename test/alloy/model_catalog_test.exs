@@ -101,7 +101,7 @@ defmodule Alloy.ModelCatalogTest do
 
   describe "Alloy.ModelMetadata as the default Alloy.ModelCatalog" do
     test "context_window/1 matches catalog entries" do
-      assert Alloy.ModelMetadata.context_window("gpt-5") == 400_000
+      assert Alloy.ModelMetadata.context_window("gpt-5") == 272_000
       assert Alloy.ModelMetadata.context_window("totally-unknown") == nil
     end
 

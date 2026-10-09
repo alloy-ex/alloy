@@ -1,7 +1,10 @@
 defmodule Alloy.Tool.Core.BashTest do
   use ExUnit.Case, async: true
 
+  alias Alloy.Agent.{Config, State}
+  alias Alloy.Message
   alias Alloy.Tool.Core.Bash
+  alias Alloy.Tool.{Executor, Registry}
 
   @moduletag :core_tools
 
@@ -79,6 +82,93 @@ defmodule Alloy.Tool.Core.BashTest do
       assert msg =~ ~r/server|loop|input/i
     end
 
+    test "a timeout kills the command, not just the Elixir task", %{tmp_dir: tmp_dir} do
+      marker = Path.join(tmp_dir, "marker")
+
+      assert {:error, msg} =
+               Bash.execute(
+                 %{"command" => "sleep 1; touch #{marker}", "timeout" => 200},
+                 %{working_directory: tmp_dir}
+               )
+
+      assert msg =~ "timed out"
+      Process.sleep(1_500)
+      refute File.exists?(marker)
+    end
+
+    test "a timeout kills background children too", %{tmp_dir: tmp_dir} do
+      marker = Path.join(tmp_dir, "bg_marker")
+
+      assert {:error, _msg} =
+               Bash.execute(
+                 %{"command" => "(sleep 1; touch #{marker}) & sleep 5", "timeout" => 200},
+                 %{working_directory: tmp_dir}
+               )
+
+      Process.sleep(1_500)
+      refute File.exists?(marker)
+    end
+
+    test "the command dies with the process that ran it", %{tmp_dir: tmp_dir} do
+      # The executor kills a tool's task on :tool_timeout; the shell it
+      # started must not outlive it.
+      marker = Path.join(tmp_dir, "orphan_marker")
+
+      caller =
+        spawn(fn ->
+          Bash.execute(
+            %{"command" => "sleep 1; touch #{marker}", "timeout" => 10_000},
+            %{working_directory: tmp_dir}
+          )
+        end)
+
+      Process.sleep(200)
+      Process.exit(caller, :kill)
+      Process.sleep(1_500)
+      refute File.exists?(marker)
+    end
+
+    # A steady flood of output must not postpone the timeout: the deadline
+    # is checked before each receive, not only when the mailbox is empty.
+    test "a command that floods output still times out and is killed", %{tmp_dir: tmp_dir} do
+      tag = "alloy-flood-#{System.unique_integer([:positive])}"
+
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          Bash.execute(%{"command" => "yes #{tag}", "timeout" => 300}, %{
+            working_directory: tmp_dir
+          })
+        end)
+
+      assert {:error, msg} = result
+      assert msg =~ "timed out after 300ms"
+      assert elapsed_us < 2_000_000
+
+      Process.sleep(200)
+      assert {"", 1} = System.cmd("pgrep", ["-f", tag])
+    end
+
+    test "the model's timeout is clamped to :bash_max_timeout", %{tmp_dir: tmp_dir} do
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          Bash.execute(
+            %{"command" => "sleep 5", "timeout" => 600_000},
+            %{working_directory: tmp_dir, bash_max_timeout: 200}
+          )
+        end)
+
+      assert {:error, msg} = result
+      assert msg =~ "timed out after 200ms"
+      assert elapsed_us < 2_000_000
+    end
+
+    test "a missing working directory is an error", %{tmp_dir: tmp_dir} do
+      missing = Path.join(tmp_dir, "nope")
+
+      assert {:error, msg} = Bash.execute(%{"command" => "pwd"}, %{working_directory: missing})
+      assert msg =~ "Working directory does not exist"
+    end
+
     test "honors explicit timeouts above the default", %{tmp_dir: tmp_dir} do
       assert {:ok, result} =
                Bash.execute(
@@ -103,6 +193,150 @@ defmodule Alloy.Tool.Core.BashTest do
     test "uses default working directory when not in context" do
       assert {:ok, result} = Bash.execute(%{"command" => "echo works"}, %{})
       assert result =~ "works"
+    end
+  end
+
+  describe "environment" do
+    setup do
+      # Unique names: the OS environment is global and tests run async.
+      suffix = System.unique_integer([:positive])
+      secret = "ALLOY_TEST_#{suffix}_API_KEY"
+      token = "alloy_test_#{suffix}_token"
+      plain = "ALLOY_TEST_#{suffix}_PLAIN"
+      System.put_env(%{secret => "sk-secret", token => "tok-secret", plain => "visible"})
+      on_exit(fn -> Enum.each([secret, token, plain], &System.delete_env/1) end)
+
+      {:ok, secret: secret, token: token, plain: plain}
+    end
+
+    test "secret-looking variables are not inherited by default", vars do
+      out = printenv([vars.secret, vars.token, vars.plain], %{})
+
+      assert out =~ "#{vars.secret}=unset"
+      assert out =~ "#{vars.token}=unset"
+      assert out =~ "#{vars.plain}=visible"
+      refute out =~ "secret"
+    end
+
+    test ":bash_env sets or removes variables explicitly", vars do
+      context = %{bash_env: %{vars.secret => "granted", vars.plain => nil}}
+      out = printenv([vars.secret, vars.token, vars.plain], context)
+
+      assert out =~ "#{vars.secret}=granted"
+      assert out =~ "#{vars.token}=unset"
+      assert out =~ "#{vars.plain}=unset"
+    end
+
+    test "bash_env: :inherit passes the whole environment", vars do
+      out = printenv([vars.secret, vars.plain], %{bash_env: :inherit})
+
+      assert out =~ "#{vars.secret}=sk-secret"
+      assert out =~ "#{vars.plain}=visible"
+    end
+  end
+
+  describe "output limits" do
+    test "keeps the head and the tail, where errors appear", %{tmp_dir: tmp_dir} do
+      assert {:ok, result} =
+               Bash.execute(
+                 %{"command" => "seq 1 100000; echo THE_REAL_TAIL; exit 3"},
+                 %{working_directory: tmp_dir}
+               )
+
+      assert String.starts_with?(result, "1\n2\n3\n")
+      assert result =~ ~r/bytes of output truncated/
+      assert String.ends_with?(result, "100000\nTHE_REAL_TAIL\n\nexit code: 3")
+      assert String.length(result) <= Bash.max_result_chars()
+    end
+
+    test "the executor does not truncate bash output a second time" do
+      executor = fn _cmd, _dir -> {String.duplicate("a", 39_000) <> "THE_REAL_TAIL", 1} end
+      {_defs, tool_fns} = Registry.build([Bash])
+
+      state =
+        State.init(%Config{
+          provider: Alloy.Provider.Test,
+          provider_config: %{},
+          tools: [Bash],
+          context: %{bash_executor: executor}
+        })
+
+      call = %{id: "b", name: "bash", type: "tool_use", input: %{"command" => "x"}}
+
+      assert %Message{content: [%{content: out}]} =
+               Executor.execute_all([call], tool_fns, state)
+
+      assert length(Regex.scan(~r/truncated/, out)) == 1
+      assert String.ends_with?(out, "THE_REAL_TAIL\nexit code: 1")
+    end
+
+    test "multibyte output is only marked truncated when something was cut" do
+      short = String.duplicate("é", 10_000)
+      long = String.duplicate("é", 20_001)
+
+      assert {:ok, result} =
+               Bash.execute(%{"command" => "x"}, %{bash_executor: fn _, _ -> {short, 0} end})
+
+      assert result == short <> "\nexit code: 0"
+
+      assert {:ok, result} =
+               Bash.execute(%{"command" => "x"}, %{bash_executor: fn _, _ -> {long, 0} end})
+
+      assert result =~ "truncated"
+      assert String.length(result) < String.length(long)
+      assert String.valid?(result)
+    end
+
+    test "a timed-out command reports the output it produced", %{tmp_dir: tmp_dir} do
+      assert {:error, msg} =
+               Bash.execute(
+                 %{"command" => "echo started; sleep 5", "timeout" => 300},
+                 %{working_directory: tmp_dir}
+               )
+
+      assert msg =~ "started"
+      assert msg =~ "timed out"
+    end
+
+    @tag timeout: 60_000
+    test "huge output is capped while it streams, not buffered", %{tmp_dir: tmp_dir} do
+      bytes = 64 * 1024 * 1024
+      parent = self()
+
+      sampler =
+        spawn_link(fn ->
+          :erlang.garbage_collect()
+          sample_peak(:erlang.memory(:binary), parent)
+        end)
+
+      assert {:ok, result} =
+               Bash.execute(
+                 %{"command" => "head -c #{bytes} /dev/zero | tr '\\0' a", "timeout" => 50_000},
+                 %{working_directory: tmp_dir}
+               )
+
+      send(sampler, :stop)
+      assert_receive {:peak_growth, growth}, 1_000
+
+      # Buffering the whole output (as before) grows binary memory by
+      # roughly twice its size; streaming keeps it to a few chunks.
+      assert growth < div(bytes, 2)
+      assert result =~ "truncated"
+      assert String.length(result) <= Bash.max_result_chars()
+    end
+  end
+
+  defp printenv(names, context) do
+    command = Enum.map_join(names, "; ", &~s(echo "#{&1}=${#{&1}-unset}"))
+    {:ok, out} = Bash.execute(%{"command" => command}, context)
+    out
+  end
+
+  defp sample_peak(base, parent, peak \\ 0) do
+    receive do
+      :stop -> send(parent, {:peak_growth, peak})
+    after
+      5 -> sample_peak(base, parent, max(peak, :erlang.memory(:binary) - base))
     end
   end
 

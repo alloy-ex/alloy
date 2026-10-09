@@ -83,6 +83,125 @@ defmodule Alloy.Tool.Core.ReadTest do
       refute result =~ "5\tline 5"
     end
 
+    test "refuses binary files", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "image.png")
+      File.write!(file, <<0x89, "PNG\r\n", 0x1A, 0, 0, 0, 0x0D, "IHDR", 0xFF, 0xFE>>)
+
+      assert {:error, msg} = Read.execute(%{"file_path" => file}, %{})
+      assert msg =~ "binary file"
+      assert String.valid?(msg)
+    end
+
+    test "returns valid UTF-8 for non-UTF-8 text without a NUL byte", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "mixed.bin")
+      File.write!(file, <<0x89, "PNG\r\n", 0x1A, 0xFF, 0xFE, "\n", "caf", 0xE9, "\n">>)
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file}, %{})
+      assert String.valid?(result)
+      assert result =~ "caf�"
+    end
+
+    test "an unreadable file is an error, not a crash", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "secret.txt")
+      File.write!(file, "hidden\n")
+      File.chmod!(file, 0o000)
+      on_exit(fn -> File.chmod(file, 0o600) end)
+
+      assert {:error, msg} = Read.execute(%{"file_path" => file}, %{})
+      assert msg =~ "Cannot read"
+    end
+
+    test "a NUL byte after the first 8KB does not make a file binary", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "late_nul.txt")
+      File.write!(file, String.duplicate("a", 8_192) <> "\n" <> <<0>> <> "\n")
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file, "limit" => 1}, %{})
+      assert result =~ "1\taaaa"
+    end
+
+    test ":allowed_paths does not admit a sibling directory sharing the prefix", %{
+      tmp_dir: tmp_dir
+    } do
+      project = Path.join(tmp_dir, "project")
+      File.mkdir_p!(project)
+      File.mkdir_p!(project <> "-secrets")
+      File.write!(Path.join(project <> "-secrets", "key.txt"), "SECRET\n")
+      File.write!(Path.join(project, "ok.txt"), "fine\n")
+      ctx = %{allowed_paths: [project], working_directory: project}
+
+      assert {:error, msg} =
+               Read.execute(%{"file_path" => project <> "-secrets/key.txt"}, ctx)
+
+      assert msg =~ "outside allowed directories"
+      assert {:ok, result} = Read.execute(%{"file_path" => "ok.txt"}, ctx)
+      assert result =~ "fine"
+    end
+
+    test "offset and limit must be positive integers", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "params.txt")
+      File.write!(file, "1\n2\n3\n")
+
+      for bad <- [%{"offset" => 0}, %{"offset" => -2}, %{"offset" => "2"}] do
+        assert {:error, msg} = Read.execute(Map.put(bad, "file_path", file), %{})
+        assert msg =~ "offset must be an integer >= 1"
+      end
+
+      for bad <- [%{"limit" => 0}, %{"limit" => -1}, %{"limit" => 1.5}] do
+        assert {:error, msg} = Read.execute(Map.put(bad, "file_path", file), %{})
+        assert msg =~ "limit must be an integer >= 1"
+      end
+    end
+
+    test "an empty file reads as empty", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "empty.txt")
+      File.write!(file, "")
+
+      assert {:ok, ""} = Read.execute(%{"file_path" => file}, %{})
+    end
+
+    test "shows CRLF lines without the carriage return", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "crlf.txt")
+      File.write!(file, "one\r\ntwo\r\n")
+
+      assert {:ok, "     1\tone\n     2\ttwo\n"} = Read.execute(%{"file_path" => file}, %{})
+    end
+
+    test "an offset past the end is an error that gives the line count", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "short.txt")
+      File.write!(file, "1\n2\n3\n")
+
+      assert {:error, msg} = Read.execute(%{"file_path" => file, "offset" => 99}, %{})
+      assert msg =~ "beyond the end of the file"
+      assert msg =~ "3 lines"
+    end
+
+    test "tells the model how to continue when lines remain", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "ten.txt")
+      File.write!(file, Enum.map_join(1..10, "\n", &"line #{&1}"))
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file, "limit" => 3}, %{})
+      assert result =~ "[Showing lines 1-3 of 10. Use offset=4 to continue.]"
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file, "offset" => 8}, %{})
+      refute result =~ "Showing lines"
+      assert result =~ "10\tline 10"
+    end
+
+    test "stops at a whole line before the result size limit", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "wide.txt")
+      line = String.duplicate("x", 99)
+      File.write!(file, Enum.map_join(1..1_500, "\n", fn _ -> line end))
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file}, %{})
+      assert String.length(result) <= Read.max_result_chars()
+
+      [_, last, next] =
+        Regex.run(~r/\[Showing lines 1-(\d+) of 1500\. Use offset=(\d+) to continue\.\]/, result)
+
+      assert String.to_integer(next) == String.to_integer(last) + 1
+      assert result =~ "#{last}\t#{line}\n"
+    end
+
     test "returns error for missing file" do
       assert {:error, msg} = Read.execute(%{"file_path" => "/nonexistent/file.txt"}, %{})
       assert msg =~ "does not exist" or msg =~ "not a readable file"

@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.12.4"
+  @version "0.12.5"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -16,9 +16,40 @@ defmodule Alloy.MixProject do
       docs: docs(),
       dialyzer: [
         plt_local_path: "priv/plts/project.plt",
-        plt_core_path: "priv/plts/core.plt"
+        plt_core_path: "priv/plts/core.plt",
+        # Third-party callers rely on our specs, so hold them to what the
+        # code actually returns.
+        flags: [:error_handling, :extra_return, :missing_return, :unmatched_returns]
       ],
+      test_coverage: [
+        # Ratchet: raise as coverage improves, never lower it.
+        summary: [threshold: 90],
+        ignore_modules: [~r/^Alloy\.Test\./, Alloy.StreamTestHelpers]
+      ],
+      aliases: aliases(),
       elixirc_paths: elixirc_paths(Mix.env())
+    ]
+  end
+
+  def cli do
+    [preferred_envs: [ci: :test]]
+  end
+
+  # `mix ci` runs every gate CI enforces, in the order that fails fastest.
+  # Docs build separately (`MIX_ENV=dev mix docs --warnings-as-errors`)
+  # because ex_doc is a dev-only dependency.
+  defp aliases do
+    [
+      ci: [
+        "format --check-formatted",
+        "deps.unlock --check-unused",
+        "hex.audit",
+        "compile --warnings-as-errors --force",
+        "xref graph --format cycles --label compile-connected --fail-above 0",
+        "credo",
+        "test --warnings-as-errors --cover",
+        "dialyzer"
+      ]
     ]
   end
 
@@ -34,16 +65,20 @@ defmodule Alloy.MixProject do
 
   defp deps do
     [
-      # ~> 0.6 floor: req 0.6.0 fixes GHSA-px9f-whj3-246m (multipart header
-      # injection) and GHSA-655f-mp8p-96gv (decompression bomb) — relevant
-      # because Alloy can target user-configured OpenAI-compatible endpoints.
-      {:req, "~> 0.6"},
+      # Req 0.6.1 fixes GHSA-655f-mp8p-96gv (decompression bomb).
+      # Bound the tested API range while allowing the patched 0.6 line.
+      {:req, ">= 0.6.1 and < 0.8.0"},
+      # Not used directly: a security floor for the transport Req uses.
+      # Downstream apps don't inherit our lockfile, so the constraint is the
+      # only way to keep them off Mint < 1.11 (HTTP/1 DoS and smuggling CVEs)
+      # and HPAX < 1.0.4. See CHANGELOG "Security".
+      {:mint, "~> 1.11"},
       {:jason, "~> 1.2"},
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:plug, "~> 1.16", only: :test},
+      {:plug, "~> 1.19.5 or ~> 1.20.3", only: :test},
       {:phoenix_pubsub, "~> 2.1", optional: true}
     ]
   end
@@ -63,12 +98,13 @@ defmodule Alloy.MixProject do
       source_ref: "v#{@version}",
       extras: [
         "docs/events.md",
+        "docs/provider-compatibility.md",
         "docs/recipes/sub-agents.md",
         "docs/recipes/mcp-tools.md",
         "livebooks/quickstart.livemd"
       ],
       groups_for_extras: [
-        Guides: ~r{docs/events\.md|livebooks/.*},
+        Guides: ~r{docs/(events|provider-compatibility)\.md|livebooks/.*},
         Recipes: ~r{docs/recipes/.*}
       ],
       groups_for_modules: [
@@ -90,6 +126,7 @@ defmodule Alloy.MixProject do
           Alloy.Provider,
           Alloy.Provider.Anthropic,
           Alloy.Provider.Codex,
+          Alloy.Provider.Error,
           Alloy.Provider.Gemini,
           Alloy.Provider.OpenAI,
           Alloy.Provider.OpenAICompat,

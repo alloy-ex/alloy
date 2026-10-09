@@ -14,7 +14,7 @@ defmodule Alloy.Test.MemoryStore do
 
   use Agent
 
-  @spec start_link() :: {:ok, pid()}
+  @spec start_link() :: Agent.on_start()
   def start_link, do: Agent.start_link(fn -> %{} end)
 
   @spec contents(pid()) :: map()

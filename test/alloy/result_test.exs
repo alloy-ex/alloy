@@ -130,6 +130,29 @@ defmodule Alloy.ResultTest do
       assert length(result.messages) == 2
     end
 
+    test "text is \"\" when the last assistant message has no text blocks" do
+      config = %Config{provider: Alloy.Provider.Test, provider_config: %{}}
+
+      tool_only =
+        Message.assistant_blocks([%{type: "tool_use", id: "t1", name: "echo", input: %{}}])
+
+      state =
+        State.init(config, [
+          Message.user("hello"),
+          Message.assistant("earlier answer"),
+          Message.user("again"),
+          tool_only
+        ])
+
+      assert Result.from_state(state).text == ""
+    end
+
+    test "text is nil when there is no assistant message" do
+      config = %Config{provider: Alloy.Provider.Test, provider_config: %{}}
+
+      assert Result.from_state(State.init(config, [Message.user("hello")])).text == nil
+    end
+
     test "surfaces the final assistant thinking text" do
       config = %Config{provider: Alloy.Provider.Test, provider_config: %{}}
 
@@ -159,6 +182,22 @@ defmodule Alloy.ResultTest do
         |> Result.from_state()
 
       assert result.thinking == nil
+    end
+  end
+
+  describe "wrap/1" do
+    test "completed and max_turns runs are {:ok, result}" do
+      for status <- [:completed, :max_turns] do
+        result = %Result{status: status}
+        assert Result.wrap(result) == {:ok, result}
+      end
+    end
+
+    test "every other status is {:error, result}" do
+      for status <- [:error, :halted, :budget_exceeded] do
+        result = %Result{status: status}
+        assert Result.wrap(result) == {:error, result}
+      end
     end
   end
 

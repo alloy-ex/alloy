@@ -13,17 +13,36 @@ defmodule Alloy.Provider.Anthropic do
     "claude-sonnet-4-6", "claude-haiku-4-5")
 
   Optional:
-  - `:max_tokens` - Max output tokens (default: 4096)
+  - `:max_tokens` - Max output tokens, thinking included (default: 16_000).
+    Thinking is on by default on Claude 5.x models and counts toward this
+    limit, so a low value can cut off the answer (`stop_reason: :max_tokens`).
+    Raise it for long outputs or high effort.
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.anthropic.com")
   - `:api_version` - API version header (default: "2023-06-01")
-  - `:extra_headers` - Additional headers as `[{name, value}]`
-  - `:extra_body` - Additional request body fields, merged last
+  - `:extra_headers` - Additional headers as `[{name, value}]`. Every
+    `anthropic-beta` value is merged into a single `anthropic-beta` header.
+    Alloy adds `context-management-2025-06-27` itself when `:extra_body`
+    sets `context_management`; the other features it drives are GA and
+    need no beta.
+  - `:extra_body` - Additional request body fields, merged last. A `"tools"`
+    key here replaces every tool Alloy generates; use `:server_tools` to add
+    tools instead.
+  - `:server_tools` - Raw tool maps sent after Alloy's own tools, for
+    Anthropic-run tools such as web search, web fetch, tool search or an
+    `mcp_toolset` (default: `[]`). For example
+    `[%{"type" => "web_search_20260209", "name" => "web_search"}]`. Add any
+    request fields or beta headers they need through `:extra_body` and
+    `:extra_headers`.
   - `:req_options` - Additional options passed to Req (useful for testing)
-  - `:extended_thinking` - Enable extended thinking. Pass a keyword list with
-    `:budget_tokens` (e.g., `[budget_tokens: 5000]`). Thinking blocks are
-    returned in the message content and must be round-tripped verbatim in
-    subsequent turns (Anthropic requires the `signature` field).
+  - `:extended_thinking` - *Deprecated, removed in 0.13; configure thinking
+    through `:extra_body` instead (see "Thinking" below).* A keyword list with a
+    positive `:budget_tokens` (e.g., `[budget_tokens: 5000]`) sends
+    `"thinking": {"type": "enabled", "budget_tokens": ...}`. It still works on
+    the models that accept manual budgets (Claude Opus 4.5, Sonnet 4.5,
+    Haiku 4.5, and Opus 4.6 and Sonnet 4.6, where Anthropic deprecates it),
+    but Claude Opus 4.7 and later and every Claude 5.x model reject it with
+    HTTP 400.
   - `:on_event` - Streaming event callback `(event -> :ok)`. Called for each
     streaming delta. When used via `Server.stream_chat/4`, `event` is a
     normalized envelope map:
@@ -32,6 +51,42 @@ defmodule Alloy.Provider.Anthropic do
     Pass via `Server.stream_chat/4` opts: `on_event: fn event -> ... end`.
     Note: direct callers of `Alloy.Provider.Anthropic.stream/4` (without Turn)
     receive provider-native tuples (for example `{:thinking_delta, text}`).
+  - `:code_execution` - `true` adds the server-side code execution tool
+    (`code_execution_20260521`)
+
+  ## Thinking
+
+  Claude 5.x models think by default (adaptive thinking); Claude Opus 4.6 to
+  4.8 and Sonnet 4.6 think once asked. Configure thinking with `:extra_body`:
+
+      extra_body: %{
+        "thinking" => %{"type" => "adaptive", "display" => "summarized"},
+        "output_config" => %{"effort" => "high"}
+      }
+
+  `"display" => "summarized"` returns the thinking text; most current models
+  default to `"omitted"`, which returns thinking blocks with an empty
+  `thinking` field and only the signature. `output_config.effort` (`"low"`,
+  `"medium"`, `"high"`, and on some models `"xhigh"` or `"max"`) sets how
+  much the model thinks. Thinking counts toward `:max_tokens`. Thinking
+  blocks come back in the message content and are sent back verbatim on
+  later turns, as the API requires. See
+  <https://platform.claude.com/docs/en/build-with-claude/thinking> and
+  <https://platform.claude.com/docs/en/build-with-claude/effort>.
+
+  ## Programmatic tool calling
+
+  With `code_execution: true`, Claude can call your tools from code it runs
+  in the sandbox. Opt a tool in with `allowed_callers: [:code_execution]`
+  (sent as `"code_execution_20260120"`); `:human` and `:direct` are sent as
+  `"direct"`, and strings pass through unchanged. Such calls arrive as
+  ordinary tool calls with a `:caller` field, which Alloy sends back with the
+  history. The response's container id is kept in `provider_state` as
+  `:container_id` (with `:container_expires_at`) and sent as `"container"` on
+  the next request, which the API requires while a programmatic call is
+  waiting for its result. An expired container is not sent, so a session that
+  resumes after the container was reclaimed gets a fresh one. See
+  <https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling>.
 
   ## Example
 
@@ -46,16 +101,21 @@ defmodule Alloy.Provider.Anthropic do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.SSE
+  alias Alloy.Provider.{Error, HTTP}
 
   @default_api_url "https://api.anthropic.com"
   @default_api_version "2023-06-01"
-  @default_max_tokens 4096
-  @code_execution_tool_type "code_execution_20250825"
-  @code_execution_beta "code-execution-2025-08-25"
+  # Thinking counts toward max_tokens and is on by default on Claude 5.x;
+  # this is the value Anthropic's thinking examples use.
+  @default_max_tokens 16_000
+  # code_execution_20260120 and later support programmatic tool calling;
+  # every model that has code execution accepts this version.
+  @code_execution_tool_type "code_execution_20260521"
+  # The caller name that lets code execution call a tool. The API accepts it
+  # with either newer tool version and tags programmatic calls with it.
+  @code_execution_caller "code_execution_20260120"
   @memory_tool_type "memory_20250818"
-  @memory_beta "context-management-2025-06-27"
-  @advanced_tool_use_beta "advanced-tool-use-2025-11-20"
+  @context_management_beta "context-management-2025-06-27"
 
   @typedoc """
   Configuration for the Anthropic provider. See the module doc for field
@@ -70,11 +130,14 @@ defmodule Alloy.Provider.Anthropic do
           optional(:api_version) => String.t(),
           optional(:extra_headers) => [{String.t(), String.t()}],
           optional(:extra_body) => map(),
+          optional(:server_tools) => [map()],
           optional(:req_options) => keyword(),
           optional(:extended_thinking) => keyword(),
           optional(:on_event) => (term() -> :ok),
           optional(:cache) => boolean(),
-          optional(:memory) => {module(), term()}
+          optional(:memory) => {module(), term()},
+          optional(:code_execution) => boolean(),
+          optional(:provider_state) => map()
         }
 
   @impl true
@@ -83,24 +146,14 @@ defmodule Alloy.Provider.Anthropic do
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
-    req_opts =
-      ([
-         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
-         method: :post,
-         headers: build_headers(config, tool_defs),
-         body: Jason.encode!(body)
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200, body: resp_body}} ->
-        parse_response(resp_body)
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, parse_error(status, resp_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, resp_body} <-
+           HTTP.post_json(
+             messages_url(config),
+             build_headers(config, body),
+             body,
+             Map.get(config, :req_options, [])
+           ) do
+      parse_response(resp_body)
     end
   end
 
@@ -123,52 +176,28 @@ defmodule Alloy.Provider.Anthropic do
 
     initial_acc = %{
       buffer: "",
+      error: nil,
+      message: %{},
       content_blocks: %{},
       input_json_buffers: %{},
-      stop_reason: nil,
-      usage: %{},
       on_chunk: on_chunk,
       on_event: on_event
     }
 
-    stream_handler = SSE.req_stream_handler(initial_acc, &handle_sse_raw_event/2)
-
-    req_opts =
-      ([
-         url: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages",
-         method: :post,
-         headers: build_headers(config, tool_defs),
-         body: Jason.encode!(body),
-         into: stream_handler
-       ] ++ Map.get(config, :req_options, []))
-      |> Keyword.put(:retry, false)
-
-    case Req.request(req_opts) do
-      {:ok, %{status: 200} = resp} ->
-        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
-        build_stream_response(sse_acc)
-
-      {:ok, %{status: status} = resp} ->
-        error_body = streaming_error_body(resp, initial_acc)
-        {:error, parse_error(status, error_body)}
-
-      {:error, reason} ->
-        {:error, "HTTP request failed: #{inspect(reason)}"}
+    with {:ok, sse_acc} <-
+           HTTP.stream_sse(
+             messages_url(config),
+             build_headers(config, body),
+             body,
+             initial_acc,
+             &handle_sse_raw_event/2,
+             Map.get(config, :req_options, [])
+           ) do
+      build_stream_response(sse_acc)
     end
   end
 
-  # When streaming (into: handler), the error body is consumed by the SSE
-  # callback and resp.body is left as "". Recover it from the SSE buffer.
-  defp streaming_error_body(resp, initial_acc) do
-    case resp.body do
-      "" ->
-        sse_acc = Map.get(resp.private, :sse_acc, initial_acc)
-        sse_acc.buffer
-
-      body ->
-        body
-    end
-  end
+  defp messages_url(config), do: "#{Map.get(config, :api_url, @default_api_url)}/v1/messages"
 
   # Bridge from SSE module's raw events to Anthropic's typed event handler.
   # Anthropic events always have an event type and JSON-decodable data.
@@ -182,8 +211,7 @@ defmodule Alloy.Provider.Anthropic do
   defp handle_sse_raw_event(acc, _event), do: acc
 
   defp handle_sse_event(acc, "message_start", %{"message" => msg}) do
-    usage = Map.get(msg, "usage", %{})
-    %{acc | usage: merge_sse_usage(acc.usage, usage)}
+    %{acc | message: msg}
   end
 
   defp handle_sse_event(acc, "content_block_start", %{
@@ -248,45 +276,46 @@ defmodule Alloy.Provider.Anthropic do
     end
   end
 
-  defp handle_sse_event(acc, "message_delta", %{"delta" => delta, "usage" => usage}) do
-    stop_reason = Map.get(delta, "stop_reason")
-    %{acc | stop_reason: stop_reason, usage: merge_sse_usage(acc.usage, usage)}
+  # The delta carries the message's final top-level fields (stop_reason,
+  # stop_details, container). Its usage is cumulative, so it replaces the
+  # message_start counts rather than adding to them.
+  defp handle_sse_event(acc, "message_delta", %{"delta" => delta} = event) do
+    usage = put_present(Map.get(acc.message, "usage", %{}), Map.get(event, "usage", %{}))
+    message = acc.message |> put_present(delta) |> Map.put("usage", usage)
+    %{acc | message: message}
   end
 
-  defp handle_sse_event(acc, "message_delta", %{"delta" => delta}) do
-    stop_reason = Map.get(delta, "stop_reason")
-    %{acc | stop_reason: stop_reason}
-  end
+  # Retry retries a retryable error only when no output was streamed yet.
+  defp handle_sse_event(acc, "error", event), do: %{acc | error: Error.from_body(event)}
 
   defp handle_sse_event(acc, _event_type, _data), do: acc
 
-  defp merge_sse_usage(existing, new) do
-    Map.merge(existing, new, fn _k, v1, v2 ->
-      if is_number(v1) and is_number(v2), do: v1 + v2, else: v2
-    end)
+  # A null in a later event means "not reported here", not "reset".
+  defp put_present(map, updates) do
+    Map.merge(map, Map.reject(updates, fn {_key, value} -> is_nil(value) end))
   end
 
-  defp build_stream_response(acc) do
-    # Sort content blocks by index and convert to normalized format
-    content_blocks =
+  defp build_stream_response(%{error: %Error{} = error}), do: {:error, error}
+
+  defp build_stream_response(%{message: %{"stop_reason" => stop_reason}} = acc)
+       when is_binary(stop_reason) do
+    content =
       acc.content_blocks
-      |> Enum.sort_by(fn {index, _} -> index end)
+      |> Enum.sort_by(fn {index, _block} -> index end)
       |> Enum.map(fn {_index, block} -> block end)
-      |> parse_content_blocks()
 
-    stop_reason = parse_stop_reason(acc.stop_reason)
-    usage = parse_usage(acc.usage)
+    acc.message
+    |> Map.put("content", content)
+    |> message_response()
+  end
 
-    message = %Message{
-      role: :assistant,
-      content: content_blocks
-    }
-
-    {:ok,
-     %{
-       stop_reason: stop_reason,
-       messages: [message],
-       usage: usage
+  # Only the final message_delta carries a stop_reason, so a stream that ends
+  # without one was cut off and its content is incomplete.
+  defp build_stream_response(_acc) do
+    {:error,
+     %Error{
+       kind: :network,
+       message: "Anthropic stream ended before a stop_reason was received"
      }}
   end
 
@@ -320,21 +349,18 @@ defmodule Alloy.Provider.Anthropic do
           Map.put(body, "system", prompt)
       end
 
-    body =
-      case tool_defs do
-        [] ->
-          body
+    client_tools =
+      tool_defs
+      |> Enum.map(&format_tool_def/1)
+      |> maybe_add_cache_to_last_tool(cache?)
 
-        defs ->
-          tools = Enum.map(defs, &format_tool_def/1)
-          tools = maybe_add_cache_to_last_tool(tools, cache?)
-          Map.put(body, "tools", tools)
-      end
+    tools =
+      client_tools ++ code_execution_tools(config) ++ memory_tools(config) ++ server_tools(config)
 
     body =
       body
-      |> maybe_add_code_execution(config)
-      |> maybe_add_memory_tool(config)
+      |> maybe_put_tools(tools)
+      |> maybe_put_container(config)
 
     body =
       case Map.get(config, :extended_thinking) do
@@ -368,91 +394,76 @@ defmodule Alloy.Provider.Anthropic do
 
   defp stringify_extra_body(_), do: %{}
 
-  defp maybe_add_code_execution(body, config) do
-    if Map.get(config, :code_execution, false) do
-      code_exec_tool = %{
-        "type" => @code_execution_tool_type,
-        "name" => "code_execution"
-      }
+  defp maybe_put_tools(body, []), do: body
+  defp maybe_put_tools(body, tools), do: Map.put(body, "tools", tools)
 
-      existing_tools = Map.get(body, "tools", [])
-      Map.put(body, "tools", existing_tools ++ [code_exec_tool])
-    else
-      body
+  defp code_execution_tools(%{code_execution: true}),
+    do: [%{"type" => @code_execution_tool_type, "name" => "code_execution"}]
+
+  defp code_execution_tools(_config), do: []
+
+  defp memory_tools(%{memory: {_module, _store}}),
+    do: [%{"type" => @memory_tool_type, "name" => "memory"}]
+
+  defp memory_tools(_config), do: []
+
+  # Anthropic runs these tools itself, so they are sent exactly as given.
+  defp server_tools(config),
+    do: config |> Map.get(:server_tools, []) |> Alloy.Provider.stringify_keys()
+
+  # Reusing the container keeps code execution state between turns, and the
+  # API rejects a continuation of a pending programmatic tool call without it.
+  # Idle containers are reclaimed after about 5 minutes, so an expired one is
+  # not sent: the API then starts a fresh container instead of the session
+  # failing on every later request.
+  defp maybe_put_container(body, %{provider_state: %{container_id: id} = state})
+       when is_binary(id) do
+    if container_live?(state), do: Map.put(body, "container", id), else: body
+  end
+
+  defp maybe_put_container(body, _config), do: body
+
+  defp container_live?(%{container_expires_at: expires_at}) when is_binary(expires_at) do
+    case DateTime.from_iso8601(expires_at) do
+      {:ok, expires, _offset} -> DateTime.compare(DateTime.utc_now(), expires) == :lt
+      {:error, _reason} -> true
     end
   end
 
-  defp maybe_add_memory_tool(body, config) do
-    case Map.get(config, :memory) do
-      nil ->
-        body
+  defp container_live?(_state), do: true
 
-      {_module, _store} ->
-        memory_tool = %{"type" => @memory_tool_type, "name" => "memory"}
-        existing_tools = Map.get(body, "tools", [])
-        Map.put(body, "tools", existing_tools ++ [memory_tool])
-    end
-  end
+  defp build_headers(config, body) do
+    {user_betas, other_headers} =
+      config
+      |> Map.get(:extra_headers, [])
+      |> Enum.split_with(fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
 
-  defp build_headers(config, tool_defs) do
-    extra_headers = Map.get(config, :extra_headers, [])
-    {beta_values, other_headers} = split_anthropic_beta_headers(extra_headers)
-
-    beta_values =
-      if Map.get(config, :code_execution, false) do
-        [@code_execution_beta | beta_values]
-      else
-        beta_values
-      end
-
-    beta_values =
-      case Map.get(config, :memory) do
-        nil -> beta_values
-        {_module, _store} -> [@memory_beta | beta_values]
-      end
-
-    beta_values =
-      if advanced_tool_use?(tool_defs) do
-        [@advanced_tool_use_beta | beta_values]
-      else
-        beta_values
-      end
+    betas = Enum.map(user_betas, fn {_name, value} -> value end) ++ required_betas(body)
 
     [
       {"x-api-key", config.api_key},
       {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
       {"content-type", "application/json"}
-    ] ++ build_beta_headers(beta_values) ++ other_headers
+    ] ++ beta_header(betas) ++ other_headers
   end
 
-  defp advanced_tool_use?(tool_defs) do
-    Enum.any?(tool_defs, fn tool_def ->
-      Map.get(tool_def, :defer_loading) == true or
-        match?([_ | _], Map.get(tool_def, :input_examples))
-    end)
+  # Code execution, memory, tool search and tool use examples went GA on
+  # 2026-02-17 and need no header; context editing is still in beta.
+  defp required_betas(%{"context_management" => _}), do: [@context_management_beta]
+  defp required_betas(_body), do: []
+
+  # The API reads one comma-separated anthropic-beta header.
+  defp beta_header(values) do
+    values
+    |> Enum.flat_map(&String.split(&1, ","))
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> joined_beta_header()
   end
 
-  defp split_anthropic_beta_headers(headers) do
-    Enum.reduce(headers, {[], []}, fn
-      {"anthropic-beta", value}, {betas, others} -> {[value | betas], others}
-      {name, value}, {betas, others} -> {betas, [{name, value} | others]}
-    end)
-  end
-
-  defp build_beta_headers([]), do: []
-
-  defp build_beta_headers(beta_values) do
-    merged_value =
-      beta_values
-      |> Enum.reverse()
-      |> Enum.flat_map(&String.split(&1, ",", trim: true))
-      |> Enum.map(&String.trim/1)
-      |> Enum.reject(&(&1 == ""))
-      |> Enum.uniq()
-      |> Enum.join(",")
-
-    [{"anthropic-beta", merged_value}]
-  end
+  defp joined_beta_header([]), do: []
+  defp joined_beta_header(betas), do: [{"anthropic-beta", Enum.join(betas, ",")}]
 
   defp maybe_add_cache_to_conversation_tail(body, false), do: body
 
@@ -471,28 +482,29 @@ defmodule Alloy.Provider.Anthropic do
 
   defp add_cache_to_message_tail(%{"content" => blocks} = message)
        when is_list(blocks) and blocks != [] do
-    Map.put(message, "content", add_cache_to_last_cacheable_block(blocks))
+    Map.put(message, "content", put_cache_on_last(blocks, &cacheable_message_block?/1))
   end
 
   defp add_cache_to_message_tail(message), do: message
 
-  defp add_cache_to_last_cacheable_block(blocks) do
-    {blocks, _added?} =
-      blocks
+  # Marks the last item that may carry a breakpoint; none if no item may.
+  defp put_cache_on_last(items, cacheable?) do
+    {items, _added?} =
+      items
       |> Enum.reverse()
       |> Enum.map_reduce(false, fn
-        block, false ->
-          if cacheable_message_block?(block) do
-            {Map.put(block, "cache_control", %{"type" => "ephemeral"}), true}
+        item, false ->
+          if cacheable?.(item) do
+            {Map.put(item, "cache_control", %{"type" => "ephemeral"}), true}
           else
-            {block, false}
+            {item, false}
           end
 
-        block, true ->
-          {block, true}
+        item, true ->
+          {item, true}
       end)
 
-    Enum.reverse(blocks)
+    Enum.reverse(items)
   end
 
   defp cacheable_message_block?(%{"type" => type}) when type in ["thinking", "redacted_thinking"],
@@ -506,8 +518,23 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp format_message(%Message{role: role, content: blocks}) when is_list(blocks) do
-    %{"role" => to_string(role), "content" => Enum.map(blocks, &format_content_block/1)}
+    content =
+      blocks
+      |> Enum.reject(&unsendable_block?/1)
+      |> Enum.map(&format_content_block/1)
+
+    %{"role" => to_string(role), "content" => content}
   end
+
+  # Blocks the Messages API rejects, dropped so the transcript still works:
+  # "server_tool_result" was written by Alloy <= 0.12.4, which answered
+  # server tools client-side; "reasoning" and "output_item" are opaque
+  # OpenAI Responses items in a transcript that switched provider.
+  defp unsendable_block?(%{type: type})
+       when type in ["server_tool_result", "reasoning", "output_item"],
+       do: true
+
+  defp unsendable_block?(_block), do: false
 
   defp format_content_block(%{type: "thinking", thinking: thinking} = block) do
     %{"type" => "thinking", "thinking" => thinking}
@@ -518,8 +545,9 @@ defmodule Alloy.Provider.Anthropic do
     %{"type" => "text", "text" => text}
   end
 
-  defp format_content_block(%{type: "tool_use", id: id, name: name, input: input}) do
+  defp format_content_block(%{type: "tool_use", id: id, name: name, input: input} = block) do
     %{"type" => "tool_use", "id" => id, "name" => name, "input" => input}
+    |> maybe_put("caller", block[:caller])
   end
 
   defp format_content_block(%{type: "tool_result", tool_use_id: id, content: content} = block) do
@@ -529,17 +557,6 @@ defmodule Alloy.Provider.Anthropic do
 
   defp format_content_block(%{type: "server_tool_use", id: id, name: name, input: input}) do
     %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input}
-  end
-
-  defp format_content_block(
-         %{
-           type: "server_tool_result",
-           tool_use_id: id,
-           content: content
-         } = block
-       ) do
-    result = %{"type" => "server_tool_result", "tool_use_id" => id, "content" => content}
-    if Map.get(block, :is_error), do: Map.put(result, "is_error", true), else: result
   end
 
   defp format_content_block(%{type: "image", mime_type: mime_type, data: data}) do
@@ -574,13 +591,12 @@ defmodule Alloy.Provider.Anthropic do
     Map.new(block, fn {k, v} -> {to_string(k), v} end)
   end
 
-  defp maybe_add_cache_to_last_tool([], _cache?), do: []
   defp maybe_add_cache_to_last_tool(tools, false), do: tools
+  defp maybe_add_cache_to_last_tool(tools, true), do: put_cache_on_last(tools, &cacheable_tool?/1)
 
-  defp maybe_add_cache_to_last_tool(tools, true) do
-    {init, [last]} = Enum.split(tools, -1)
-    init ++ [Map.put(last, "cache_control", %{"type" => "ephemeral"})]
-  end
+  # The API rejects cache_control on a tool with defer_loading: true.
+  defp cacheable_tool?(%{"defer_loading" => true}), do: false
+  defp cacheable_tool?(_tool), do: true
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do
     base =
@@ -593,11 +609,18 @@ defmodule Alloy.Provider.Anthropic do
       |> maybe_put_input_examples(def_map)
       |> maybe_put_defer_loading(def_map)
 
-    case Map.get(def_map, :allowed_callers) do
-      nil -> base
-      callers -> Map.put(base, "allowed_callers", Enum.map(callers, &to_string/1))
-    end
+    maybe_put_allowed_callers(base, def_map)
   end
+
+  defp maybe_put_allowed_callers(tool, %{allowed_callers: callers}) when is_list(callers),
+    do: Map.put(tool, "allowed_callers", Enum.map(callers, &allowed_caller/1))
+
+  defp maybe_put_allowed_callers(tool, _def_map), do: tool
+
+  # Alloy's :human and :code_execution predate the API's caller names.
+  defp allowed_caller(caller) when caller in [:human, :direct], do: "direct"
+  defp allowed_caller(:code_execution), do: @code_execution_caller
+  defp allowed_caller(caller), do: to_string(caller)
 
   defp maybe_put_strict(tool, %{strict: true}), do: Map.put(tool, "strict", true)
   defp maybe_put_strict(tool, _def_map), do: tool
@@ -623,34 +646,52 @@ defmodule Alloy.Provider.Anthropic do
     end
   end
 
-  defp parse_response(%{"type" => "message"} = resp) do
-    stop_reason = parse_stop_reason(resp["stop_reason"])
-    content_blocks = parse_content_blocks(resp["content"] || [])
-    usage = parse_usage(resp["usage"] || %{})
+  defp parse_response(%{"type" => "message"} = resp), do: message_response(resp)
 
-    message = %Message{
-      role: :assistant,
-      content: content_blocks
-    }
+  defp parse_response(%{"type" => "error"} = resp), do: {:error, Error.from_body(resp)}
 
-    {:ok,
-     %{
-       stop_reason: stop_reason,
-       messages: [message],
-       usage: usage
-     }}
+  # The HTTP status was already 200 when the failure arrived in the body or
+  # the stream, so it is classified by its error type: overloaded_error
+  # becomes :overloaded, which Retry retries like an HTTP 529.
+  # Shared by complete/3 and stream/4: `resp` is a Messages API message, or
+  # the equivalent assembled from stream events.
+  defp message_response(resp) do
+    response =
+      %{
+        stop_reason: parse_stop_reason(resp["stop_reason"]),
+        messages: [
+          %Message{role: :assistant, content: parse_content_blocks(resp["content"] || [])}
+        ],
+        usage: parse_usage(resp["usage"] || %{})
+      }
+      |> maybe_put(:response_metadata, response_metadata(resp))
+      |> maybe_put(:provider_state, provider_state(resp))
+
+    {:ok, response}
   end
 
-  defp parse_response(%{"type" => "error"} = resp) do
-    error = resp["error"] || %{}
-    {:error, "#{error["type"]}: #{error["message"]}"}
-  end
+  # Turn feeds provider_state back in config, so the next request reuses
+  # the container (see maybe_put_container/2).
+  defp provider_state(%{"container" => %{"id" => id} = container}) when is_binary(id),
+    do: maybe_put(%{container_id: id}, :container_expires_at, container["expires_at"])
 
+  defp provider_state(_resp), do: nil
+
+  # https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
   defp parse_stop_reason("end_turn"), do: :end_turn
-  defp parse_stop_reason("tool_use"), do: :tool_use
-  defp parse_stop_reason("max_tokens"), do: :end_turn
   defp parse_stop_reason("stop_sequence"), do: :end_turn
-  defp parse_stop_reason(_), do: :end_turn
+  defp parse_stop_reason("tool_use"), do: :tool_use
+  defp parse_stop_reason("max_tokens"), do: :max_tokens
+  defp parse_stop_reason("model_context_window_exceeded"), do: :max_tokens
+  defp parse_stop_reason("refusal"), do: :refusal
+  defp parse_stop_reason("pause_turn"), do: :pause_turn
+  # The API may add stop reasons; an unknown one ends the turn rather than
+  # failing a run that produced a usable response.
+  defp parse_stop_reason(_stop_reason), do: :end_turn
+
+  # stop_details is null for every stop reason except refusal.
+  defp response_metadata(%{"stop_details" => %{} = details}), do: %{stop_details: details}
+  defp response_metadata(_resp), do: nil
 
   defp parse_content_blocks(blocks) do
     Enum.map(blocks, &parse_content_block/1)
@@ -665,8 +706,12 @@ defmodule Alloy.Provider.Anthropic do
     %{type: "text", text: text}
   end
 
-  defp parse_content_block(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
+  # A programmatic call's `caller` must go back unchanged with the history.
+  defp parse_content_block(
+         %{"type" => "tool_use", "id" => id, "name" => name, "input" => input} = block
+       ) do
     %{type: "tool_use", id: id, name: name, input: input}
+    |> maybe_put(:caller, block["caller"])
   end
 
   defp parse_content_block(%{
@@ -695,28 +740,5 @@ defmodule Alloy.Provider.Anthropic do
       cache_creation_input_tokens: Map.get(usage, "cache_creation_input_tokens", 0),
       cache_read_input_tokens: Map.get(usage, "cache_read_input_tokens", 0)
     }
-  end
-
-  defp parse_error(status, body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, %{"type" => "error", "error" => error}} ->
-        "#{error["type"]}: #{error["message"]}"
-
-      {:ok, %{"error" => error}} when is_map(error) ->
-        "#{error["type"]}: #{error["message"]}"
-
-      _ ->
-        "HTTP #{status}: #{body}"
-    end
-  end
-
-  defp parse_error(status, body) when is_map(body) do
-    case body do
-      %{"type" => "error", "error" => error} ->
-        "#{error["type"]}: #{error["message"]}"
-
-      _ ->
-        "HTTP #{status}: #{inspect(body)}"
-    end
   end
 end

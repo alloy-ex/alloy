@@ -2,7 +2,7 @@ defmodule Alloy.Provider.OpenAIStreamTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
-  alias Alloy.Provider.OpenAIStream
+  alias Alloy.Provider.{Error, OpenAIStream}
 
   # ── Helper: build SSE chunks ─────────────────────────────────────────
 
@@ -298,10 +298,34 @@ defmodule Alloy.Provider.OpenAIStreamTest do
       assert {:ok, %{stop_reason: :tool_use}} = result
     end
 
-    test "length maps to :end_turn" do
+    test "length maps to :max_tokens" do
       chunks = [sse_chunk(text_delta("hi")), sse_chunk(finish_chunk("length")), sse_done()]
       {_, result} = collect_stream(chunks, test_name: :finish_length)
-      assert {:ok, %{stop_reason: :end_turn}} = result
+      assert {:ok, %{stop_reason: :max_tokens}} = result
+    end
+
+    test "content_filter maps to :refusal with the details" do
+      chunks = [
+        sse_chunk(text_delta("hi")),
+        sse_chunk(finish_chunk("content_filter")),
+        sse_done()
+      ]
+
+      {_, result} = collect_stream(chunks, test_name: :finish_filter)
+
+      assert {:ok, %{stop_reason: :refusal} = response} = result
+      assert response.response_metadata.stop_details == %{"finish_reason" => "content_filter"}
+    end
+
+    test "the deprecated function_call maps to :tool_use" do
+      chunks = [
+        sse_chunk(tool_call_start(0, "c1", "read")),
+        sse_chunk(finish_chunk("function_call")),
+        sse_done()
+      ]
+
+      {_, result} = collect_stream(chunks, test_name: :finish_function_call)
+      assert {:ok, %{stop_reason: :tool_use}} = result
     end
   end
 
@@ -351,6 +375,36 @@ defmodule Alloy.Provider.OpenAIStreamTest do
 
       # Should return an error tuple, NOT raise an exception
       assert {:error, _reason} = result
+    end
+
+    test "cached prompt tokens are reported apart from uncached input" do
+      usage = %{
+        "id" => "chatcmpl-test",
+        "choices" => [],
+        "usage" => %{
+          "prompt_tokens" => 20,
+          "completion_tokens" => 10,
+          "prompt_tokens_details" => %{"cached_tokens" => 8, "cache_write_tokens" => 2}
+        }
+      }
+
+      chunks = [
+        sse_chunk(text_delta("hi")),
+        sse_chunk(finish_chunk("stop")),
+        sse_chunk(usage),
+        sse_done()
+      ]
+
+      {_collected, result} = collect_stream(chunks, test_name: :usage_cached)
+
+      assert {:ok, response} = result
+
+      assert response.usage == %{
+               input_tokens: 10,
+               output_tokens: 10,
+               cache_read_input_tokens: 8,
+               cache_creation_input_tokens: 2
+             }
     end
 
     test "usage event with empty choices array is captured correctly" do
@@ -408,6 +462,61 @@ defmodule Alloy.Provider.OpenAIStreamTest do
 
       text = Enum.find(blocks, &(&1.type == "text"))
       assert text.text == "The answer."
+    end
+  end
+
+  describe "stream/5 failures inside a 200 stream" do
+    test "a mid-stream error chunk is an error classified by its type" do
+      error_chunk = %{
+        "error" => %{
+          "type" => "server_error",
+          "code" => nil,
+          "message" => "The server had an error"
+        }
+      }
+
+      chunks = [sse_chunk(text_delta("Hel")), sse_chunk(error_chunk)]
+      {_, result} = collect_stream(chunks, test_name: :mid_stream_error)
+
+      assert {:error, %Error{kind: :server_error} = error} = result
+      assert Exception.message(error) == "server_error: The server had an error"
+    end
+
+    test "an error chunk that also carries finish_reason \"error\" is an error" do
+      # OpenRouter's mid-stream error shape.
+      error_chunk = %{
+        "id" => "gen-1",
+        "object" => "chat.completion.chunk",
+        "error" => %{"code" => 502, "message" => "Provider disconnected"},
+        "choices" => [%{"index" => 0, "delta" => %{"content" => ""}, "finish_reason" => "error"}]
+      }
+
+      chunks = [sse_chunk(text_delta("Hel")), sse_chunk(error_chunk), sse_done()]
+      {_, result} = collect_stream(chunks, test_name: :openrouter_error)
+
+      assert {:error, %Error{message: "Provider disconnected"}} = result
+    end
+
+    test "a stream that ends without finish_reason or [DONE] is an error" do
+      chunks = [sse_chunk(text_delta("Hel")), sse_chunk(tool_call_start(0, "call_1", "read"))]
+      {_, result} = collect_stream(chunks, test_name: :truncated_stream)
+
+      assert {:error, %Error{kind: :network} = error} = result
+      assert Exception.message(error) =~ "ended before"
+    end
+
+    test "[DONE] without a finish_reason still completes" do
+      chunks = [sse_chunk(text_delta("ok")), sse_done()]
+      {_, result} = collect_stream(chunks, test_name: :done_only)
+
+      assert {:ok, %{stop_reason: :end_turn}} = result
+    end
+
+    test "a finish_reason without [DONE] still completes" do
+      chunks = [sse_chunk(text_delta("ok")), sse_chunk(finish_chunk("stop"))]
+      {_, result} = collect_stream(chunks, test_name: :finish_only)
+
+      assert {:ok, %{stop_reason: :end_turn}} = result
     end
   end
 

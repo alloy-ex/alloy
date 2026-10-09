@@ -37,8 +37,10 @@ defmodule Alloy.Tool do
         tools: [Alloy.Tool.Core.Read]
       )
 
-  When configured, `resolve_path/2` returns `{:error, reason}` for
-  paths outside the allowed directories.
+  When configured, `resolve_path/2` follows symlinks and returns
+  `{:error, reason}` for paths whose real location is outside the allowed
+  directories. The built-in read, write and edit tools use it; it does
+  not restrict the bash tool.
 
   ## Example
 
@@ -208,61 +210,91 @@ defmodule Alloy.Tool do
   @doc """
   Resolve a file path against the working directory from context.
 
-  Absolute paths are returned as-is. Relative paths are joined with
-  the `:working_directory` from context, or expanded from cwd if not set.
+  Absolute paths are expanded. Relative paths are joined with the
+  `:working_directory` from context, or expanded from cwd if not set.
 
-  When `:allowed_paths` is set in context, validates the resolved path
-  falls within one of the allowed directories. Returns `{:error, reason}`
-  if the path is outside the allowed directories.
+  When `:allowed_paths` is set in context, every symlink in the path is
+  followed and the resulting real path must equal one of the allowed
+  directories (themselves resolved the same way) or sit beneath it.
+  `/proj` allows `/proj/lib/app.ex` but not `/proj-secrets/key.txt`.
+  Components that do not exist yet (a file about to be written) are
+  accepted as they are. The real path is returned, so the tool opens the
+  file that was checked. Returns `{:error, reason}` for a path outside
+  the allowed directories or one that cannot be resolved (a symlink
+  loop).
+
+  The check happens before the tool opens the file. It is a guard for an
+  agent's file tools, not a sandbox: a process that can create symlinks
+  under an allowed directory between the check and the open (for
+  example the agent's own bash tool) can still race it.
   """
   @spec resolve_path(String.t(), map()) :: {:ok, String.t()} | {:error, String.t()}
   def resolve_path(file_path, context) do
-    resolved =
-      if Path.type(file_path) == :absolute do
-        Path.expand(file_path)
-      else
-        case Map.get(context, :working_directory) do
-          nil -> Path.expand(file_path)
-          wd -> Path.expand(Path.join(wd, file_path))
-        end
+    expanded =
+      case Map.get(context, :working_directory) do
+        nil -> Path.expand(file_path)
+        wd -> Path.expand(file_path, wd)
       end
 
     case Map.get(context, :allowed_paths) do
-      nil ->
-        {:ok, resolved}
-
-      paths when is_list(paths) ->
-        # Resolve symlinks to prevent escaping allowed directories via symlink traversal.
-        # Falls back to the expanded path for non-existent targets.
-        real = resolve_real_path(resolved)
-
-        if Enum.any?(paths, fn allowed ->
-             String.starts_with?(real, resolve_real_path(Path.expand(allowed)))
-           end) do
-          {:ok, resolved}
-        else
-          {:error, "Path #{resolved} is outside allowed directories"}
-        end
+      nil -> {:ok, expanded}
+      roots when is_list(roots) -> check_allowed(expanded, roots)
     end
   end
 
-  defp resolve_real_path(path) do
-    case :file.read_link_all(String.to_charlist(path)) do
-      {:ok, target} ->
-        target
-        |> List.to_string()
-        |> Path.expand(Path.dirname(path))
-        |> resolve_real_path()
+  defp check_allowed(expanded, roots) do
+    with {:ok, real} <- real_path(expanded) do
+      if Enum.any?(roots, &inside?(real, &1)) do
+        {:ok, real}
+      else
+        {:error, "Path #{expanded} is outside allowed directories"}
+      end
+    end
+  end
+
+  defp inside?(real, root) do
+    case real_path(Path.expand(root)) do
+      {:ok, root} ->
+        real == root or String.starts_with?(real, String.trim_trailing(root, "/") <> "/")
 
       {:error, _} ->
-        # Not a symlink — check if a parent component is
-        parent = Path.dirname(path)
+        false
+    end
+  end
 
-        if parent == path do
-          path
-        else
-          Path.join(resolve_real_path(parent), Path.basename(path))
-        end
+  # Linux's MAXSYMLINKS; a path needing more hops is a loop.
+  @max_symlink_hops 40
+
+  # Walks the path one component at a time from its root, following
+  # symlinks and applying ".." to the real directory reached so far (as
+  # the kernel does), so the result names the file the OS would open.
+  defp real_path(path) do
+    [root | segments] = Path.split(path)
+
+    case walk(segments, root, 0) do
+      {:ok, real} -> {:ok, real}
+      :loop -> {:error, "Path #{path} cannot be resolved: too many levels of symbolic links"}
+    end
+  end
+
+  defp walk(_segments, _real, hops) when hops > @max_symlink_hops, do: :loop
+  defp walk([], real, _hops), do: {:ok, real}
+  defp walk(["." | rest], real, hops), do: walk(rest, real, hops)
+  defp walk([".." | rest], real, hops), do: walk(rest, Path.dirname(real), hops)
+
+  defp walk([segment | rest], real, hops) do
+    candidate = Path.join(real, segment)
+
+    case :file.read_link_all(candidate) do
+      {:ok, target} -> follow(List.to_string(target), rest, real, hops + 1)
+      {:error, _not_a_link_or_missing} -> walk(rest, candidate, hops)
+    end
+  end
+
+  defp follow(target, rest, real, hops) do
+    case {Path.type(target), Path.split(target)} do
+      {:absolute, [root | segments]} -> walk(segments ++ rest, root, hops)
+      {_relative, segments} -> walk(segments ++ rest, real, hops)
     end
   end
 end
