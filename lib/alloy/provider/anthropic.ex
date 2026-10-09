@@ -20,7 +20,11 @@ defmodule Alloy.Provider.Anthropic do
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: "https://api.anthropic.com")
   - `:api_version` - API version header (default: "2023-06-01")
-  - `:extra_headers` - Additional headers as `[{name, value}]`
+  - `:extra_headers` - Additional headers as `[{name, value}]`. Every
+    `anthropic-beta` value is merged into a single `anthropic-beta` header.
+    Alloy adds `context-management-2025-06-27` itself when `:extra_body`
+    sets `context_management`; the other features it drives are GA and
+    need no beta.
   - `:extra_body` - Additional request body fields, merged last. A `"tools"`
     key here replaces every tool Alloy generates; use `:server_tools` to add
     tools instead.
@@ -108,10 +112,8 @@ defmodule Alloy.Provider.Anthropic do
   # The caller name that lets code execution call a tool. The API accepts it
   # with either newer tool version and tags programmatic calls with it.
   @code_execution_caller "code_execution_20260120"
-  @code_execution_beta "code-execution-2025-08-25"
   @memory_tool_type "memory_20250818"
-  @memory_beta "context-management-2025-06-27"
-  @advanced_tool_use_beta "advanced-tool-use-2025-11-20"
+  @context_management_beta "context-management-2025-06-27"
 
   @typedoc """
   Configuration for the Anthropic provider. See the module doc for field
@@ -145,7 +147,7 @@ defmodule Alloy.Provider.Anthropic do
     with {:ok, resp_body} <-
            HTTP.post_json(
              messages_url(config),
-             build_headers(config, tool_defs),
+             build_headers(config, body),
              body,
              Map.get(config, :req_options, [])
            ) do
@@ -183,7 +185,7 @@ defmodule Alloy.Provider.Anthropic do
     with {:ok, sse_acc} <-
            HTTP.stream_sse(
              messages_url(config),
-             build_headers(config, tool_defs),
+             build_headers(config, body),
              body,
              initial_acc,
              &handle_sse_raw_event/2,
@@ -418,65 +420,38 @@ defmodule Alloy.Provider.Anthropic do
 
   defp maybe_put_container(body, _config), do: body
 
-  defp build_headers(config, tool_defs) do
-    extra_headers = Map.get(config, :extra_headers, [])
-    {beta_values, other_headers} = split_anthropic_beta_headers(extra_headers)
+  defp build_headers(config, body) do
+    {user_betas, other_headers} =
+      config
+      |> Map.get(:extra_headers, [])
+      |> Enum.split_with(fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
 
-    beta_values =
-      if Map.get(config, :code_execution, false) do
-        [@code_execution_beta | beta_values]
-      else
-        beta_values
-      end
-
-    beta_values =
-      case Map.get(config, :memory) do
-        nil -> beta_values
-        {_module, _store} -> [@memory_beta | beta_values]
-      end
-
-    beta_values =
-      if advanced_tool_use?(tool_defs) do
-        [@advanced_tool_use_beta | beta_values]
-      else
-        beta_values
-      end
+    betas = Enum.map(user_betas, fn {_name, value} -> value end) ++ required_betas(body)
 
     [
       {"x-api-key", config.api_key},
       {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
       {"content-type", "application/json"}
-    ] ++ build_beta_headers(beta_values) ++ other_headers
+    ] ++ beta_header(betas) ++ other_headers
   end
 
-  defp advanced_tool_use?(tool_defs) do
-    Enum.any?(tool_defs, fn tool_def ->
-      Map.get(tool_def, :defer_loading) == true or
-        match?([_ | _], Map.get(tool_def, :input_examples))
-    end)
+  # Code execution, memory, tool search and tool use examples went GA on
+  # 2026-02-17 and need no header; context editing is still in beta.
+  defp required_betas(%{"context_management" => _}), do: [@context_management_beta]
+  defp required_betas(_body), do: []
+
+  # The API reads one comma-separated anthropic-beta header.
+  defp beta_header(values) do
+    values
+    |> Enum.flat_map(&String.split(&1, ","))
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> joined_beta_header()
   end
 
-  defp split_anthropic_beta_headers(headers) do
-    Enum.reduce(headers, {[], []}, fn
-      {"anthropic-beta", value}, {betas, others} -> {[value | betas], others}
-      {name, value}, {betas, others} -> {betas, [{name, value} | others]}
-    end)
-  end
-
-  defp build_beta_headers([]), do: []
-
-  defp build_beta_headers(beta_values) do
-    merged_value =
-      beta_values
-      |> Enum.reverse()
-      |> Enum.flat_map(&String.split(&1, ",", trim: true))
-      |> Enum.map(&String.trim/1)
-      |> Enum.reject(&(&1 == ""))
-      |> Enum.uniq()
-      |> Enum.join(",")
-
-    [{"anthropic-beta", merged_value}]
-  end
+  defp joined_beta_header([]), do: []
+  defp joined_beta_header(betas), do: [{"anthropic-beta", Enum.join(betas, ",")}]
 
   defp maybe_add_cache_to_conversation_tail(body, false), do: body
 

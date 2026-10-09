@@ -51,7 +51,9 @@ defmodule Alloy.Memory.IntegrationTest do
       {:ok, plug: plug}
     end
 
-    test "injects the memory_20250818 tool and beta header when memory is set", %{plug: plug} do
+    test "injects the memory_20250818 tool without a beta header when memory is set", %{
+      plug: plug
+    } do
       {:ok, store_pid} = MemoryStore.start_link()
 
       {:ok, _result} =
@@ -67,10 +69,8 @@ defmodule Alloy.Memory.IntegrationTest do
       assert [memory_tool] = Enum.filter(body["tools"] || [], &(&1["type"] == "memory_20250818"))
       assert memory_tool["name"] == "memory"
 
-      assert {"anthropic-beta", beta_values} =
-               Enum.find(headers, fn {name, _} -> name == "anthropic-beta" end)
-
-      assert String.contains?(beta_values, "context-management-2025-06-27")
+      # The memory tool is GA (no beta header) since February 17, 2026.
+      refute List.keymember?(headers, "anthropic-beta", 0)
     end
 
     test "omits the memory tool and beta header when memory is absent", %{plug: plug} do

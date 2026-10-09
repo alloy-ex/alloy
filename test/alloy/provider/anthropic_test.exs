@@ -412,34 +412,14 @@ defmodule Alloy.Provider.AnthropicTest do
       assert code_exec_tool["name"] == "code_execution"
     end
 
-    test "adds anthropic-beta header for code_execution and merges extra beta headers" do
+    test "GA features send their fields without a beta header" do
+      # Code execution, memory, tool search (defer_loading) and tool use
+      # examples need no beta header since February 17, 2026:
+      # https://platform.claude.com/docs/en/release-notes/overview
       config =
         config_that_captures_request()
         |> Map.put(:code_execution, true)
-        |> Map.put(:extra_headers, [{"anthropic-beta", "context-1m-2025-08-07"}])
-
-      Anthropic.complete([Message.user("Hi")], [], config)
-
-      assert_received {:request_headers, headers}
-
-      anthropic_beta_values =
-        headers
-        |> Enum.filter(fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
-        |> Enum.map(fn {_name, value} -> value end)
-
-      assert [merged_beta_header] = anthropic_beta_values
-
-      merged_beta_values =
-        merged_beta_header
-        |> String.split(",", trim: true)
-        |> Enum.map(&String.trim/1)
-        |> Enum.sort()
-
-      assert merged_beta_values == ["code-execution-2025-08-25", "context-1m-2025-08-07"]
-    end
-
-    test "emits advanced tool-use fields and beta header when used" do
-      config = config_that_captures_request()
+        |> Map.put(:memory, {Alloy.Test.MemoryStore, %{}})
 
       tool_defs = [
         %{
@@ -456,50 +436,50 @@ defmodule Alloy.Provider.AnthropicTest do
       assert_received {:request_body, body}
       assert_received {:request_headers, headers}
 
-      decoded = Jason.decode!(body)
-      assert [tool] = decoded["tools"]
-      assert tool["input_examples"] == [%{"query" => "release notes"}]
-      assert tool["defer_loading"] == true
+      assert [search, %{"name" => "code_execution"}, %{"name" => "memory"}] =
+               Jason.decode!(body)["tools"]
 
-      assert beta_values(headers) == ["advanced-tool-use-2025-11-20"]
+      assert search["input_examples"] == [%{"query" => "release notes"}]
+      assert search["defer_loading"] == true
+      assert beta_headers(headers) == []
     end
 
-    test "advanced tool-use beta merges with memory beta" do
+    test "user-supplied betas pass through merged into one anthropic-beta header" do
+      config =
+        Map.put(config_that_captures_request(), :extra_headers, [
+          {"anthropic-beta", "context-1m-2025-08-07"},
+          {"x-request-tag", "alloy"},
+          {"Anthropic-Beta", "files-api-2025-04-14, context-1m-2025-08-07"}
+        ])
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_headers, headers}
+
+      assert [_one] = beta_headers(headers)
+      assert beta_values(headers) == ["context-1m-2025-08-07", "files-api-2025-04-14"]
+      assert {"x-request-tag", "alloy"} in headers
+    end
+
+    test "context editing in extra_body adds its beta, merged with the user's" do
+      # Context editing is still in beta:
+      # https://platform.claude.com/docs/en/build-with-claude/context-editing
       config =
         config_that_captures_request()
         |> Map.put(:memory, {Alloy.Test.MemoryStore, %{}})
+        |> Map.put(:extra_headers, [{"anthropic-beta", "context-1m-2025-08-07"}])
+        |> Map.put(:extra_body, %{
+          context_management: %{edits: [%{type: "clear_tool_uses_20250919"}]}
+        })
 
-      tool_defs = [
-        %{
-          name: "search",
-          description: "Search",
-          input_schema: %{type: "object", properties: %{}},
-          input_examples: [%{}]
-        }
-      ]
-
-      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+      Anthropic.complete([Message.user("Hi")], [], config)
 
       assert_received {:request_headers, headers}
 
       assert beta_values(headers) == [
-               "advanced-tool-use-2025-11-20",
+               "context-1m-2025-08-07",
                "context-management-2025-06-27"
              ]
-    end
-
-    test "does not add advanced tool-use beta when advanced fields are absent" do
-      config = config_that_captures_request()
-
-      tool_defs = [
-        %{name: "read", description: "Read", input_schema: %{type: "object", properties: %{}}}
-      ]
-
-      Anthropic.complete([Message.user("Hi")], tool_defs, config)
-
-      assert_received {:request_headers, headers}
-
-      refute "advanced-tool-use-2025-11-20" in beta_values(headers)
     end
 
     test "does not include code_execution tool when code_execution is false" do
@@ -2029,9 +2009,13 @@ defmodule Alloy.Provider.AnthropicTest do
 
   defp count_cache_controls(_value), do: 0
 
+  defp beta_headers(headers) do
+    Enum.filter(headers, fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
+  end
+
   defp beta_values(headers) do
     headers
-    |> Enum.filter(fn {name, _value} -> String.downcase(name) == "anthropic-beta" end)
+    |> beta_headers()
     |> Enum.flat_map(fn {_name, value} -> String.split(value, ",", trim: true) end)
     |> Enum.map(&String.trim/1)
     |> Enum.sort()
