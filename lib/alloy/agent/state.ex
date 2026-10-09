@@ -176,6 +176,9 @@ defmodule Alloy.Agent.State do
 
   @doc """
   Extract the text from the last assistant message.
+
+  Returns `""` when that message has no text blocks and `nil` when there is
+  no assistant message.
   """
   @spec last_assistant_text(t()) :: String.t() | nil
   def last_assistant_text(%__MODULE__{} = state) do

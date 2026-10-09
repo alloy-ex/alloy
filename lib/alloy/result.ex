@@ -7,7 +7,9 @@ defmodule Alloy.Result do
 
   ## Fields
 
-    * `:text` — the final assistant text (or `nil` if the model returned no text)
+    * `:text` — the text of the last assistant message (see `Alloy.Message.text/1`):
+      `""` when that message has no text blocks (it only called tools, or the
+      output was cut off), `nil` only when the conversation has no assistant message
     * `:thinking` — the final assistant thinking/reasoning text (or `nil` if none),
       so callers need not dig it out of the last message's content blocks
     * `:messages` — full conversation history

@@ -130,6 +130,29 @@ defmodule Alloy.ResultTest do
       assert length(result.messages) == 2
     end
 
+    test "text is \"\" when the last assistant message has no text blocks" do
+      config = %Config{provider: Alloy.Provider.Test, provider_config: %{}}
+
+      tool_only =
+        Message.assistant_blocks([%{type: "tool_use", id: "t1", name: "echo", input: %{}}])
+
+      state =
+        State.init(config, [
+          Message.user("hello"),
+          Message.assistant("earlier answer"),
+          Message.user("again"),
+          tool_only
+        ])
+
+      assert Result.from_state(state).text == ""
+    end
+
+    test "text is nil when there is no assistant message" do
+      config = %Config{provider: Alloy.Provider.Test, provider_config: %{}}
+
+      assert Result.from_state(State.init(config, [Message.user("hello")])).text == nil
+    end
+
     test "surfaces the final assistant thinking text" do
       config = %Config{provider: Alloy.Provider.Test, provider_config: %{}}
 

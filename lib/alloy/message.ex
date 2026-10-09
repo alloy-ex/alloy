@@ -68,7 +68,9 @@ defmodule Alloy.Message do
 
   @doc """
   Extracts plain text from a message, ignoring tool blocks.
-  Returns nil if no text content exists.
+
+  Joins the message's text blocks with newlines. Returns `""` (never `nil`)
+  when the message has no text blocks, for example when it only calls tools.
   """
   @spec text(t()) :: String.t()
   def text(%__MODULE__{content: content}) when is_binary(content), do: content
