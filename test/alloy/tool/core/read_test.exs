@@ -128,6 +128,71 @@ defmodule Alloy.Tool.Core.ReadTest do
       assert result =~ "fine"
     end
 
+    test "offset and limit must be positive integers", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "params.txt")
+      File.write!(file, "1\n2\n3\n")
+
+      for bad <- [%{"offset" => 0}, %{"offset" => -2}, %{"offset" => "2"}] do
+        assert {:error, msg} = Read.execute(Map.put(bad, "file_path", file), %{})
+        assert msg =~ "offset must be an integer >= 1"
+      end
+
+      for bad <- [%{"limit" => 0}, %{"limit" => -1}, %{"limit" => 1.5}] do
+        assert {:error, msg} = Read.execute(Map.put(bad, "file_path", file), %{})
+        assert msg =~ "limit must be an integer >= 1"
+      end
+    end
+
+    test "an empty file reads as empty", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "empty.txt")
+      File.write!(file, "")
+
+      assert {:ok, ""} = Read.execute(%{"file_path" => file}, %{})
+    end
+
+    test "shows CRLF lines without the carriage return", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "crlf.txt")
+      File.write!(file, "one\r\ntwo\r\n")
+
+      assert {:ok, "     1\tone\n     2\ttwo\n"} = Read.execute(%{"file_path" => file}, %{})
+    end
+
+    test "an offset past the end is an error that gives the line count", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "short.txt")
+      File.write!(file, "1\n2\n3\n")
+
+      assert {:error, msg} = Read.execute(%{"file_path" => file, "offset" => 99}, %{})
+      assert msg =~ "beyond the end of the file"
+      assert msg =~ "3 lines"
+    end
+
+    test "tells the model how to continue when lines remain", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "ten.txt")
+      File.write!(file, Enum.map_join(1..10, "\n", &"line #{&1}"))
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file, "limit" => 3}, %{})
+      assert result =~ "[Showing lines 1-3 of 10. Use offset=4 to continue.]"
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file, "offset" => 8}, %{})
+      refute result =~ "Showing lines"
+      assert result =~ "10\tline 10"
+    end
+
+    test "stops at a whole line before the result size limit", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "wide.txt")
+      line = String.duplicate("x", 99)
+      File.write!(file, Enum.map_join(1..1_500, "\n", fn _ -> line end))
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file}, %{})
+      assert String.length(result) <= Read.max_result_chars()
+
+      [_, last, next] =
+        Regex.run(~r/\[Showing lines 1-(\d+) of 1500\. Use offset=(\d+) to continue\.\]/, result)
+
+      assert String.to_integer(next) == String.to_integer(last) + 1
+      assert result =~ "#{last}\t#{line}\n"
+    end
+
     test "returns error for missing file" do
       assert {:error, msg} = Read.execute(%{"file_path" => "/nonexistent/file.txt"}, %{})
       assert msg =~ "does not exist" or msg =~ "not a readable file"
