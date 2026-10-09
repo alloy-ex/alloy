@@ -18,7 +18,11 @@ defmodule Alloy.ModelMetadata do
 
   @behaviour Alloy.ModelCatalog
 
-  @type model_entry :: {Regex.t(), pos_integer()}
+  @type model_entry :: %{
+          name: String.t(),
+          limit: pos_integer(),
+          suffix_patterns: [String.t() | Regex.t()]
+        }
 
   @type override_entry ::
           pos_integer()
@@ -129,12 +133,21 @@ defmodule Alloy.ModelMetadata do
   @spec default_context_window() :: pos_integer()
   def default_context_window, do: @default_limit
 
+  @doc deprecated: "Use context_window/1. The catalog is now family patterns; removed in 0.13."
   @doc """
-  Returns the ordered family rows: a pattern over the full model id and the
-  limit for ids it matches. The first matching row wins.
+  Returns the built-in families in the entry shape used before 0.12.5.
+
+  Each family is one entry with an empty `:name` and its full-id pattern as
+  the only suffix pattern, so the documented matching rule (an id is the
+  name followed by a matching suffix) still selects exactly the ids
+  `context_window/1` knows. Kept only for compatibility.
   """
   @spec catalog() :: [model_entry()]
-  def catalog, do: @families
+  def catalog do
+    Enum.map(@families, fn {pattern, limit} ->
+      %{name: "", limit: limit, suffix_patterns: [pattern]}
+    end)
+  end
 
   defp override_limit({name, limit}, model_name) when is_integer(limit) do
     override_limit({name, %{limit: limit}}, model_name)

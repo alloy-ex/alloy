@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `result.metadata.run.provider_error`. The struct implements `String.Chars`,
   so interpolating it still works; code that applies `=~` or binary
   patterns to a provider's raw error should use `Exception.message/1`.
+- **OpenAI context limits are the documented maximum input**, not the
+  advertised window (which includes output): `gpt-5.4`/`gpt-5.5` and the
+  GPT-6 family budget 922,000 tokens, `gpt-5`/`5.1`/`5.2` 272,000. Compaction
+  now fires before the API rejects the request instead of after.
+- **Long-tail OpenAI-compatible models** (Kimi, Qwen, GLM, Mistral, Gemma)
+  are no longer in the built-in catalog, because their limits could not be
+  verified; they use the 200,000-token default. Set
+  `model_metadata_overrides` or a `:model_catalog` for them. Compaction may
+  fire earlier than before, which is the safe direction.
 - Restrict test-only Plug to patched 1.19/1.20 versions.
 - Pin the contributor toolchain to Elixir 1.20.4 / OTP 28.5.0.7, add OTP 29
   coverage, dependency audits, weekly CI, and explicit read-only CI permissions.
@@ -57,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Custom providers that only return `:tool_use`/`:end_turn` are unaffected.
   A provider returning an unknown stop reason now fails the run with a clear
   error instead of crashing the loop.
+- **Model catalog: current models.** Claude Opus 4.7, Opus 5/5.5, Sonnet
+  5/5.5, Haiku 5.5, Fable 5.1 and Mythos (1M); GPT-6 Astra/Sol/Luna, GPT-6.1
+  Sol and GPT-5.6 Sol/Terra/Luna; Gemini 3.1 Flash-Lite, 3.5–3.8 Flash and
+  3.5 Flash-Lite; Grok 4.5–4.7 and Build 0.1. Every limit was checked against
+  the vendor's model pages on 2026-10-09 and the source is cited in the code.
 - **`Alloy.Provider.Error`** — structured provider failures with a `:kind`
   (`:rate_limited`, `:overloaded`, `:server_error`, `:timeout`, `:network`,
   `:context_overflow`, `:quota`, `:auth`, `:invalid_request`, `:unknown`),
@@ -65,11 +79,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
+- `Alloy.ModelMetadata.catalog/0`. The built-in catalog is now a short list of
+  family patterns; the function keeps its entry shape (one entry per family,
+  empty `:name`, full-id pattern as the suffix pattern) and will be removed
+  in 0.13. Use `context_window/1`.
 - `Alloy.Message.server_tool_result_block/3`. No provider accepts the block
   it builds; it will be removed in 0.13.
 
 ### Fixed
 
+- **Overstated context windows.** Grok 4.20 was listed at 2M (documented 1M)
+  and retired Grok slugs at up to 2M, so compaction never fired before the
+  API rejected the request. Claude Opus/Sonnet 4.6 were listed at 200k (now
+  1M), and `claude-fable-5-1` fell through to the default.
 - **Retries are classified on HTTP status and error code, not message
   text.** Previously not retried: Anthropic `api_error` (500) and
   `timeout_error` (504), OpenAI 503 `server_is_overloaded` and 429s whose
