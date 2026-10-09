@@ -79,6 +79,73 @@ defmodule Alloy.Tool.Core.BashTest do
       assert msg =~ ~r/server|loop|input/i
     end
 
+    test "a timeout kills the command, not just the Elixir task", %{tmp_dir: tmp_dir} do
+      marker = Path.join(tmp_dir, "marker")
+
+      assert {:error, msg} =
+               Bash.execute(
+                 %{"command" => "sleep 1; touch #{marker}", "timeout" => 200},
+                 %{working_directory: tmp_dir}
+               )
+
+      assert msg =~ "timed out"
+      Process.sleep(1_500)
+      refute File.exists?(marker)
+    end
+
+    test "a timeout kills background children too", %{tmp_dir: tmp_dir} do
+      marker = Path.join(tmp_dir, "bg_marker")
+
+      assert {:error, _msg} =
+               Bash.execute(
+                 %{"command" => "(sleep 1; touch #{marker}) & sleep 5", "timeout" => 200},
+                 %{working_directory: tmp_dir}
+               )
+
+      Process.sleep(1_500)
+      refute File.exists?(marker)
+    end
+
+    test "the command dies with the process that ran it", %{tmp_dir: tmp_dir} do
+      # The executor kills a tool's task on :tool_timeout; the shell it
+      # started must not outlive it.
+      marker = Path.join(tmp_dir, "orphan_marker")
+
+      caller =
+        spawn(fn ->
+          Bash.execute(
+            %{"command" => "sleep 1; touch #{marker}", "timeout" => 10_000},
+            %{working_directory: tmp_dir}
+          )
+        end)
+
+      Process.sleep(200)
+      Process.exit(caller, :kill)
+      Process.sleep(1_500)
+      refute File.exists?(marker)
+    end
+
+    test "the model's timeout is clamped to :bash_max_timeout", %{tmp_dir: tmp_dir} do
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          Bash.execute(
+            %{"command" => "sleep 5", "timeout" => 600_000},
+            %{working_directory: tmp_dir, bash_max_timeout: 200}
+          )
+        end)
+
+      assert {:error, msg} = result
+      assert msg =~ "timed out after 200ms"
+      assert elapsed_us < 2_000_000
+    end
+
+    test "a missing working directory is an error", %{tmp_dir: tmp_dir} do
+      missing = Path.join(tmp_dir, "nope")
+
+      assert {:error, msg} = Bash.execute(%{"command" => "pwd"}, %{working_directory: missing})
+      assert msg =~ "Working directory does not exist"
+    end
+
     test "honors explicit timeouts above the default", %{tmp_dir: tmp_dir} do
       assert {:ok, result} =
                Bash.execute(
