@@ -75,7 +75,10 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
   produced after the history compaction had just rewritten. Claude Fable
   5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 reject such thinking for accounts
   created on or after 2026-08-31. Compaction now removes all thinking it
-  keeps, which those models (adaptive thinking only) accept. The
+  keeps, which those models (adaptive thinking only) accept. Under manual
+  thinking (`"type" => "enabled"`), which requires the turn in progress to
+  start with thinking and whose models don't check history, that turn keeps
+  it. The
   `thinking-binding-controls-2026-08-01` beta is not needed. To opt into
   `prefix_mismatch_behavior: "drop_block"` yourself, pass it through
   `:extra_body` and `:extra_headers`.

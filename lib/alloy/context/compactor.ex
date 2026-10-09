@@ -241,16 +241,39 @@ defmodule Alloy.Context.Compactor do
   # accounts created on or after 2026-08-31. That includes the turn in
   # progress. Removing all of it is a documented valid change, and those
   # models think adaptively, which does not require the turn in progress to
-  # start with thinking. See
+  # start with thinking. Manual thinking ("enabled" with a budget) does
+  # require it, and the models that accept manual thinking do not check the
+  # history, so there the turn in progress keeps its thinking. See
   # https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
   defp finalize(%State{} = state, messages) do
     messages =
       messages
-      |> Enum.flat_map(&drop_thinking/1)
+      |> strip_thinking(manual_thinking?(state))
       |> fit_tool_results(state)
 
     %{state | messages: messages}
   end
+
+  defp strip_thinking(messages, false = _manual?), do: Enum.flat_map(messages, &drop_thinking/1)
+
+  defp strip_thinking(messages, true = _manual?) do
+    {settled, in_flight} = Enum.split(messages, in_flight_start(messages))
+    Enum.flat_map(settled, &drop_thinking/1) ++ in_flight
+  end
+
+  # extra_body is merged into the request with its keys stringified, so the
+  # caller may have written either form.
+  defp manual_thinking?(%State{config: %{provider_config: provider_config}}) do
+    case Map.get(provider_config, :extra_body) do
+      %{"thinking" => thinking} -> manual_type?(thinking)
+      %{thinking: thinking} -> manual_type?(thinking)
+      _extra_body -> false
+    end
+  end
+
+  defp manual_type?(%{"type" => "enabled"}), do: true
+  defp manual_type?(%{type: "enabled"}), do: true
+  defp manual_type?(_thinking), do: false
 
   # The turn in progress is everything after the last real user message; a
   # conversation that ends with one has no turn in progress.
