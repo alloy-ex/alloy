@@ -73,6 +73,73 @@ defmodule Alloy.Provider.AnthropicTest do
     end
   end
 
+  describe "stop reasons" do
+    # https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+    for {wire, expected} <- [
+          {"end_turn", :end_turn},
+          {"stop_sequence", :end_turn},
+          {"tool_use", :tool_use},
+          {"max_tokens", :max_tokens},
+          {"model_context_window_exceeded", :max_tokens},
+          {"pause_turn", :pause_turn},
+          {"refusal", :refusal}
+        ] do
+      test "complete/3 maps #{wire} to #{inspect(expected)}" do
+        config = config_with_response(%{status: 200, body: message_json(unquote(wire))})
+
+        assert {:ok, %{stop_reason: unquote(expected)}} =
+                 Anthropic.complete([Message.user("Hi")], [], config)
+      end
+
+      test "stream/4 maps #{wire} to #{inspect(expected)}" do
+        config = config_with_sse_stream(text_stream("ok", %{"stop_reason" => unquote(wire)}))
+
+        assert {:ok, %{stop_reason: unquote(expected)}} =
+                 Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+      end
+    end
+
+    test "complete/3 puts refusal stop_details in response_metadata" do
+      details = %{"type" => "refusal", "category" => "cyber", "explanation" => "Declined."}
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body: message_json("refusal", %{"content" => [], "stop_details" => details})
+        })
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Hi")], [], config)
+      assert result.stop_reason == :refusal
+      assert result.response_metadata == %{stop_details: details}
+    end
+
+    test "stream/4 puts refusal stop_details from message_delta in response_metadata" do
+      details = %{"type" => "refusal", "category" => nil, "explanation" => nil}
+
+      config =
+        config_with_sse_stream(
+          text_stream("partial", %{"stop_reason" => "refusal", "stop_details" => details})
+        )
+
+      assert {:ok, result} =
+               Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert result.stop_reason == :refusal
+      assert result.response_metadata == %{stop_details: details}
+    end
+
+    test "omits response_metadata when stop_details is null" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body: message_json("end_turn", %{"stop_details" => nil})
+        })
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Hi")], [], config)
+      refute Map.has_key?(result, :response_metadata)
+    end
+  end
+
   describe "complete/3 message formatting" do
     test "formats user messages correctly" do
       config = config_that_captures_request()
@@ -1352,11 +1419,44 @@ defmodule Alloy.Provider.AnthropicTest do
     end)
   end
 
+  defp message_json(stop_reason, overrides \\ %{}) do
+    %{
+      "id" => "msg_stop",
+      "type" => "message",
+      "role" => "assistant",
+      "content" => [%{"type" => "text", "text" => "ok"}],
+      "stop_reason" => stop_reason,
+      "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+    }
+    |> Map.merge(overrides)
+    |> Jason.encode!()
+  end
+
   # --- SSE Streaming Helpers ---
 
   # Build an Anthropic-format SSE event string: "event: <type>\ndata: <json>\n\n"
   defp ant_event(type, data) do
     "event: #{type}\ndata: #{Jason.encode!(data)}\n\n"
+  end
+
+  # A complete one-text-block stream whose message_delta carries `delta`.
+  defp text_stream(text, delta) do
+    [
+      ant_event("message_start", %{
+        "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 1}}
+      }),
+      ant_event("content_block_start", %{
+        "index" => 0,
+        "content_block" => %{"type" => "text", "text" => ""}
+      }),
+      ant_event("content_block_delta", %{
+        "index" => 0,
+        "delta" => %{"type" => "text_delta", "text" => text}
+      }),
+      ant_event("content_block_stop", %{"index" => 0}),
+      ant_event("message_delta", %{"delta" => delta, "usage" => %{"output_tokens" => 2}}),
+      ant_event("message_stop", %{})
+    ]
   end
 
   defp config_with_sse_stream(chunks) do

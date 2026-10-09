@@ -113,10 +113,9 @@ defmodule Alloy.Provider.Anthropic do
 
     initial_acc = %{
       buffer: "",
+      message: %{},
       content_blocks: %{},
       input_json_buffers: %{},
-      stop_reason: nil,
-      usage: %{},
       on_chunk: on_chunk,
       on_event: on_event
     }
@@ -148,8 +147,7 @@ defmodule Alloy.Provider.Anthropic do
   defp handle_sse_raw_event(acc, _event), do: acc
 
   defp handle_sse_event(acc, "message_start", %{"message" => msg}) do
-    usage = Map.get(msg, "usage", %{})
-    %{acc | usage: merge_sse_usage(acc.usage, usage)}
+    %{acc | message: msg}
   end
 
   defp handle_sse_event(acc, "content_block_start", %{
@@ -214,14 +212,17 @@ defmodule Alloy.Provider.Anthropic do
     end
   end
 
-  defp handle_sse_event(acc, "message_delta", %{"delta" => delta, "usage" => usage}) do
-    stop_reason = Map.get(delta, "stop_reason")
-    %{acc | stop_reason: stop_reason, usage: merge_sse_usage(acc.usage, usage)}
-  end
+  # The delta carries the message's final top-level fields (stop_reason,
+  # stop_details, container); null fields leave earlier values in place.
+  defp handle_sse_event(acc, "message_delta", %{"delta" => delta} = event) do
+    usage = merge_sse_usage(Map.get(acc.message, "usage", %{}), Map.get(event, "usage", %{}))
 
-  defp handle_sse_event(acc, "message_delta", %{"delta" => delta}) do
-    stop_reason = Map.get(delta, "stop_reason")
-    %{acc | stop_reason: stop_reason}
+    message =
+      acc.message
+      |> Map.merge(Map.reject(delta, fn {_key, value} -> is_nil(value) end))
+      |> Map.put("usage", usage)
+
+    %{acc | message: message}
   end
 
   defp handle_sse_event(acc, _event_type, _data), do: acc
@@ -233,27 +234,14 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp build_stream_response(acc) do
-    # Sort content blocks by index and convert to normalized format
-    content_blocks =
+    content =
       acc.content_blocks
-      |> Enum.sort_by(fn {index, _} -> index end)
+      |> Enum.sort_by(fn {index, _block} -> index end)
       |> Enum.map(fn {_index, block} -> block end)
-      |> parse_content_blocks()
 
-    stop_reason = parse_stop_reason(acc.stop_reason)
-    usage = parse_usage(acc.usage)
-
-    message = %Message{
-      role: :assistant,
-      content: content_blocks
-    }
-
-    {:ok,
-     %{
-       stop_reason: stop_reason,
-       messages: [message],
-       usage: usage
-     }}
+    acc.message
+    |> Map.put("content", content)
+    |> message_response()
   end
 
   # --- Request Building ---
@@ -589,34 +577,44 @@ defmodule Alloy.Provider.Anthropic do
     end
   end
 
-  defp parse_response(%{"type" => "message"} = resp) do
-    stop_reason = parse_stop_reason(resp["stop_reason"])
-    content_blocks = parse_content_blocks(resp["content"] || [])
-    usage = parse_usage(resp["usage"] || %{})
-
-    message = %Message{
-      role: :assistant,
-      content: content_blocks
-    }
-
-    {:ok,
-     %{
-       stop_reason: stop_reason,
-       messages: [message],
-       usage: usage
-     }}
-  end
+  defp parse_response(%{"type" => "message"} = resp), do: message_response(resp)
 
   defp parse_response(%{"type" => "error"} = resp) do
     error = resp["error"] || %{}
     {:error, "#{error["type"]}: #{error["message"]}"}
   end
 
+  # Shared by complete/3 and stream/4: `resp` is a Messages API message, or
+  # the equivalent assembled from stream events.
+  defp message_response(resp) do
+    response =
+      %{
+        stop_reason: parse_stop_reason(resp["stop_reason"]),
+        messages: [
+          %Message{role: :assistant, content: parse_content_blocks(resp["content"] || [])}
+        ],
+        usage: parse_usage(resp["usage"] || %{})
+      }
+      |> maybe_put(:response_metadata, response_metadata(resp))
+
+    {:ok, response}
+  end
+
+  # https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
   defp parse_stop_reason("end_turn"), do: :end_turn
-  defp parse_stop_reason("tool_use"), do: :tool_use
-  defp parse_stop_reason("max_tokens"), do: :end_turn
   defp parse_stop_reason("stop_sequence"), do: :end_turn
-  defp parse_stop_reason(_), do: :end_turn
+  defp parse_stop_reason("tool_use"), do: :tool_use
+  defp parse_stop_reason("max_tokens"), do: :max_tokens
+  defp parse_stop_reason("model_context_window_exceeded"), do: :max_tokens
+  defp parse_stop_reason("refusal"), do: :refusal
+  defp parse_stop_reason("pause_turn"), do: :pause_turn
+  # The API may add stop reasons; an unknown one ends the turn rather than
+  # failing a run that produced a usable response.
+  defp parse_stop_reason(_stop_reason), do: :end_turn
+
+  # stop_details is null for every stop reason except refusal.
+  defp response_metadata(%{"stop_details" => %{} = details}), do: %{stop_details: details}
+  defp response_metadata(_resp), do: nil
 
   defp parse_content_blocks(blocks) do
     Enum.map(blocks, &parse_content_block/1)
