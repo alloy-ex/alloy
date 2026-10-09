@@ -15,6 +15,17 @@ defmodule Alloy.Agent.Config do
   # The summary prompts are optional because a bare `%Config{}` omits them;
   # `from_opts/1` always fills them and the Compactor falls back to its
   # defaults when they are absent.
+  @compaction_keys [
+    :reserve_tokens,
+    :keep_recent_tokens,
+    :fallback,
+    :clear_tool_results,
+    :keep_recent_tool_results,
+    :summary_system_prompt,
+    :summary_prompt
+  ]
+  @compaction_keys_by_name Map.new(@compaction_keys, &{Atom.to_string(&1), &1})
+
   @type compaction :: %{
           optional(:summary_system_prompt) => String.t(),
           optional(:summary_prompt) => String.t(),
@@ -399,52 +410,18 @@ defmodule Alloy.Agent.Config do
   end
 
   defp normalize_compaction_map(map) do
-    Enum.reduce(map, %{}, fn
-      {:reserve_tokens, value}, acc ->
-        Map.put(acc, :reserve_tokens, value)
+    Map.new(map, fn {key, value} -> {compaction_key!(key), value} end)
+  end
 
-      {"reserve_tokens", value}, acc ->
-        Map.put(acc, :reserve_tokens, value)
+  # String keys are matched against the whitelist instead of converted, so
+  # untrusted config cannot create atoms.
+  defp compaction_key!(key) when key in @compaction_keys, do: key
 
-      {:keep_recent_tokens, value}, acc ->
-        Map.put(acc, :keep_recent_tokens, value)
-
-      {"keep_recent_tokens", value}, acc ->
-        Map.put(acc, :keep_recent_tokens, value)
-
-      {:fallback, value}, acc ->
-        Map.put(acc, :fallback, value)
-
-      {"fallback", value}, acc ->
-        Map.put(acc, :fallback, value)
-
-      {:clear_tool_results, value}, acc ->
-        Map.put(acc, :clear_tool_results, value)
-
-      {"clear_tool_results", value}, acc ->
-        Map.put(acc, :clear_tool_results, value)
-
-      {:keep_recent_tool_results, value}, acc ->
-        Map.put(acc, :keep_recent_tool_results, value)
-
-      {"keep_recent_tool_results", value}, acc ->
-        Map.put(acc, :keep_recent_tool_results, value)
-
-      {:summary_system_prompt, value}, acc ->
-        Map.put(acc, :summary_system_prompt, value)
-
-      {"summary_system_prompt", value}, acc ->
-        Map.put(acc, :summary_system_prompt, value)
-
-      {:summary_prompt, value}, acc ->
-        Map.put(acc, :summary_prompt, value)
-
-      {"summary_prompt", value}, acc ->
-        Map.put(acc, :summary_prompt, value)
-
-      {key, _value}, _acc ->
-        raise ArgumentError, "unsupported compaction option: #{inspect(key)}"
-    end)
+  defp compaction_key!(key) do
+    case Map.fetch(@compaction_keys_by_name, key) do
+      {:ok, known} -> known
+      :error -> raise ArgumentError, "unsupported compaction option: #{inspect(key)}"
+    end
   end
 
   defp resolve_compaction_field(current_value, true, _default_value), do: current_value

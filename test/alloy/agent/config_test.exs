@@ -151,6 +151,42 @@ defmodule Alloy.Agent.ConfigTest do
       assert config.compaction.summary_prompt == Compactor.default_summary_prompt()
     end
 
+    test "accepts string keys for every compaction option" do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          compaction: %{
+            "reserve_tokens" => 111,
+            "keep_recent_tokens" => 222,
+            "fallback" => :truncate,
+            "clear_tool_results" => false,
+            "keep_recent_tool_results" => 1,
+            "summary_system_prompt" => "system",
+            "summary_prompt" => "prompt"
+          }
+        )
+
+      assert config.compaction == %{
+               reserve_tokens: 111,
+               keep_recent_tokens: 222,
+               fallback: :truncate,
+               clear_tool_results: false,
+               keep_recent_tool_results: 1,
+               summary_system_prompt: "system",
+               summary_prompt: "prompt"
+             }
+
+      assert config.compaction_explicit == %{reserve_tokens: true, keep_recent_tokens: true}
+    end
+
+    test "rejects unknown compaction options, atom or string" do
+      for key <- [:reserve, "reserve", 42] do
+        assert_raise ArgumentError, "unsupported compaction option: #{inspect(key)}", fn ->
+          Config.from_opts(provider: {Alloy.Provider.Test, []}, compaction: [{key, 1}])
+        end
+      end
+    end
+
     test "accepts explicit compaction overrides" do
       config =
         Config.from_opts(
