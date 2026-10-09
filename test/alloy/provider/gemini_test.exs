@@ -558,6 +558,52 @@ defmodule Alloy.Provider.GeminiTest do
 
       assert Exception.message(error) == "INVALID_ARGUMENT: bad request"
     end
+
+    test "an error chunk mid-stream fails the stream instead of returning partial output" do
+      error = %{"code" => 503, "message" => "The model is overloaded.", "status" => "UNAVAILABLE"}
+
+      assert {:error, %Error{kind: :overloaded, status: 503} = error} =
+               stream_with([
+                 gemini_response([%{"text" => "Partial"}], nil),
+                 %{"error" => error}
+               ])
+
+      assert Exception.message(error) == "UNAVAILABLE: The model is overloaded."
+    end
+
+    test "an error object without a numeric code is still classified by its status" do
+      assert {:error, %Error{kind: :server_error, type: "INTERNAL"}} =
+               stream_with([%{"error" => %{"status" => "INTERNAL", "message" => "boom"}}])
+    end
+
+    test "a stream that ends without a finishReason is a retryable error" do
+      assert {:error, %Error{kind: :network} = error} =
+               stream_with([gemini_response([%{"text" => "Cut o"}], nil)])
+
+      assert Error.retryable?(error)
+      assert Exception.message(error) =~ "finishReason"
+    end
+
+    test "an empty stream is an error, not an empty answer" do
+      assert {:error, %Error{kind: :network}} = stream_with([])
+    end
+
+    test "an error object in a 200 response is a provider error" do
+      response = %{"error" => %{"code" => 500, "message" => "Internal", "status" => "INTERNAL"}}
+
+      assert {:error, %Error{kind: :server_error, status: 500}} = complete_with(response)
+    end
+
+    test "an unrecognised payload is a provider error" do
+      assert {:error, %Error{kind: :unknown} = error} = complete_with(%{"candidates" => []})
+      assert Exception.message(error) =~ "Unexpected Gemini response payload"
+    end
+
+    test "a body that is not JSON is a provider error" do
+      config = config_with_response(%{status: 200, body: "<html>proxy error</html>"})
+
+      assert {:error, %Error{kind: :unknown}} = Gemini.complete([Message.user("Hi")], [], config)
+    end
   end
 
   # A nil finish reason builds an intermediate stream chunk.

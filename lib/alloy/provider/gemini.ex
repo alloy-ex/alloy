@@ -291,7 +291,7 @@ defmodule Alloy.Provider.Gemini do
   defp parse_response(body) when is_binary(body) do
     case Alloy.Provider.decode_body(body) do
       {:ok, decoded} -> parse_response(decoded)
-      {:error, _} = err -> err
+      {:error, message} -> {:error, %Error{kind: :unknown, message: message}}
     end
   end
 
@@ -306,9 +306,22 @@ defmodule Alloy.Provider.Gemini do
   defp parse_response(%{"promptFeedback" => %{"blockReason" => _}} = resp),
     do: prompt_blocked(resp)
 
+  defp parse_response(%{"error" => error}), do: {:error, in_band_error(error)}
+
   defp parse_response(other) do
-    {:error, "Unexpected Gemini response payload: #{inspect(other)}"}
+    {:error,
+     %Error{kind: :unknown, message: "Unexpected Gemini response payload: #{inspect(other)}"}}
   end
+
+  # Errors can also arrive in a 200 body: as an SSE chunk mid-stream, or
+  # from a proxy. Google's error object carries the HTTP status it stands
+  # for in "code"; without one the error is classified by its "status"
+  # label alone and keeps no HTTP status.
+  defp in_band_error(%{"code" => status} = error) when is_integer(status) and status >= 400,
+    do: Error.from_response(status, [], %{"error" => error})
+
+  defp in_band_error(error),
+    do: %{Error.from_response(200, [], %{"error" => error}) | status: nil}
 
   defp respond(_blocks, %{"finishReason" => reason} = candidate, _resp)
        when reason in @generation_errors,
@@ -499,11 +512,19 @@ defmodule Alloy.Provider.Gemini do
 
   defp merge_stream_block(block, blocks), do: [block | blocks]
 
+  defp build_stream_response(%{response: %{"error" => error}}), do: {:error, in_band_error(error)}
+
   defp build_stream_response(%{
          content_blocks: [],
          response: %{"promptFeedback" => %{"blockReason" => _}} = resp
        }),
        do: prompt_blocked(resp)
+
+  # A finished stream always ends with a finishReason; without one the
+  # connection was cut and the output is incomplete.
+  defp build_stream_response(%{candidate: candidate})
+       when not is_map_key(candidate, "finishReason"),
+       do: {:error, %Error{kind: :network, message: "Gemini stream ended before a finishReason"}}
 
   defp build_stream_response(acc),
     do: acc.content_blocks |> Enum.reverse() |> respond(acc.candidate, acc.response)
