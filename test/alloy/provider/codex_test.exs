@@ -2,7 +2,7 @@ defmodule Alloy.Provider.CodexTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
-  alias Alloy.Provider.Codex
+  alias Alloy.Provider.{Codex, Error}
 
   describe "complete/3" do
     test "returns an end_turn assistant message from Codex JSON output" do
@@ -345,8 +345,8 @@ defmodule Alloy.Provider.CodexTest do
       result = Codex.complete([Message.user("hang")], [], config)
       elapsed = System.monotonic_time(:millisecond) - started_at
 
-      assert {:error, reason} = result
-      assert reason =~ "timed out"
+      assert {:error, %Error{kind: :timeout} = error} = result
+      assert Exception.message(error) == "codex exec timed out after 200ms"
       # Generous slack for TERM/KILL grace window and CI noise.
       assert elapsed < 5_000,
              "expected timeout to fire within ~200ms + grace, took #{elapsed}ms"
@@ -391,7 +391,8 @@ defmodule Alloy.Provider.CodexTest do
       result = Codex.complete([Message.user("progress")], [], config)
       elapsed = System.monotonic_time(:millisecond) - started_at
 
-      assert {:error, "codex exec timed out after 1000ms"} = result
+      assert {:error, %Error{kind: :timeout} = error} = result
+      assert Exception.message(error) == "codex exec timed out after 1000ms"
       assert elapsed < 3_000, "progress reset the turn deadline: #{elapsed}ms"
     end
 
@@ -430,7 +431,8 @@ defmodule Alloy.Provider.CodexTest do
       result = Codex.complete([Message.user("deadline")], [], config)
       elapsed = System.monotonic_time(:millisecond) - started_at
 
-      assert {:error, "codex exec timed out after 150ms"} = result
+      assert {:error, %Error{kind: :timeout} = error} = result
+      assert Exception.message(error) == "codex exec timed out after 150ms"
 
       assert elapsed < 5_000,
              "expected receive_timeout to cap the port timeout, took #{elapsed}ms"
@@ -473,7 +475,8 @@ defmodule Alloy.Provider.CodexTest do
       result = Codex.complete([Message.user("deadline")], [], config)
       elapsed = System.monotonic_time(:millisecond) - started_at
 
-      assert {:error, "codex exec timed out after 150ms"} = result
+      assert {:error, %Error{kind: :timeout} = error} = result
+      assert Exception.message(error) == "codex exec timed out after 150ms"
       assert elapsed < 5_000, "turn deadline was not applied, took #{elapsed}ms"
     end
   end
@@ -701,6 +704,60 @@ defmodule Alloy.Provider.CodexTest do
 
       assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
       assert "#{reason}" == "codex exec failed with status 1: Error: failed to parse config.toml"
+    end
+  end
+
+  describe "errors" do
+    @tag :tmp_dir
+    test "a missing codex executable is an :unknown error naming :codex_bin", %{tmp_dir: dir} do
+      missing = Path.join(dir, "no-such-codex")
+      config = %{model: "gpt-5.4", codex_bin: missing, codex_home: dir}
+
+      assert {:error, %Error{kind: :unknown} = error} =
+               Codex.complete([Message.user("Hi")], [], config)
+
+      message = Exception.message(error)
+      assert message =~ "could not run codex executable #{inspect(missing)}"
+      assert message =~ ":codex_bin"
+    end
+
+    test "a command_runner that cannot start codex is the same error" do
+      config = %{
+        model: "gpt-5.4",
+        command_runner: fn _cmd, _args, _opts -> raise ErlangError, original: :enoent end
+      }
+
+      assert {:error, %Error{kind: :unknown} = error} =
+               Codex.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) =~ "could not run codex executable \"codex\""
+    end
+
+    test "a failed run is an :unknown error with the previous message" do
+      config = %{
+        model: "gpt-5.4",
+        command_runner: fake_runner(fn _args, _opts, _output_path -> {"boom", 2} end)
+      }
+
+      assert {:error, %Error{kind: :unknown} = error} =
+               Codex.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) == "codex exec failed with status 2: boom"
+      assert "#{error}" == "codex exec failed with status 2: boom"
+    end
+
+    # The loop compacts the conversation and retries on :context_overflow.
+    test "a context window overflow is :context_overflow" do
+      failed =
+        ~s({"type":"turn.failed","error":{"message":"Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."}})
+
+      config = %{
+        model: "gpt-5.4",
+        command_runner: fake_runner(fn _args, _opts, _output_path -> {failed, 1} end)
+      }
+
+      assert {:error, %Error{kind: :context_overflow}} =
+               Codex.complete([Message.user("Hi")], [], config)
     end
   end
 

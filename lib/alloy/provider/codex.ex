@@ -53,6 +53,14 @@ defmodule Alloy.Provider.Codex do
   `config_overrides: [~s(cli_auth_credentials_store="keyring")]`, since that
   setting lives in the ignored `config.toml`.
 
+  ## Errors
+
+  Failures of the `codex exec` process return `%Alloy.Provider.Error{}`
+  with the same message text as before: `:timeout` (which the loop retries
+  within the turn deadline), `:context_overflow` (the loop compacts and
+  retries), or `:unknown`, which covers a missing executable and other
+  failed runs. A malformed Codex response is still a string error.
+
   ## Notes
 
   - Usage comes from the `turn.completed` event of `codex exec --json`. As
@@ -70,6 +78,7 @@ defmodule Alloy.Provider.Codex do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
+  alias Alloy.Provider.Error
 
   @default_timeout_ms 120_000
   @default_codex_bin "codex"
@@ -148,7 +157,7 @@ defmodule Alloy.Provider.Codex do
 
     with {:ok, codex_home} <- codex_home(config),
          {:ok, command_result} <- execute(prompt, codex_home, config),
-         {:ok, payload} <- decode_payload(command_result) do
+         {:ok, payload} <- decode_payload(command_result, config) do
       parse_payload(payload, config, command_result)
     end
   end
@@ -203,7 +212,7 @@ defmodule Alloy.Provider.Codex do
 
     case Task.yield(task, timeout + @reply_grace_ms) || Task.shutdown(task) do
       {:ok, result} -> result
-      {:exit, reason} -> {:error, "codex exec failed: #{inspect(reason)}"}
+      {:exit, reason} -> {:error, %Error{message: "codex exec failed: #{inspect(reason)}"}}
       nil -> {:error, timed_out(timeout)}
     end
   end
@@ -291,8 +300,7 @@ defmodule Alloy.Provider.Codex do
         {:error, "codex exec returned unexpected result: #{inspect(other)}"}
     end
   rescue
-    error in ErlangError ->
-      {:error, "codex exec failed to start: #{Exception.message(error)}"}
+    error in ErlangError -> {:error, not_runnable(config, Exception.message(error))}
   end
 
   defp open_port(args, codex_home, paths, config) do
@@ -337,7 +345,7 @@ defmodule Alloy.Provider.Codex do
 
       {:DOWN, ^caller_ref, :process, _pid, reason} ->
         :ok = stop(run)
-        {:error, "codex exec cancelled: caller exited (#{inspect(reason)})"}
+        {:error, %Error{message: "codex exec cancelled: caller exited (#{inspect(reason)})"}}
 
       {:EXIT, from, reason} when is_pid(from) ->
         :ok = stop(run)
@@ -377,7 +385,8 @@ defmodule Alloy.Provider.Codex do
     :ok
   end
 
-  defp timed_out(timeout), do: "codex exec timed out after #{timeout}ms"
+  defp timed_out(timeout),
+    do: %Error{kind: :timeout, message: "codex exec timed out after #{timeout}ms"}
 
   defp read_stderr(paths) do
     case File.read(paths.stderr_path) do
@@ -413,14 +422,30 @@ defmodule Alloy.Provider.Codex do
 
   defp codex_bin(config), do: Map.get(config, :codex_bin, @default_codex_bin)
 
-  defp codex_error(%{status: status} = command_result) do
-    message =
-      command_result
-      |> failure_detail()
-      |> String.trim()
-      |> truncate(@error_truncation)
+  # sh and env exit 127 when the executable is missing and 126 when it
+  # cannot be run.
+  defp codex_error(%{status: status} = command_result, config) when status in [126, 127],
+    do: not_runnable(config, "status #{status}: #{detail(command_result)}")
 
-    "codex exec failed with status #{status}: #{message}"
+  defp codex_error(%{status: status} = command_result, _config) do
+    message = "codex exec failed with status #{status}: #{detail(command_result)}"
+    kind = if Error.overflow_text?(message), do: :context_overflow, else: :unknown
+    %Error{kind: kind, message: message}
+  end
+
+  defp not_runnable(config, detail) do
+    %Error{
+      message:
+        "could not run codex executable #{inspect(codex_bin(config))}; install the Codex CLI " <>
+          "or set :codex_bin (#{detail})"
+    }
+  end
+
+  defp detail(command_result) do
+    command_result
+    |> failure_detail()
+    |> String.trim()
+    |> truncate(@error_truncation)
   end
 
   # turn.failed is the last event. Failures before the first event (bad
@@ -444,11 +469,11 @@ defmodule Alloy.Provider.Codex do
 
   # A payload counts even when codex exits non-zero; without one, a non-zero
   # exit is the error worth reporting.
-  defp decode_payload(%{last_message: last_message, status: status} = command_result) do
+  defp decode_payload(%{last_message: last_message, status: status} = command_result, config) do
     case decode_last_message(last_message) do
       {:ok, payload} -> {:ok, payload}
       {:error, reason} when status == 0 -> {:error, reason}
-      {:error, _reason} -> {:error, codex_error(command_result)}
+      {:error, _reason} -> {:error, codex_error(command_result, config)}
     end
   end
 
