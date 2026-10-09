@@ -88,6 +88,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Gemini:**
+  - streamed text no longer gains a newline between chunks
+    (`"Hello\n world"`); consecutive text and thought pieces are merged and
+    thought signatures stay on the block they arrived with;
+  - `output_tokens` now includes thinking tokens (billed as output), and
+    `input_tokens` excludes cache reads (reported as
+    `cache_read_input_tokens`, matching Anthropic) and includes tool-use
+    prompt tokens;
+  - `maxOutputTokens` is sent only when `:max_tokens` is set; the old 4096
+    default also had to fit thinking, so 3.x responses were cut short;
+  - `finishReason` maps to `:max_tokens`/`:refusal` (details in
+    `response_metadata.stop_details`), blocked prompts are a `:refusal`,
+    and malformed or unexpected function calls are retryable errors;
+  - mid-stream error chunks and streams cut off before a `finishReason`
+    are errors instead of partial successes.
 - **Overstated context windows.** Grok 4.20 was listed at 2M (documented 1M)
   and retired Grok slugs at up to 2M, so compaction never fired before the
   API rejected the request. Claude Opus/Sonnet 4.6 were listed at 200k (now
