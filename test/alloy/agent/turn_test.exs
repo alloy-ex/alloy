@@ -2209,6 +2209,71 @@ defmodule Alloy.Agent.TurnTest do
       assert_received {[:alloy, :turn, :stop], ^ref_stop, _m, %{turn: 2}}
     end
 
+    test "each turn stops before the next one starts, carrying its own status" do
+      handler_id = attach_loop_telemetry(self())
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tool_1", name: "echo", input: %{"text" => "hi"}}
+          ]),
+          TestProvider.text_response("Done")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool]
+      }
+
+      try do
+        result = Turn.run_loop(State.init(config, [Message.user("Echo hi")]))
+        assert result.status == :completed
+
+        assert [
+                 {[:alloy, :run, :start], _},
+                 {[:alloy, :turn, :start], %{turn: 1}},
+                 {[:alloy, :turn, :stop], %{turn: 1, status: :running}},
+                 {[:alloy, :turn, :start], %{turn: 2}},
+                 {[:alloy, :turn, :stop], %{turn: 2, status: :completed}},
+                 {[:alloy, :run, :stop], %{status: :completed, turns: 2}}
+               ] = collect_loop_telemetry()
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
+    test "a raising turn emits turn and run exception events" do
+      defmodule RaisingMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_completion, _state), do: raise("middleware bug")
+        def call(_hook, state), do: state
+      end
+
+      handler_id = attach_loop_telemetry(self())
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: self()},
+        middleware: [RaisingMiddleware]
+      }
+
+      try do
+        assert_raise RuntimeError, "middleware bug", fn ->
+          Turn.run_loop(State.init(config, [Message.user("Hi")]))
+        end
+
+        assert [
+                 {[:alloy, :run, :start], _},
+                 {[:alloy, :turn, :start], %{turn: 1}},
+                 {[:alloy, :turn, :exception], %{turn: 1, kind: :error}},
+                 {[:alloy, :run, :exception], %{kind: :error, reason: %RuntimeError{}}}
+               ] = collect_loop_telemetry()
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "emits [:alloy, :compaction, :done] when compaction fires" do
       ref = :telemetry_test.attach_event_handlers(self(), [[:alloy, :compaction, :done]])
 
@@ -2484,6 +2549,38 @@ defmodule Alloy.Agent.TurnTest do
 
       assert result.status == :completed
       assert result.turn == 1
+    end
+  end
+
+  @loop_events [
+    [:alloy, :run, :start],
+    [:alloy, :run, :stop],
+    [:alloy, :run, :exception],
+    [:alloy, :turn, :start],
+    [:alloy, :turn, :stop],
+    [:alloy, :turn, :exception]
+  ]
+
+  # Telemetry handlers are global and tests run async, so only events emitted
+  # by the test's own process (where run_loop runs) are forwarded.
+  defp attach_loop_telemetry(test_pid) do
+    handler_id = "loop-telemetry-#{inspect(make_ref())}"
+    :telemetry.attach_many(handler_id, @loop_events, &__MODULE__.forward_loop_event/4, test_pid)
+    handler_id
+  end
+
+  @doc false
+  def forward_loop_event(event, _measurements, metadata, test_pid) when test_pid == self() do
+    send(test_pid, {:loop_telemetry, event, metadata})
+  end
+
+  def forward_loop_event(_event, _measurements, _metadata, _test_pid), do: :ok
+
+  defp collect_loop_telemetry do
+    receive do
+      {:loop_telemetry, event, metadata} -> [{event, metadata} | collect_loop_telemetry()]
+    after
+      0 -> []
     end
   end
 end
