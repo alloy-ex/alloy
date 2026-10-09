@@ -150,6 +150,31 @@ defmodule Alloy.Agent.ServerTest do
     end
   end
 
+  describe "default call timeout" do
+    test "covers the agent's own :timeout_ms plus a margin" do
+      pid = start_provider([])
+
+      {:ok, default_agent} = Server.start_link(opts(pid))
+      {:ok, slow_agent} = Server.start_link(opts(pid, timeout_ms: 300_000))
+
+      assert Server.default_call_timeout(default_agent) == 130_000
+      assert Server.default_call_timeout(slow_agent) == 310_000
+    end
+
+    test "chat and stream_chat without :timeout use it and complete" do
+      pid =
+        start_provider([
+          {:with_delay, 50, TestProvider.text_response("Late but fine")},
+          TestProvider.text_response("Streamed")
+        ])
+
+      {:ok, agent} = Server.start_link(opts(pid, timeout_ms: 300_000))
+
+      assert {:ok, %{text: "Late but fine"}} = Server.chat(agent, "Hello")
+      assert {:ok, %{text: "Streamed"}} = Server.stream_chat(agent, "Again", fn _ -> :ok end)
+    end
+  end
+
   describe "stream_chat/4 with timeout option" do
     test "uses default timeout (2 min) when not specified" do
       pid = start_provider([TestProvider.text_response("Hi")])

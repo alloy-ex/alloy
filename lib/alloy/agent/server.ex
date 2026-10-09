@@ -65,6 +65,13 @@ defmodule Alloy.Agent.Server do
 
   @type result :: Result.t()
 
+  # A synchronous chat may still be finishing its last tool round or
+  # building its result after the loop's provider deadline, so callers wait
+  # a little longer than :timeout_ms before giving up.
+  @call_timeout_margin_ms 10_000
+  @default_call_timeout_ms %Config{provider: nil, provider_config: %{}}.timeout_ms +
+                             @call_timeout_margin_ms
+
   # ── Client API ────────────────────────────────────────────────────────────
 
   @doc """
@@ -86,14 +93,37 @@ defmodule Alloy.Agent.Server do
   `{:ok, result}` for `:completed` and `:max_turns`, `{:error, result}`
   otherwise. Before 0.12.5 a `:budget_exceeded` run returned `{:ok, result}`.
 
+  The loop runs inside the server process, so every other call to this
+  agent, including `health/1` and `cancel_request/2`, waits until it
+  finishes. Use `send_message/3` when the agent must stay responsive.
+
   ## Options
 
-    - `:timeout` - GenServer call timeout in milliseconds (default: `30_000`).
+    - `:timeout` - GenServer call timeout in milliseconds (default: the
+      agent's `:timeout_ms` plus #{div(@call_timeout_margin_ms, 1_000)} seconds; see
+      `default_call_timeout/1`). A caller that gives up earlier does not
+      stop the run, which still commits its messages to the history.
   """
   @spec chat(GenServer.server(), String.t(), keyword()) :: {:ok, result()} | {:error, result()}
   def chat(server, message, opts \\ []) when is_binary(message) do
-    timeout = Keyword.get(opts, :timeout, 30_000)
+    timeout = Keyword.get_lazy(opts, :timeout, fn -> default_call_timeout(server) end)
     GenServer.call(server, {:chat, message}, timeout)
+  end
+
+  @doc """
+  The call timeout `chat/3` and `stream_chat/4` use when `:timeout` is not
+  given: the agent's `:timeout_ms` plus a #{div(@call_timeout_margin_ms, 1_000)}-second margin.
+
+  Until 0.12.5 the default was 30 seconds, shorter than the 120-second
+  default `:timeout_ms`, so callers gave up on turns that were still
+  running and committing to the history.
+
+  Waits for a `chat/3` already running on this agent, for at most the
+  default agent's timeout plus the margin.
+  """
+  @spec default_call_timeout(GenServer.server()) :: pos_integer()
+  def default_call_timeout(server) do
+    GenServer.call(server, :default_call_timeout, @default_call_timeout_ms)
   end
 
   @doc """
@@ -151,13 +181,14 @@ defmodule Alloy.Agent.Server do
 
   ## Options
 
-    - `:timeout` - GenServer call timeout in milliseconds (default: `30_000`).
+    - `:timeout` - GenServer call timeout in milliseconds (default: the
+      agent's `:timeout_ms` plus a margin, as for `chat/3`).
   """
   @spec stream_chat(GenServer.server(), String.t(), (String.t() -> :ok), keyword()) ::
           {:ok, result()} | {:error, result()}
   def stream_chat(server, message, on_chunk, opts \\ [])
       when is_binary(message) and is_function(on_chunk, 1) do
-    timeout = Keyword.get(opts, :timeout, 30_000)
+    timeout = Keyword.get_lazy(opts, :timeout, fn -> default_call_timeout(server) end)
     stream_opts = Keyword.drop(opts, [:timeout])
 
     case Keyword.get(stream_opts, :on_event) do
@@ -227,6 +258,10 @@ defmodule Alloy.Agent.Server do
 
   When cancelled, the server broadcasts an `{:agent_response, result}` payload
   with `status: :error`, `error: :cancelled`, and the matching `:request_id`.
+
+  Only `send_message/3` requests can be cancelled. A synchronous `chat/3`
+  or `stream_chat/4` runs inside the server process, so this call waits
+  until it finishes.
   """
   @spec cancel_request(GenServer.server(), binary()) :: :ok | {:error, :not_found}
   def cancel_request(server, request_id) when is_binary(request_id) do
@@ -254,6 +289,10 @@ defmodule Alloy.Agent.Server do
 
   @doc """
   Returns a health summary map for the agent process.
+
+  Answers immediately while an async `send_message/3` turn runs, but waits
+  behind a synchronous `chat/3` or `stream_chat/4`, which run inside the
+  server process; it exits if that takes longer than 5 seconds.
   """
   @spec health(GenServer.server()) :: map()
   def health(server) do
@@ -367,6 +406,11 @@ defmodule Alloy.Agent.Server do
     final_state = Turn.run_loop(state, turn_opts)
 
     {:reply, final_state |> build_result() |> Result.wrap(), reset_for_new_run(final_state)}
+  end
+
+  @impl GenServer
+  def handle_call(:default_call_timeout, _from, state) do
+    {:reply, state.config.timeout_ms + @call_timeout_margin_ms, state}
   end
 
   @impl GenServer
