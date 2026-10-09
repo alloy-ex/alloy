@@ -22,10 +22,6 @@ defmodule Alloy.Provider.Codex do
     the user config, including its MCP servers and plugins.
   - `:config_overrides` - `key=value` strings passed to `codex exec` as
     `-c` flags, for example `[~s(model_reasoning_effort="high")]`
-  - `:auth_path` - Deprecated, removed in 0.13; use `:codex_home`. A path to
-    an `auth.json` file uses its directory as `CODEX_HOME`. A file with any
-    other name is copied into a private per-call `CODEX_HOME`, as in 0.12.4,
-    so tokens Codex refreshes during the call are not kept.
   - `:tmp_dir` - Parent for the provider's temp working directory
     (default: `System.tmp_dir!/0`)
   - `:timeout_ms` - Timeout for a single `codex exec` invocation
@@ -81,8 +77,6 @@ defmodule Alloy.Provider.Codex do
 
   alias Alloy.{Message, OSProcess}
   alias Alloy.Provider.Error
-
-  require Logger
 
   @default_timeout_ms 120_000
   @default_codex_bin "codex"
@@ -143,7 +137,6 @@ defmodule Alloy.Provider.Codex do
           optional(:profile) => String.t(),
           optional(:codex_home) => String.t(),
           optional(:config_overrides) => [String.t()],
-          optional(:auth_path) => String.t(),
           optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
           optional(:receive_timeout) => pos_integer(),
@@ -159,8 +152,7 @@ defmodule Alloy.Provider.Codex do
   def complete(messages, tool_defs, config) do
     prompt = build_prompt(messages, tool_defs, config)
 
-    with {:ok, codex_home} <- codex_home(config),
-         {:ok, command_result} <- execute(prompt, codex_home, config),
+    with {:ok, command_result} <- execute(prompt, codex_home(config), config),
          {:ok, payload} <- decode_payload(command_result, config) do
       parse_payload(payload, config, command_result)
     end
@@ -184,54 +176,23 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp codex_home(%{codex_home: codex_home}) when is_binary(codex_home), do: {:ok, codex_home}
-
-  defp codex_home(%{auth_path: auth_path}) when is_binary(auth_path) do
-    warn_auth_path_deprecated()
-
-    case Path.basename(auth_path) do
-      "auth.json" -> {:ok, Path.dirname(auth_path)}
-      _other -> {:ok, {:copy_auth, auth_path}}
-    end
+  # A removed option raises, like every config mistake: ignoring :auth_path
+  # would silently run Codex as whichever account the default CODEX_HOME holds.
+  defp codex_home(%{auth_path: _auth_path}) do
+    raise ArgumentError,
+          "Alloy.Provider.Codex :auth_path was removed in Alloy 0.13; " <>
+            "set :codex_home to the directory holding auth.json instead"
   end
 
-  defp codex_home(_config), do: {:ok, nil}
-
-  # Once per node: an app may build a provider per request.
-  defp warn_auth_path_deprecated do
-    unless :persistent_term.get({__MODULE__, :auth_path_warned}, false) do
-      :persistent_term.put({__MODULE__, :auth_path_warned}, true)
-
-      Logger.warning(
-        "Alloy.Provider.Codex :auth_path is deprecated and will be removed in Alloy 0.13; " <>
-          "set :codex_home to the directory holding auth.json instead."
-      )
-    end
-  end
-
-  # The 0.12.4 :auth_path behaviour for a file not named auth.json: copy it
-  # into a home inside the call's private (0700) temp directory.
-  defp resolve_home({:copy_auth, auth_path}, paths) do
-    home = Path.join(paths.base_dir, "codex-home")
-
-    with :ok <- File.mkdir_p(home),
-         :ok <- File.cp(auth_path, Path.join(home, "auth.json")) do
-      {:ok, home}
-    else
-      {:error, reason} ->
-        {:error, %Error{message: "could not copy :auth_path #{auth_path}: #{inspect(reason)}"}}
-    end
-  end
-
-  defp resolve_home(codex_home, _paths), do: {:ok, codex_home}
+  defp codex_home(%{codex_home: codex_home}) when is_binary(codex_home), do: codex_home
+  defp codex_home(_config), do: nil
 
   # Test hook: a synchronous function matching `System.cmd/3`, run in the
   # caller with no timeout of its own.
   defp execute(prompt, codex_home, %{command_runner: runner} = config) do
     in_temp_dir(config, fn paths ->
-      with :ok <- write_inputs(paths, prompt),
-           {:ok, home} <- resolve_home(codex_home, paths) do
-        run_injected(runner, codex_args(paths, config) ++ [prompt], home, paths, config)
+      with :ok <- write_inputs(paths, prompt) do
+        run_injected(runner, codex_args(paths, config) ++ [prompt], codex_home, paths, config)
       end
     end)
   end
@@ -275,9 +236,8 @@ defmodule Alloy.Provider.Codex do
 
     result =
       in_temp_dir(config, fn paths ->
-        with :ok <- write_inputs(paths, prompt),
-             {:ok, home} <- resolve_home(codex_home, paths) do
-          port = open_port(codex_args(paths, config) ++ ["-"], home, paths, config)
+        with :ok <- write_inputs(paths, prompt) do
+          port = open_port(codex_args(paths, config) ++ ["-"], codex_home, paths, config)
 
           run = %{
             port: port,
@@ -319,7 +279,6 @@ defmodule Alloy.Provider.Codex do
 
   defp paths(base_dir, config) do
     %{
-      base_dir: base_dir,
       prompt_path: Path.join(base_dir, "prompt.txt"),
       schema_path: Path.join(base_dir, "response_schema.json"),
       last_message_path: Path.join(base_dir, "last_message.json"),

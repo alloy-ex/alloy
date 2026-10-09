@@ -7,6 +7,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-09
+
+Alloy 0.13 is the loop and nothing else: the supervised runtime moves to
+the `alloy_agent` package, memory and compaction become an ordinary tool
+and ordinary middleware, and what 0.12.5 deprecated is removed. See
+[Upgrading to 0.13](docs/upgrading-to-0.13.md).
+
+### Removed
+
+- **The agent runtime moved to [`alloy_agent`](https://github.com/alloy-ex/alloy_agent):**
+  `Alloy.Agent.Server`, `Alloy.Session`, `Alloy.send_message/3`,
+  `Alloy.cancel_request/2`, the `config :alloy, :pubsub` app-start PubSub
+  and the optional `phoenix_pubsub` dependency. The deprecated
+  `Alloy.Agent.Events` shim is gone; use `Alloy.Events`.
+- **Everything 0.12.5 deprecated:**
+  - `:max_budget_cents` and the `:budget_exceeded` status. Use the
+    budget middleware recipe.
+  - Anthropic `:extended_thinking`. Setting it now raises instead of
+    silently turning thinking off.
+  - Codex `:auth_path`. Setting it now raises instead of silently running
+    as the default account.
+  - `State.materialize/1`, `State.cleanup/1` and `state.messages_new`.
+  - `ModelMetadata.catalog/0` and its `model_entry` type.
+  - `Message.server_tool_result_block/3`.
+- `Alloy.Memory.Router`'s public functions (`dispatch_all/2`,
+  `memory_call?/1`, `tool_name/0`); the router is internal now.
+- `state.current_task` and `state.pending_requests`, which were server
+  state.
+
+### Changed
+
+- **Unknown options raise.** `Alloy.run/2`, `Alloy.stream/3` and
+  `Config.from_opts/1` ignored options they did not know, so a typo ran
+  silently without its setting. Server options name `alloy_agent` in the
+  error. Removed provider options (`:extended_thinking`, `:auth_path`) raise
+  at startup too, for fallback providers as well as the primary, and
+  `compaction: false` with the compactor in `:middleware` raises.
+- **`%Alloy.Agent.Config{}` drops** `memory`, `pubsub`, `subscribe`,
+  `max_pending`, `on_shutdown` and `max_budget_cents`. Middleware reading
+  one gets a `KeyError` when that hook runs.
+- **Memory is an ordinary tool.** `Alloy.Memory.tool/1` builds it, and
+  `memory:` is shorthand for it.
+  - Memory calls run through the tool executor, so `:before_tool_call`
+    middleware, tool events, `:tool_timeout` and `result.tool_calls` cover
+    them; they bypassed all four.
+  - They run one at a time in call order.
+  - Memory now works with every provider: Anthropic gets its native
+    `memory_20250818` tool, and the others get a function tool with the
+    same commands.
+  - Store callbacks now run in a supervised task, like every tool, not in
+    the process that called `Alloy.run/2`. Stores that rely on the calling
+    process need checking: the process dictionary, caller-owned ETS
+    tables, Logger metadata, or a `Repo.transaction` around the run.
+  - A store that raises now becomes an error result the model reads (and
+    is logged), instead of crashing the run.
+- **Compaction is middleware.** `Alloy.Context.Compactor` implements
+  `Alloy.Middleware`, and `Alloy.run/2` puts it first, so default behaviour
+  is unchanged.
+  - `compaction: false` turns it off, and listing it in `:middleware`
+    chooses its position.
+  - A hand-built `%Config{}` gets no compaction unless it lists the
+    compactor.
+  - On a context-overflow error the loop runs the new
+    `:on_context_overflow` hook and retries once, only if the messages
+    changed. 0.12 retried even when nothing could be removed.
+  - `:after_compaction` and `[:alloy, :compaction, :done]` now also fire
+    after that forced compaction.
+  - The retried request runs `:before_completion` again, including
+    compaction. A history still estimated over budget can be compacted
+    again in that turn.
+  - `[:alloy, :turn, :prompt_too_long_recovery]` fires on a turn's first
+    overflow as before, and now carries `retry: true | false`.
+- **A middleware halt keeps the work done before it in that hook.** In
+  0.12 a halt returned the state from before the hook ran. Now a halt
+  after compaction keeps the compacted history and the summary request's
+  usage. Middleware can return `{:halt, reason, state}` to keep its own
+  changes as well.
+- **Module tools are validated like inline tools** at startup. An invalid
+  `strict?/0`, `input_examples/0`, `defer_loading?/0` or `native_types/0`
+  raises `ArgumentError`.
+- **Tool names must be unique.** Two tools with the same name raise at
+  startup instead of reaching the API, which rejects them.
+- **Assistant messages record where they came from.**
+  - New fields: `message.provider`, `message.model`, and `message.origin`.
+    The origin is a hash of the provider module, `:api_url` and `:api_key`;
+    the key itself is never stored.
+  - Code that compares whole messages with `==` sees the new fields.
+    Messages you build yourself leave them `nil`.
+  - Persist all three with transcripts. A message without an origin is
+    sent as it is.
+
+### Fixed
+
+- **Switching provider, endpoint or account mid-conversation** no longer
+  sends one origin's signed reasoning to another. That failed with HTTP
+  400s such as `invalid_encrypted_content` or an invalid thinking
+  signature. It covers a fallback provider, an OpenAI fallback on another
+  organisation's key, and a model switch to another provider. Before every
+  request the loop applies `Alloy.Message.normalize_for/3`, following pi's
+  rules:
+  - another provider's thinking becomes text;
+  - its redacted thinking, raw OpenAI/xAI items and server tool records
+    are dropped;
+  - signatures are removed, and blank text blocks (kept only for a
+    signature, and rejected by Anthropic) are dropped;
+  - tool-call ids Anthropic would reject (Kimi's `functions.read:0`, for
+    one) are rewritten together with their results.
+
+  Switching models with the same provider and credentials keeps
+  everything, as Anthropic, OpenAI and Gemini document. Messages without an
+  origin (built by hand, or saved without it) are sent unchanged.
+- **Gemini tool calls written by another provider** get Google's
+  documented placeholder thought signature
+  (`skip_thought_signature_validator`) on the first call of each step, so
+  Gemini 3 accepts a tool loop that started elsewhere.
+- **Anthropic thinking without a signature** (written by hand, or by a
+  reasoning model behind OpenAICompat) is sent as text instead of failing
+  the request; empty unsigned thinking is dropped.
+
+### Added
+
+- `Alloy.Tool.native_types/0` (optional) and `:native_types` on inline
+  tools: a provider's built-in type for the tool, such as Anthropic's
+  `memory_20250818`.
+- The `:on_context_overflow` middleware hook.
+- `Alloy.Agent.State.deadline`: the monotonic deadline for the run's
+  provider requests, for middleware that makes its own.
+- `Alloy.Message.normalize_for/3` and `Alloy.Message.origin/2`, for
+  callers who call a provider directly.
+
 ## [0.12.5] - 2026-10-09
 
 ### Security

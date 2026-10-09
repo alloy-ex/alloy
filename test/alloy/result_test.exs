@@ -194,7 +194,7 @@ defmodule Alloy.ResultTest do
     end
 
     test "every other status is {:error, result}" do
-      for status <- [:error, :halted, :budget_exceeded] do
+      for status <- [:error, :halted] do
         result = %Result{status: status}
         assert Result.wrap(result) == {:error, result}
       end

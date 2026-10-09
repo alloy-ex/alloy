@@ -1,68 +1,19 @@
 defmodule Alloy.Memory.Router do
-  @moduledoc """
-  Routes `memory_20250818` tool calls to a configured `Alloy.Memory`
-  store.
-
-  This module is deliberately independent of `Alloy.Tool.Executor`.
-  Anthropic's memory tool is a typed tool (`{"type": "memory_20250818"}`),
-  not a generic function tool — its command vocabulary, argument shape,
-  and result-string conventions are fixed by the provider contract, so
-  it does not benefit from the generic tool pipeline's concurrency,
-  tagging, or schema validation.
-
-  The router's job is narrow: take a list of memory tool-use blocks,
-  dispatch each command to the store in order, and return the matching
-  `tool_result` blocks.
-  """
+  @moduledoc false
+  # Runs one memory tool command against an `Alloy.Memory` store: path
+  # checks, the root guards, view_range and the optional new_str all follow
+  # Anthropic's memory tool contract, so stores only handle storage.
 
   alias Alloy.Memory
 
-  @memory_tool_name "memory"
   @root "/memories"
 
-  @doc """
-  Returns the tool name that provider wiring uses for the
-  `memory_20250818` tool. Exposed so providers and `Turn` can
-  partition tool calls without re-declaring the string.
-  """
-  @spec tool_name() :: String.t()
-  def tool_name, do: @memory_tool_name
-
-  @doc """
-  Predicate: is this tool-use block a memory call?
-  """
-  @spec memory_call?(map()) :: boolean()
-  def memory_call?(%{type: "tool_use", name: @memory_tool_name}), do: true
-  def memory_call?(_), do: false
-
-  @doc """
-  Dispatch a list of memory tool-use blocks to the configured store.
-
-  Returns `[%{type: "tool_result", tool_use_id: id, content: text, is_error: bool}]`
-  in the same order as the input blocks.
-
-  `memory_config` is the `{module, opts}` tuple that `Alloy.run/2`
-  received as the `:memory` option. The second element is passed to
-  every callback as the opaque `store` term.
-  """
-  @spec dispatch_all([map()], {module(), term()}) :: [map()]
-  def dispatch_all(tool_calls, {module, store})
-      when is_list(tool_calls) and is_atom(module) do
-    Enum.map(tool_calls, &dispatch_one(&1, module, store))
-  end
-
-  defp dispatch_one(%{type: "tool_use", id: id, input: input}, module, store) do
+  # Runs the command in `input` against the `{module, store}` binding.
+  @spec dispatch({module(), Memory.store()}, map()) :: {:ok, String.t()} | {:error, String.t()}
+  def dispatch({module, store}, input) when is_atom(module) and is_map(input) do
     case execute(module, store, input) do
-      {:ok, text} ->
-        %{type: "tool_result", tool_use_id: id, content: text, is_error: false}
-
-      {:error, reason} ->
-        %{
-          type: "tool_result",
-          tool_use_id: id,
-          content: format_error(reason),
-          is_error: true
-        }
+      {:ok, text} when is_binary(text) -> {:ok, text}
+      {:error, reason} -> {:error, format_error(reason)}
     end
   end
 

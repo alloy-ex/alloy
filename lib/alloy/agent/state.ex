@@ -4,17 +4,21 @@ defmodule Alloy.Agent.State do
 
   Tracks the conversation history, turn count, token usage, and
   current status. Passed through each iteration of the agent loop.
+
+  `deadline` is the monotonic time in milliseconds (see
+  `System.monotonic_time/1`) by which the run's provider requests must
+  finish; `Alloy.Agent.Turn.run_loop/2` sets it. Middleware that makes its
+  own provider request, as compaction does, should finish by it.
   """
 
   alias Alloy.Agent.Config
   alias Alloy.{Message, Usage}
 
-  @type status :: :idle | :running | :completed | :error | :max_turns | :budget_exceeded | :halted
+  @type status :: :idle | :running | :completed | :error | :max_turns | :halted
 
   @type t :: %__MODULE__{
           config: Config.t(),
           messages: [Message.t()],
-          messages_new: [Message.t()],
           turn: non_neg_integer(),
           usage: Usage.t(),
           status: status(),
@@ -27,9 +31,8 @@ defmodule Alloy.Agent.State do
           provider_response_metadata: map(),
           run_metadata: map(),
           started_at: integer() | nil,
-          agent_id: String.t(),
-          current_task: {reference(), pid(), binary()} | nil,
-          pending_requests: term()
+          deadline: integer() | nil,
+          agent_id: String.t()
         }
 
   @enforce_keys [:config]
@@ -38,10 +41,6 @@ defmodule Alloy.Agent.State do
     :error,
     :stop_reason,
     messages: [],
-    # Deprecated: always [] since 0.12.5 (state.messages is the full
-    # history). Kept so code that builds or resets the struct still
-    # compiles; removed in 0.13.
-    messages_new: [],
     turn: 0,
     usage: %Usage{},
     tool_calls: [],
@@ -52,9 +51,8 @@ defmodule Alloy.Agent.State do
     provider_response_metadata: %{},
     run_metadata: %{},
     started_at: nil,
-    agent_id: "",
-    current_task: nil,
-    pending_requests: :queue.new()
+    deadline: nil,
+    agent_id: ""
   ]
 
   @doc """
@@ -82,12 +80,11 @@ defmodule Alloy.Agent.State do
   Append messages to the conversation history.
 
   `state.messages` always holds the full history in chronological order,
-  so middleware can read it directly. Messages a caller left in the
-  deprecated `messages_new` accumulator are folded in first.
+  so middleware can read it directly.
   """
   @spec append_messages(t(), [Message.t()] | Message.t()) :: t()
   def append_messages(%__MODULE__{} = state, messages) when is_list(messages) do
-    %{state | messages: messages(state) ++ messages, messages_new: []}
+    %{state | messages: state.messages ++ messages}
   end
 
   def append_messages(%__MODULE__{} = state, %Message{} = message),
@@ -132,33 +129,11 @@ defmodule Alloy.Agent.State do
   end
 
   @doc """
-  Return messages in chronological order.
-
-  Equal to `state.messages`, plus anything left in the deprecated
-  `messages_new` accumulator by code written for Alloy 0.12.4 or earlier.
+  Return the conversation history in chronological order, the same as
+  `state.messages`.
   """
   @spec messages(t()) :: [Message.t()]
-  def messages(%__MODULE__{messages: base, messages_new: []}) do
-    base
-  end
-
-  def messages(%__MODULE__{messages: base, messages_new: new}) do
-    base ++ Enum.reverse(new)
-  end
-
-  @doc deprecated: "state.messages is always complete; read it or call messages/1."
-  @doc """
-  Fold the deprecated `messages_new` accumulator into `state.messages`.
-
-  Alloy no longer fills the accumulator, so this only matters for a state
-  built by hand with a non-empty `messages_new`. Removed in 0.13.
-  """
-  @spec materialize(t()) :: t()
-  def materialize(%__MODULE__{messages_new: []} = state), do: state
-
-  def materialize(%__MODULE__{} = state) do
-    %{state | messages: messages(state), messages_new: []}
-  end
+  def messages(%__MODULE__{messages: messages}), do: messages
 
   @doc """
   Increment the turn counter.
@@ -194,20 +169,11 @@ defmodule Alloy.Agent.State do
   def last_assistant_thinking(%__MODULE__{} = state),
     do: find_last_assistant(state, &Message.thinking/1)
 
-  @doc deprecated: "A state owns no resources; drop the call. Removed in 0.13."
-  @doc """
-  Does nothing and returns `:ok`. A state owns no resources to release;
-  kept only so existing callers compile during 0.12.x.
-  """
-  @spec cleanup(t()) :: :ok
-  def cleanup(%__MODULE__{}), do: :ok
-
   # Newest first, the first assistant message for which `extract` returns a
   # value. Message.text/1 returns "" rather than nil, so text stops at the
   # last assistant message while thinking keeps looking further back.
   defp find_last_assistant(%__MODULE__{} = state, extract) do
-    state
-    |> messages()
+    state.messages
     |> Enum.reverse()
     |> Enum.find_value(fn
       %Message{role: :assistant} = message -> extract.(message)

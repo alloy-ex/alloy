@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.12.5"
+  @version "0.13.0"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -78,8 +78,7 @@ defmodule Alloy.MixProject do
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:plug, "~> 1.19.5 or ~> 1.20.3", only: :test},
-      {:phoenix_pubsub, "~> 2.1", optional: true}
+      {:plug, "~> 1.19.5 or ~> 1.20.3", only: :test}
     ]
   end
 
@@ -97,6 +96,7 @@ defmodule Alloy.MixProject do
       source_url: @source_url,
       source_ref: "v#{@version}",
       extras: [
+        "docs/upgrading-to-0.13.md",
         "docs/events.md",
         "docs/provider-compatibility.md",
         "docs/recipes/sub-agents.md",
@@ -104,14 +104,13 @@ defmodule Alloy.MixProject do
         "livebooks/quickstart.livemd"
       ],
       groups_for_extras: [
-        Guides: ~r{docs/(events|provider-compatibility)\.md|livebooks/.*},
+        Guides: ~r{docs/(upgrading-to-0\.13|events|provider-compatibility)\.md|livebooks/.*},
         Recipes: ~r{docs/recipes/.*}
       ],
       groups_for_modules: [
         Core: [
           Alloy,
           Alloy.Agent.Config,
-          Alloy.Agent.Server,
           Alloy.Events,
           Alloy.ModelCatalog,
           Alloy.ModelMetadata,
@@ -119,7 +118,6 @@ defmodule Alloy.MixProject do
           Alloy.Agent.Turn,
           Alloy.Message,
           Alloy.Result,
-          Alloy.Session,
           Alloy.Usage
         ],
         Providers: [
@@ -148,8 +146,7 @@ defmodule Alloy.MixProject do
           Alloy.Context.Compactor
         ],
         Memory: [
-          Alloy.Memory,
-          Alloy.Memory.Router
+          Alloy.Memory
         ],
         Middleware: [
           Alloy.Middleware

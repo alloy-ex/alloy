@@ -416,10 +416,10 @@ defmodule Alloy.Provider.AnthropicTest do
       # Code execution, memory, tool search (defer_loading) and tool use
       # examples need no beta header since February 17, 2026:
       # https://platform.claude.com/docs/en/release-notes/overview
-      config =
-        config_that_captures_request()
-        |> Map.put(:code_execution, true)
-        |> Map.put(:memory, {Alloy.Test.MemoryStore, %{}})
+      config = Map.put(config_that_captures_request(), :code_execution, true)
+
+      {[memory], _fns} =
+        Alloy.Tool.Registry.build([Alloy.Memory.tool({Alloy.Test.MemoryStore, %{}})])
 
       tool_defs = [
         %{
@@ -428,7 +428,8 @@ defmodule Alloy.Provider.AnthropicTest do
           input_schema: %{type: "object", properties: %{query: %{type: "string"}}},
           input_examples: [%{query: "release notes"}],
           defer_loading: true
-        }
+        },
+        memory
       ]
 
       Anthropic.complete([Message.user("Hi")], tool_defs, config)
@@ -436,7 +437,11 @@ defmodule Alloy.Provider.AnthropicTest do
       assert_received {:request_body, body}
       assert_received {:request_headers, headers}
 
-      assert [search, %{"name" => "code_execution"}, %{"name" => "memory"}] =
+      assert [
+               search,
+               %{"type" => "memory_20250818", "name" => "memory"},
+               %{"name" => "code_execution"}
+             ] =
                Jason.decode!(body)["tools"]
 
       assert search["input_examples"] == [%{"query" => "release notes"}]
@@ -1558,23 +1563,9 @@ defmodule Alloy.Provider.AnthropicTest do
       assert thinking_block.signature == "sig_abc123"
     end
 
-    test "includes thinking in request body when extended_thinking opt set" do
+    test "thinking is configured through extra_body" do
       config =
         config_that_captures_request()
-        |> Map.put(:extended_thinking, budget_tokens: 5_000)
-
-      Anthropic.complete([Message.user("Think hard")], [], config)
-
-      assert_received {:request_body, body}
-      decoded = Jason.decode!(body)
-
-      assert %{"type" => "enabled", "budget_tokens" => 5_000} = decoded["thinking"]
-    end
-
-    test "the documented replacement sends adaptive thinking and effort through extra_body" do
-      config =
-        config_that_captures_request()
-        |> Map.put(:extended_thinking, budget_tokens: 5_000)
         |> Map.put(:extra_body, %{
           "thinking" => %{"type" => "adaptive", "display" => "summarized"},
           "output_config" => %{"effort" => "high"}
@@ -1585,22 +1576,19 @@ defmodule Alloy.Provider.AnthropicTest do
       assert_received {:request_body, body}
       decoded = Jason.decode!(body)
 
-      # extra_body is merged last, so it wins over a leftover :extended_thinking.
       assert decoded["thinking"] == %{"type" => "adaptive", "display" => "summarized"}
       assert decoded["output_config"] == %{"effort" => "high"}
     end
 
-    test "raises ArgumentError when extended_thinking is set without budget_tokens" do
-      config =
-        config_that_captures_request()
-        |> Map.put(:extended_thinking, [])
+    test "the removed :extended_thinking raises instead of silently disabling thinking" do
+      config = Map.put(config_that_captures_request(), :extended_thinking, budget_tokens: 5_000)
 
-      assert_raise ArgumentError, ~r/budget_tokens/, fn ->
+      assert_raise ArgumentError, ~r/:extended_thinking was removed/, fn ->
         Anthropic.complete([Message.user("Think hard")], [], config)
       end
     end
 
-    test "no thinking key in request body when extended_thinking not set" do
+    test "no thinking key in request body unless configured" do
       config = config_that_captures_request()
 
       Anthropic.complete([Message.user("Simple question")], [], config)
@@ -1609,25 +1597,6 @@ defmodule Alloy.Provider.AnthropicTest do
       decoded = Jason.decode!(body)
 
       refute Map.has_key?(decoded, "thinking")
-    end
-
-    test "ignores extended_thinking when value is not a keyword list" do
-      config =
-        config_with_response(%{
-          status: 200,
-          body:
-            Jason.encode!(%{
-              "id" => "msg_ignore_thinking",
-              "type" => "message",
-              "role" => "assistant",
-              "content" => [%{"type" => "text", "text" => "ok"}],
-              "stop_reason" => "end_turn",
-              "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
-            })
-        })
-        |> Map.put(:extended_thinking, true)
-
-      assert {:ok, _result} = Anthropic.complete([Message.user("Think hard")], [], config)
     end
 
     test "thinking block round-trips correctly through format_content_block" do
@@ -1653,6 +1622,34 @@ defmodule Alloy.Provider.AnthropicTest do
 
       assert thinking_wire["thinking"] == "My reasoning..."
       assert thinking_wire["signature"] == "sig_xyz"
+    end
+
+    # The API rejects thinking without a signature; this thinking was written
+    # by hand or by an OpenAI-compatible reasoning model.
+    test "unsigned thinking is sent as text, and empty unsigned thinking is dropped" do
+      config = config_that_captures_request()
+
+      messages = [
+        Message.user("Question"),
+        Message.assistant_blocks([
+          %{type: "thinking", thinking: "Plain reasoning"},
+          %{type: "thinking", thinking: " ", signature: nil},
+          %{type: "thinking", thinking: "", signature: "sig_omitted_display"},
+          %{type: "text", text: "Answer"}
+        ]),
+        Message.user("Follow-up")
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      assistant = Enum.find(Jason.decode!(body)["messages"], &(&1["role"] == "assistant"))
+
+      assert assistant["content"] == [
+               %{"type" => "text", "text" => "Plain reasoning"},
+               %{"type" => "thinking", "thinking" => "", "signature" => "sig_omitted_display"},
+               %{"type" => "text", "text" => "Answer"}
+             ]
     end
   end
 

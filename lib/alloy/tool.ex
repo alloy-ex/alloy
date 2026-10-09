@@ -21,6 +21,8 @@ defmodule Alloy.Tool do
     tool-use metadata. Defaults to `[]`.
   - `defer_loading?/0` — requests provider-side deferred loading where
     supported. Defaults to `false`.
+  - `native_types/0` — a provider's built-in type for this tool, such as
+    Anthropic's `memory_20250818`. Defaults to `%{}`.
 
   ## Structured Results
 
@@ -155,6 +157,18 @@ defmodule Alloy.Tool do
   """
   @callback concurrent?() :: boolean()
 
+  @doc """
+  A provider's own schema for this tool, keyed by provider family.
+
+  A provider that finds its key sends the tool as that built-in type
+  instead of as a function with `input_schema`; every other provider uses
+  `input_schema`. `Alloy.Provider.Anthropic` reads `:anthropic`, so
+  `%{anthropic: "memory_20250818"}` makes Claude use its trained memory
+  tool while other models see the JSON schema. The tool still runs on the
+  client like any other. Defaults to `%{}`.
+  """
+  @callback native_types() :: %{optional(atom()) => String.t()}
+
   @optional_callbacks [
     allowed_callers: 0,
     result_type: 0,
@@ -162,7 +176,8 @@ defmodule Alloy.Tool do
     input_examples: 0,
     defer_loading?: 0,
     max_result_chars: 0,
-    concurrent?: 0
+    concurrent?: 0,
+    native_types: 0
   ]
 
   @doc """

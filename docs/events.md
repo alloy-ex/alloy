@@ -13,8 +13,8 @@ fields) may change between minor versions.
   every envelope for the run.
 - `Alloy.run/2` — pass `:on_event` in opts; the callback receives every
   envelope except text deltas, which only a streaming run produces.
-- `Alloy.Agent.Server` (until its move to `alloy_agent`) — envelopes are
-  broadcast over Phoenix.PubSub.
+- `alloy_agent` — `AlloyAgent.Server` passes the same envelopes to its
+  callers and PubSub subscribers.
 
 A lower-level analogue is fired for every envelope via `:telemetry` as
 `[:alloy, :event]` with measurements `%{seq: seq}` and metadata

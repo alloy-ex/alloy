@@ -79,24 +79,6 @@ defmodule Alloy.MessageTest do
     end
   end
 
-  describe "server_tool_result_block/3" do
-    test "creates a server_tool_result block" do
-      block = Message.server_tool_result_block("srvtoolu_01", "file contents here")
-      assert block.type == "server_tool_result"
-      assert block.tool_use_id == "srvtoolu_01"
-      assert block.content == "file contents here"
-      refute Map.has_key?(block, :is_error)
-    end
-
-    test "creates a server_tool_result error block" do
-      block = Message.server_tool_result_block("srvtoolu_01", "something failed", true)
-      assert block.type == "server_tool_result"
-      assert block.tool_use_id == "srvtoolu_01"
-      assert block.content == "something failed"
-      assert block.is_error == true
-    end
-  end
-
   describe "text/1" do
     test "extracts text from a string-content message" do
       assert Message.text(Message.user("hello")) == "hello"
@@ -148,6 +130,120 @@ defmodule Alloy.MessageTest do
     test "returns nil when no thinking blocks are present" do
       msg = Message.assistant_blocks([%{type: "text", text: "the answer"}])
       assert Message.thinking(msg) == nil
+    end
+  end
+
+  describe "normalize_for/3" do
+    @anthropic Alloy.Provider.Anthropic
+    @openai Alloy.Provider.OpenAI
+
+    defp from(provider, blocks, config \\ %{}) do
+      %{
+        Message.assistant_blocks(blocks)
+        | provider: provider,
+          model: "m",
+          origin: Message.origin(provider, config)
+      }
+    end
+
+    test "leaves the same origin's, user-built and user messages alone" do
+      own = from(@anthropic, [%{type: "thinking", thinking: "t", signature: "sig"}])
+
+      hand_built =
+        Message.assistant_blocks([%{type: "thinking", thinking: "t", signature: "sig"}])
+
+      other_model = %{own | model: "another-claude"}
+
+      messages = [Message.user("hi"), own, hand_built, other_model]
+      assert Message.normalize_for(messages, @anthropic, %{}) == messages
+    end
+
+    # OpenAI ties encrypted reasoning to the organisation that issued it.
+    test "another account or endpoint of the same provider is a different origin" do
+      reasoning = %{type: "reasoning", raw: %{"type" => "reasoning", "encrypted_content" => "e"}}
+      text = %{type: "text", text: "answer"}
+      org_a = from(@openai, [reasoning, text], %{api_key: "key-a"})
+
+      assert [%Message{content: [^reasoning, ^text]}] =
+               Message.normalize_for([org_a], @openai, %{api_key: "key-a", model: "other"})
+
+      for config <- [%{api_key: "key-b"}, %{api_key: "key-a", api_url: "https://proxy.example"}] do
+        assert [%Message{content: [^text]}] = Message.normalize_for([org_a], @openai, config)
+      end
+    end
+
+    test "the origin fingerprint never contains the key" do
+      origin = Message.origin(@openai, %{api_key: "sk-secret-value"})
+      assert byte_size(origin) == 16
+      refute origin =~ "secret"
+    end
+
+    test "turns another provider's thinking into text and drops what only it can read" do
+      message =
+        from(@anthropic, [
+          %{type: "thinking", thinking: "I should read the file", signature: "sig"},
+          %{type: "thinking", thinking: "   ", signature: "sig2"},
+          %{type: "redacted_thinking", data: "opaque"},
+          %{type: "server_tool_use", id: "srv_1", name: "web_search", input: %{}},
+          %{type: "web_search_tool_result", tool_use_id: "srv_1", content: []},
+          %{type: "text", text: "Reading it.", signature: "gemini-sig"}
+        ])
+
+      assert [%Message{content: content, provider: @anthropic}] =
+               Message.normalize_for([message], @openai, %{})
+
+      assert content == [
+               %{type: "text", text: "I should read the file"},
+               %{type: "text", text: "Reading it."}
+             ]
+    end
+
+    test "drops OpenAI raw items and a message left empty" do
+      message = from(@openai, [%{type: "reasoning", raw: %{"type" => "reasoning"}}])
+
+      assert Message.normalize_for([Message.user("hi"), message], @anthropic, %{}) == [
+               Message.user("hi")
+             ]
+    end
+
+    test "strips call signatures and rewrites ids the target would reject, with their results" do
+      call = %{
+        type: "tool_use",
+        id: "functions.read:0",
+        name: "read",
+        input: %{},
+        thought_signature: "sig"
+      }
+
+      result = Message.tool_results([Message.tool_result_block("functions.read:0", "ok")])
+      unrelated = Message.tool_results([Message.tool_result_block("toolu_1", "ok")])
+
+      assert [%Message{content: [new_call]}, %Message{content: [new_result]}, ^unrelated] =
+               Message.normalize_for(
+                 [from(Alloy.Provider.OpenAICompat, [call]), result, unrelated],
+                 @anthropic,
+                 %{}
+               )
+
+      assert %{type: "tool_use", id: "functions_read_0_" <> hash, name: "read", input: %{}} =
+               new_call
+
+      assert byte_size(hash) == 8
+      assert new_result.tool_use_id == new_call.id
+    end
+
+    test "rewritten ids are at most 64 characters, distinct and stable" do
+      calls =
+        for id <- ["a.b", "a:b", String.duplicate("x", 100), ""],
+            do: %{type: "tool_use", id: id, name: "read", input: %{}}
+
+      message = from(@openai, calls)
+      [%Message{content: rewritten}] = Message.normalize_for([message], @anthropic, %{})
+      ids = Enum.map(rewritten, & &1.id)
+
+      assert Enum.all?(ids, &Regex.match?(~r/^[a-zA-Z0-9_-]{1,64}$/, &1))
+      assert ids == Enum.uniq(ids)
+      assert [%Message{content: ^rewritten}] = Message.normalize_for([message], @anthropic, %{})
     end
   end
 end

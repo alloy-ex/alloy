@@ -11,9 +11,11 @@ defmodule Alloy.Context.Compactor do
   assistant tool call before it, and truncation keeps the turn in progress
   whole. Because compaction edits earlier history, it removes every
   `thinking` and `redacted_thinking` block it keeps, including the turn in
-  progress (signed thinking is bound to the history it was produced after);
-  under manual thinking the turn in progress keeps its thinking, which that
-  mode requires. If the compacted request is still
+  progress: signed thinking is bound to the history it was produced after.
+  Under manual thinking (`"type" => "enabled"` in `:extra_body`), which
+  requires the turn in progress to start with thinking and whose models do
+  not check history, that turn keeps its thinking. If the compacted request
+  is still
   over budget, the largest retained tool results are shortened, keeping
   their beginning and a `[tool result truncated: ...]` marker.
 
@@ -28,8 +30,10 @@ defmodule Alloy.Context.Compactor do
       serialized conversation
   """
 
+  @behaviour Alloy.Middleware
+
   alias Alloy.Agent.State
-  alias Alloy.Message
+  alias Alloy.{Message, Middleware}
   alias Alloy.Provider.Retry
 
   require Logger
@@ -115,6 +119,48 @@ defmodule Alloy.Context.Compactor do
   def summary_prefix, do: @summary_prefix
 
   @doc """
+  Compaction as middleware.
+
+  On `:before_completion` it compacts when the history nears the budget;
+  on `:on_context_overflow` (the provider rejected the request as too long)
+  it compacts regardless of the estimate. Either way, when the messages
+  changed it emits `[:alloy, :compaction, :done]` and runs the
+  `:after_compaction` hook. Every other hook returns the state unchanged.
+  """
+  @impl Middleware
+  @spec call(Middleware.hook(), State.t()) :: State.t() | {:halt, String.t(), State.t()}
+  def call(:before_completion, %State{} = state) do
+    case maybe_compact(state) do
+      {:unchanged, unchanged} -> unchanged
+      {:compacted, compacted} -> after_compaction(state, compacted)
+    end
+  end
+
+  def call(:on_context_overflow, %State{} = state) do
+    case force_compact(state) do
+      %State{messages: messages} = compacted when messages == state.messages -> compacted
+      compacted -> after_compaction(state, compacted)
+    end
+  end
+
+  def call(_hook, state), do: state
+
+  defp after_compaction(%State{} = before, %State{} = compacted) do
+    :telemetry.execute(
+      [:alloy, :compaction, :done],
+      %{messages_before: length(before.messages), messages_after: length(compacted.messages)},
+      %{turn: before.turn + 1}
+    )
+
+    # A halt in :after_compaction still keeps the compaction and the usage
+    # of its summary request, so it is passed on with that state.
+    case Middleware.run_hook(:after_compaction, compacted) do
+      {:halted, reason, halted} -> {:halt, reason, halted}
+      %State{} = state -> state
+    end
+  end
+
+  @doc """
   Forces compaction regardless of reserve budget.
   Used when the provider rejects the prompt as too long.
 
@@ -147,7 +193,8 @@ defmodule Alloy.Context.Compactor do
     * `:turn` - turn number reported in compaction telemetry
       (default: `state.turn + 1`)
     * `:deadline` - monotonic time in milliseconds by which the summary
-      request must finish (default: now plus `config.timeout_ms`)
+      request must finish (default: `state.deadline`, or now plus
+      `config.timeout_ms` when that is unset)
 
   Returns `{:compacted, state}` when compaction occurred, or
   `{:unchanged, state}` when already within budget.
@@ -200,9 +247,9 @@ defmodule Alloy.Context.Compactor do
   # accounts created on or after 2026-08-31. That includes the turn in
   # progress. Removing all of it is a documented valid change, and those
   # models think adaptively, which does not require the turn in progress to
-  # start with thinking. Manual thinking (a budget) does require it, and the
-  # models that accept manual thinking do not check the history, so there
-  # the turn in progress keeps its thinking. See
+  # start with thinking. Manual thinking ("enabled" with a budget) does
+  # require it, and the models that accept manual thinking do not check the
+  # history, so there the turn in progress keeps its thinking. See
   # https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
   defp finalize(%State{} = state, messages) do
     messages =
@@ -210,7 +257,7 @@ defmodule Alloy.Context.Compactor do
       |> strip_thinking(manual_thinking?(state))
       |> fit_tool_results(state)
 
-    %{state | messages: messages, messages_new: []}
+    %{state | messages: messages}
   end
 
   defp strip_thinking(messages, false = _manual?), do: Enum.flat_map(messages, &drop_thinking/1)
@@ -220,13 +267,8 @@ defmodule Alloy.Context.Compactor do
     Enum.flat_map(settled, &drop_thinking/1) ++ in_flight
   end
 
-  # Manual thinking is the deprecated :extended_thinking option or an
-  # extra_body thinking of type "enabled" (keys in either form, since
-  # extra_body is stringified when merged into the request).
-  defp manual_thinking?(%State{config: %{provider_config: %{extended_thinking: opts}}})
-       when is_list(opts),
-       do: true
-
+  # extra_body is merged into the request with its keys stringified, so the
+  # caller may have written either form.
   defp manual_thinking?(%State{config: %{provider_config: provider_config}}) do
     case Map.get(provider_config, :extra_body) do
       %{"thinking" => thinking} -> manual_type?(thinking)
@@ -610,12 +652,11 @@ defmodule Alloy.Context.Compactor do
     # The summary goes through Retry like any turn request, so it gets the
     # same retries, fallback providers and receive timeout, bounded by the
     # caller's deadline.
-    summary_state = %{state | messages: [Message.user(prompt)], messages_new: [], tool_defs: []}
+    summary_state = %{state | messages: [Message.user(prompt)], tool_defs: []}
 
     deadline =
-      Keyword.get_lazy(opts, :deadline, fn ->
+      Keyword.get(opts, :deadline) || state.deadline ||
         System.monotonic_time(:millisecond) + state.config.timeout_ms
-      end)
 
     no_chunks = fn _chunk -> :ok end
 

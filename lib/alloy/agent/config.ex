@@ -7,10 +7,47 @@ defmodule Alloy.Agent.Config do
   """
 
   alias Alloy.Context.Compactor
-  alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.ModelMetadata
 
-  require Logger
+  @options [
+    :provider,
+    :tools,
+    :system_prompt,
+    :max_turns,
+    :max_tokens,
+    :max_retries,
+    :retry_backoff_ms,
+    :timeout_ms,
+    :tool_timeout,
+    :middleware,
+    :compaction,
+    :working_directory,
+    :context,
+    :on_compaction,
+    :fallback_providers,
+    :code_execution,
+    :model_metadata_overrides,
+    :model_catalog,
+    :until_tool,
+    :memory
+  ]
+
+  @runtime_options [:pubsub, :subscribe, :max_pending, :on_shutdown]
+
+  # Built-in provider options removed in 0.13, checked for the primary and
+  # every fallback provider at startup: a fallback is first used during an
+  # outage, which is the wrong moment to find a config error. Keyed by the
+  # provider that had the option, since a custom provider may use the name.
+  @removed_provider_options %{
+    Alloy.Provider.Anthropic =>
+      {:extended_thinking,
+       ":extended_thinking was removed in Alloy 0.13; configure thinking through " <>
+         ~s(:extra_body, for example %{"thinking" => %{"type" => "adaptive"}})},
+    Alloy.Provider.Codex =>
+      {:auth_path,
+       ":auth_path was removed in Alloy 0.13; set :codex_home to the directory " <>
+         "holding auth.json"}
+  }
 
   # The summary prompts are optional because a bare `%Config{}` omits them;
   # `from_opts/1` always fills them and the Compactor falls back to its
@@ -36,18 +73,6 @@ defmodule Alloy.Agent.Config do
           keep_recent_tool_results: non_neg_integer()
         }
 
-  @typedoc """
-  Memory store binding — `{store_module, opaque_store_term}`. The store
-  module implements `Alloy.Memory`. The store term is whatever the
-  module needs (keyword list, map, pid, struct) — Alloy passes it
-  through verbatim.
-
-  As of 0.12.0, memory is Anthropic-only. `Alloy.run/2` raises if
-  `:memory` is set with any other provider, or if `:tools` also contains a
-  tool named `"memory"` (the name the memory tool reserves).
-  """
-  @type memory :: {module(), term()} | nil
-
   @type t :: %__MODULE__{
           provider: module(),
           provider_config: map(),
@@ -68,20 +93,12 @@ defmodule Alloy.Agent.Config do
           },
           working_directory: String.t(),
           context: map(),
-          # Accepts any session-shaped struct (%Alloy.Session{} or
-          # %AlloyAgent.Session{}) — see issue #40.
-          on_shutdown: (struct() -> any()) | nil,
           on_compaction: (list(), Alloy.Agent.State.t() -> any()) | nil,
-          pubsub: module() | nil,
-          subscribe: [String.t()],
-          max_pending: non_neg_integer(),
           fallback_providers: [{module(), map()}],
           code_execution: boolean(),
           model_metadata_overrides: map(),
           model_catalog: module(),
-          max_budget_cents: number() | nil,
-          until_tool: String.t() | nil,
-          memory: memory()
+          until_tool: String.t() | nil
         }
 
   @enforce_keys [:provider, :provider_config]
@@ -110,27 +127,25 @@ defmodule Alloy.Agent.Config do
     compaction_explicit: %{reserve_tokens: false, keep_recent_tokens: false},
     working_directory: ".",
     context: %{},
-    on_shutdown: nil,
     on_compaction: nil,
-    pubsub: nil,
-    subscribe: [],
-    max_pending: 0,
     fallback_providers: [],
     code_execution: false,
     model_metadata_overrides: %{},
     model_catalog: ModelMetadata,
-    max_budget_cents: nil,
-    until_tool: nil,
-    memory: nil
+    until_tool: nil
   ]
 
   @doc """
   Builds a config from `Alloy.run/2` options.
   """
   @spec from_opts(keyword()) :: t()
-  def from_opts(opts) do
+  def from_opts(opts) when is_list(opts) do
+    validate_option_names!(opts)
     {provider_mod, provider_config} = parse_provider(opts[:provider])
-    provider_config = normalize_provider_config(provider_config)
+
+    provider_config =
+      provider_config |> normalize_provider_config() |> reject_removed!(provider_mod)
+
     model_metadata_overrides = normalize_model_metadata_overrides(opts[:model_metadata_overrides])
 
     model_catalog =
@@ -148,7 +163,7 @@ defmodule Alloy.Agent.Config do
       )
 
     {compaction, compaction_explicit} = resolve_compaction(opts[:compaction], max_tokens)
-    tools = Keyword.get(opts, :tools, [])
+    tools = Keyword.get(opts, :tools, []) ++ memory_tools(Keyword.get(opts, :memory))
 
     %__MODULE__{
       provider: provider_mod,
@@ -162,16 +177,12 @@ defmodule Alloy.Agent.Config do
       retry_backoff_ms: Keyword.get(opts, :retry_backoff_ms, 1_000),
       timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
       tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
-      middleware: Keyword.get(opts, :middleware, []),
+      middleware: resolve_middleware(Keyword.get(opts, :middleware, []), opts[:compaction]),
       compaction: compaction,
       compaction_explicit: compaction_explicit,
       working_directory: Keyword.get(opts, :working_directory, "."),
       context: Keyword.get(opts, :context, %{}),
-      on_shutdown: Keyword.get(opts, :on_shutdown, nil),
       on_compaction: Keyword.get(opts, :on_compaction, nil),
-      pubsub: Keyword.get(opts, :pubsub, nil),
-      subscribe: Keyword.get(opts, :subscribe, []),
-      max_pending: Keyword.get(opts, :max_pending, 0),
       fallback_providers:
         opts
         |> Keyword.get(:fallback_providers, [])
@@ -179,69 +190,65 @@ defmodule Alloy.Agent.Config do
       code_execution: Keyword.get(opts, :code_execution, false),
       model_metadata_overrides: model_metadata_overrides,
       model_catalog: model_catalog,
-      max_budget_cents: opts |> Keyword.get(:max_budget_cents) |> warn_max_budget_cents(),
-      until_tool: Keyword.get(opts, :until_tool),
-      memory: validate_memory(Keyword.get(opts, :memory), provider_mod, tools)
+      until_tool: Keyword.get(opts, :until_tool)
     }
   end
 
-  defp validate_memory(nil, _provider, _tools), do: nil
-
-  defp validate_memory({module, _store} = memory, provider, tools)
-       when is_atom(module) do
-    cond do
-      provider != Alloy.Provider.Anthropic ->
-        raise ArgumentError,
-              "Alloy.Memory is Anthropic-only in 0.12.0. Got provider #{inspect(provider)} " <>
-                "with memory store module #{inspect(module)}. " <>
-                "Use Alloy.Provider.Anthropic or omit :memory."
-
-      # With :memory set, every "memory" call goes to the store, so a user
-      # tool of that name would never run.
-      Enum.any?(tools, &(tool_name(&1) == MemoryRouter.tool_name())) ->
-        raise ArgumentError,
-              ~s(:memory reserves the tool name "memory", but a tool named "memory" ) <>
-                "is also configured in :tools. Rename that tool or omit :memory."
-
-      true ->
-        memory
+  # A misspelt or removed option used to be ignored silently, which hides
+  # mistakes such as a budget or tool list that never applies.
+  defp validate_option_names!(opts) do
+    case opts |> Keyword.drop(@options) |> Keyword.keys() |> Enum.uniq() do
+      [] -> :ok
+      unknown -> raise ArgumentError, unknown_options_message(unknown)
     end
   end
 
-  defp validate_memory(bad, _provider, _tools) do
-    raise ArgumentError,
-          ":memory must be a {module, store_opts} tuple where module implements " <>
-            "Alloy.Memory. Got: #{inspect(bad)}"
+  defp unknown_options_message([:max_budget_cents]) do
+    ":max_budget_cents was removed in Alloy 0.13. Enforce a budget with " <>
+      ":before_completion middleware instead (see \"Budget limits\" in the Alloy docs)."
   end
 
-  defp warn_max_budget_cents(nil), do: nil
+  defp unknown_options_message(unknown) do
+    case Enum.filter(unknown, &(&1 in @runtime_options)) do
+      [] ->
+        "unknown options #{inspect(unknown)}. Valid options: #{inspect(@options)} " <>
+          "(Alloy.run/2 and Alloy.stream/3 also take :messages and :on_event). " <>
+          "See docs/upgrading-to-0.13.md for options removed in 0.13."
 
-  # Once per node: agents are started per request in many apps, and a
-  # warning per run would flood their logs.
-  defp warn_max_budget_cents(max_budget_cents) do
-    if :persistent_term.get({__MODULE__, :max_budget_cents_warned}, false) do
-      max_budget_cents
-    else
-      :persistent_term.put({__MODULE__, :max_budget_cents_warned}, true)
-      log_max_budget_cents_deprecation(max_budget_cents)
+      runtime ->
+        "#{inspect(runtime)} belong to the agent server, which moved to the " <>
+          "alloy_agent package in Alloy 0.13; pass them to AlloyAgent.start_link/1. " <>
+          "All unknown options: #{inspect(unknown)}"
     end
   end
 
-  defp log_max_budget_cents_deprecation(max_budget_cents) do
-    Logger.warning(
-      ":max_budget_cents is deprecated and will be removed in Alloy 0.13. " <>
-        "It only stops a run when the provider reports usage.estimated_cost_cents, " <>
-        "which none of the built-in providers do. Enforce a budget with " <>
-        ":before_completion middleware instead (see the Alloy module docs)."
-    )
+  # Compaction is middleware, on by default and first, so it runs before the
+  # caller's :before_completion middleware as it did when the loop called it
+  # directly. Listing it yourself sets its position instead.
+  defp resolve_middleware(middleware, false) do
+    if Compactor in middleware do
+      raise ArgumentError,
+            "compaction: false conflicts with Alloy.Context.Compactor in :middleware; " <>
+              "remove one of them"
+    end
 
-    max_budget_cents
+    middleware
   end
 
-  # Matches Alloy.Tool.Inline structs as plain maps so Config does not
-  # compile-depend on the tool modules.
-  defp tool_name(%{name: name}), do: name
-  defp tool_name(module) when is_atom(module), do: module.name()
+  defp resolve_middleware(middleware, _compaction) do
+    if Compactor in middleware, do: middleware, else: [Compactor | middleware]
+  end
+
+  defp reject_removed!(provider_config, provider) do
+    case Map.get(@removed_provider_options, provider) do
+      {key, message} when is_map_key(provider_config, key) -> raise ArgumentError, message
+      _none -> provider_config
+    end
+  end
+
+  # `memory: binding` is shorthand for `tools: [Alloy.Memory.tool(binding)]`.
+  defp memory_tools(nil), do: []
+  defp memory_tools(binding), do: [Alloy.Memory.tool(binding)]
 
   @doc """
   Returns an updated config with a new provider while preserving unrelated options.
@@ -252,7 +259,9 @@ defmodule Alloy.Agent.Config do
   @spec with_provider(t(), module() | {module(), keyword() | map()}) :: t()
   def with_provider(%__MODULE__{} = config, provider) do
     {provider_mod, provider_config} = parse_provider(provider)
-    provider_config = normalize_provider_config(provider_config)
+
+    provider_config =
+      provider_config |> normalize_provider_config() |> reject_removed!(provider_mod)
 
     max_tokens =
       if config.max_tokens_explicit? do
@@ -305,7 +314,7 @@ defmodule Alloy.Agent.Config do
   end
 
   defp parse_fallback_provider({module, provider_config}) when is_atom(module) do
-    {module, normalize_provider_config(provider_config)}
+    {module, provider_config |> normalize_provider_config() |> reject_removed!(module)}
   end
 
   defp parse_fallback_provider(module) when is_atom(module) do
@@ -408,6 +417,7 @@ defmodule Alloy.Agent.Config do
   end
 
   defp normalize_compaction(nil), do: %{}
+  defp normalize_compaction(false), do: %{}
 
   defp normalize_compaction(compaction) when is_map(compaction),
     do: normalize_compaction_map(compaction)

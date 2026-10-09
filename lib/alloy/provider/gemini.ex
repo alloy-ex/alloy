@@ -61,6 +61,8 @@ defmodule Alloy.Provider.Gemini do
   alias Alloy.Message
   alias Alloy.Provider.{Error, HTTP}
 
+  @placeholder_thought_signature "skip_thought_signature_validator"
+
   @default_api_url "https://generativelanguage.googleapis.com"
   @default_api_version "v1beta"
 
@@ -209,11 +211,30 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp format_message(%Message{role: role, content: blocks}, messages) when is_list(blocks) do
-    %{
-      "role" => format_role(role),
-      "parts" => blocks |> Enum.map(&format_content_block(&1, messages)) |> Enum.reject(&is_nil/1)
-    }
+    parts = blocks |> Enum.map(&format_content_block(&1, messages)) |> Enum.reject(&is_nil/1)
+    %{"role" => format_role(role), "parts" => sign_first_function_call(role, parts)}
   end
+
+  # Gemini 3 rejects a step whose first function call has no thought
+  # signature. A call another provider made (or one built by hand) has
+  # none, so it gets the placeholder Google documents for history it did
+  # not produce. Later calls in a parallel step never carry one.
+  # https://docs.cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures
+  defp sign_first_function_call(:assistant, parts) do
+    case Enum.find_index(parts, &Map.has_key?(&1, "functionCall")) do
+      nil ->
+        parts
+
+      index ->
+        List.update_at(
+          parts,
+          index,
+          &Map.put_new(&1, "thoughtSignature", @placeholder_thought_signature)
+        )
+    end
+  end
+
+  defp sign_first_function_call(:user, parts), do: parts
 
   defp format_role(:assistant), do: "model"
   defp format_role(:user), do: "user"

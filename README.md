@@ -9,7 +9,7 @@
 
 Alloy is the completion-tool-call loop and nothing else. Send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. No opinions on sessions, persistence, memory, scheduling, or UI — those belong in your application, where OTP already gives you the runtime.
 
-Alloy is a harness, not a framework. Four runtime dependencies, ~11,000 lines — small enough to read in a day, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
+Alloy is a harness, not a framework. Four runtime dependencies, ~10,000 lines — small enough to read in a day, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and tell me the version",
@@ -17,7 +17,7 @@ Alloy is a harness, not a framework. Four runtime dependencies, ~11,000 lines �
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.12.5"
+result.text #=> "The version is 0.13.0"
 ```
 
 ## Why Alloy?
@@ -61,12 +61,10 @@ application layer. The library stays small so those choices remain yours.
 
 - **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
 - **4 built-in tools** — read, write, edit, bash — plus inline tools defined as data with `Alloy.Tool.inline/1`
-- **GenServer agents** — supervised, stateful, message-passing (moving to the optional `alloy_agent` runtime package in 0.13)
 - **Streaming** — incremental HTTP provider output; Codex replays final text through the same interface
-- **Async dispatch** — `send_message/2` fires non-blocking, result arrives via PubSub
 - **Middleware** — custom hooks, tool blocking, argument editing
-- **Context compaction** — tool-result clearing plus summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
-- **Memory primitive** — `Alloy.Memory` behaviour for Anthropic's `memory_20250818` tool. Alloy owns the wire format and path validation; you own the store (in-memory, disk, Postgres — whatever fits)
+- **Context compaction** — middleware, on by default: tool-result clearing plus summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
+- **Memory tool** — `Alloy.Memory.tool/1` for any provider (Anthropic gets its native `memory_20250818` type). Alloy owns the commands and path validation; you own the store (in-memory, disk, Postgres — whatever fits)
 - **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
 - **Reasoning blocks** — OpenAI encrypted reasoning, Anthropic and Gemini signed thinking, and DeepSeek/Kimi/GLM `reasoning_content` are kept as blocks and sent back the way each API requires
 - **Tool guardrails** — `concurrent?/0` controls parallel execution, `max_result_chars/0` caps output, prompt-too-long auto-recovery. Note: the bash tool's restricted mode is a guardrail, not a sandbox — see [Built-in tools](#built-in-tools)
@@ -75,7 +73,7 @@ application layer. The library stays small so those choices remain yours.
 - **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
 - **Budget limits** — a small `:before_completion` middleware [recipe](#budget-limits) prices usage and halts the run
 - **Pluggable model catalog** — `Alloy.ModelCatalog` behaviour; bring your own context-window source (e.g., an `llm_db` adapter)
-- **~11,000 lines** — small enough to read, understand, and extend
+- **~10,000 lines** — small enough to read, understand, and extend
 
 ## Installation
 
@@ -84,16 +82,15 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.12"}
+    {:alloy, "~> 0.13"}
   ]
 end
 ```
 
-> **Note:** the optional `alloy_agent` runtime wrapper (sessions, async
-> dispatch, memory stores) referenced by the 0.12.x deprecation notices is
-> **not yet published** to Hex. Until it ships, keep using
-> `Alloy.Agent.Server` and `Alloy.Session` from this package — the 0.13
-> removals will not happen before `alloy_agent` is available.
+For a supervised agent process — sessions, async dispatch over
+Phoenix.PubSub, backpressure, and ready-made memory stores — add
+[`alloy_agent`](https://github.com/alloy-ex/alloy_agent) as well. It moved
+out of Alloy in 0.13; see [Upgrading to 0.13](docs/upgrading-to-0.13.md).
 
 ## Quick Start
 
@@ -162,19 +159,6 @@ For a one-shot run, use `Alloy.stream/3`:
   end,
     provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"}
   )
-```
-
-For a persistent agent process with conversation state, use `Alloy.Agent.Server.stream_chat/4`:
-
-```elixir
-{:ok, agent} = Alloy.Agent.Server.start_link(
-  provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"},
-  tools: [Alloy.Tool.Core.Read]
-)
-
-{:ok, result} = Alloy.Agent.Server.stream_chat(agent, "Explain OTP", fn chunk ->
-  IO.write(chunk)  # Print each token as it arrives
-end)
 ```
 
 HTTP providers stream incrementally; Codex emulates streaming by replaying final text. If a custom provider doesn't implement
@@ -268,7 +252,7 @@ before Alloy ships a catalog update, override it in config:
 
 Set `max_tokens` explicitly when you want a fixed compaction budget. Otherwise
 Alloy derives it from the current model, including after
-`Alloy.Agent.Server.set_model/2` switches to a different provider model.
+`Alloy.Agent.Config.with_provider/2` switches to a different provider model.
 
 ### Pluggable model catalog
 
@@ -336,6 +320,14 @@ Set `summary_system_prompt:` and `summary_prompt:` inside `compaction:` when
 your application needs to own the handoff format. Both values must be strings;
 omitting them uses Alloy's default summary prompts.
 
+Compaction is ordinary middleware, `Alloy.Context.Compactor`, which
+`Alloy.run/2` puts first in `:middleware`. Pass `compaction: false` to turn it
+off (for example when your application manages context itself), or list the
+compactor in `:middleware` to choose where it runs. When the provider rejects
+a request as too long, the loop runs the `:on_context_overflow` hook — the
+compactor forces a compaction there — and retries once if the history
+changed.
+
 ### Budget limits
 
 Price the accumulated usage in `:before_completion` middleware, which runs
@@ -373,8 +365,8 @@ A halted run returns `{:error, result}` with `status: :halted`.
 `estimate_cost/3` prices input and output tokens only; `usage.input_tokens`
 is uncached input, so add your provider's cache read and write prices
 (`cache_read_input_tokens`, `cache_creation_input_tokens`) if you use prompt
-caching. The `max_budget_cents:` option is deprecated and will be removed in
-0.13: no built-in provider reports a cost, so it never fired with them.
+caching. (The `max_budget_cents:` option was removed in 0.13: no built-in
+provider reports a cost, so it never fired with them.)
 
 ### Anthropic prompt caching
 
@@ -397,12 +389,13 @@ result.usage.cache_creation_input_tokens  #=> 1500
 result.usage.cache_read_input_tokens      #=> 1500  (on subsequent calls)
 ```
 
-### Memory (Anthropic `memory_20250818`)
+### Memory
 
-Alloy exposes memory as a behaviour — `Alloy.Memory` — matching the split
-Anthropic uses in their own Python SDK: Alloy owns the protocol (six
-commands on a `/memories/` tree, return-string formats, path validation);
-your code owns the backing store. No bytes touch Anthropic's servers.
+Alloy exposes memory as a behaviour — `Alloy.Memory` — and a tool built on
+it, matching the split Anthropic uses in their own Python SDK: Alloy owns
+the protocol (six commands on a `/memories/` tree, return-string formats,
+path validation); your code owns the backing store. No bytes touch the
+provider's servers.
 
 ```elixir
 defmodule MyApp.Memory.Disk do
@@ -424,26 +417,25 @@ end
 
 {:ok, result} = Alloy.run("Remember the user prefers SI units",
   provider: {Alloy.Provider.Anthropic, api_key: "sk-ant-...", model: "claude-sonnet-5-5"},
-  memory: {MyApp.Memory.Disk, root: "/var/agent/memories"}
+  tools: [Alloy.Memory.tool({MyApp.Memory.Disk, root: "/var/agent/memories"})]
 )
 ```
 
-When `:memory` is set, Alloy injects the `memory_20250818` tool into the
-Anthropic request (the memory tool is generally available; no beta header is
-needed). Memory tool calls are routed through `Alloy.Memory.Router`, which
-validates every path against the `/memories` root, so the typed-tool
-contract stays clean. Configuring `:memory` together with your own tool named
-`memory` raises at startup.
+`memory: {MyApp.Memory.Disk, opts}` is shorthand for that tool. It is an
+ordinary tool named `memory`: it runs through the tool executor, so
+`:before_tool_call` middleware, tool events and `:tool_timeout` apply, and
+its calls run one at a time in the order the model made them. Every path is
+validated against the `/memories` root before your store sees it. Anthropic
+receives it as its native `memory_20250818` type (generally available, no
+beta header); every other provider gets a function tool with the same six
+commands. [`alloy_agent`](https://github.com/alloy-ex/alloy_agent) ships
+in-memory and disk stores.
 
 The store term (second element of `{module, opts}`) is opaque — pass a
 keyword list, a map, a `pid()`, or a struct, whichever your store needs.
 Alloy does not bake session scoping into the contract; if you want
 per-session memory trees, thread `session_id: "..."` through your store
 opts and namespace inside your implementation.
-
-As of 0.12.0, memory is Anthropic-only — configuring `:memory` with any
-other provider raises at `Alloy.run/2` entry. Other providers will be
-wired as they ship their own memory primitives.
 
 ### Reasoning model support (DeepSeek, Kimi, GLM)
 
@@ -580,37 +572,24 @@ defmodule SanitizeBash do
 end
 ```
 
-### Supervised GenServer agent
+### Supervised agents and async dispatch
+
+A GenServer agent with conversation state, PubSub broadcast for LiveView,
+and request queueing lives in the
+[`alloy_agent`](https://github.com/alloy-ex/alloy_agent) package:
 
 ```elixir
-{:ok, agent} = Alloy.Agent.Server.start_link(
-  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"},
-  tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Edit, Alloy.Tool.Core.Bash],
-  system_prompt: "You are a senior Elixir developer."
+{:ok, agent} = AlloyAgent.start_link(
+  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-5-5"},
+  tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Edit, Alloy.Tool.Core.Bash]
 )
 
-{:ok, response} = Alloy.Agent.Server.chat(agent, "What does this project do?")
-{:ok, response} = Alloy.Agent.Server.chat(agent, "Now refactor the main module")
+{:ok, response} = AlloyAgent.chat(agent, "What does this project do?")
 ```
 
-### Async dispatch (Phoenix LiveView)
-
-Fire a message without blocking the caller — ideal for LiveView and background jobs:
-
-```elixir
-# Subscribe to receive the result
-Phoenix.PubSub.subscribe(MyApp.PubSub, "agent:#{session_id}:responses")
-
-# Returns {:ok, request_id} immediately — agent works in the background
-{:ok, req_id} = Alloy.Agent.Server.send_message(agent, "Summarise this report",
-  request_id: "req-123"
-)
-
-# Handle the result whenever it arrives
-def handle_info({:agent_response, %{text: text, request_id: "req-123"}}, socket) do
-  {:noreply, assign(socket, :response, text)}
-end
-```
+Without it, `Alloy.run/2` inside your own `Task.Supervisor` or GenServer is
+all a supervised agent needs: pass `messages: previous_result.messages` to
+continue a conversation.
 
 ## Providers
 
@@ -642,9 +621,9 @@ requires one (16,000 tokens by default). Reasoning counts against the cap on
 current models, so set `:max_tokens` only when you want a hard limit; a
 truncated answer completes with `result.stop_reason == :max_tokens`.
 
-**Anthropic thinking.** Claude 4.7 and later reject the manual
-`extended_thinking: [budget_tokens: ...]` option, which is deprecated; use
-adaptive thinking through `extra_body`:
+**Anthropic thinking.** Configure thinking through `extra_body` (the
+`extended_thinking` option was removed in 0.13; Claude 4.7 and later reject
+manual budgets anyway):
 
 ```elixir
 {Alloy.Provider.Anthropic,
@@ -794,13 +773,17 @@ provider's `:server_tools` option, alongside your own tools:
 
 ```
 Alloy.run/2                    One-shot agent loop (pure function)
-Alloy.Agent.Server             GenServer wrapper (stateful, supervisable)
 Alloy.Agent.Turn               Single turn: call provider → execute tools → return
 Alloy.Provider                 Behaviour: translate wire format ↔ Alloy.Message
 Alloy.Tool                     Behaviour: name, description, input_schema, execute
 Alloy.Middleware               Pipeline: custom hooks, tool blocking
-Alloy.Context.Compactor        Automatic conversation summarization
+Alloy.Context.Compactor        Compaction middleware (on by default)
+Alloy.Memory                   Memory store behaviour and the memory tool
 ```
+
+The supervised runtime (GenServer agents, PubSub, sessions, memory stores)
+is the separate [`alloy_agent`](https://github.com/alloy-ex/alloy_agent)
+package.
 
 Sessions, persistence, multi-agent coordination, scheduling, skills, and UI
 belong in your application layer. See [Anvil](https://github.com/alloy-ex/anvil)

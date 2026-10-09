@@ -22,7 +22,8 @@ defmodule Alloy.Tool.Registry do
   """
   @spec build([tool()]) :: {[map()], %{String.t() => tool()}}
   def build(tools) when is_list(tools) do
-    specs = Enum.map(tools, &(&1 |> validate!() |> to_inline()))
+    specs = Enum.map(tools, &(&1 |> validate!() |> to_inline() |> Inline.validate!()))
+    reject_duplicate_names!(specs)
     tool_defs = Enum.map(specs, &tool_def/1)
     tool_fns = tools |> Enum.zip(specs) |> Map.new(fn {tool, spec} -> {spec.name, tool} end)
     {tool_defs, tool_fns}
@@ -49,7 +50,8 @@ defmodule Alloy.Tool.Registry do
       result_type: optional(mod, :result_type, nil),
       strict: optional(mod, :strict?, false),
       input_examples: optional(mod, :input_examples, []),
-      defer_loading: optional(mod, :defer_loading?, false)
+      defer_loading: optional(mod, :defer_loading?, false),
+      native_types: optional(mod, :native_types, %{})
     }
   end
 
@@ -57,7 +59,20 @@ defmodule Alloy.Tool.Registry do
     if function_exported?(mod, callback, 0), do: apply(mod, callback, []), else: default
   end
 
-  defp validate!(%Inline{} = tool), do: Inline.validate!(tool)
+  # Every provider API rejects a request with two tools of the same name,
+  # and only one of them could ever be dispatched.
+  defp reject_duplicate_names!(specs) do
+    case for({name, count} <- Enum.frequencies_by(specs, & &1.name), count > 1, do: name) do
+      [] ->
+        :ok
+
+      duplicates ->
+        raise ArgumentError,
+              "tool names must be unique; configured more than once: #{inspect(duplicates)}"
+    end
+  end
+
+  defp validate!(%Inline{} = tool), do: tool
   defp validate!(mod) when is_atom(mod), do: mod
 
   defp validate!(other) do
@@ -81,6 +96,7 @@ defmodule Alloy.Tool.Registry do
     |> maybe_put_true(:strict, tool.strict)
     |> maybe_put_non_empty(:input_examples, tool.input_examples)
     |> maybe_put_true(:defer_loading, tool.defer_loading)
+    |> maybe_put_non_empty(:native_types, tool.native_types)
   end
 
   defp maybe_put(map, _key, nil), do: map
@@ -88,6 +104,7 @@ defmodule Alloy.Tool.Registry do
 
   defp maybe_put_non_empty(map, _key, nil), do: map
   defp maybe_put_non_empty(map, _key, []), do: map
+  defp maybe_put_non_empty(map, _key, value) when is_map(value) and map_size(value) == 0, do: map
   defp maybe_put_non_empty(map, key, value), do: Map.put(map, key, value)
 
   defp maybe_put_true(map, key, true), do: Map.put(map, key, true)

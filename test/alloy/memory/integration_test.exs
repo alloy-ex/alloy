@@ -2,25 +2,77 @@ defmodule Alloy.Memory.IntegrationTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
-  alias Alloy.Test.MemoryStore
+  alias Alloy.Provider.Test, as: TestProvider
+  alias Alloy.Test.{EchoTool, MemoryStore}
 
   describe "Alloy.run/2 with :memory option" do
-    test "raises when memory is configured with a non-Anthropic provider" do
-      assert_raise ArgumentError, ~r/Anthropic-only/, fn ->
+    test "raises on a malformed :memory value" do
+      assert_raise ArgumentError, ~r/expects a \{module, store\} tuple/, fn ->
         Alloy.run("hi",
-          provider: {Alloy.Provider.OpenAI, api_key: "sk-test", model: "gpt-5.4"},
-          memory: {MemoryStore, self()}
+          provider: {Alloy.Provider.Anthropic, api_key: "sk-test", model: "claude-sonnet-5-5"},
+          memory: :bogus
         )
       end
     end
 
-    test "raises on malformed :memory value" do
-      assert_raise ArgumentError, ~r/must be a \{module, store_opts\} tuple/, fn ->
+    test "raises when a configured tool is also named memory" do
+      other_memory =
+        Alloy.Tool.inline(
+          name: "memory",
+          description: "The app's own memory tool",
+          input_schema: %{type: "object"},
+          execute: fn _input, _context -> {:ok, "ok"} end
+        )
+
+      assert_raise ArgumentError, ~r/tool names must be unique.*"memory"/, fn ->
         Alloy.run("hi",
-          provider: {Alloy.Provider.Anthropic, api_key: "sk-test", model: "claude-sonnet-4-6"},
-          memory: :bogus
+          provider: {TestProvider, []},
+          memory: {MemoryStore, self()},
+          tools: [other_memory]
         )
       end
+    end
+
+    test "other providers get the memory tool as a function with a JSON schema" do
+      parent = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:captured, Jason.decode!(body)})
+
+        response = %{
+          "id" => "resp_1",
+          "status" => "completed",
+          "output" => [
+            %{
+              "type" => "message",
+              "role" => "assistant",
+              "content" => [%{"type" => "output_text", "text" => "ok"}]
+            }
+          ],
+          "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+        }
+
+        conn
+        |> Plug.Conn.put_resp_header("content-type", "application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(response))
+      end
+
+      {:ok, store_pid} = MemoryStore.start_link()
+
+      {:ok, _result} =
+        Alloy.run("hello",
+          provider:
+            {Alloy.Provider.OpenAI,
+             api_key: "sk-test", model: "gpt-6-sol", req_options: [plug: plug]},
+          memory: {MemoryStore, store_pid}
+        )
+
+      assert_receive {:captured, body}
+      assert [tool] = body["tools"]
+      assert %{"type" => "function", "name" => "memory", "parameters" => parameters} = tool
+      assert parameters["required"] == ["command"]
+      assert "str_replace" in parameters["properties"]["command"]["enum"]
     end
   end
 
@@ -51,7 +103,7 @@ defmodule Alloy.Memory.IntegrationTest do
       {:ok, plug: plug}
     end
 
-    test "injects the memory_20250818 tool without a beta header when memory is set", %{
+    test "sends the memory tool as the memory_20250818 type without a beta header", %{
       plug: plug
     } do
       {:ok, store_pid} = MemoryStore.start_link()
@@ -67,7 +119,11 @@ defmodule Alloy.Memory.IntegrationTest do
       assert_receive {:captured, headers, body}
 
       assert [memory_tool] = Enum.filter(body["tools"] || [], &(&1["type"] == "memory_20250818"))
-      assert memory_tool["name"] == "memory"
+
+      assert Map.delete(memory_tool, "cache_control") == %{
+               "type" => "memory_20250818",
+               "name" => "memory"
+             }
 
       # The memory tool is GA (no beta header) since February 17, 2026.
       refute List.keymember?(headers, "anthropic-beta", 0)
@@ -98,7 +154,7 @@ defmodule Alloy.Memory.IntegrationTest do
     # Simulate a two-turn flow: turn 1 Claude calls `memory.create`;
     # turn 2 Claude returns end_turn text. The provider plug serves
     # both responses in order.
-    test "routes memory tool_use blocks through the router, not the executor" do
+    test "runs memory calls through the executor like any other tool" do
       {:ok, store_pid} = MemoryStore.start_link()
 
       state = :counters.new(1, [])
@@ -152,10 +208,19 @@ defmodule Alloy.Memory.IntegrationTest do
           provider:
             {Alloy.Provider.Anthropic,
              api_key: "sk-test", model: "claude-sonnet-4-6", req_options: [plug: plug]},
-          memory: {MemoryStore, store_pid}
+          memory: {MemoryStore, store_pid},
+          middleware: [Alloy.Test.ReportToolCalls],
+          context: %{report_to: parent},
+          on_event: &send(parent, {:event, &1.event})
         )
 
       assert result.text == "noted"
+
+      # Middleware and tool events see memory calls; they used to bypass both.
+      assert_received {:before_tool_call, "memory"}
+      assert_received {:event, :tool_start}
+      assert_received {:event, :tool_end}
+      assert [%{name: "memory", error: nil}] = result.tool_calls
 
       # By the time the second turn fires, the memory store should hold
       # the value the first turn wrote.
@@ -163,7 +228,7 @@ defmodule Alloy.Memory.IntegrationTest do
       assert store["/memories/note.md"] == "user prefers SI units"
 
       # The conversation should include a user/tool_result message with
-      # the memory router's output — not a regular tool-call result.
+      # the store's output.
       tool_result_msg =
         Enum.find(result.messages, fn
           %Message{role: :user, content: blocks} when is_list(blocks) ->
@@ -176,8 +241,45 @@ defmodule Alloy.Memory.IntegrationTest do
       assert tool_result_msg
       [block] = tool_result_msg.content
       assert block.tool_use_id == "toolu_mem1"
-      assert block.is_error == false
+      refute block[:is_error]
       assert block.content =~ "created"
+    end
+  end
+
+  describe "memory calls through the executor" do
+    test "calls in one response run in the order the model made them, alongside other tools" do
+      {:ok, store_pid} = MemoryStore.start_link()
+      memory = fn id, input -> %{id: id, name: "memory", input: input} end
+
+      {:ok, provider} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            memory.("m1", %{
+              "command" => "create",
+              "path" => "/memories/prefs.md",
+              "file_text" => "units: imperial"
+            }),
+            %{id: "e1", name: "echo", input: %{"text" => "hi"}},
+            memory.("m2", %{
+              "command" => "str_replace",
+              "path" => "/memories/prefs.md",
+              "old_str" => "imperial",
+              "new_str" => "SI"
+            })
+          ]),
+          TestProvider.text_response("Saved")
+        ])
+
+      {:ok, result} =
+        Alloy.run("remember SI units",
+          provider: {TestProvider, agent_pid: provider},
+          tools: [EchoTool],
+          memory: {MemoryStore, store_pid}
+        )
+
+      assert MemoryStore.contents(store_pid) == %{"/memories/prefs.md" => "units: SI"}
+      assert Enum.map(result.tool_calls, & &1.id) == ["m1", "e1", "m2"]
+      assert Enum.all?(result.tool_calls, &is_nil(&1.error))
     end
   end
 end

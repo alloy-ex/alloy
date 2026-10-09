@@ -15,7 +15,7 @@ use a 200,000-token fallback; use `model_metadata_overrides` or your own
 | Provider | Current examples | Alloy route and constraints |
 | --- | --- | --- |
 | OpenAI | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` | `Alloy.Provider.OpenAI` uses Responses and preserves opaque reasoning items. Sol requires Responses for tool calls; Luna's Chat Completions tool support requires reasoning disabled. Check each model's allowed effort values. [Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol), [Astra](https://developers.openai.com/api/docs/models/gpt-6-astra), [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna). |
-| Anthropic | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | `Alloy.Provider.Anthropic` uses Messages. New models use adaptive thinking; fixed `extended_thinking: [budget_tokens: ...]` sends an unsupported manual mode on Claude 4.7 and later. [Models](https://platform.claude.com/docs/en/models/overview), [manual thinking compatibility](https://platform.claude.com/docs/en/build-with-claude/extended-thinking). |
+| Anthropic | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | `Alloy.Provider.Anthropic` uses Messages. New models use adaptive thinking; manual budgets are rejected on Claude 4.7 and later. [Models](https://platform.claude.com/docs/en/models/overview), [manual thinking compatibility](https://platform.claude.com/docs/en/build-with-claude/extended-thinking). |
 | Gemini | `gemini-3.8-flash`, `gemini-3.5-flash-lite` | `Alloy.Provider.Gemini` uses GenerateContent; `generation_config` passes native settings. `OpenAICompat` can use Google's Chat Completions endpoint. Preserve thought signatures through tool turns. 2.5 models remain served but access is restricted to prior active users. [Models](https://ai.google.dev/gemini-api/docs/models), [compatibility endpoint](https://ai.google.dev/gemini-api/docs/openai). |
 | xAI | `grok-4.7` | `Alloy.Provider.XAI` wraps the Responses adapter. The model returns encrypted reasoning even without an explicit include request; preserve those items. Its documented window is 500,000 tokens. [Models](https://docs.x.ai/developers/models). |
 | Other compatible endpoints | Your endpoint's supported model ID | `Alloy.Provider.OpenAICompat` implements Chat Completions. Compatibility is specific to the endpoint; tool calling, reasoning fields, and usage extensions are not universal. |
@@ -37,8 +37,8 @@ Alloy.run("Summarize this repository",
 )
 ```
 
-For current Claude models, use adaptive thinking through existing passthrough.
-Omit the legacy `extended_thinking` option. Thinking text is omitted by default
+For current Claude models, use adaptive thinking through existing passthrough
+(the `extended_thinking` option was removed in 0.13). Thinking text is omitted by default
 on several new models; request summarized display when your UI needs it.
 Do not carry old sampling or forced-tool-choice settings into a new model
 without checking its contract. [Thinking configuration](https://platform.claude.com/docs/en/build-with-claude/thinking).
@@ -50,6 +50,67 @@ provider = {Alloy.Provider.Anthropic,
   extra_body: %{"thinking" => %{"type" => "adaptive", "display" => "summarized"}}
 }
 ```
+
+### Preserved thinking and compaction
+
+Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 accept a replayed
+thinking block only while the `system` prompt, `tools` and earlier messages
+are unchanged. Accounts created on or after 31 August 2026 get a 400
+otherwise. Alloy keeps `system` and `tools` fixed for a run and only appends
+to `messages`, except when it compacts. After compaction it removes every
+thinking block it keeps, which is the documented valid change, so no beta
+header is needed. If you edit history yourself, either do the same or opt
+into the API dropping stale blocks:
+
+```elixir
+extra_headers: [{"anthropic-beta", "thinking-binding-controls-2026-08-01"}],
+extra_body: %{
+  "thinking" => %{
+    "type" => "adaptive",
+    "block_binding" => %{"prefix_mismatch_behavior" => "drop_block"}
+  }
+}
+```
+
+[Preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking).
+
+### Switching provider mid-conversation
+
+Each assistant message records its provider, model and origin: a hash of
+the provider module, `:api_url` and `:api_key`. Before every request,
+including to a fallback provider, `Alloy.Message.normalize_for/3` rewrites
+messages from a different origin, meaning another provider, endpoint or
+account:
+
+- thinking becomes plain text, with signatures removed;
+- redacted thinking, raw OpenAI and xAI reasoning items, and Anthropic
+  server-tool records are dropped;
+- tool-call ids outside `[a-zA-Z0-9_-]{1,64}` are rewritten.
+
+Gemini receives Google's placeholder thought signature on the first tool
+call of each step it did not produce.
+
+Switching models on one origin keeps everything. Anthropic and OpenAI drop
+reasoning the new model can't use themselves, and Gemini says to resend it.
+Encrypted reasoning only ever goes back to the endpoint and credentials
+that issued it, since OpenAI ties it to the issuing organisation. Rotating
+an API key counts as a new origin, so earlier reasoning is then sent as
+text. Messages saved without their `origin` are sent unchanged.
+
+Known limits:
+
+- **DeepSeek thinking mode with tools** requires `reasoning_content` on
+  every earlier assistant turn. Turns written by another provider have
+  none, so switching to DeepSeek in the middle of a tool conversation can
+  be rejected. Start a new conversation, or turn thinking off for it.
+- **Anthropic manual thinking** (`"type" => "enabled"`, Claude 4.6 and
+  earlier) requires the turn in progress to start with a thinking block,
+  which a turn written by another provider lacks. Adaptive thinking, the
+  only mode on current models, has no such rule.
+- **`OpenAICompat`** reaches each vendor at its own `:api_url`, so
+  switching vendors is a change of origin: earlier `reasoning_content` is
+  sent as plain text in the assistant message, and Gemini signatures from
+  Google's compatibility endpoint are dropped.
 
 The provider tests check serialization, stream parsing, and opaque state
 round-trips using fixtures. Those checks do not certify every current model
@@ -88,9 +149,8 @@ meaning: `input_tokens` is uncached input, cache reads and writes are in
 `output_tokens` includes reasoning or thinking tokens. Total prompt tokens
 are the sum of the three input fields.
 
-No built-in provider attaches a monetary cost. `max_budget_cents` is
-deprecated (removed in 0.13) because it only acts on provider-reported costs;
-enforce a budget with `:before_completion` middleware that prices
+No built-in provider attaches a monetary cost, which is why the
+`max_budget_cents` option was removed in 0.13; enforce a budget with `:before_completion` middleware that prices
 `state.usage` (see "Budget limits" in the README). Application billing
 controls must still account for cache tiers, long-context surcharges and
 server-tool fees. `Alloy.Usage.estimate_cost/3` is a helper, not price

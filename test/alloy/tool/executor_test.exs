@@ -943,7 +943,7 @@ defmodule Alloy.Tool.ExecutorTest do
   end
 
   describe "execute_all — cancellation" do
-    # Server.cancel_request kills the turn outright; tool tasks are unlinked
+    # A runtime cancelling a request kills the turn outright; tool tasks are unlinked
     # (so a crashing tool can't take the turn down) and must still stop.
     test "killing the caller stops its in-flight tool tasks" do
       test_pid = self()

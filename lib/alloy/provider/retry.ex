@@ -9,6 +9,7 @@ defmodule Alloy.Provider.Retry do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Message
   alias Alloy.Provider.Error
 
   require Logger
@@ -27,7 +28,7 @@ defmodule Alloy.Provider.Retry do
   def call_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline) do
     {result, chunks_emitted?} =
       do_provider_call(
-        state,
+        normalize_for(state, provider, provider_config),
         provider,
         provider_config,
         streaming?,
@@ -121,7 +122,7 @@ defmodule Alloy.Provider.Retry do
 
           {result, chunks_emitted?} =
             do_provider_call(
-              state,
+              normalize_for(state, fb_provider, fb_provider_config),
               fb_provider,
               fb_provider_config,
               streaming?,
@@ -175,8 +176,8 @@ defmodule Alloy.Provider.Retry do
     )
 
     case result do
-      {:ok, _} = success ->
-        {success, chunks_emitted?}
+      {:ok, response} ->
+        {{:ok, record_origin(response, provider, provider_config)}, chunks_emitted?}
 
       {:error, reason} when retries_left > 0 ->
         if retryable?(reason) and not chunks_emitted? do
@@ -190,7 +191,7 @@ defmodule Alloy.Provider.Retry do
 
           if remaining < backoff do
             # Not enough time left — return the error rather than sleeping
-            # past the GenServer.call timeout.
+            # past the turn deadline.
             {{:error, reason}, false}
           else
             Process.sleep(backoff)
@@ -212,6 +213,24 @@ defmodule Alloy.Provider.Retry do
       {:error, _reason} = error ->
         {error, chunks_emitted?}
     end
+  end
+
+  # Normalized once per provider rather than per attempt: retries resend the
+  # same history.
+  defp normalize_for(%State{} = state, provider, provider_config),
+    do: %{state | messages: Message.normalize_for(state.messages, provider, provider_config)}
+
+  # Provenance lets a later request to a different provider (a fallback, or
+  # a model switch) rewrite blocks only this provider can read.
+  defp record_origin(%{messages: messages} = response, provider, provider_config) do
+    model = Map.get(provider_config, :model)
+    origin = Message.origin(provider, provider_config)
+
+    stamp = fn %Message{} = message ->
+      %{message | provider: provider, model: model, origin: origin}
+    end
+
+    %{response | messages: Enum.map(messages, stamp)}
   end
 
   defp retry_after_ms(%Error{retry_after_ms: ms}) when is_integer(ms), do: ms
@@ -239,14 +258,12 @@ defmodule Alloy.Provider.Retry do
 
     provider_config = Map.put(provider_config, :on_event, wrapped_on_event)
 
-    messages = State.messages(state)
-    result = provider.stream(messages, state.tool_defs, provider_config, wrapped_chunk)
+    result = provider.stream(state.messages, state.tool_defs, provider_config, wrapped_chunk)
     {result, :atomics.get(ref, 1) == 1}
   end
 
   defp call_provider(provider, state, provider_config, false = _streaming?, _on_chunk) do
-    messages = State.messages(state)
-    {provider.complete(messages, state.tool_defs, provider_config), false}
+    {provider.complete(state.messages, state.tool_defs, provider_config), false}
   end
 
   # The caller's streaming callbacks run inside the provider's stream

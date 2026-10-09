@@ -9,9 +9,7 @@ defmodule Alloy.Agent.Turn do
   """
 
   alias Alloy.Agent.State
-  alias Alloy.Context.Compactor
   alias Alloy.Events
-  alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.{Message, Middleware}
   alias Alloy.Provider.{Error, Retry}
   alias Alloy.Tool.Executor
@@ -52,7 +50,8 @@ defmodule Alloy.Agent.Turn do
     deadline =
       System.monotonic_time(:millisecond) + state.config.timeout_ms - @deadline_headroom_ms
 
-    run_span(state.config.provider_config[:model], fn -> loop(state, opts, deadline) end)
+    state = %{state | deadline: deadline}
+    run_span(state.config.provider_config[:model], fn -> loop(state, opts) end)
   end
 
   # :telemetry.span/3 accepts extra stop measurements only from telemetry 1.3,
@@ -89,34 +88,26 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  defp loop(%State{turn: turn, config: config} = state, _opts, _deadline)
+  defp loop(%State{turn: turn, config: config} = state, _opts)
        when turn >= config.max_turns do
     %{state | status: :max_turns}
   end
 
-  defp loop(%State{} = state, opts, deadline) do
-    if budget_exceeded?(state) do
-      %{state | status: :budget_exceeded}
-    else
-      case run_turn(state, opts, deadline) do
-        {:continue, state} -> loop(state, opts, deadline)
-        {:halt, state} -> state
-      end
+  defp loop(%State{} = state, opts) do
+    case run_turn(state, opts) do
+      {:continue, state} -> loop(state, opts)
+      {:halt, state} -> state
     end
   end
 
-  # One turn: compaction, one provider response and the tool calls it asks
-  # for. Every step returns {:continue, state} to start another turn or
-  # {:halt, state} with the final status set.
-  defp run_turn(%State{} = state, opts, deadline) do
+  # One turn: one provider response and the tool calls it asks for. Every
+  # step returns {:continue, state} to start another turn or {:halt, state}
+  # with the final status set.
+  defp run_turn(%State{} = state, opts) do
     turn = state.turn + 1
 
     :telemetry.span([:alloy, :turn], %{turn: turn}, fn ->
-      step =
-        with {:continue, state} <- compact(state, turn, deadline) do
-          complete(state, opts, deadline, false)
-        end
-
+      step = complete(state, opts, false)
       {step, %{turn: turn, status: step_status(step)}}
     end)
   end
@@ -124,27 +115,9 @@ defmodule Alloy.Agent.Turn do
   defp step_status({:continue, %State{}}), do: :running
   defp step_status({:halt, %State{status: status}}), do: status
 
-  defp compact(%State{} = state, turn, deadline) do
-    messages_before = length(State.messages(state))
-
-    case Compactor.maybe_compact(state, turn: turn, deadline: deadline) do
-      {:unchanged, state} ->
-        {:continue, state}
-
-      {:compacted, state} ->
-        :telemetry.execute(
-          [:alloy, :compaction, :done],
-          %{messages_before: messages_before, messages_after: length(State.messages(state))},
-          %{turn: turn}
-        )
-
-        run_middleware(:after_compaction, state)
-    end
-  end
-
-  defp complete(%State{} = state, opts, deadline, prompt_retried?) do
+  defp complete(%State{} = state, opts, overflow_retried?) do
     with {:continue, state} <- run_middleware(:before_completion, state) do
-      case request(state, opts, deadline) do
+      case request(state, opts) do
         {:ok, %{stop_reason: :refusal} = response} ->
           {:halt, refuse(state, response)}
 
@@ -155,12 +128,12 @@ defmodule Alloy.Agent.Turn do
           |> continue_after(stop_reason, new_msgs, opts)
 
         {:error, reason} ->
-          handle_provider_error(reason, state, opts, deadline, prompt_retried?)
+          handle_provider_error(reason, state, opts, overflow_retried?)
       end
     end
   end
 
-  defp request(%State{} = state, opts, deadline) do
+  defp request(%State{} = state, opts) do
     provider = state.config.provider
     provider_config = build_provider_config(state)
     provider_event_turn = state.turn + 1
@@ -181,7 +154,7 @@ defmodule Alloy.Agent.Turn do
         do: Map.put(provider_config, :on_event, on_event),
         else: provider_config
 
-    Retry.call_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline)
+    Retry.call_with_retry(state, provider, provider_config, streaming?, on_chunk, state.deadline)
   end
 
   defp account_response(state, %{stop_reason: stop_reason, usage: usage} = response) do
@@ -256,15 +229,17 @@ defmodule Alloy.Agent.Turn do
   defp fail(state, reason) do
     state = %{state | status: :error, error: reason}
 
-    case Middleware.run(:on_error, state) do
-      {:halted, halted_reason} -> halt(state, halted_reason)
+    case Middleware.run_hook(:on_error, state) do
+      {:halted, halted_reason, halted} -> halt(halted, halted_reason)
       %State{} = state -> state
     end
   end
 
+  # A halt keeps what earlier middleware in the chain did, such as a
+  # compaction whose summary request was already billed.
   defp run_middleware(hook, %State{} = state) do
-    case Middleware.run(hook, state) do
-      {:halted, reason} -> {:halt, halt(state, reason)}
+    case Middleware.run_hook(hook, state) do
+      {:halted, reason, halted} -> {:halt, halt(halted, reason)}
       %State{} = state -> {:continue, state}
     end
   end
@@ -272,29 +247,49 @@ defmodule Alloy.Agent.Turn do
   defp halt(%State{} = state, reason),
     do: %{state | status: :halted, error: "Halted by middleware: #{reason}"}
 
-  defp handle_provider_error(reason, state, opts, deadline, false = _prompt_retried?) do
-    if prompt_too_long?(reason) do
-      Logger.info("[Turn] Prompt too long — forcing compaction and retrying")
+  defp handle_provider_error(reason, state, opts, false = _overflow_retried?) do
+    if prompt_too_long?(reason),
+      do: recover_from_overflow(reason, state, opts),
+      else: {:halt, fail(state, reason)}
+  end
 
-      :telemetry.execute(
-        [:alloy, :turn, :prompt_too_long_recovery],
-        %{},
-        %{turn: state.turn + 1}
-      )
+  defp handle_provider_error(reason, state, _opts, true = _overflow_retried?),
+    do: {:halt, fail(state, reason)}
 
-      {next, state} =
-        state
-        |> Compactor.force_compact(turn: state.turn + 1, deadline: deadline)
-        |> complete(opts, deadline, true)
+  # The provider rejected the prompt as too long. :on_context_overflow
+  # middleware (compaction, unless it is turned off) may shrink the history;
+  # the request is retried once, and only if the messages changed. The
+  # middleware's own changes (a summary request's usage) are kept either way.
+  defp recover_from_overflow(reason, state, opts) do
+    case run_middleware(:on_context_overflow, state) do
+      {:halt, halted} ->
+        overflow_event(state, false)
+        {:halt, put_provider_error(halted, reason)}
 
-      {next, State.merge_run_metadata(state, %{prompt_too_long_recovery: true})}
-    else
-      {:halt, fail(state, reason)}
+      {:continue, %State{messages: messages} = unchanged} when messages == state.messages ->
+        overflow_event(state, false)
+        {:halt, fail(unchanged, reason)}
+
+      {:continue, shrunk} ->
+        Logger.info("[Turn] Prompt too long — history shrunk by middleware, retrying")
+        overflow_event(state, true)
+        {next, state} = complete(shrunk, opts, true)
+        {next, State.merge_run_metadata(state, %{prompt_too_long_recovery: true})}
     end
   end
 
-  defp handle_provider_error(reason, state, _opts, _deadline, true = _prompt_retried?),
-    do: {:halt, fail(state, reason)}
+  defp overflow_event(%State{turn: turn}, retry?) do
+    :telemetry.execute(
+      [:alloy, :turn, :prompt_too_long_recovery],
+      %{},
+      %{turn: turn + 1, retry: retry?}
+    )
+  end
+
+  defp put_provider_error(state, %Error{} = error),
+    do: State.merge_run_metadata(state, %{provider_error: error})
+
+  defp put_provider_error(state, _reason), do: state
 
   defp handle_tool_use(%State{} = state, tool_calls, opts) do
     case run_middleware(:after_tool_request, state) do
@@ -303,36 +298,18 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  # Memory calls go to the store before the other tools run (memory becomes
-  # an ordinary tool in 0.13); answer_tool_calls/3 puts every result back in
-  # call order.
   defp execute_tools(%State{} = state, tool_calls, opts) do
-    {memory_calls, regular_calls} = split_memory_calls(tool_calls, state.config.memory)
-    memory_results = dispatch_memory(memory_calls, state.config.memory)
-
-    case run_executor(regular_calls, state, opts) do
+    case run_executor(tool_calls, state, opts) do
       {:halted, reason} ->
-        {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, memory_results)}
+        {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, [])}
 
       {:ok, result_blocks, tool_call_meta} ->
         state
-        |> answer_tool_calls(tool_calls, memory_results ++ result_blocks)
+        |> answer_tool_calls(tool_calls, result_blocks)
         |> State.append_tool_calls(tool_call_meta)
         |> then(&run_middleware(:after_tool_execution, &1))
     end
   end
-
-  # Without a :memory store, "memory" is an ordinary tool name: the executor
-  # runs the user's tool of that name or reports it as unknown.
-  defp split_memory_calls(tool_calls, nil), do: {[], tool_calls}
-
-  defp split_memory_calls(tool_calls, _memory),
-    do: Enum.split_with(tool_calls, &MemoryRouter.memory_call?/1)
-
-  defp dispatch_memory([], _memory), do: []
-  defp dispatch_memory(calls, memory), do: MemoryRouter.dispatch_all(calls, memory)
-
-  defp run_executor([], _state, _opts), do: {:ok, [], []}
 
   defp run_executor(calls, state, opts) do
     executor_opts =
@@ -346,11 +323,11 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  # Appends one tool_result per call, in call order, whichever path produced
-  # it. A call without a result (the loop halted before it ran) is answered
-  # with an error, because every API rejects a tool_use left unanswered and
-  # the halted transcript must stay usable for the next request. Tool-call IDs
-  # are unique per turn, so id-keyed lookup is safe.
+  # Appends one tool_result per call, in call order. A call without a result
+  # (the loop halted before it ran) is answered with an error, because every
+  # API rejects a tool_use left unanswered and the halted transcript must stay
+  # usable for the next request. Tool-call IDs are unique per turn, so
+  # id-keyed lookup is safe.
   defp answer_tool_calls(%State{} = state, tool_calls, result_blocks) do
     by_id = Map.new(result_blocks, &{&1.tool_use_id, &1})
 
@@ -368,12 +345,8 @@ defmodule Alloy.Agent.Turn do
     config.provider_config
     |> Map.put(:system_prompt, config.system_prompt)
     |> Map.put(:provider_state, provider_state)
-    |> maybe_put_memory(config.memory)
     |> maybe_enable_code_execution(config.code_execution)
   end
-
-  defp maybe_put_memory(provider_config, nil), do: provider_config
-  defp maybe_put_memory(provider_config, memory), do: Map.put(provider_config, :memory, memory)
 
   # The top-level option only turns code execution on, so a provider config
   # that already sets :code_execution itself is left alone when it is false.
@@ -411,11 +384,5 @@ defmodule Alloy.Agent.Turn do
   # model has not produced the required output yet.
   defp until_tool_pending?(%State{config: %{until_tool: name}, tool_calls: calls}) do
     not Enum.any?(calls, fn call -> call[:name] == name and is_nil(call[:error]) end)
-  end
-
-  defp budget_exceeded?(%State{config: %{max_budget_cents: nil}}), do: false
-
-  defp budget_exceeded?(%State{config: %{max_budget_cents: max}, usage: usage}) do
-    usage.estimated_cost_cents >= max
   end
 end
