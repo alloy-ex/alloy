@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.5] - 2026-10-09
+
 ### Security
 
 - **`:allowed_paths` is enforced on a directory boundary.** It was a string
@@ -243,6 +245,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A streamed tool call keeps its id when later chunks repeat it as
+  `null`.** Some OpenAI-compatible hosts (DeepInfra, serving DeepSeek and GLM)
+  send `"id": null` on every chunk after the first, which overwrote the real
+  id; the next request then echoed a null `tool_call_id` and was rejected.
+  Chunks carrying `"tool_calls": null` are also accepted. Thanks @johns10
+  (#50).
 - **`until_tool` requires a successful call.** A failed, blocked or unknown
   call to the target tool used to satisfy it.
 - **A middleware halt no longer leaves an unanswered tool call.** Halting in
