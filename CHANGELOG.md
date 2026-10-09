@@ -52,6 +52,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `result.metadata.run.provider_error`. The struct implements `String.Chars`,
   so interpolating it still works; code that applies `=~` or binary
   patterns to a provider's raw error should use `Exception.message/1`.
+- **Turn telemetry fires in order.** Each `[:alloy, :turn, :stop]` is
+  emitted when that turn ends; previously the loop recursed first, so stops
+  arrived in reverse and turn 1's stop carried the run's final status. A
+  turn the loop continues past now reports `status: :running`. Dashboards
+  that read a turn's stop status as the run outcome should use
+  `[:alloy, :run, :stop]`.
+- **`Alloy.Agent.Server.chat/3` returns `{:error, result}` for
+  `:budget_exceeded`**, as `Alloy.run/2` always did (it returned
+  `{:ok, result}`), and its default call timeout is the agent's
+  `timeout_ms` plus 10 seconds instead of 30 seconds, so a caller no longer
+  gives up while the turn is still running.
+- **Compaction strips reasoning from earlier turns.** After any compaction,
+  thinking blocks are removed from turns before the current one: Claude 5.x
+  rejects signed thinking whose earlier history changed, and removing all
+  thinking from earlier turns is the documented way to keep the transcript
+  valid. Truncation never splits a tool round, and oversized retained tool
+  results are shortened with a marker.
+- **The compaction estimate counts the whole request** — system prompt, tool
+  definitions and every block type, by bytes rather than characters (CJK text
+  was undercounted about 3x) — so compaction fires earlier and more
+  accurately.
 - **Every tool call runs in a supervised, unlinked task** (previously
   sequential tools ran in the agent process). `self()` and the process
   dictionary inside a tool differ for sequential tools; Ecto's SQL sandbox
@@ -131,6 +152,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Codex reports token usage** from `codex exec --json` `turn.completed`
   events (it reported zero), and a `:config_overrides` option passes `-c`
   settings to the CLI.
+- `Alloy.Result.wrap/1` (the status → `{:ok, _}`/`{:error, _}` mapping shared
+  by `Alloy.run/2` and `Alloy.Agent.Server`), `Alloy.Agent.Server.default_call_timeout/1`
+  and `Alloy.Context.Compactor.force_compact/2`.
+- **Telemetry:** `[:alloy, :turn, :exception]` and `[:alloy, :run, :exception]`
+  (with `kind`, `reason`, `stacktrace`); turn start gains `monotonic_time`,
+  turn stop gains `duration` and `monotonic_time`, and turn metadata gains
+  `telemetry_span_context`. The compaction summary request emits
+  `[:alloy, :provider, :request]`.
 - **Tool input is checked before `execute/2`:** a non-map input or missing
   `required` keys return an error result naming them, instead of a
   `FunctionClauseError` the model can't act on. No type checking or coercion.
@@ -166,6 +195,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
+- **`:max_budget_cents`** (removed in 0.13). It stops a run only when the
+  provider reports `usage.estimated_cost_cents`, which no built-in provider
+  does, so with them it never fired. A warning is logged once per node when
+  it is set. The `Alloy` module docs have a "Budget limits" recipe: a
+  `:before_completion` middleware that prices `state.usage` with
+  `Alloy.Usage.estimate_cost/3`.
+- `Alloy.Agent.State.materialize/1`, `Alloy.Agent.State.cleanup/1` and the
+  `messages_new` field: the history now lives in `state.messages`.
 - Codex `:auth_path`. Use `:codex_home` (its directory is used as
   `CODEX_HOME`).
 - Anthropic `:extended_thinking`. It sends manual thinking
@@ -182,6 +219,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`until_tool` requires a successful call.** A failed, blocked or unknown
+  call to the target tool used to satisfy it.
+- **A middleware halt no longer leaves an unanswered tool call.** Halting in
+  `:before_tool_call` or `:after_tool_request` left the assistant's
+  `tool_use` without a result, so the next request in that session failed
+  with HTTP 400; each call now gets an error result first.
+- **A tool named `memory` works when `:memory` is not configured** (the turn
+  crashed with a `KeyError`); configuring both `:memory` and a tool named
+  `memory` raises at startup instead of silently shadowing the tool.
+- **The compaction summary call** goes through retries and the turn
+  deadline, and its token usage is counted. Results that compaction already
+  cleared are not cleared again (which lost their original size and
+  invalidated the prompt cache).
+- **A stream callback that raises no longer corrupts history.** Text from a
+  delta whose `on_chunk`/`on_event` raised was missing from the stored
+  message, so the UI and the transcript disagreed.
+- `Alloy.run/2` passes `:on_event` through (it was silently ignored), and the
+  documented top-level `code_execution: true` now reaches the provider.
+- `Alloy.Usage.estimate_cost/3` no longer rounds per-million rates to whole
+  cents ($0.075/M priced as 8¢).
 - **A tool that calls `exit/1` or `throw/1` no longer kills the agent**, and
   `:tool_timeout` now applies to sequential tools too.
 - **Tools run in the order the model called them.** Sequential tools used to

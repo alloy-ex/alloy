@@ -85,28 +85,6 @@ defmodule Alloy.Agent.ConfigTest do
     end
   end
 
-  describe "max_budget_cents option (deprecated)" do
-    import ExUnit.CaptureLog
-
-    test "logs a deprecation warning when set and keeps the value" do
-      log =
-        capture_log(fn ->
-          config = Config.from_opts(provider: {Alloy.Provider.Test, []}, max_budget_cents: 50)
-          send(self(), {:config, config})
-        end)
-
-      assert_received {:config, %Config{max_budget_cents: 50}}
-      assert log =~ ":max_budget_cents is deprecated"
-      assert log =~ "0.13"
-    end
-
-    test "logs nothing when unset" do
-      log = capture_log(fn -> Config.from_opts(provider: {Alloy.Provider.Test, []}) end)
-
-      refute log =~ "max_budget_cents"
-    end
-  end
-
   describe "code_execution option" do
     test "defaults to false when not specified" do
       config = Config.from_opts(provider: {Alloy.Provider.Test, []})

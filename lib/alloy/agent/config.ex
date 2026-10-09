@@ -216,7 +216,18 @@ defmodule Alloy.Agent.Config do
 
   defp warn_max_budget_cents(nil), do: nil
 
+  # Once per node: agents are started per request in many apps, and a
+  # warning per run would flood their logs.
   defp warn_max_budget_cents(max_budget_cents) do
+    if :persistent_term.get({__MODULE__, :max_budget_cents_warned}, false) do
+      max_budget_cents
+    else
+      :persistent_term.put({__MODULE__, :max_budget_cents_warned}, true)
+      log_max_budget_cents_deprecation(max_budget_cents)
+    end
+  end
+
+  defp log_max_budget_cents_deprecation(max_budget_cents) do
     Logger.warning(
       ":max_budget_cents is deprecated and will be removed in Alloy 0.13. " <>
         "It only stops a run when the provider reports usage.estimated_cost_cents, " <>

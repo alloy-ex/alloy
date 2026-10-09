@@ -87,10 +87,14 @@ defmodule AlloyTest do
                )
 
       assert_receive {:captured, headers, body}
-      assert Enum.any?(body["tools"] || [], &(&1["name"] == "code_execution"))
 
-      assert {"anthropic-beta", beta} = List.keyfind(headers, "anthropic-beta", 0)
-      assert beta =~ "code-execution"
+      assert Enum.any?(
+               body["tools"] || [],
+               &(&1["name"] == "code_execution" and &1["type"] =~ "code_execution_")
+             )
+
+      # Code execution is GA (2026-02-17): no beta header is needed.
+      refute List.keyfind(headers, "anthropic-beta", 0)
     end
   end
 
