@@ -66,7 +66,7 @@ defmodule Alloy.Provider.OpenAICompat do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.{HTTP, OpenAIStream}
+  alias Alloy.Provider.{Error, HTTP, OpenAIStream}
 
   @default_max_tokens 4096
   @default_chat_path "/v1/chat/completions"
@@ -265,6 +265,10 @@ defmodule Alloy.Provider.OpenAICompat do
     end
   end
 
+  defp parse_response(%{"error" => error} = resp) when is_map(error) or is_binary(error) do
+    {:error, Error.from_body(resp)}
+  end
+
   defp parse_response(%{"choices" => [choice | _]} = resp) do
     message = choice["message"]
     finish_reason = choice["finish_reason"]
@@ -289,8 +293,8 @@ defmodule Alloy.Provider.OpenAICompat do
     end
   end
 
-  defp parse_response(%{"error" => error}) do
-    {:error, "#{error["type"]}: #{error["message"]}"}
+  defp parse_response(resp) do
+    {:error, %Error{message: "Unexpected chat completion payload: #{inspect(resp)}"}}
   end
 
   defp parse_message_to_blocks(message) do

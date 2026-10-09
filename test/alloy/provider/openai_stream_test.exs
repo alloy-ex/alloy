@@ -2,7 +2,7 @@ defmodule Alloy.Provider.OpenAIStreamTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
-  alias Alloy.Provider.OpenAIStream
+  alias Alloy.Provider.{Error, OpenAIStream}
 
   # ── Helper: build SSE chunks ─────────────────────────────────────────
 
@@ -335,6 +335,61 @@ defmodule Alloy.Provider.OpenAIStreamTest do
 
       text = Enum.find(blocks, &(&1.type == "text"))
       assert text.text == "The answer."
+    end
+  end
+
+  describe "stream/5 failures inside a 200 stream" do
+    test "a mid-stream error chunk is an error classified by its type" do
+      error_chunk = %{
+        "error" => %{
+          "type" => "server_error",
+          "code" => nil,
+          "message" => "The server had an error"
+        }
+      }
+
+      chunks = [sse_chunk(text_delta("Hel")), sse_chunk(error_chunk)]
+      {_, result} = collect_stream(chunks, test_name: :mid_stream_error)
+
+      assert {:error, %Error{kind: :server_error} = error} = result
+      assert Exception.message(error) == "server_error: The server had an error"
+    end
+
+    test "an error chunk that also carries finish_reason \"error\" is an error" do
+      # OpenRouter's mid-stream error shape.
+      error_chunk = %{
+        "id" => "gen-1",
+        "object" => "chat.completion.chunk",
+        "error" => %{"code" => 502, "message" => "Provider disconnected"},
+        "choices" => [%{"index" => 0, "delta" => %{"content" => ""}, "finish_reason" => "error"}]
+      }
+
+      chunks = [sse_chunk(text_delta("Hel")), sse_chunk(error_chunk), sse_done()]
+      {_, result} = collect_stream(chunks, test_name: :openrouter_error)
+
+      assert {:error, %Error{message: "Provider disconnected"}} = result
+    end
+
+    test "a stream that ends without finish_reason or [DONE] is an error" do
+      chunks = [sse_chunk(text_delta("Hel")), sse_chunk(tool_call_start(0, "call_1", "read"))]
+      {_, result} = collect_stream(chunks, test_name: :truncated_stream)
+
+      assert {:error, %Error{kind: :network} = error} = result
+      assert Exception.message(error) =~ "ended before"
+    end
+
+    test "[DONE] without a finish_reason still completes" do
+      chunks = [sse_chunk(text_delta("ok")), sse_done()]
+      {_, result} = collect_stream(chunks, test_name: :done_only)
+
+      assert {:ok, %{stop_reason: :end_turn}} = result
+    end
+
+    test "a finish_reason without [DONE] still completes" do
+      chunks = [sse_chunk(text_delta("ok")), sse_chunk(finish_chunk("stop"))]
+      {_, result} = collect_stream(chunks, test_name: :finish_only)
+
+      assert {:ok, %{stop_reason: :end_turn}} = result
     end
   end
 

@@ -419,6 +419,23 @@ defmodule Alloy.Provider.OpenAICompatTest do
     end
   end
 
+  describe "complete/3 failures inside a 200 response" do
+    test "an error body is an error classified by its code" do
+      body = %{"error" => %{"code" => "rate_limit_exceeded", "message" => "Slow down"}}
+      config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+      assert {:error, %Error{kind: :rate_limited, message: "Slow down"}} =
+               OpenAICompat.complete([Message.user("Hi")], [], config)
+    end
+
+    test "a body without choices is an error, not a crash" do
+      config = config_with_response(%{status: 200, body: Jason.encode!(%{"choices" => []})})
+
+      assert {:error, %Error{} = error} = OpenAICompat.complete([Message.user("Hi")], [], config)
+      assert Exception.message(error) =~ "Unexpected"
+    end
+  end
+
   # ── Step 3: extra_body merge ─────────────────────────────────────────
 
   describe "extra_body in request" do

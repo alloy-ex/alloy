@@ -21,7 +21,7 @@ defmodule Alloy.Provider.OpenAIStream do
   """
 
   alias Alloy.Message
-  alias Alloy.Provider.HTTP
+  alias Alloy.Provider.{Error, HTTP}
 
   @doc """
   Execute a streaming request against an OpenAI-compatible endpoint.
@@ -42,6 +42,8 @@ defmodule Alloy.Provider.OpenAIStream do
       reasoning_content: "",
       tool_calls: %{},
       finish_reason: nil,
+      done?: false,
+      stream_error: nil,
       usage: %{},
       on_chunk: on_chunk
     }
@@ -62,13 +64,19 @@ defmodule Alloy.Provider.OpenAIStream do
 
   # ── SSE Event Handling ───────────────────────────────────────────────
 
-  defp handle_event(acc, %{data: "[DONE]"}), do: acc
+  defp handle_event(acc, %{data: "[DONE]"}), do: %{acc | done?: true}
 
   defp handle_event(acc, %{data: data}) do
     case Jason.decode(data) do
       {:ok, parsed} -> process_event(acc, parsed)
       {:error, _} -> acc
     end
+  end
+
+  # Servers report failures after the 200 status line as an error chunk
+  # (OpenRouter adds finish_reason "error" alongside it).
+  defp process_event(acc, %{"error" => error} = event) when is_map(error) or is_binary(error) do
+    %{acc | stream_error: Error.from_body(event)}
   end
 
   defp process_event(acc, %{"choices" => [%{"delta" => delta} | _]} = event) do
@@ -171,6 +179,18 @@ defmodule Alloy.Provider.OpenAIStream do
   end
 
   # ── Response Building ────────────────────────────────────────────────
+
+  defp build_response(%{stream_error: %Error{} = error}), do: {:error, error}
+
+  # Neither a finish_reason nor [DONE]: the connection was cut mid-response,
+  # so the partial output must not be passed off as a complete answer.
+  defp build_response(%{finish_reason: nil, done?: false}) do
+    {:error,
+     %Error{
+       kind: :network,
+       message: "Chat Completions stream ended before the response completed"
+     }}
+  end
 
   defp build_response(acc) do
     reasoning_blocks =
