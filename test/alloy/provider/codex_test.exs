@@ -612,6 +612,98 @@ defmodule Alloy.Provider.CodexTest do
     end
   end
 
+  describe "usage and output streams" do
+    # Recorded from codex-cli 0.160.0 `exec --json` against a stub Responses
+    # endpoint; input_tokens includes cached_input_tokens.
+    @completed_events """
+    {"type":"thread.started","thread_id":"01a11dff-5e81-7913-b098-adc2ffe98ea5"}
+    {"type":"turn.started"}
+    {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"{}"}}
+    {"type":"turn.completed","usage":{"input_tokens":1234,"cached_input_tokens":1000,"cache_write_input_tokens":0,"output_tokens":56,"reasoning_output_tokens":7}}
+    """
+
+    @failed_events """
+    {"type":"thread.started","thread_id":"01a11dfc-fc75-77f2-b638-1a812de443c1"}
+    {"type":"turn.started"}
+    {"type":"error","message":"Reconnecting... 5/5 (unexpected status 401 Unauthorized)"}
+    {"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"}}
+    """
+
+    test "reports token usage from the turn.completed event" do
+      parent = self()
+
+      config = %{
+        model: "gpt-5.4",
+        command_runner:
+          fake_runner(fn args, _opts, output_path ->
+            send(parent, {:codex_args, args})
+            File.write!(output_path, ~s({"stop_reason":"end_turn","text":"OK","tool_calls":[]}))
+            @completed_events
+          end)
+      }
+
+      assert {:ok, result} = Codex.complete([Message.user("Hi")], [], config)
+      assert_receive {:codex_args, args}
+      assert "--json" in args
+
+      assert result.usage == %{
+               input_tokens: 1234,
+               output_tokens: 56,
+               cache_read_input_tokens: 1000,
+               cache_creation_input_tokens: 0,
+               reasoning_output_tokens: 7
+             }
+    end
+
+    test "a failed turn reports the turn.failed message" do
+      config = %{
+        model: "gpt-5.4",
+        command_runner: fake_runner(fn _args, _opts, _output_path -> {@failed_events, 1} end)
+      }
+
+      assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
+
+      assert "#{reason}" ==
+               "codex exec failed with status 1: unexpected status 401 Unauthorized: " <>
+                 "Missing bearer or basic authentication in header"
+    end
+
+    @tag :tmp_dir
+    test "stderr is kept out of the parsed event stream", %{tmp_dir: dir} do
+      events = String.replace(@completed_events, "'", "")
+
+      script =
+        fake_codex!(dir, """
+        echo 'ERROR codex_api: failed to connect {not json' >&2
+        printf '%s' '#{events}'
+        """)
+
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir}
+
+      assert {:ok, result} = Codex.complete([Message.user("Hi")], [], config)
+      assert result.usage.input_tokens == 1234
+      refute result.response_metadata.command_output =~ "failed to connect"
+    end
+
+    @tag :tmp_dir
+    test "a startup failure with no events reports stderr", %{tmp_dir: dir} do
+      script = Path.join(dir, "broken-codex")
+
+      File.write!(script, """
+      #!/bin/sh
+      cat > /dev/null
+      echo 'Error: failed to parse config.toml' >&2
+      exit 1
+      """)
+
+      File.chmod!(script, 0o755)
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir}
+
+      assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
+      assert "#{reason}" == "codex exec failed with status 1: Error: failed to parse config.toml"
+    end
+  end
+
   describe "stream/4" do
     test "replays the final assistant text through the callback" do
       parent = self()

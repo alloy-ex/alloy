@@ -55,8 +55,11 @@ defmodule Alloy.Provider.Codex do
 
   ## Notes
 
-  - Usage accounting is not exposed by `codex exec` in a structured form yet,
-    so this provider currently reports zero token counts.
+  - Usage comes from the `turn.completed` event of `codex exec --json`. As
+    with the OpenAI provider, `:input_tokens` includes the cached input
+    reported as `:cache_read_input_tokens`; `:reasoning_output_tokens` is
+    part of `:output_tokens`. Counts include Codex's own instructions and
+    tool definitions, not just the transcript.
   - Streaming is emulated by running a normal completion and replaying the final
     text to the provided callback.
   """
@@ -74,6 +77,13 @@ defmodule Alloy.Provider.Codex do
   # Matches any `\X` where X is NOT a valid JSON single-character escape
   # (valid set: " \ / b f n r t u). Used by the decode repair pass.
   @invalid_json_escape_re ~r{\\(?!["\\/bfnrtu])}
+
+  # sh only wires up redirects: the prompt file on stdin (codex reads it to
+  # EOF, which a port cannot send) and stderr to a file, so stdout carries
+  # nothing but --json events. Paths and arguments are positional
+  # parameters, never spliced into the script. `exec` keeps the port's OS
+  # pid on codex itself.
+  @launch_script ~S(prompt="$1"; stderr="$2"; shift 2; exec "$@" < "$prompt" 2> "$stderr")
 
   @response_schema %{
     type: "object",
@@ -189,6 +199,7 @@ defmodule Alloy.Provider.Codex do
       prompt_path: Path.join(base_dir, "prompt.txt"),
       schema_path: Path.join(base_dir, "response_schema.json"),
       last_message_path: Path.join(base_dir, "last_message.json"),
+      stderr_path: Path.join(base_dir, "stderr.log"),
       workdir: Map.get(config, :workdir, base_dir)
     }
   end
@@ -205,6 +216,7 @@ defmodule Alloy.Provider.Codex do
     args =
       [
         "exec",
+        "--json",
         "--skip-git-repo-check",
         "--ephemeral",
         "--ignore-rules",
@@ -242,11 +254,11 @@ defmodule Alloy.Provider.Codex do
   # to rely on ExUnit's own timeout.
   defp run_injected(config, executable, args, paths) do
     runner = Map.fetch!(config, :command_runner)
-    opts = [cd: paths.workdir, env: codex_env(paths), stderr_to_stdout: true]
+    opts = [cd: paths.workdir, env: codex_env(paths)]
 
     case runner.(executable, args, opts) do
       {output, status} when is_binary(output) and is_integer(status) ->
-        {:ok, %{output: output, status: status}}
+        {:ok, command_result(output, "", status)}
 
       other ->
         {:error, "codex exec returned unexpected result: #{inspect(other)}"}
@@ -256,52 +268,58 @@ defmodule Alloy.Provider.Codex do
       {:error, "codex exec failed to start: #{Exception.message(error)}"}
   end
 
-  # Real path: spawn via Port so we capture the OS pid and can kill the
-  # subprocess on timeout. `exec env ... codex ...` makes the shell process
-  # replace itself with env, which replaces itself with codex — so
-  # `Port.info(:os_pid)` returns codex's own pid rather than a shell pid
-  # whose children we'd otherwise orphan.
   defp run_port(executable, args, paths, timeout) do
-    shell_command = build_port_command(executable, args, paths)
     deadline = System.monotonic_time(:millisecond) + timeout
+    env = Enum.map(codex_env(paths), fn {key, value} -> "#{key}=#{value}" end)
+
+    launch_args =
+      ["-lc", @launch_script, "alloy-codex", paths.prompt_path, paths.stderr_path, "env"] ++
+        env ++ [executable | args]
 
     port =
       Port.open(
         {:spawn_executable, "/bin/sh"},
-        [
-          {:args, ["-lc", shell_command]},
-          {:cd, paths.workdir},
-          :binary,
-          :exit_status,
-          :use_stdio,
-          :stderr_to_stdout
-        ]
+        [{:args, launch_args}, {:cd, paths.workdir}, :binary, :exit_status, :use_stdio]
       )
 
     # Port.info/2 returns nil when the process already exited — its output
     # and exit_status messages are still in the mailbox, so collect them;
     # there is just no OS pid left to kill on timeout.
-    case Port.info(port, :os_pid) do
-      {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, deadline, [])
-      nil -> collect_port(port, nil, timeout, deadline, [])
+    result =
+      case Port.info(port, :os_pid) do
+        {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, deadline, [])
+        nil -> collect_port(port, nil, timeout, deadline, [])
+      end
+
+    with {:ok, output, status} <- result do
+      {:ok, command_result(output, read_stderr(paths), status)}
     end
   rescue
     error in ErlangError ->
       {:error, "codex exec failed to start: #{Exception.message(error)}"}
   end
 
-  defp build_port_command(executable, args, paths) do
-    env_args =
-      paths
-      |> codex_env()
-      |> Enum.map_join(" ", fn {key, value} -> shell_escape("#{key}=#{value}") end)
+  defp read_stderr(paths) do
+    case File.read(paths.stderr_path) do
+      {:ok, stderr} -> stderr
+      {:error, _reason} -> ""
+    end
+  end
 
-    "exec env " <>
-      env_args <>
-      " " <>
-      Enum.map_join([executable | args], " ", &shell_escape/1) <>
-      " < " <>
-      shell_escape(paths.prompt_path)
+  defp command_result(output, stderr, status) do
+    %{output: output, stderr: stderr, status: status, events: decode_events(output)}
+  end
+
+  # `codex exec --json` writes one event object per line.
+  defp decode_events(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn line ->
+      case Jason.decode(line) do
+        {:ok, %{"type" => type} = event} when is_binary(type) -> [event]
+        _other -> []
+      end
+    end)
   end
 
   defp codex_env(%{codex_home: nil}), do: [{"OTEL_SDK_DISABLED", "true"}]
@@ -325,7 +343,7 @@ defmodule Alloy.Provider.Codex do
         collect_port(port, os_pid, timeout, deadline, [acc, data])
 
       {^port, {:exit_status, status}} ->
-        {:ok, %{output: IO.iodata_to_binary(acc), status: status}}
+        {:ok, IO.iodata_to_binary(acc), status}
     after
       remaining ->
         timeout_port(port, os_pid, timeout)
@@ -381,16 +399,36 @@ defmodule Alloy.Provider.Codex do
   # through the shell wrapper so we can inject env and stdin-feed the prompt.
   defp injected_runner?(config), do: Map.has_key?(config, :command_runner)
 
-  defp codex_error(status, output) do
+  defp codex_error(%{status: status} = command_result) do
     message =
-      output
+      command_result
+      |> failure_detail()
       |> String.trim()
       |> truncate(@error_truncation)
 
     "codex exec failed with status #{status}: #{message}"
   end
 
-  defp read_payload_or_error(path, %{status: status, output: output}) do
+  # turn.failed is the last event. Failures before the first event (bad
+  # config, missing login) only reach stderr.
+  defp failure_detail(%{events: events, stderr: stderr, output: output}) do
+    case events |> Enum.reverse() |> Enum.find_value(&event_error/1) do
+      message when is_binary(message) -> message
+      nil when stderr == "" -> output
+      nil -> stderr
+    end
+  end
+
+  defp event_error(%{"type" => "turn.failed", "error" => %{"message" => message}})
+       when is_binary(message),
+       do: message
+
+  defp event_error(%{"type" => "error", "message" => message}) when is_binary(message),
+    do: message
+
+  defp event_error(_event), do: nil
+
+  defp read_payload_or_error(path, %{status: status} = command_result) do
     case read_payload(path) do
       {:ok, payload} ->
         {:ok, payload}
@@ -399,7 +437,7 @@ defmodule Alloy.Provider.Codex do
         {:error, reason}
 
       {:error, _reason} ->
-        {:error, codex_error(status, output)}
+        {:error, codex_error(command_result)}
     end
   end
 
@@ -427,7 +465,7 @@ defmodule Alloy.Provider.Codex do
        %{
          stop_reason: :end_turn,
          messages: [Message.assistant(text)],
-         usage: @zero_usage,
+         usage: usage(command_result),
          response_metadata: response_metadata(config, command_result)
        }}
     else
@@ -446,7 +484,7 @@ defmodule Alloy.Provider.Codex do
        %{
          stop_reason: :tool_use,
          messages: [Message.assistant_blocks(blocks)],
-         usage: @zero_usage,
+         usage: usage(command_result),
          response_metadata: response_metadata(config, command_result)
        }}
     end
@@ -574,6 +612,24 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
+  # Codex runs one turn per exec; its turn.completed event carries the usage.
+  defp usage(%{events: events}) do
+    Enum.reduce(events, @zero_usage, fn
+      %{"type" => "turn.completed", "usage" => %{} = usage}, _acc -> to_usage(usage)
+      _event, acc -> acc
+    end)
+  end
+
+  defp to_usage(usage) do
+    %{
+      input_tokens: Map.get(usage, "input_tokens", 0),
+      output_tokens: Map.get(usage, "output_tokens", 0),
+      cache_read_input_tokens: Map.get(usage, "cached_input_tokens", 0),
+      cache_creation_input_tokens: Map.get(usage, "cache_write_input_tokens", 0),
+      reasoning_output_tokens: Map.get(usage, "reasoning_output_tokens", 0)
+    }
+  end
+
   defp build_prompt(messages, tool_defs, config) do
     payload = %{
       system_prompt: Map.get(config, :system_prompt),
@@ -660,10 +716,6 @@ defmodule Alloy.Provider.Codex do
       nil -> args
       model -> args ++ ["--model", model]
     end
-  end
-
-  defp shell_escape(value) when is_binary(value) do
-    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
   # `limit` is a character budget, not a byte budget — `String.slice/3`
