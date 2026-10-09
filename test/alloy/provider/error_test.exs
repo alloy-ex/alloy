@@ -145,6 +145,24 @@ defmodule Alloy.Provider.ErrorTest do
     end
   end
 
+  describe "from_body/1" do
+    test "classifies in-band errors by code and type, without an HTTP status" do
+      error =
+        Error.from_body(%{"error" => %{"code" => "server_error", "message" => "Model failed"}})
+
+      assert %Error{kind: :server_error, status: nil, code: "server_error"} = error
+      assert Error.retryable?(error)
+      assert Exception.message(error) == "Model failed"
+
+      assert Error.from_body(anthropic("overloaded_error", "Overloaded")).kind == :overloaded
+
+      assert Error.from_body(openai("invalid_request_error", "context_length_exceeded", "long")).kind ==
+               :context_overflow
+
+      assert Error.from_body(%{"error" => %{"code" => "invalid_prompt"}}).kind == :unknown
+    end
+  end
+
   describe "from_transport/1" do
     test "classifies transport failures structurally" do
       assert Error.from_transport(%Req.TransportError{reason: :timeout}).kind == :timeout

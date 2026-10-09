@@ -126,6 +126,23 @@ defmodule Alloy.Provider.Error do
   end
 
   @doc """
+  Builds an error reported inside a successful HTTP response: a failed
+  response object or an error event in an SSE stream. Accepts the body
+  shapes `from_response/3` reads and classifies by code and type alone.
+  """
+  @spec from_body(term()) :: t()
+  def from_body(body) do
+    {type, code, message} = body |> decode() |> fields()
+
+    %__MODULE__{
+      kind: classify(nil, type, code, message),
+      type: type,
+      code: code,
+      message: message
+    }
+  end
+
+  @doc """
   Builds an error from a transport failure (connection refused, closed,
   timed out) reported by Req, Finch or Mint.
   """
