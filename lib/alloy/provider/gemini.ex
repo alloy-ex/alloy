@@ -9,7 +9,9 @@ defmodule Alloy.Provider.Gemini do
 
   Required:
   - `:api_key` - Gemini API key
-  - `:model` - Model name (for example `"gemini-2.5-flash"`)
+  - `:model` - Model name, for example `"gemini-3.8-flash"` or
+    `"gemini-3.5-flash-lite"`. Gemini 2.5 models are open only to projects
+    that already used them.
 
   Optional:
   - `:max_tokens` - Max output tokens, sent as `maxOutputTokens`. Thinking
@@ -18,18 +20,38 @@ defmodule Alloy.Provider.Gemini do
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: `"https://generativelanguage.googleapis.com"`)
   - `:api_version` - API version path (default: `"v1beta"`)
-  - `:generation_config` - Raw Gemini `generationConfig` fields
+  - `:generation_config` - Raw Gemini `generationConfig` fields (see Thinking)
   - `:tool_config` - Raw Gemini `toolConfig`
   - `:safety_settings` - Raw Gemini `safetySettings`
   - `:extra_headers` - Additional headers as `[{name, value}]`
   - `:req_options` - Additional options passed to Req
+
+  ## Thinking
+
+  Gemini 3 models think by default. Set the depth with `thinkingLevel`
+  (`"MINIMAL"`, `"LOW"`, `"MEDIUM"` or `"HIGH"`; each model accepts a
+  subset) under `thinkingConfig`. `thinkingBudget`, a token count, is the
+  older control: Gemini 2.5 models need it, and Gemini 3 still accepts it.
+  Never send both; the API rejects the request. Thinking tokens are billed
+  as output and count against `:max_tokens`, so lower `thinkingLevel`
+  rather than `:max_tokens` to save cost. Set `includeThoughts: true` to
+  get thought summaries back as `"thinking"` blocks.
+
+  ## Stop reasons
+
+  `MAX_TOKENS` maps to `:max_tokens`. Safety, recitation and other content
+  filters, and blocked prompts, map to `:refusal`, with the reason in
+  `response_metadata.stop_details`. A malformed or unexpected function call
+  returns `{:error, %Alloy.Provider.Error{}}`, which the loop retries
+  unless output was already streamed.
 
   ## Example
 
       Alloy.run("Summarize this code.",
         provider: {Alloy.Provider.Gemini,
           api_key: System.get_env("GEMINI_API_KEY"),
-          model: "gemini-2.5-flash"
+          model: "gemini-3.8-flash",
+          generation_config: %{thinkingConfig: %{thinkingLevel: "LOW"}}
         }
       )
   """
