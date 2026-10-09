@@ -357,12 +357,24 @@ defmodule Alloy.Provider.Gemini do
     if Enum.any?(content_blocks, &(&1[:type] == "tool_use")), do: :tool_use, else: :end_turn
   end
 
+  # Alloy follows Anthropic's usage semantics, where input_tokens excludes
+  # cache reads, so input + cache reads + output is everything billed.
+  # Gemini's promptTokenCount already includes cachedContentTokenCount, so
+  # the cached part is moved out of input. toolUsePromptTokenCount (results
+  # of built-in tools such as URL context or code execution, fed back to the
+  # model) is reported apart from the prompt but billed as input. Thinking
+  # tokens are billed as output, yet candidatesTokenCount leaves them out.
   defp parse_usage(usage) do
+    cached = Map.get(usage, "cachedContentTokenCount", 0)
+
     %{
-      input_tokens: Map.get(usage, "promptTokenCount", 0),
-      output_tokens: Map.get(usage, "candidatesTokenCount", 0),
+      input_tokens:
+        Map.get(usage, "promptTokenCount", 0) - cached +
+          Map.get(usage, "toolUsePromptTokenCount", 0),
+      output_tokens:
+        Map.get(usage, "candidatesTokenCount", 0) + Map.get(usage, "thoughtsTokenCount", 0),
       cache_creation_input_tokens: 0,
-      cache_read_input_tokens: Map.get(usage, "cachedContentTokenCount", 0)
+      cache_read_input_tokens: cached
     }
   end
 

@@ -31,6 +31,35 @@ defmodule Alloy.Provider.GeminiTest do
       assert result.response_metadata == %{finish_reason: "STOP"}
     end
 
+    test "bills thoughts as output and splits cache reads and tool-use prompts from input" do
+      usage = %{
+        "promptTokenCount" => 1_000,
+        "cachedContentTokenCount" => 600,
+        "toolUsePromptTokenCount" => 300,
+        "candidatesTokenCount" => 50,
+        "thoughtsTokenCount" => 200,
+        "totalTokenCount" => 1_550
+      }
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body: Jason.encode!(gemini_response([%{"text" => "Hi"}], "STOP", usage))
+        })
+
+      assert {:ok, result} = Gemini.complete([Message.user("Hi")], [], config)
+
+      assert result.usage == %{
+               input_tokens: 700,
+               output_tokens: 250,
+               cache_creation_input_tokens: 0,
+               cache_read_input_tokens: 600
+             }
+
+      assert result.usage.input_tokens + result.usage.cache_read_input_tokens +
+               result.usage.output_tokens == usage["totalTokenCount"]
+    end
+
     test "preserves thinking parts with thought signatures" do
       config =
         config_with_response(%{
@@ -300,6 +329,36 @@ defmodule Alloy.Provider.GeminiTest do
 
       refute Map.has_key?(text, :signature)
       refute Map.has_key?(second_call, :signature)
+    end
+
+    test "reports the final cumulative usage, thoughts included" do
+      config =
+        config_with_sse_stream([
+          sse_chunk(
+            gemini_response([%{"text" => "Hel"}], nil, %{
+              "promptTokenCount" => 40,
+              "cachedContentTokenCount" => 30,
+              "thoughtsTokenCount" => 90
+            })
+          ),
+          sse_chunk(
+            gemini_response([%{"text" => "lo"}], "STOP", %{
+              "promptTokenCount" => 40,
+              "cachedContentTokenCount" => 30,
+              "candidatesTokenCount" => 2,
+              "thoughtsTokenCount" => 90
+            })
+          )
+        ])
+
+      assert {:ok, result} = Gemini.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert result.usage == %{
+               input_tokens: 10,
+               output_tokens: 92,
+               cache_creation_input_tokens: 0,
+               cache_read_input_tokens: 30
+             }
     end
 
     test "never puts two signatures in one block" do
