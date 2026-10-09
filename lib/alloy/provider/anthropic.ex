@@ -46,7 +46,7 @@ defmodule Alloy.Provider.Anthropic do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.HTTP
+  alias Alloy.Provider.{Error, HTTP}
 
   @default_api_url "https://api.anthropic.com"
   @default_api_version "2023-06-01"
@@ -113,6 +113,7 @@ defmodule Alloy.Provider.Anthropic do
 
     initial_acc = %{
       buffer: "",
+      error: nil,
       message: %{},
       content_blocks: %{},
       input_json_buffers: %{},
@@ -221,6 +222,13 @@ defmodule Alloy.Provider.Anthropic do
     %{acc | message: message}
   end
 
+  # The response was already a 200 when the failure arrived in-band, so the
+  # error is classified by its type: overloaded_error becomes :overloaded,
+  # which Retry retries when no output was streamed yet.
+  defp handle_sse_event(acc, "error", event) do
+    %{acc | error: Error.from_response(200, [], event)}
+  end
+
   defp handle_sse_event(acc, _event_type, _data), do: acc
 
   # A null in a later event means "not reported here", not "reset".
@@ -228,7 +236,10 @@ defmodule Alloy.Provider.Anthropic do
     Map.merge(map, Map.reject(updates, fn {_key, value} -> is_nil(value) end))
   end
 
-  defp build_stream_response(acc) do
+  defp build_stream_response(%{error: %Error{} = error}), do: {:error, error}
+
+  defp build_stream_response(%{message: %{"stop_reason" => stop_reason}} = acc)
+       when is_binary(stop_reason) do
     content =
       acc.content_blocks
       |> Enum.sort_by(fn {index, _block} -> index end)
@@ -237,6 +248,16 @@ defmodule Alloy.Provider.Anthropic do
     acc.message
     |> Map.put("content", content)
     |> message_response()
+  end
+
+  # Only the final message_delta carries a stop_reason, so a stream that ends
+  # without one was cut off and its content is incomplete.
+  defp build_stream_response(_acc) do
+    {:error,
+     %Error{
+       kind: :network,
+       message: "Anthropic stream ended before a stop_reason was received"
+     }}
   end
 
   # --- Request Building ---

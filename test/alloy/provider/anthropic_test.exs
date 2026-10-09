@@ -1081,6 +1081,100 @@ defmodule Alloy.Provider.AnthropicTest do
       assert Exception.message(reason) =~ "max_tokens"
     end
 
+    test "returns a classified error for an in-band error event" do
+      # https://platform.claude.com/docs/en/build-with-claude/streaming#error-events
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 1}}
+          }),
+          ant_event("error", %{
+            "type" => "error",
+            "error" => %{"type" => "overloaded_error", "message" => "Overloaded"}
+          })
+        ])
+
+      assert {:error, %Error{kind: :overloaded, type: "overloaded_error"} = error} =
+               Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert Error.retryable?(error)
+      assert Exception.message(error) == "overloaded_error: Overloaded"
+    end
+
+    test "an error event after partial output still fails the stream" do
+      chunks =
+        "partial"
+        |> text_stream(%{"stop_reason" => "end_turn"})
+        |> Enum.take(4)
+        |> Kernel.++([
+          ant_event("error", %{
+            "type" => "error",
+            "error" => %{"type" => "api_error", "message" => "Internal server error"}
+          })
+        ])
+
+      assert {:error, %Error{kind: :server_error}} =
+               Anthropic.stream([Message.user("Hi")], [], config_with_sse_stream(chunks), fn _ ->
+                 :ok
+               end)
+    end
+
+    test "returns an error when the stream ends without a stop_reason" do
+      truncated = "cut off" |> text_stream(%{"stop_reason" => "end_turn"}) |> Enum.take(3)
+
+      assert {:error, %Error{kind: :network} = error} =
+               Anthropic.stream(
+                 [Message.user("Hi")],
+                 [],
+                 config_with_sse_stream(truncated),
+                 fn _ -> :ok end
+               )
+
+      assert Error.retryable?(error)
+      assert Exception.message(error) =~ "stop_reason"
+    end
+
+    test "Alloy.stream/3 retries an in-band overloaded error that arrived before any output" do
+      attempts = :counters.new(1, [])
+
+      overloaded =
+        ant_event("error", %{
+          "type" => "error",
+          "error" => %{"type" => "overloaded_error", "message" => "Overloaded"}
+        })
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        :counters.add(attempts, 1, 1)
+
+        chunks =
+          case :counters.get(attempts, 1) do
+            1 -> [overloaded]
+            _ -> text_stream("Recovered", %{"stop_reason" => "end_turn"})
+          end
+
+        Enum.reduce(chunks, Plug.Conn.send_chunked(conn, 200), fn chunk, conn ->
+          {:ok, conn} = Plug.Conn.chunk(conn, chunk)
+          conn
+        end)
+      end)
+
+      provider_config = [
+        api_key: "sk-ant-test-key",
+        model: "claude-sonnet-4-6",
+        req_options: [plug: {Req.Test, __MODULE__}]
+      ]
+
+      assert {:ok, result} =
+               Alloy.stream("Hi", fn _ -> :ok end,
+                 provider: {Anthropic, provider_config},
+                 max_retries: 1,
+                 retry_backoff_ms: 1
+               )
+
+      assert result.text == "Recovered"
+      assert :counters.get(attempts, 1) == 2
+    end
+
     test "returns raw body when stream error is not JSON" do
       config = config_with_sse_error_stream(502, "Bad Gateway")
 
