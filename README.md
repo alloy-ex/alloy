@@ -17,7 +17,7 @@ Alloy is a harness, not a framework. Four runtime dependencies, ~10,000 lines â€
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.12.5"
+result.text #=> "The version is 0.13.0"
 ```
 
 ## Why Alloy?

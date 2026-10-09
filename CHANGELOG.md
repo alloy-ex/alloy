@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-09
+
 Alloy 0.13 is the loop and nothing else: the supervised runtime moves to
 the `alloy_agent` package, memory and compaction become an ordinary tool
 and ordinary middleware, and what 0.12.5 deprecated is removed. See
