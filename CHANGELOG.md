@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Codex no longer copies `auth.json` into temp directories**, and the temp
+  directory holding the prompt (the whole conversation) is created `0700`
+  instead of the default mode, which left it readable on a shared `/tmp`.
 - **Mint is now constrained to `~> 1.11`** (and through it HPAX `~> 1.1`).
   Mint 1.9 and earlier carry several advisories on the HTTP/1 client path
   every Alloy provider uses by default, including memory-exhaustion DoS from
@@ -30,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `result.metadata.run.provider_error`. The struct implements `String.Chars`,
   so interpolating it still works; code that applies `=~` or binary
   patterns to a provider's raw error should use `Exception.message/1`.
+- **Codex runs against your real `CODEX_HOME`** (or `:codex_home`) with
+  `--ignore-user-config --ignore-rules`, and requires Codex CLI 0.122.0 or
+  later. Your `$CODEX_HOME/AGENTS.md` and skills now reach Alloy runs; for
+  full isolation, and to keep agents from refreshing the same token as your
+  interactive Codex, log in to a dedicated home
+  (`CODEX_HOME=~/.codex-alloy codex login`) and pass it as `:codex_home`.
+  Codex failures return `%Alloy.Provider.Error{}`; timeouts are retried
+  within the turn deadline. `response_metadata.command_output` is now the
+  JSONL event stream.
 - **OpenAI, xAI and OpenAI-compatible providers no longer send a default
   output cap** (`max_output_tokens`/`max_tokens` were 4,096). Reasoning
   tokens count against the cap on current models, so responses came back
@@ -89,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Custom providers that only return `:tool_use`/`:end_turn` are unaffected.
   A provider returning an unknown stop reason now fails the run with a clear
   error instead of crashing the loop.
+- **Codex reports token usage** from `codex exec --json` `turn.completed`
+  events (it reported zero), and a `:config_overrides` option passes `-c`
+  settings to the CLI.
 - `Alloy.Provider.Error.from_body/1` for errors a provider reports inside a
   200 response (mid-stream `error` events, failed responses).
 - **OpenAI Responses replay keeps every output item.** Assistant `phase`
@@ -118,6 +133,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
+- Codex `:auth_path`. Use `:codex_home` (its directory is used as
+  `CODEX_HOME`).
 - Anthropic `:extended_thinking`. It sends manual thinking
   (`type: "enabled"` with `budget_tokens`), which Claude 4.7 and later
   reject. It keeps working for older models; for current ones pass
@@ -132,6 +149,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Codex keeps your login.** Each call copied `auth.json` into a temp
+  `CODEX_HOME` and deleted it afterwards, discarding refreshed tokens; since
+  Codex CLI 0.136.0 a reused refresh token forces a re-login. Keyring
+  credentials and `:profile` (broken since CLI 0.134.0) now work too.
+- **Cancelled or timed-out Codex turns no longer leak** the `codex` process,
+  its children or temp files: a supervised owner process monitors the caller
+  and stops the whole process group.
 - **OpenAI Responses (and xAI) no longer chain responses on their own.**
   Every response's id was fed back as `previous_response_id` while the full
   history was still sent, so from the second request of a run the server

@@ -64,8 +64,8 @@ defmodule Alloy.Provider.Codex do
   ## Notes
 
   - Usage comes from the `turn.completed` event of `codex exec --json`. As
-    with the OpenAI provider, `:input_tokens` includes the cached input
-    reported as `:cache_read_input_tokens`; `:reasoning_output_tokens` is
+    with every built-in provider, `:input_tokens` is uncached input; cache
+    reads and writes are reported separately. `:reasoning_output_tokens` is
     part of `:output_tokens`. Counts include Codex's own instructions and
     tool definitions, not just the transcript.
   - Each call runs `codex exec` under `Alloy.TaskSupervisor`. A timeout, or
@@ -250,15 +250,18 @@ defmodule Alloy.Provider.Codex do
     parent = Map.get(config, :tmp_dir) || System.tmp_dir!()
     base_dir = Path.join(parent, "alloy-codex-#{System.unique_integer([:positive])}")
 
-    case File.mkdir_p(base_dir) do
-      :ok ->
-        try do
-          fun.(paths(base_dir, config))
-        after
-          _ = File.rm_rf(base_dir)
-        end
-
+    # 0700: the prompt file holds the whole conversation, and the default
+    # mode leaves it readable by other users on a shared /tmp.
+    with :ok <- File.mkdir_p(base_dir),
+         :ok <- File.chmod(base_dir, 0o700) do
+      try do
+        fun.(paths(base_dir, config))
+      after
+        _ = File.rm_rf(base_dir)
+      end
+    else
       {:error, reason} ->
+        _ = File.rm_rf(base_dir)
         {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
     end
   end
@@ -656,12 +659,17 @@ defmodule Alloy.Provider.Codex do
     end)
   end
 
+  # Codex reports input_tokens including cache reads and writes; Alloy's
+  # input_tokens is uncached input, as for every built-in provider.
   defp to_usage(usage) do
+    cache_read = Map.get(usage, "cached_input_tokens", 0)
+    cache_write = Map.get(usage, "cache_write_input_tokens", 0)
+
     %{
-      input_tokens: Map.get(usage, "input_tokens", 0),
+      input_tokens: max(Map.get(usage, "input_tokens", 0) - cache_read - cache_write, 0),
       output_tokens: Map.get(usage, "output_tokens", 0),
-      cache_read_input_tokens: Map.get(usage, "cached_input_tokens", 0),
-      cache_creation_input_tokens: Map.get(usage, "cache_write_input_tokens", 0),
+      cache_read_input_tokens: cache_read,
+      cache_creation_input_tokens: cache_write,
       reasoning_output_tokens: Map.get(usage, "reasoning_output_tokens", 0)
     }
   end

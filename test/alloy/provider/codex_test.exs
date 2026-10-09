@@ -505,13 +505,35 @@ defmodule Alloy.Provider.CodexTest do
       assert_receive {:codex_args, args}
       assert "--json" in args
 
+      # input_tokens is uncached input (1234 - 1000 cached), as for every
+      # other built-in provider.
       assert result.usage == %{
-               input_tokens: 1234,
+               input_tokens: 234,
                output_tokens: 56,
                cache_read_input_tokens: 1000,
                cache_creation_input_tokens: 0,
                reasoning_output_tokens: 7
              }
+    end
+
+    # The prompt holds the whole conversation; on a shared /tmp it must not
+    # be readable by other users.
+    test "the temp directory holding the prompt is private to the owner" do
+      parent = self()
+
+      config = %{
+        model: "gpt-5.4",
+        command_runner:
+          fake_runner(fn _args, _opts, output_path ->
+            %File.Stat{mode: mode} = File.stat!(Path.dirname(output_path))
+            send(parent, {:dir_mode, Bitwise.band(mode, 0o777)})
+            File.write!(output_path, ~s({"stop_reason":"end_turn","text":"OK","tool_calls":[]}))
+            @completed_events
+          end)
+      }
+
+      assert {:ok, _result} = Codex.complete([Message.user("secret")], [], config)
+      assert_receive {:dir_mode, 0o700}
     end
 
     test "a failed turn reports the turn.failed message" do
@@ -540,7 +562,7 @@ defmodule Alloy.Provider.CodexTest do
       config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir}
 
       assert {:ok, result} = Codex.complete([Message.user("Hi")], [], config)
-      assert result.usage.input_tokens == 1234
+      assert result.usage.input_tokens == 234
       refute result.response_metadata.command_output =~ "failed to connect"
     end
 
