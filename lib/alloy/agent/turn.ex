@@ -311,10 +311,11 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  # Appends one tool_result per call, in call order. A call without a result (the loop halted before it ran) is answered
-  # with an error, because every API rejects a tool_use left unanswered and
-  # the halted transcript must stay usable for the next request. Tool-call IDs
-  # are unique per turn, so id-keyed lookup is safe.
+  # Appends one tool_result per call, in call order. A call without a result
+  # (the loop halted before it ran) is answered with an error, because every
+  # API rejects a tool_use left unanswered and the halted transcript must stay
+  # usable for the next request. Tool-call IDs are unique per turn, so
+  # id-keyed lookup is safe.
   defp answer_tool_calls(%State{} = state, tool_calls, result_blocks) do
     by_id = Map.new(result_blocks, &{&1.tool_use_id, &1})
 

@@ -61,7 +61,7 @@ defmodule Alloy.Provider.Gemini do
   alias Alloy.Message
   alias Alloy.Provider.{Error, HTTP}
 
-  @foreign_thought_signature "skip_thought_signature_validator"
+  @placeholder_thought_signature "skip_thought_signature_validator"
 
   @default_api_url "https://generativelanguage.googleapis.com"
   @default_api_version "v1beta"
@@ -221,15 +221,16 @@ defmodule Alloy.Provider.Gemini do
   # not produce. Later calls in a parallel step never carry one.
   # https://docs.cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures
   defp sign_first_function_call(:assistant, parts) do
-    case Enum.split_while(parts, &(not Map.has_key?(&1, "functionCall"))) do
-      {before, [%{"thoughtSignature" => _} | _] = rest} ->
-        before ++ rest
-
-      {before, [call | rest]} ->
-        before ++ [Map.put(call, "thoughtSignature", @foreign_thought_signature) | rest]
-
-      {parts, []} ->
+    case Enum.find_index(parts, &Map.has_key?(&1, "functionCall")) do
+      nil ->
         parts
+
+      index ->
+        List.update_at(
+          parts,
+          index,
+          &Map.put_new(&1, "thoughtSignature", @placeholder_thought_signature)
+        )
     end
   end
 

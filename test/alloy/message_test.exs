@@ -198,18 +198,25 @@ defmodule Alloy.MessageTest do
                  @anthropic
                )
 
-      assert new_call == %{type: "tool_use", id: "functions_read_0", name: "read", input: %{}}
-      assert new_result.tool_use_id == "functions_read_0"
+      assert %{type: "tool_use", id: "functions_read_0_" <> hash, name: "read", input: %{}} =
+               new_call
+
+      assert byte_size(hash) == 8
+      assert new_result.tool_use_id == new_call.id
     end
 
-    test "caps tool-call ids at 64 characters" do
-      long_id = String.duplicate("a", 100)
-      call = %{type: "tool_use", id: long_id, name: "read", input: %{}}
+    test "rewritten ids are at most 64 characters, distinct and stable" do
+      calls =
+        for id <- ["a.b", "a:b", String.duplicate("x", 100), ""],
+            do: %{type: "tool_use", id: id, name: "read", input: %{}}
 
-      assert [%Message{content: [%{id: id}]}] =
-               Message.normalize_for([from(@openai, [call])], @anthropic)
+      message = from(@openai, calls)
+      [%Message{content: rewritten}] = Message.normalize_for([message], @anthropic)
+      ids = Enum.map(rewritten, & &1.id)
 
-      assert id == String.duplicate("a", 64)
+      assert Enum.all?(ids, &Regex.match?(~r/^[a-zA-Z0-9_-]{1,64}$/, &1))
+      assert ids == Enum.uniq(ids)
+      assert [%Message{content: ^rewritten}] = Message.normalize_for([message], @anthropic)
     end
   end
 end

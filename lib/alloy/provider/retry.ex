@@ -28,7 +28,7 @@ defmodule Alloy.Provider.Retry do
   def call_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline) do
     {result, chunks_emitted?} =
       do_provider_call(
-        state,
+        normalize_for(state, provider),
         provider,
         provider_config,
         streaming?,
@@ -122,7 +122,7 @@ defmodule Alloy.Provider.Retry do
 
           {result, chunks_emitted?} =
             do_provider_call(
-              state,
+              normalize_for(state, fb_provider),
               fb_provider,
               fb_provider_config,
               streaming?,
@@ -215,6 +215,11 @@ defmodule Alloy.Provider.Retry do
     end
   end
 
+  # Normalized once per provider rather than per attempt: retries resend the
+  # same history.
+  defp normalize_for(%State{} = state, provider),
+    do: %{state | messages: Message.normalize_for(state.messages, provider)}
+
   # Provenance lets a later request to a different provider (a fallback, or
   # a model switch) rewrite blocks only this provider can read.
   defp record_origin(%{messages: messages} = response, provider, provider_config) do
@@ -222,8 +227,6 @@ defmodule Alloy.Provider.Retry do
     stamp = fn %Message{} = message -> %{message | provider: provider, model: model} end
     %{response | messages: Enum.map(messages, stamp)}
   end
-
-  defp record_origin(response, _provider, _provider_config), do: response
 
   defp retry_after_ms(%Error{retry_after_ms: ms}) when is_integer(ms), do: ms
   defp retry_after_ms(_reason), do: 0
@@ -250,14 +253,12 @@ defmodule Alloy.Provider.Retry do
 
     provider_config = Map.put(provider_config, :on_event, wrapped_on_event)
 
-    messages = Message.normalize_for(state.messages, provider)
-    result = provider.stream(messages, state.tool_defs, provider_config, wrapped_chunk)
+    result = provider.stream(state.messages, state.tool_defs, provider_config, wrapped_chunk)
     {result, :atomics.get(ref, 1) == 1}
   end
 
   defp call_provider(provider, state, provider_config, false = _streaming?, _on_chunk) do
-    messages = Message.normalize_for(state.messages, provider)
-    {provider.complete(messages, state.tool_defs, provider_config), false}
+    {provider.complete(state.messages, state.tool_defs, provider_config), false}
   end
 
   # The caller's streaming callbacks run inside the provider's stream

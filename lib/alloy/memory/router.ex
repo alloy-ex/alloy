@@ -8,9 +8,7 @@ defmodule Alloy.Memory.Router do
 
   @root "/memories"
 
-  @doc """
-  Runs the command in `input` against the `{module, store}` binding.
-  """
+  # Runs the command in `input` against the `{module, store}` binding.
   @spec dispatch({module(), Memory.store()}, map()) :: {:ok, String.t()} | {:error, String.t()}
   def dispatch({module, store}, input) when is_atom(module) and is_map(input) do
     case execute(module, store, input) do

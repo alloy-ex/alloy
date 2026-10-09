@@ -56,7 +56,7 @@ options.
 |---|---|
 | `max_budget_cents:` and the `:budget_exceeded` status | `:before_completion` middleware that prices `state.usage` (see "Budget limits" in the README). No built-in provider reported a cost, so the option never fired with them. |
 | Anthropic `extended_thinking:` | `extra_body: %{"thinking" => %{"type" => "adaptive"}}`. Setting it now raises, rather than silently turning thinking off. |
-| Codex `auth_path:` | `codex_home:` pointing at the directory that holds `auth.json`. Setting it now returns an error, rather than silently running as the default account. |
+| Codex `auth_path:` | `codex_home:` pointing at the directory that holds `auth.json`. Setting it now raises, rather than silently running as the default account. |
 | `Alloy.Agent.State.materialize`, `State.cleanup`, `state.messages_new` | Read `state.messages`; it always holds the full history. |
 | `state.current_task`, `state.pending_requests` | Server state, now kept by `alloy_agent`. |
 | `Alloy.ModelMetadata.catalog` | `Alloy.ModelMetadata.context_window/1`, or your own `Alloy.ModelCatalog`. |

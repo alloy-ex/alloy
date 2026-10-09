@@ -128,7 +128,7 @@ defmodule Alloy.Context.Compactor do
   @spec call(Middleware.hook(), State.t()) :: State.t() | {:halt, String.t()}
   def call(:before_completion, %State{} = state) do
     case maybe_compact(state) do
-      {:unchanged, state} -> state
+      {:unchanged, unchanged} -> unchanged
       {:compacted, compacted} -> after_compaction(state, compacted)
     end
   end
@@ -149,6 +149,8 @@ defmodule Alloy.Context.Compactor do
       %{turn: before.turn + 1}
     )
 
+    # Middleware.run/2 reports a halt as {:halted, reason}; a middleware
+    # returns {:halt, reason} to request one.
     case Middleware.run(:after_compaction, compacted) do
       {:halted, reason} -> {:halt, reason}
       %State{} = state -> state

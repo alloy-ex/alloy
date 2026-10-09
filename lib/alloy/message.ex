@@ -62,7 +62,7 @@ defmodule Alloy.Message do
 
   # Anthropic accepts tool-use ids matching ^[a-zA-Z0-9_-]+$; OpenAI accepts
   # at most 64 characters. Kimi, for one, uses ids like "functions.read:0".
-  @max_tool_id_length 64
+  @portable_tool_id ~r/^[a-zA-Z0-9_-]{1,64}$/
 
   @doc """
   Creates a user message with text content.
@@ -263,9 +263,16 @@ defmodule Alloy.Message do
 
   defp rename_result(block, _ids), do: block
 
+  # A rewritten id ends in a hash of the original, so two ids that sanitize
+  # alike ("a.b", "a:b") stay distinct, and the same history always yields
+  # the same bytes (Anthropic rejects thinking whose earlier history changed).
   defp portable_tool_id(id) do
-    id
-    |> String.replace(~r/[^a-zA-Z0-9_-]/, "_")
-    |> String.slice(0, @max_tool_id_length)
+    if Regex.match?(@portable_tool_id, id) do
+      id
+    else
+      hash = :sha256 |> :crypto.hash(id) |> Base.encode16(case: :lower) |> binary_slice(0, 8)
+      prefix = id |> String.replace(~r/[^a-zA-Z0-9_-]/, "_") |> binary_slice(0, 55)
+      prefix <> "_" <> hash
+    end
   end
 end

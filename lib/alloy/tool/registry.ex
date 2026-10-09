@@ -62,14 +62,13 @@ defmodule Alloy.Tool.Registry do
   # Every provider API rejects a request with two tools of the same name,
   # and only one of them could ever be dispatched.
   defp reject_duplicate_names!(specs) do
-    case specs |> Enum.frequencies_by(& &1.name) |> Enum.filter(fn {_name, n} -> n > 1 end) do
+    case for({name, count} <- Enum.frequencies_by(specs, & &1.name), count > 1, do: name) do
       [] ->
         :ok
 
       duplicates ->
         raise ArgumentError,
-              "tool names must be unique; configured more than once: " <>
-                inspect(Enum.map(duplicates, &elem(&1, 0)))
+              "tool names must be unique; configured more than once: #{inspect(duplicates)}"
     end
   end
 
@@ -105,7 +104,7 @@ defmodule Alloy.Tool.Registry do
 
   defp maybe_put_non_empty(map, _key, nil), do: map
   defp maybe_put_non_empty(map, _key, []), do: map
-  defp maybe_put_non_empty(map, _key, value) when value == %{}, do: map
+  defp maybe_put_non_empty(map, _key, value) when is_map(value) and map_size(value) == 0, do: map
   defp maybe_put_non_empty(map, key, value), do: Map.put(map, key, value)
 
   defp maybe_put_true(map, key, true), do: Map.put(map, key, true)

@@ -152,8 +152,7 @@ defmodule Alloy.Provider.Codex do
   def complete(messages, tool_defs, config) do
     prompt = build_prompt(messages, tool_defs, config)
 
-    with {:ok, codex_home} <- codex_home(config),
-         {:ok, command_result} <- execute(prompt, codex_home, config),
+    with {:ok, command_result} <- execute(prompt, codex_home(config), config),
          {:ok, payload} <- decode_payload(command_result, config) do
       parse_payload(payload, config, command_result)
     end
@@ -177,20 +176,16 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  # Ignoring a removed :auth_path would silently run Codex as whichever
-  # account the default CODEX_HOME holds.
+  # A removed option raises, like every config mistake: ignoring :auth_path
+  # would silently run Codex as whichever account the default CODEX_HOME holds.
   defp codex_home(%{auth_path: _auth_path}) do
-    {:error,
-     %Error{
-       kind: :invalid_request,
-       message:
-         "Alloy.Provider.Codex :auth_path was removed in Alloy 0.13; " <>
-           "set :codex_home to the directory holding auth.json instead"
-     }}
+    raise ArgumentError,
+          "Alloy.Provider.Codex :auth_path was removed in Alloy 0.13; " <>
+            "set :codex_home to the directory holding auth.json instead"
   end
 
-  defp codex_home(%{codex_home: codex_home}) when is_binary(codex_home), do: {:ok, codex_home}
-  defp codex_home(_config), do: {:ok, nil}
+  defp codex_home(%{codex_home: codex_home}) when is_binary(codex_home), do: codex_home
+  defp codex_home(_config), do: nil
 
   # Test hook: a synchronous function matching `System.cmd/3`, run in the
   # caller with no timeout of its own.

@@ -24,8 +24,8 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
     budget middleware recipe.
   - Anthropic `:extended_thinking`. Setting it now raises instead of
     silently turning thinking off.
-  - Codex `:auth_path`. Setting it now returns an error instead of
-    silently running as the default account.
+  - Codex `:auth_path`. Setting it now raises instead of silently running
+    as the default account.
   - `State.materialize/1`, `State.cleanup/1` and `state.messages_new`.
   - `ModelMetadata.catalog/0` and its `model_entry` type.
   - `Message.server_tool_result_block/3`.

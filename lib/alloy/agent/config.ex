@@ -179,7 +179,7 @@ defmodule Alloy.Agent.Config do
   # A misspelt or removed option used to be ignored silently, which hides
   # mistakes such as a budget or tool list that never applies.
   defp validate_option_names!(opts) do
-    case opts |> Keyword.keys() |> Enum.uniq() |> Kernel.--(@options) do
+    case opts |> Keyword.drop(@options) |> Keyword.keys() |> Enum.uniq() do
       [] -> :ok
       unknown -> raise ArgumentError, unknown_options_message(unknown)
     end

@@ -488,13 +488,12 @@ defmodule Alloy.Provider.CodexTest do
     end
 
     # Ignoring it would run Codex as whichever account ~/.codex holds.
-    test "the removed :auth_path is an error, not silently ignored" do
+    test "the removed :auth_path raises instead of being silently ignored" do
       config = %{model: "gpt-5.4", auth_path: "/tmp/auth.json"}
 
-      assert {:error, %Error{kind: :invalid_request, message: message}} =
-               Codex.complete([Message.user("Hi")], [], config)
-
-      assert message =~ ":auth_path was removed"
+      assert_raise ArgumentError, ~r/:auth_path was removed/, fn ->
+        Codex.complete([Message.user("Hi")], [], config)
+      end
     end
   end
 
