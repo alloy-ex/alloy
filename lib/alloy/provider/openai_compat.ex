@@ -156,8 +156,13 @@ defmodule Alloy.Provider.OpenAICompat do
         defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
       end
 
-    # Merge extra_body LAST so caller can override any field
-    Map.merge(body, Map.get(config, :extra_body, %{}))
+    # Merge extra_body LAST so caller can override any field. Keys are
+    # stringified first: an atom key would sit beside the string key it
+    # meant to replace and be encoded as a duplicate JSON key.
+    extra_body =
+      Map.new(Map.get(config, :extra_body, %{}), fn {key, value} -> {to_string(key), value} end)
+
+    Map.merge(body, extra_body)
   end
 
   defp maybe_put(map, _key, nil), do: map

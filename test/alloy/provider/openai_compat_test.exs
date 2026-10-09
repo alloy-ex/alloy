@@ -559,6 +559,18 @@ defmodule Alloy.Provider.OpenAICompatTest do
       assert decoded["max_tokens"] == 8192
     end
 
+    test "atom keys in extra_body override defaults instead of duplicating them" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:extra_body, %{max_tokens: 100, temperature: 0.2})
+
+      OpenAICompat.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert length(String.split(body, ~s("max_tokens"))) == 2
+      assert %{"max_tokens" => 100, "temperature" => 0.2} = Jason.decode!(body)
+    end
+
     test "no extra_body means no extra fields" do
       config = config_that_captures_request()
 
