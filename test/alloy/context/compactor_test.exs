@@ -39,15 +39,37 @@ defmodule Alloy.Context.CompactorTest do
         provider: {provider, provider_config},
         max_tokens: max_tokens,
         compaction: compaction,
-        on_compaction: on_compaction
+        on_compaction: on_compaction,
+        system_prompt: Keyword.get(opts, :system_prompt)
       )
 
     %State{
       config: config,
       messages: messages,
       messages_new: [],
+      tool_defs: Keyword.get(opts, :tool_defs, []),
       provider_state: Keyword.get(opts, :provider_state, %{})
     }
+  end
+
+  # 180 tokens of room: max_tokens 200 minus reserve 20.
+  defp small_budget_state(messages, opts \\ []) do
+    build_state(
+      messages,
+      Keyword.merge(
+        [
+          max_tokens: 200,
+          compaction: [reserve_tokens: 20, keep_recent_tokens: 20],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("Budget")}, test_pid: self()}
+        ],
+        opts
+      )
+    )
+  end
+
+  defp short_conversation do
+    [Message.user("hi"), Message.assistant("hello"), Message.user("next")]
   end
 
   defp start_scripted_provider(responses) do
@@ -590,6 +612,94 @@ defmodule Alloy.Context.CompactorTest do
         end)
 
       assert log =~ "summary compaction failed, falling back to truncation"
+    end
+  end
+
+  describe "token estimate" do
+    test "a short conversation fits the budget" do
+      assert {:unchanged, _state} =
+               Compactor.maybe_compact(small_budget_state(short_conversation()))
+    end
+
+    test "counts the system prompt" do
+      state = small_budget_state(short_conversation(), system_prompt: String.duplicate("s", 800))
+
+      assert {:compacted, _state} = Compactor.maybe_compact(state)
+    end
+
+    test "counts tool definitions" do
+      tool_def = %{
+        name: "lookup",
+        description: String.duplicate("d", 800),
+        input_schema: %{type: "object"}
+      }
+
+      state = small_budget_state(short_conversation(), tool_defs: [tool_def])
+
+      assert {:compacted, _state} = Compactor.maybe_compact(state)
+    end
+
+    test "counts bytes, so CJK text is not undercounted" do
+      # 300 characters but 900 bytes; String.length/4 saw only 75 tokens.
+      cjk = String.duplicate("漢", 300)
+
+      state =
+        small_budget_state([Message.user("hi"), Message.assistant(cjk), Message.user("next")])
+
+      assert {:compacted, _state} = Compactor.maybe_compact(state)
+    end
+
+    test "counts string-keyed, list-content and unknown blocks by their JSON size" do
+      big = String.duplicate("x", 800)
+
+      for block <- [
+            %{"type" => "text", "text" => big},
+            %{type: "tool_result", tool_use_id: "t1", content: [%{type: "text", text: big}]},
+            %{type: "reasoning", raw: %{"encrypted_content" => big}}
+          ] do
+        messages = [Message.user("hi"), Message.assistant_blocks([block]), Message.user("next")]
+
+        assert {:compacted, _state} = Compactor.maybe_compact(small_budget_state(messages)),
+               "#{inspect(Map.keys(block))} was not counted"
+      end
+    end
+
+    test "counts thinking signatures, which carry omitted thinking" do
+      thinking = %{type: "thinking", thinking: "", signature: String.duplicate("g", 800)}
+
+      messages = [
+        Message.user("hi"),
+        Message.assistant_blocks([thinking, %{type: "text", text: "ok"}]),
+        Message.user("next")
+      ]
+
+      assert {:compacted, _state} = Compactor.maybe_compact(small_budget_state(messages))
+    end
+
+    test "force_compact summarizes even when clearing alone looks sufficient" do
+      messages =
+        [Message.user("original")] ++
+          bulky_tool_messages(5, 400) ++
+          [Message.assistant("analysis"), Message.user("latest")]
+
+      state =
+        build_state(messages,
+          max_tokens: 540,
+          compaction: [reserve_tokens: 100, keep_recent_tokens: 10],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("Forced")}, test_pid: self()}
+        )
+
+      # The estimate says clearing is enough, but the provider has just
+      # rejected the prompt as too long, so the estimate is wrong.
+      assert {:compacted, cleared_only} = Compactor.maybe_compact(state)
+      refute Enum.any?(cleared_only.messages, &summary_message?/1)
+      refute_received {:summary_request, _, _, _}
+
+      forced = Compactor.force_compact(state)
+
+      assert_received {:summary_request, _, _, _}
+      assert Enum.any?(forced.messages, &summary_message?/1)
     end
   end
 

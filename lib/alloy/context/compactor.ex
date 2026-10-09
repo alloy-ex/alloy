@@ -101,14 +101,23 @@ defmodule Alloy.Context.Compactor do
   @doc """
   Forces compaction regardless of reserve budget.
   Used when the provider rejects the prompt as too long.
+
+  The token estimate is not trusted here, because the provider has just
+  rejected a prompt the estimate allowed: clearing old tool results is
+  always followed by summarization (or truncation).
   """
   @spec force_compact(State.t()) :: State.t()
   def force_compact(%State{} = state) do
-    compact_messages_in_state(state, State.messages(state))
+    {_fits_estimate, messages} = maybe_clear_tool_results(State.messages(state), state, [])
+    summarize_or_fallback(state, messages)
   end
 
   @doc """
-  Compacts state messages when they exceed `max_tokens - reserve_tokens`.
+  Compacts state messages when the estimated prompt exceeds
+  `max_tokens - reserve_tokens`.
+
+  The estimate counts the system prompt, the tool definitions and every
+  message at roughly four bytes per token.
 
   Returns `{:compacted, state}` when compaction occurred, or
   `{:unchanged, state}` when already within budget.
@@ -116,9 +125,8 @@ defmodule Alloy.Context.Compactor do
   @spec maybe_compact(State.t(), keyword()) :: {:compacted | :unchanged, State.t()}
   def maybe_compact(%State{} = state, opts \\ []) do
     messages = State.messages(state)
-    reserve_tokens = state.config.compaction.reserve_tokens
 
-    if within_reserve?(messages, state.config.max_tokens, reserve_tokens) do
+    if within_reserve?(messages, state) do
       {:unchanged, state}
     else
       {:compacted, compact_messages_in_state(state, messages, opts)}
@@ -135,7 +143,7 @@ defmodule Alloy.Context.Compactor do
     {first, middle, recent}
   end
 
-  defp compact_messages_in_state(%State{} = state, messages, opts \\ []) do
+  defp compact_messages_in_state(%State{} = state, messages, opts) do
     case maybe_clear_tool_results(messages, state, opts) do
       {:done, cleared_messages} ->
         %{state | messages: cleared_messages, messages_new: []}
@@ -150,15 +158,13 @@ defmodule Alloy.Context.Compactor do
          %State{
            turn: turn,
            config: %{
-             max_tokens: max_tokens,
              compaction:
                %{
                  clear_tool_results: true,
-                 keep_recent_tokens: keep_recent_tokens,
-                 reserve_tokens: reserve_tokens
+                 keep_recent_tokens: keep_recent_tokens
                } = compaction
            }
-         },
+         } = state,
          opts
        ) do
     keep_recent_tool_results = Map.get(compaction, :keep_recent_tool_results, 3)
@@ -177,7 +183,7 @@ defmodule Alloy.Context.Compactor do
         %{turn: telemetry_turn}
       )
 
-      if within_reserve?(cleared_messages, max_tokens, reserve_tokens) do
+      if within_reserve?(cleared_messages, state) do
         {:done, cleared_messages}
       else
         {:continue, cleared_messages}
@@ -674,16 +680,18 @@ defmodule Alloy.Context.Compactor do
 
   defp compact_message(msg), do: msg
 
-  # --- Token estimation (inlined from TokenCounter) ---
-  # Chars/4 heuristic — good enough for budget decisions, not billing.
+  # --- Token estimation ---
+  # Bytes/4: good enough for budget decisions, not billing. Bytes rather than
+  # characters, because a CJK character is three bytes and at least one token.
 
-  # Fixed heuristics for media types. Intentionally conservative rough estimates.
+  # Fixed heuristics for media types, whose payload size says little about
+  # their token cost. Intentionally conservative rough estimates.
   @image_tokens 1_000
   @audio_tokens 500
   @video_tokens 2_000
   @document_tokens 3_000
 
-  defp estimate_tokens(text) when is_binary(text), do: div(String.length(text), 4)
+  defp estimate_tokens(text) when is_binary(text), do: div(byte_size(text), 4)
 
   defp estimate_tokens(messages) when is_list(messages) do
     Enum.reduce(messages, 0, fn msg, acc -> acc + estimate_message_tokens(msg) end)
@@ -701,50 +709,49 @@ defmodule Alloy.Context.Compactor do
     estimate_tokens(text)
   end
 
-  defp estimate_block_tokens(%{type: "tool_use", name: name, input: input}) do
-    name_tokens = estimate_tokens(to_string(name))
-
-    input_str =
-      case Jason.encode(input) do
-        {:ok, json} -> json
-        {:error, _} -> inspect(input)
-      end
-
-    name_tokens + estimate_tokens(input_str)
+  defp estimate_block_tokens(%{type: type, name: name, input: input})
+       when type in ["tool_use", "server_tool_use"] do
+    estimate_tokens(to_string(name)) + estimate_json_tokens(input)
   end
 
-  defp estimate_block_tokens(%{type: "tool_result", content: content}) when is_binary(content) do
+  defp estimate_block_tokens(%{type: type, content: content})
+       when type in ["tool_result", "server_tool_result"] and is_binary(content) do
     estimate_tokens(content)
   end
 
-  defp estimate_block_tokens(%{type: "thinking", thinking: text}) when is_binary(text) do
-    estimate_tokens(text)
-  end
-
-  defp estimate_block_tokens(%{type: "server_tool_use", name: name, input: input}) do
-    name_tokens = estimate_tokens(to_string(name))
-
-    input_str =
-      case Jason.encode(input) do
-        {:ok, json} -> json
-        {:error, _} -> inspect(input)
-      end
-
-    name_tokens + estimate_tokens(input_str)
-  end
-
-  defp estimate_block_tokens(%{type: "server_tool_result", content: content})
-       when is_binary(content) do
-    estimate_tokens(content)
+  # With display "omitted" the thinking text is empty and the signature
+  # carries the full encrypted reasoning the provider replays as input.
+  defp estimate_block_tokens(%{type: "thinking", thinking: text} = block) when is_binary(text) do
+    estimate_tokens(text) + estimate_tokens(Map.get(block, :signature) || "")
   end
 
   defp estimate_block_tokens(%{type: "image"}), do: @image_tokens
   defp estimate_block_tokens(%{type: "audio"}), do: @audio_tokens
   defp estimate_block_tokens(%{type: "video"}), do: @video_tokens
   defp estimate_block_tokens(%{type: "document"}), do: @document_tokens
-  defp estimate_block_tokens(_block), do: 0
 
-  defp within_reserve?(messages, max_tokens, reserve_tokens) do
-    estimate_tokens(messages) <= max(max_tokens - reserve_tokens, 0)
+  # String-keyed blocks, list content and block types this module does not
+  # know are still sent to the provider, so they cost roughly their JSON size.
+  defp estimate_block_tokens(block), do: estimate_json_tokens(block)
+
+  defp estimate_json_tokens(term) do
+    case Jason.encode(term) do
+      {:ok, json} -> estimate_tokens(json)
+      {:error, _reason} -> term |> inspect() |> estimate_tokens()
+    end
+  end
+
+  # The system prompt and tool definitions are sent with every request and
+  # count against the same context window as the messages.
+  defp request_overhead_tokens(%State{config: config, tool_defs: tool_defs}) do
+    system_prompt_tokens(config.system_prompt) + estimate_json_tokens(tool_defs)
+  end
+
+  defp system_prompt_tokens(nil), do: 0
+  defp system_prompt_tokens(prompt) when is_binary(prompt), do: estimate_tokens(prompt)
+
+  defp within_reserve?(messages, %State{config: config} = state) do
+    budget = max(config.max_tokens - config.compaction.reserve_tokens, 0)
+    request_overhead_tokens(state) + estimate_tokens(messages) <= budget
   end
 end
