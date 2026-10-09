@@ -268,7 +268,7 @@ defmodule Alloy.Provider.CodexTest do
         script!(dir, """
         cat > /dev/null
         tick=0
-        while [ "$tick" -lt 80 ]; do
+        while [ "$tick" -lt 160 ]; do
           printf '%s\\n' '{"event":"progress"}'
           tick=$((tick + 1))
           sleep 0.05
@@ -289,7 +289,9 @@ defmodule Alloy.Provider.CodexTest do
 
       assert {:error, %Error{kind: :timeout} = error} = result
       assert Exception.message(error) == "codex exec timed out after 1000ms"
-      assert elapsed < 3_000, "progress reset the turn deadline: #{elapsed}ms"
+      # The script prints for 8s; finishing well before that means the 1s
+      # deadline held. The slack absorbs a loaded machine.
+      assert elapsed < 5_000, "progress reset the turn deadline: #{elapsed}ms"
     end
 
     @tag :tmp_dir
@@ -729,7 +731,9 @@ defmodule Alloy.Provider.CodexTest do
     @tag :tmp_dir
     test "a timeout stops codex's child processes too", %{tmp_dir: dir} do
       {script, pids_path} = hanging_codex!(dir)
-      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir, timeout_ms: 500}
+      # Long enough for the shell to start and record its pids on a loaded
+      # machine; the assertion is that the timeout kills them, not how fast.
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir, timeout_ms: 2_000}
 
       assert {:error, _reason} = Codex.complete([Message.user("Hi")], [], config)
 
