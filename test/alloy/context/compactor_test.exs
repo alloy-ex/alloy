@@ -125,6 +125,12 @@ defmodule Alloy.Context.CompactorTest do
 
   defp tool_result_message?(_message), do: false
 
+  defp has_thinking?(%Message{content: blocks}) when is_list(blocks) do
+    Enum.any?(blocks, &match?(%{type: type} when type in ["thinking", "redacted_thinking"], &1))
+  end
+
+  defp has_thinking?(_message), do: false
+
   defp assistant_tool_call_message?(%Message{role: :assistant, content: blocks})
        when is_list(blocks) do
     Enum.any?(blocks, fn
@@ -426,7 +432,9 @@ defmodule Alloy.Context.CompactorTest do
       assert Enum.any?(compacted.messages, &summary_message?/1)
     end
 
-    test "tool-result clearing does not touch thinking blocks" do
+    # Clearing edits earlier history, which invalidates every later signed
+    # thinking block; removing all of them is the documented valid change.
+    test "tool-result clearing strips thinking from settled turns and keeps other blocks" do
       signed_thinking = String.duplicate("signed", 80)
       unsigned_thinking = String.duplicate("unsigned", 80)
 
@@ -458,13 +466,10 @@ defmodule Alloy.Context.CompactorTest do
         )
 
       {:compacted, compacted} = Compactor.maybe_compact(state)
-      thinking_message = Enum.at(compacted.messages, 1)
 
-      assert [
-               %{type: "thinking", thinking: ^signed_thinking, signature: "sig-1"},
-               %{type: "thinking", thinking: ^unsigned_thinking},
-               ^reasoning
-             ] = thinking_message.content
+      assert tool_result_content(compacted.messages, "t1") == "[tool result cleared: 300 bytes]"
+      assert Enum.at(compacted.messages, 1).content == [reasoning]
+      refute Enum.any?(compacted.messages, &has_thinking?/1)
     end
 
     test "preserves recent messages intact based on the keep_recent_tokens budget" do
@@ -613,6 +618,116 @@ defmodule Alloy.Context.CompactorTest do
         end)
 
       assert log =~ "summary compaction failed, falling back to truncation"
+    end
+  end
+
+  describe "thinking blocks and tool rounds" do
+    defp signed_thinking(label),
+      do: %{type: "thinking", thinking: "", signature: "sig-#{label}"}
+
+    test "a summary strips thinking from every settled turn it keeps" do
+      messages = [
+        Message.user("original request"),
+        Message.assistant_blocks([
+          signed_thinking("old"),
+          %{type: "text", text: String.duplicate("a", 900)}
+        ]),
+        Message.user("follow-up"),
+        Message.assistant_blocks([
+          signed_thinking("kept"),
+          %{type: "redacted_thinking", data: "opaque"},
+          %{type: "text", text: "recent answer"}
+        ]),
+        Message.user("latest")
+      ]
+
+      state =
+        build_state(messages,
+          max_tokens: 250,
+          compaction: [reserve_tokens: 25, keep_recent_tokens: 20],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("Strip")}, test_pid: self()}
+        )
+
+      {:compacted, compacted} = Compactor.maybe_compact(state)
+
+      assert Enum.any?(compacted.messages, &summary_message?/1)
+
+      assert %Message{role: :assistant, content: [%{type: "text", text: "recent answer"}]} =
+               Enum.find(compacted.messages, &(&1.role == :assistant))
+
+      refute Enum.any?(compacted.messages, &has_thinking?/1)
+    end
+
+    test "keeps the thinking of the turn still in progress" do
+      in_flight_call =
+        Message.assistant_blocks([
+          signed_thinking("in-flight"),
+          %{type: "tool_use", id: "t9", name: "read_file", input: %{path: "lib/x.ex"}}
+        ])
+
+      in_flight_result =
+        Message.tool_results([%{type: "tool_result", tool_use_id: "t9", content: "small"}])
+
+      messages = [
+        Message.user("original request"),
+        Message.assistant_blocks([
+          signed_thinking("old"),
+          %{type: "text", text: String.duplicate("a", 900)}
+        ]),
+        Message.user("now read the file"),
+        in_flight_call,
+        in_flight_result
+      ]
+
+      state =
+        build_state(messages,
+          max_tokens: 250,
+          compaction: [reserve_tokens: 25, keep_recent_tokens: 20],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("InFlight")}, test_pid: self()}
+        )
+
+      {:compacted, compacted} = Compactor.maybe_compact(state)
+
+      assert Enum.take(compacted.messages, -2) == [in_flight_call, in_flight_result]
+      assert Enum.count(compacted.messages, &has_thinking?/1) == 1
+    end
+
+    test "truncation keeps the in-flight round whole and shrinks its oversized result" do
+      big_result = String.duplicate("r", 40_000)
+
+      in_flight_call =
+        Message.assistant_blocks([
+          signed_thinking("in-flight"),
+          %{type: "tool_use", id: "t1", name: "read_file", input: %{path: "big.log"}}
+        ])
+
+      messages = [
+        Message.user("read the log"),
+        in_flight_call,
+        Message.tool_results([%{type: "tool_result", tool_use_id: "t1", content: big_result}])
+      ]
+
+      state =
+        build_state(messages,
+          max_tokens: 2_000,
+          compaction: [reserve_tokens: 200, keep_recent_tokens: 500],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:error, :boom}, test_pid: self()}
+        )
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        {:compacted, compacted} = Compactor.maybe_compact(state)
+        send(self(), {:compacted, compacted})
+      end)
+
+      assert_received {:compacted, compacted}
+      assert [_user, ^in_flight_call, %Message{content: [result]}] = compacted.messages
+      assert result.tool_use_id == "t1"
+      assert byte_size(result.content) < 7_200
+      assert result.content =~ ~r/\[tool result truncated: kept \d+ of 40000 bytes\]$/
+      assert {:unchanged, _} = Compactor.maybe_compact(compacted)
     end
   end
 
@@ -1054,6 +1169,37 @@ defmodule Alloy.Context.CompactorTest do
 
       unsigned_block = Enum.find(compacted_msg.content, &match?(%{type: "thinking"}, &1))
       assert String.length(unsigned_block.thinking) <= 203
+    end
+
+    test "never starts the kept window with a tool result" do
+      call =
+        Message.assistant_blocks([
+          %{type: "thinking", thinking: "", signature: "sig-1"},
+          %{type: "tool_use", id: "t1", name: "read_file", input: %{path: "a.ex"}}
+        ])
+
+      result =
+        Message.tool_results([
+          %{type: "tool_result", tool_use_id: "t1", content: String.duplicate("r", 500)}
+        ])
+
+      messages = [
+        Message.user("original"),
+        Message.assistant(String.duplicate("a", 500)),
+        call,
+        result,
+        Message.assistant("done"),
+        Message.user("latest")
+      ]
+
+      compacted = Compactor.compact_messages(messages, keep_recent: 3)
+
+      assert Enum.take(compacted, -4) == [
+               call,
+               result,
+               Message.assistant("done"),
+               Message.user("latest")
+             ]
     end
 
     test "handles all messages within keep_recent window" do
