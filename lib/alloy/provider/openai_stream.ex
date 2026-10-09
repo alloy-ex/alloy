@@ -162,6 +162,8 @@ defmodule Alloy.Provider.OpenAIStream do
 
   # ── Tool Call Accumulation ───────────────────────────────────────────
 
+  # DeepInfra sends "tool_calls": null on chunks without a call.
+  defp accumulate_tool_calls(acc, nil), do: acc
   defp accumulate_tool_calls(acc, []), do: acc
 
   defp accumulate_tool_calls(acc, tool_call_deltas) do
@@ -179,7 +181,9 @@ defmodule Alloy.Provider.OpenAIStream do
 
         existing =
           case tc_delta do
-            %{"id" => id} -> %{existing | id: id}
+            # Some providers (DeepInfra) repeat "id": null on every later chunk of
+            # the same call; only a real id may set it, or it is overwritten.
+            %{"id" => id} when is_binary(id) and id != "" -> %{existing | id: id}
             _ -> existing
           end
 
