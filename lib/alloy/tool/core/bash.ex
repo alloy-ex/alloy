@@ -145,11 +145,24 @@ defmodule Alloy.Tool.Core.Bash do
           run_port(bash, opts, timeout, caller)
         end)
 
-      case Task.yield(task, timeout + @kill_grace_ms) || Task.shutdown(task, :brutal_kill) do
-        {:ok, {:exited, status, output}} -> {:ok, "#{output}\nexit code: #{status}"}
-        {:ok, {:timeout, output}} -> {:error, with_output(output, timeout_message(timeout))}
-        {:exit, reason} -> {:error, "Executor crashed: #{inspect(reason)}"}
-        nil -> {:error, timeout_message(timeout)}
+      result = Task.yield(task, timeout + @kill_grace_ms) || Task.shutdown(task, :brutal_kill)
+      os_pid = take_os_pid(task.pid)
+
+      case result do
+        {:ok, {:exited, status, output}} ->
+          {:ok, "#{output}\nexit code: #{status}"}
+
+        {:ok, {:timeout, output}} ->
+          {:error, with_output(output, timeout_message(timeout))}
+
+        {:exit, reason} ->
+          {:error, "Executor crashed: #{inspect(reason)}"}
+
+        # The runner missed its own deadline and was killed before it could
+        # stop the shell, so stop it here.
+        nil ->
+          OSProcess.signal_group(os_pid, "KILL")
+          {:error, timeout_message(timeout)}
       end
     end
   end
@@ -208,24 +221,37 @@ defmodule Alloy.Tool.Core.Bash do
 
     run = %{
       port: port,
-      os_pid: os_pid(port),
+      os_pid: OSProcess.os_pid(port),
       caller_ref: caller_ref,
       deadline: System.monotonic_time(:millisecond) + timeout
     }
 
+    send(caller, {:bash_os_pid, self(), run.os_pid})
     result = collect(run, new_output())
     Process.demonitor(caller_ref, [:flush])
     result
   end
 
-  defp os_pid(port) do
-    case Port.info(port, :os_pid) do
-      {:os_pid, os_pid} -> os_pid
-      nil -> nil
+  # Flushes the runner's start message in every outcome; the pid is only
+  # needed when the runner itself had to be killed.
+  defp take_os_pid(runner) do
+    receive do
+      {:bash_os_pid, ^runner, os_pid} -> os_pid
+    after
+      0 -> nil
     end
   end
 
-  defp collect(%{port: port, caller_ref: caller_ref} = run, output) do
+  # The deadline is absolute and checked before each receive, so a steady
+  # stream of output can't postpone the timeout.
+  defp collect(run, output) do
+    case run.deadline - System.monotonic_time(:millisecond) do
+      remaining when remaining > 0 -> receive_output(run, output, remaining)
+      _expired -> time_out(run, output)
+    end
+  end
+
+  defp receive_output(%{port: port, caller_ref: caller_ref} = run, output, remaining) do
     receive do
       {^port, {:data, data}} ->
         collect(run, append(output, data))
@@ -237,10 +263,13 @@ defmodule Alloy.Tool.Core.Bash do
         OSProcess.signal_group(run.os_pid, "KILL")
         :caller_down
     after
-      max(run.deadline - System.monotonic_time(:millisecond), 0) ->
-        OSProcess.signal_group(run.os_pid, "KILL")
-        {:timeout, render(output)}
+      remaining -> time_out(run, output)
     end
+  end
+
+  defp time_out(run, output) do
+    OSProcess.signal_group(run.os_pid, "KILL")
+    {:timeout, render(output)}
   end
 
   defp run_custom_executor(executor, command, working_dir, timeout) do

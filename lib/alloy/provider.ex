@@ -29,8 +29,8 @@ defmodule Alloy.Provider do
     `Alloy.Result`; a truncated tool call fails the run because it cannot
     be executed.
   - `:refusal` - a safety system stopped the output. Alloy discards the
-    partial output and fails the run; put details in `:response_metadata`
-    under `:stop_details`.
+    partial output and fails the run. Put the API's own details, with the
+    string keys it sends, in `:response_metadata` under `:stop_details`.
   - `:pause_turn` - the provider paused a long server-side tool loop; Alloy
     sends the conversation back unchanged so it can continue.
   """

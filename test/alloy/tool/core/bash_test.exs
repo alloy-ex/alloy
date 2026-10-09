@@ -128,6 +128,26 @@ defmodule Alloy.Tool.Core.BashTest do
       refute File.exists?(marker)
     end
 
+    # A steady flood of output must not postpone the timeout: the deadline
+    # is checked before each receive, not only when the mailbox is empty.
+    test "a command that floods output still times out and is killed", %{tmp_dir: tmp_dir} do
+      tag = "alloy-flood-#{System.unique_integer([:positive])}"
+
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          Bash.execute(%{"command" => "yes #{tag}", "timeout" => 300}, %{
+            working_directory: tmp_dir
+          })
+        end)
+
+      assert {:error, msg} = result
+      assert msg =~ "timed out after 300ms"
+      assert elapsed_us < 2_000_000
+
+      Process.sleep(200)
+      assert {"", 1} = System.cmd("pgrep", ["-f", tag])
+    end
+
     test "the model's timeout is clamped to :bash_max_timeout", %{tmp_dir: tmp_dir} do
       {elapsed_us, result} =
         :timer.tc(fn ->

@@ -1,6 +1,6 @@
 # Provider compatibility
 
-Checked against official documentation on **8 October 2026**. Alloy uses Req
+Checked against official documentation on **9 October 2026**. Alloy uses Req
 and provider REST wire formats; it does not depend on the Python or JavaScript
 provider SDKs. A new SDK release alone does not require an Alloy dependency
 upgrade. Model access and deployment settings still depend on your account.
@@ -19,16 +19,21 @@ use a 200,000-token fallback; use `model_metadata_overrides` or your own
 | Gemini | `gemini-3.8-flash`, `gemini-3.5-flash-lite` | `Alloy.Provider.Gemini` uses GenerateContent; `generation_config` passes native settings. `OpenAICompat` can use Google's Chat Completions endpoint. Preserve thought signatures through tool turns. 2.5 models remain served but access is restricted to prior active users. [Models](https://ai.google.dev/gemini-api/docs/models), [compatibility endpoint](https://ai.google.dev/gemini-api/docs/openai). |
 | xAI | `grok-4.7` | `Alloy.Provider.XAI` wraps the Responses adapter. The model returns encrypted reasoning even without an explicit include request; preserve those items. Its documented window is 500,000 tokens. [Models](https://docs.x.ai/developers/models). |
 | Other compatible endpoints | Your endpoint's supported model ID | `Alloy.Provider.OpenAICompat` implements Chat Completions. Compatibility is specific to the endpoint; tool calling, reasoning fields, and usage extensions are not universal. |
-| Codex CLI | A model available to your installed CLI and login | `Alloy.Provider.Codex` delegates a structured completion to `codex exec`. It replays final text for streaming and currently reports zero usage. The CLI supports JSONL usage events; this adapter does not yet consume them. [Noninteractive mode](https://developers.openai.com/codex/noninteractive). |
+| Codex CLI | A model available to your installed CLI and login | `Alloy.Provider.Codex` delegates a structured completion to `codex exec --json` (CLI 0.122.0 or later) against your `CODEX_HOME`, or `:codex_home`. It replays final text for streaming and reports usage from the CLI's `turn.completed` events. Use a dedicated home for agents so they don't share a refresh token with interactive Codex. [Noninteractive mode](https://developers.openai.com/codex/noninteractive). |
 
-For example, OpenAI documents a 1,050,000-token context window for Sol:
+Budget with the most **input** a model accepts, not its advertised window:
+OpenAI's 1,050,000-token windows include output, and the API rejects input
+above 922,000 tokens, so the built-in catalog lists 922,000 for those
+models. An override that is too large is the dangerous mistake — compaction
+then fires only after the API has started rejecting requests. For a model
+the catalog doesn't know yet:
 
 ```elixir
 Alloy.run("Summarize this repository",
   provider: {Alloy.Provider.OpenAI,
     api_key: System.fetch_env!("OPENAI_API_KEY"),
-    model: "gpt-6.1-sol"},
-  model_metadata_overrides: %{"gpt-6.1-sol" => 1_050_000}
+    model: "gpt-6.2-example"},
+  model_metadata_overrides: %{"gpt-6.2-example" => 922_000}
 )
 ```
 
@@ -77,14 +82,19 @@ all MCP features, and is not eligible for zero data retention. See the
 
 ## Usage and releases
 
-`max_budget_cents` checks accumulated provider-reported monetary estimates.
-The built-in HTTP providers report token counts but do not currently attach
-`estimated_cost_cents`; their estimate stays zero. The built-in Codex provider
-also reports zero token counts. This option therefore does not enforce an
-expense cap with the built-in providers. A custom provider can supply cost
-estimates; application billing controls must account for cache tiers, long
-contexts, and server-tool fees. `Alloy.Usage.estimate_cost/3` is a helper, not
-automatic price discovery or billing enforcement.
+Every built-in provider, including Codex, reports token counts with the same
+meaning: `input_tokens` is uncached input, cache reads and writes are in
+`cache_read_input_tokens` and `cache_creation_input_tokens`, and
+`output_tokens` includes reasoning or thinking tokens. Total prompt tokens
+are the sum of the three input fields.
+
+No built-in provider attaches a monetary cost. `max_budget_cents` is
+deprecated (removed in 0.13) because it only acts on provider-reported costs;
+enforce a budget with `:before_completion` middleware that prices
+`state.usage` (see "Budget limits" in the README). Application billing
+controls must still account for cache tiers, long-context surcharges and
+server-tool fees. `Alloy.Usage.estimate_cost/3` is a helper, not price
+discovery.
 
 Hex is the package release source. GitHub tags, GitHub Release entries,
 the landing site, and the main branch can differ. Unreleased main changes are

@@ -240,7 +240,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Alloy.Usage.estimate_cost/3` no longer rounds per-million rates to whole
   cents ($0.075/M priced as 8¢).
 - **A tool that calls `exit/1` or `throw/1` no longer kills the agent**, and
-  `:tool_timeout` now applies to sequential tools too.
+  `:tool_timeout` now applies to sequential tools too. Cancelling a turn
+  (`Alloy.Agent.Server.cancel_request/2`) still stops its in-flight tools: a
+  supervised watcher kills them when the turn is killed.
 - **Tools run in the order the model called them.** Sequential tools used to
   run before every concurrent one, so `[read f, edit f]` read the file after
   editing it. Consecutive concurrency-safe calls still run in parallel (at
@@ -263,6 +265,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CODEX_HOME` and deleted it afterwards, discarding refreshed tokens; since
   Codex CLI 0.136.0 a reused refresh token forces a re-login. Keyring
   credentials and `:profile` (broken since CLI 0.134.0) now work too.
+- Codex: an explicit `timeout_ms: nil` no longer raises `Enum.EmptyError`, a
+  missing `:workdir` is reported by name instead of as "exit status 2", and
+  every Codex failure is an `%Alloy.Provider.Error{}` (malformed responses
+  were plain strings).
 - **Cancelled or timed-out Codex turns no longer leak** the `codex` process,
   its children or temp files: a supervised owner process monitors the caller
   and stops the whole process group.

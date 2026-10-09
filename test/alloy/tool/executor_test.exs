@@ -942,6 +942,42 @@ defmodule Alloy.Tool.ExecutorTest do
     end
   end
 
+  describe "execute_all — cancellation" do
+    # Server.cancel_request kills the turn outright; tool tasks are unlinked
+    # (so a crashing tool can't take the turn down) and must still stop.
+    test "killing the caller stops its in-flight tool tasks" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "slow",
+          description: "Reports its pid, then blocks",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, _ctx ->
+            send(test_pid, {:tool_pid, self()})
+            Process.sleep(10_000)
+            {:ok, "too late"}
+          end
+        )
+
+      state = build_state([tool])
+      calls = [%{id: "c1", name: "slow", input: %{}}, %{id: "c2", name: "slow", input: %{}}]
+
+      caller =
+        spawn(fn ->
+          Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
+        end)
+
+      assert_receive {:tool_pid, tool_a}, 1_000
+      assert_receive {:tool_pid, tool_b}, 1_000
+      refs = Enum.map([tool_a, tool_b], &Process.monitor/1)
+
+      Process.exit(caller, :kill)
+
+      for ref <- refs, do: assert_receive({:DOWN, ^ref, :process, _, _}, 2_000)
+    end
+  end
+
   describe "execute_all — execution order" do
     test "a sequential call runs after the concurrent calls the model made before it" do
       # e.g. [read f, edit f] must read the file before editing it

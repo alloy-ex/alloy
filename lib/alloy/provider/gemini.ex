@@ -348,8 +348,7 @@ defmodule Alloy.Provider.Gemini do
   defp in_band_error(%{"code" => status} = error) when is_integer(status) and status >= 400,
     do: Error.from_response(status, [], %{"error" => error})
 
-  defp in_band_error(error),
-    do: %{Error.from_response(200, [], %{"error" => error}) | status: nil}
+  defp in_band_error(error), do: Error.from_body(%{"error" => error})
 
   defp respond(_blocks, %{"finishReason" => reason} = candidate, _resp)
        when reason in @generation_errors,
@@ -373,8 +372,8 @@ defmodule Alloy.Provider.Gemini do
   end
 
   # The API returns no candidates only when the prompt itself was blocked.
-  defp prompt_blocked(%{"promptFeedback" => %{"blockReason" => reason} = feedback} = resp) do
-    stop_details = maybe_put(%{block_reason: reason}, :safety_ratings, feedback["safetyRatings"])
+  defp prompt_blocked(%{"promptFeedback" => %{"blockReason" => _} = feedback} = resp) do
+    stop_details = Map.take(feedback, ["blockReason", "safetyRatings"])
 
     {:ok,
      %{
@@ -436,11 +435,9 @@ defmodule Alloy.Provider.Gemini do
     |> maybe_put(:stop_details, refusal_details(candidate))
   end
 
-  defp refusal_details(%{"finishReason" => reason} = candidate) when reason in @refusal_reasons do
-    %{finish_reason: reason}
-    |> maybe_put(:finish_message, candidate["finishMessage"])
-    |> maybe_put(:safety_ratings, candidate["safetyRatings"])
-  end
+  # Like every provider, the API's own fields with its own (string) keys.
+  defp refusal_details(%{"finishReason" => reason} = candidate) when reason in @refusal_reasons,
+    do: Map.take(candidate, ["finishReason", "finishMessage", "safetyRatings"])
 
   defp refusal_details(_candidate), do: nil
 
@@ -464,7 +461,7 @@ defmodule Alloy.Provider.Gemini do
 
     %{
       input_tokens:
-        Map.get(usage, "promptTokenCount", 0) - cached +
+        max(Map.get(usage, "promptTokenCount", 0) - cached, 0) +
           Map.get(usage, "toolUsePromptTokenCount", 0),
       output_tokens:
         Map.get(usage, "candidatesTokenCount", 0) + Map.get(usage, "thoughtsTokenCount", 0),

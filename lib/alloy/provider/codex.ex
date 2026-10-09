@@ -59,7 +59,7 @@ defmodule Alloy.Provider.Codex do
   with the same message text as before: `:timeout` (which the loop retries
   within the turn deadline), `:context_overflow` (the loop compacts and
   retries), or `:unknown`, which covers a missing executable and other
-  failed runs. A malformed Codex response is still a string error.
+  failed runs, including a malformed Codex response.
 
   ## Notes
 
@@ -160,7 +160,15 @@ defmodule Alloy.Provider.Codex do
          {:ok, payload} <- decode_payload(command_result, config) do
       parse_payload(payload, config, command_result)
     end
+    |> to_provider_error()
   end
+
+  # Every built-in provider fails with %Alloy.Provider.Error{}; the response
+  # parsing steps above still describe their failures as strings.
+  defp to_provider_error({:error, message}) when is_binary(message),
+    do: {:error, %Error{message: message}}
+
+  defp to_provider_error(result), do: result
 
   @impl true
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
@@ -202,20 +210,32 @@ defmodule Alloy.Provider.Codex do
   # is stopped and its files removed even when the caller is killed (the
   # loop kills a cancelled turn, and `after` blocks do not run on a kill).
   defp execute(prompt, codex_home, config) do
-    caller = self()
-    timeout = effective_timeout(config)
+    with :ok <- check_workdir(config) do
+      caller = self()
+      timeout = effective_timeout(config)
 
-    task =
-      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-        own_run(caller, prompt, codex_home, config, timeout)
-      end)
+      task =
+        Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
+          own_run(caller, prompt, codex_home, config, timeout)
+        end)
 
-    case Task.yield(task, timeout + @reply_grace_ms) || Task.shutdown(task) do
-      {:ok, result} -> result
-      {:exit, reason} -> {:error, %Error{message: "codex exec failed: #{inspect(reason)}"}}
-      nil -> {:error, timed_out(timeout)}
+      case Task.yield(task, timeout + @reply_grace_ms) || Task.shutdown(task) do
+        {:ok, result} -> result
+        {:exit, reason} -> {:error, %Error{message: "codex exec failed: #{inspect(reason)}"}}
+        nil -> {:error, timed_out(timeout)}
+      end
     end
   end
+
+  # The port reports a missing directory only as "exit status 2" with the
+  # reason on stderr, so check it up front for a clear error.
+  defp check_workdir(%{workdir: workdir}) when is_binary(workdir) do
+    if File.dir?(workdir),
+      do: :ok,
+      else: {:error, %Error{message: "Codex :workdir #{workdir} is not a directory"}}
+  end
+
+  defp check_workdir(_config), do: :ok
 
   defp own_run(caller, prompt, codex_home, config, timeout) do
     # Trapping exits lets a supervisor shutdown stop codex too.
@@ -230,7 +250,7 @@ defmodule Alloy.Provider.Codex do
 
           run = %{
             port: port,
-            os_pid: os_pid(port),
+            os_pid: OSProcess.os_pid(port),
             caller_ref: caller_ref,
             deadline: deadline,
             timeout: timeout
@@ -284,7 +304,7 @@ defmodule Alloy.Provider.Codex do
 
   defp effective_timeout(config) do
     [
-      Map.get(config, :timeout_ms, @default_timeout_ms),
+      Map.get(config, :timeout_ms) || @default_timeout_ms,
       Map.get(config, :receive_timeout),
       config |> Map.get(:req_options, []) |> Keyword.get(:receive_timeout)
     ]
@@ -317,16 +337,6 @@ defmodule Alloy.Provider.Codex do
       {:spawn_executable, "/bin/sh"},
       [{:args, launch_args}, {:cd, paths.workdir}, :binary, :exit_status, :use_stdio]
     )
-  end
-
-  # Port.info/2 returns nil when the process already exited — its output
-  # and exit_status messages are still in the mailbox, so collect them;
-  # there is just no OS pid left to kill.
-  defp os_pid(port) do
-    case Port.info(port, :os_pid) do
-      {:os_pid, os_pid} -> os_pid
-      nil -> nil
-    end
   end
 
   # The deadline is absolute: checking it before each receive keeps a

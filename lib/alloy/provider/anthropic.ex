@@ -286,7 +286,7 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   # Retry retries a retryable error only when no output was streamed yet.
-  defp handle_sse_event(acc, "error", event), do: %{acc | error: in_band_error(event)}
+  defp handle_sse_event(acc, "error", event), do: %{acc | error: Error.from_body(event)}
 
   defp handle_sse_event(acc, _event_type, _data), do: acc
 
@@ -648,13 +648,11 @@ defmodule Alloy.Provider.Anthropic do
 
   defp parse_response(%{"type" => "message"} = resp), do: message_response(resp)
 
-  defp parse_response(%{"type" => "error"} = resp), do: {:error, in_band_error(resp)}
+  defp parse_response(%{"type" => "error"} = resp), do: {:error, Error.from_body(resp)}
 
   # The HTTP status was already 200 when the failure arrived in the body or
   # the stream, so it is classified by its error type: overloaded_error
   # becomes :overloaded, which Retry retries like an HTTP 529.
-  defp in_band_error(body), do: Error.from_response(200, [], body)
-
   # Shared by complete/3 and stream/4: `resp` is a Messages API message, or
   # the equivalent assembled from stream events.
   defp message_response(resp) do

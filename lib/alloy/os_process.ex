@@ -6,6 +6,19 @@ defmodule Alloy.OSProcess do
   # reaches the program and everything it started, background jobs included.
 
   @doc """
+  The OS pid of a port's program, or `nil` when it already exited — its
+  output and exit-status messages are still in the mailbox, so callers
+  collect them as usual; there is just no process left to signal.
+  """
+  @spec os_pid(port()) :: non_neg_integer() | nil
+  def os_pid(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} when is_integer(os_pid) -> os_pid
+      nil -> nil
+    end
+  end
+
+  @doc """
   Sends `signal` to the process group led by `os_pid`. A group that has
   already exited is not an error.
   """

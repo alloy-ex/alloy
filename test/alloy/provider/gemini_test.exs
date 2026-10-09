@@ -475,9 +475,9 @@ defmodule Alloy.Provider.GeminiTest do
           assert {:ok, %{stop_reason: :refusal, response_metadata: metadata}} = result
 
           assert metadata.stop_details == %{
-                   finish_reason: reason,
-                   finish_message: "Blocked.",
-                   safety_ratings: [rating]
+                   "finishReason" => reason,
+                   "finishMessage" => "Blocked.",
+                   "safetyRatings" => [rating]
                  }
         end
       end
@@ -496,8 +496,8 @@ defmodule Alloy.Provider.GeminiTest do
         assert usage.input_tokens == 12
 
         assert refusal.response_metadata.stop_details == %{
-                 block_reason: "PROHIBITED_CONTENT",
-                 safety_ratings: [rating]
+                 "blockReason" => "PROHIBITED_CONTENT",
+                 "safetyRatings" => [rating]
                }
       end
     end

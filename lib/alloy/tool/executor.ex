@@ -78,7 +78,8 @@ defmodule Alloy.Tool.Executor do
 
   # Every tool runs in an unlinked, supervised task: a tool that raises,
   # exits or throws, or overruns :tool_timeout, becomes an error result
-  # instead of taking down the agent process that called the executor.
+  # instead of taking down the agent process that called the executor. If
+  # that process is killed (a cancelled turn), the tasks are killed too.
   #
   # tool_start is emitted here, before the task exists, and tool_end after
   # it finishes, so the pair matches even when the task is killed on
@@ -87,21 +88,73 @@ defmodule Alloy.Tool.Executor do
   # duration includes its wait.
   defp run_batch(batch, run) do
     started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
+    watcher = watch_caller(self(), length(started))
 
-    Alloy.TaskSupervisor
-    |> Task.Supervisor.async_stream_nolink(started, &{&1, invoke(&1.tag, run)},
-      timeout: run.timeout,
-      on_timeout: :kill_task,
-      max_concurrency: min(length(batch), System.schedulers_online()),
-      ordered: false,
-      zip_input_on_exit: true
-    )
-    |> Enum.map(fn
-      {:ok, {started, outcome}} -> finish(started, outcome, run)
-      {:exit, {started, reason}} -> finish(started, exit_outcome(started.call, reason, run), run)
-    end)
+    results =
+      Alloy.TaskSupervisor
+      |> Task.Supervisor.async_stream_nolink(started, &{&1, invoke_watched(&1.tag, run, watcher)},
+        timeout: run.timeout,
+        on_timeout: :kill_task,
+        max_concurrency: min(length(batch), System.schedulers_online()),
+        ordered: false,
+        zip_input_on_exit: true
+      )
+      |> Enum.map(fn
+        {:ok, {started, outcome}} ->
+          finish(started, outcome, run)
+
+        {:exit, {started, reason}} ->
+          finish(started, exit_outcome(started.call, reason, run), run)
+      end)
+
+    send(watcher, :done)
+
+    results
     |> Enum.sort_by(fn {index, _pair} -> index end)
     |> Enum.map(fn {_index, pair} -> pair end)
+  end
+
+  # The tasks are unlinked, so a cancelled turn — killed outright, with no
+  # chance to clean up — would leave its tools running. This supervised
+  # watcher kills them when the caller dies. Each task registers itself as
+  # it starts; after the caller dies the watcher still waits briefly for
+  # tasks that started but had not registered yet.
+  defp watch_caller(caller, expected) do
+    {:ok, watcher} =
+      Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
+        ref = Process.monitor(caller)
+        watch(ref, [], expected)
+      end)
+
+    watcher
+  end
+
+  defp watch(ref, pids, expected) do
+    receive do
+      {:watch, pid} -> watch(ref, [pid | pids], expected)
+      :done -> Process.demonitor(ref, [:flush])
+      {:DOWN, ^ref, :process, _pid, _reason} -> kill_watched(pids, expected - length(pids))
+    end
+  end
+
+  defp kill_watched(pids, unregistered) do
+    Enum.each(pids, &Process.exit(&1, :kill))
+    kill_late_registrations(unregistered)
+  end
+
+  defp kill_late_registrations(0), do: :ok
+
+  defp kill_late_registrations(unregistered) do
+    receive do
+      {:watch, pid} -> kill_watched([pid], unregistered - 1)
+    after
+      1_000 -> :ok
+    end
+  end
+
+  defp invoke_watched(tag, run, watcher) do
+    send(watcher, {:watch, self()})
+    invoke(tag, run)
   end
 
   defp tag_tool_calls(state, calls) do

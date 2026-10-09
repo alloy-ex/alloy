@@ -140,7 +140,7 @@ defmodule Alloy.Provider.CodexTest do
       }
 
       assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
-      assert reason =~ "tool_calls"
+      assert Exception.message(reason) =~ "tool_calls"
     end
 
     test "returns a helpful error when arguments_json is not valid JSON" do
@@ -162,7 +162,7 @@ defmodule Alloy.Provider.CodexTest do
       }
 
       assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
-      assert reason =~ "arguments_json"
+      assert Exception.message(reason) =~ "arguments_json"
     end
 
     test "accepts a parsed payload even if codex exits non-zero" do
@@ -313,6 +313,34 @@ defmodule Alloy.Provider.CodexTest do
 
       assert elapsed < 5_000,
              "expected receive_timeout to cap the port timeout, took #{elapsed}ms"
+    end
+
+    @tag :tmp_dir
+    test "a missing :workdir is a clear error result", %{tmp_dir: dir} do
+      config = %{
+        model: "gpt-5.4",
+        codex_bin: exiting_codex!(dir),
+        codex_home: dir,
+        workdir: Path.join(dir, "does-not-exist")
+      }
+
+      assert {:error, %Alloy.Provider.Error{message: message}} =
+               Codex.complete([Message.user("Hi")], [], config)
+
+      assert message =~ "does-not-exist"
+    end
+
+    @tag :tmp_dir
+    test "an explicit nil :timeout_ms falls back to the default", %{tmp_dir: dir} do
+      config = %{
+        model: "gpt-5.4",
+        codex_bin: exiting_codex!(dir),
+        codex_home: dir,
+        timeout_ms: nil
+      }
+
+      # Without the fallback this raised Enum.EmptyError in the caller.
+      assert {:error, %Alloy.Provider.Error{}} = Codex.complete([Message.user("Hi")], [], config)
     end
 
     # Alloy.Provider.Retry injects the turn deadline into :req_options (the
@@ -467,7 +495,7 @@ defmodule Alloy.Provider.CodexTest do
       }
 
       assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
-      assert reason =~ ":codex_home"
+      assert Exception.message(reason) =~ ":codex_home"
     end
   end
 
@@ -766,6 +794,13 @@ defmodule Alloy.Provider.CodexTest do
   end
 
   # Drains stdin so the shell redirect completes, then hangs.
+  defp exiting_codex!(dir) do
+    path = Path.join(dir, "exiting-codex.sh")
+    File.write!(path, "#!/bin/sh\nexit 0\n")
+    File.chmod!(path, 0o755)
+    path
+  end
+
   defp slow_codex!(dir), do: script!(dir, "cat > /dev/null\nsleep 30\n")
 
   # A codex that starts a child process, records both OS pids, and hangs.

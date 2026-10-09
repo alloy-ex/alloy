@@ -303,43 +303,20 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
+  # Memory calls go to the store before the other tools run (memory becomes
+  # an ordinary tool in 0.13); answer_tool_calls/3 puts every result back in
+  # call order.
   defp execute_tools(%State{} = state, tool_calls, opts) do
     {memory_calls, regular_calls} = split_memory_calls(tool_calls, state.config.memory)
-    on_event = fn raw_event -> Events.emit(opts, state.turn, raw_event) end
-    event_seq_ref = Keyword.get(opts, :event_seq_ref)
-    event_correlation_id = Keyword.get(opts, :event_correlation_id)
-    event_turn = state.turn
+    memory_results = dispatch_memory(memory_calls, state.config.memory)
 
-    memory_results =
-      case memory_calls do
-        [] -> []
-        calls -> MemoryRouter.dispatch_all(calls, state.config.memory)
-      end
-
-    regular_result =
-      case regular_calls do
-        [] ->
-          {:ok, nil, []}
-
-        calls ->
-          Executor.execute_all(
-            calls,
-            state.tool_fns,
-            state,
-            on_event: on_event,
-            event_seq_ref: event_seq_ref,
-            event_correlation_id: event_correlation_id,
-            event_turn: event_turn
-          )
-      end
-
-    case regular_result do
+    case run_executor(regular_calls, state, opts) do
       {:halted, reason} ->
         {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, memory_results)}
 
-      {:ok, regular_msg, tool_call_meta} ->
+      {:ok, result_blocks, tool_call_meta} ->
         state
-        |> answer_tool_calls(tool_calls, memory_results ++ result_blocks(regular_msg))
+        |> answer_tool_calls(tool_calls, memory_results ++ result_blocks)
         |> State.append_tool_calls(tool_call_meta)
         |> then(&run_middleware(:after_tool_execution, &1))
     end
@@ -352,8 +329,22 @@ defmodule Alloy.Agent.Turn do
   defp split_memory_calls(tool_calls, _memory),
     do: Enum.split_with(tool_calls, &MemoryRouter.memory_call?/1)
 
-  defp result_blocks(%Message{content: blocks}) when is_list(blocks), do: blocks
-  defp result_blocks(nil), do: []
+  defp dispatch_memory([], _memory), do: []
+  defp dispatch_memory(calls, memory), do: MemoryRouter.dispatch_all(calls, memory)
+
+  defp run_executor([], _state, _opts), do: {:ok, [], []}
+
+  defp run_executor(calls, state, opts) do
+    executor_opts =
+      opts
+      |> Keyword.take([:event_seq_ref, :event_correlation_id])
+      |> Keyword.merge(on_event: &Events.emit(opts, state.turn, &1), event_turn: state.turn)
+
+    case Executor.execute_all(calls, state.tool_fns, state, executor_opts) do
+      {:ok, %Message{content: blocks}, tool_call_meta} -> {:ok, blocks, tool_call_meta}
+      {:halted, _reason} = halted -> halted
+    end
+  end
 
   # Appends one tool_result per call, in call order, whichever path produced
   # it. A call without a result (the loop halted before it ran) is answered
