@@ -8,22 +8,53 @@ defmodule Alloy.Tool.Core.Bash do
   a marker giving the number of bytes left out, so the result fits in
   `max_result_chars/0` and memory stays bounded however much a command
   prints. Commands that exceed the timeout are killed, together with every
-  process they started, and return an error. The model's `timeout` is
-  capped at 10 minutes, or at `:bash_max_timeout` (milliseconds) from the
-  agent's `:context`.
+  process they started, and return an error.
+
+  ## Context options
+
+  Set these in the agent's `:context` map:
+
+  - `:bash_env` - the command's environment. By default the BEAM's
+    environment is inherited *minus* every variable whose name contains
+    `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or `CREDENTIAL` (case-insensitive),
+    so the model cannot `printenv ANTHROPIC_API_KEY`. A map such as
+    `%{"GITHUB_TOKEN" => token, "DATABASE_URL" => nil}` is applied on top
+    of that: a string sets a variable (even a secret-looking one), `nil`
+    removes it. `:inherit` passes the whole environment unchanged (the
+    behaviour before 0.12.5).
+  - `:bash_restricted` - run `bash -r` (default `true`). See Security.
+  - `:bash_max_timeout` - ceiling in milliseconds for the `timeout` the
+    model asks for (default 10 minutes). The agent's `:tool_timeout`
+    still applies on top of it.
+  - `:bash_executor` - an `t:executor/0` that runs the command instead of
+    the local shell, for a container, VM or remote runner. The options
+    above, except the timeout, do not apply to it.
+  - `:working_directory` - where the command runs (set by the agent).
 
   ## Security
 
-  By default, commands run in restricted bash (`bash -r`), which prevents:
-  - Changing directories with `cd`
-  - Setting or unsetting `SHELL`, `ENV`, `BASH_ENV`, or `PATH`
-  - Specifying commands containing `/`
-  - Redirecting output with `>`, `>>`, etc.
+  This tool runs arbitrary commands as the operating-system user of the
+  BEAM. It is not a sandbox; treat the model's shell access like a
+  contractor's laptop on your network.
 
-  Set `:bash_restricted` to `false` in the agent's `:context` map to
-  disable restricted mode.
+  - Restricted mode stops the top-level shell from using `cd`, changing
+    `PATH`, `SHELL`, `ENV` or `BASH_ENV`, running a command whose name
+    contains `/`, and redirecting output. It does not apply to programs
+    the shell runs, so `bash -c 'cd / && ...'`, `python3 -c`, `env`,
+    `find -exec` and any other interpreter on `PATH` bypass it. It guards
+    against accidents, not against a model or a prompt injection that
+    tries to escape.
+  - `:allowed_paths` limits the read, write and edit tools only; this tool
+    ignores it.
+  - The secret filter is a name heuristic: a credential stored under
+    another name (a `DATABASE_URL` with an embedded password, say) is
+    still inherited. Pass an explicit `:bash_env` for anything sensitive.
+  - Timeouts kill the command's process group. A command that starts a
+    new session (`setsid`, a double-forking daemon) leaves that group and
+    survives.
 
-  Configure `:allowed_paths` in context to restrict file tool access.
+  For isolation, supply a `:bash_executor` that runs commands in a
+  container or VM.
 
   ## Usage
 
@@ -87,15 +118,21 @@ defmodule Alloy.Tool.Core.Bash do
     working_dir = Map.get(context, :working_directory)
 
     case Map.get(context, :bash_executor) do
-      nil -> run_host(command, working_dir, timeout, Map.get(context, :bash_restricted, true))
+      nil -> run_host(command, working_dir, timeout, context)
       executor -> run_custom_executor(executor, command, working_dir, timeout)
     end
   end
 
-  defp run_host(command, working_dir, timeout, restricted?) do
+  defp run_host(command, working_dir, timeout, context) do
     with {:ok, bash} <- find_bash(),
          :ok <- check_dir(working_dir) do
-      args = [if(restricted?, do: "-rc", else: "-c"), command]
+      flag = if Map.get(context, :bash_restricted, true), do: "-rc", else: "-c"
+      env = port_env(Map.get(context, :bash_env, %{}))
+
+      opts =
+        [:binary, :exit_status, :stderr_to_stdout, :hide, args: [flag, command], env: env]
+        |> maybe_add_cd(working_dir)
+
       caller = self()
 
       # The port lives in its own process so the shell is killed even when
@@ -103,7 +140,7 @@ defmodule Alloy.Tool.Core.Bash do
       # :tool_timeout, and closing a port does not stop the shell.
       task =
         Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-          run_port(bash, args, working_dir, timeout, caller)
+          run_port(bash, opts, timeout, caller)
         end)
 
       case Task.yield(task, timeout + @kill_grace_ms) || Task.shutdown(task, :brutal_kill) do
@@ -136,12 +173,35 @@ defmodule Alloy.Tool.Core.Bash do
       "entered an infinite loop, or is waiting for input. Try a non-blocking approach."
   end
 
-  defp run_port(bash, args, working_dir, timeout, caller) do
+  # Alloy usually runs inside a server whose environment holds its own
+  # provider keys and database credentials; the model should not be able
+  # to `printenv` them. Names are matched case-insensitively.
+  @secret_name_parts ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
+
+  defp port_env(:inherit), do: []
+
+  defp port_env(overrides) when is_map(overrides) do
+    overrides = Map.new(overrides, fn {name, value} -> {to_string(name), value} end)
+
+    scrubbed =
+      for {name, _value} <- System.get_env(),
+          secret_name?(name),
+          not Map.has_key?(overrides, name),
+          do: {name, nil}
+
+    Enum.map(scrubbed ++ Map.to_list(overrides), fn
+      {name, nil} -> {String.to_charlist(name), false}
+      {name, value} -> {String.to_charlist(name), String.to_charlist(value)}
+    end)
+  end
+
+  defp secret_name?(name) do
+    name = String.upcase(name)
+    Enum.any?(@secret_name_parts, &String.contains?(name, &1))
+  end
+
+  defp run_port(bash, opts, timeout, caller) do
     caller_ref = Process.monitor(caller)
-
-    opts =
-      maybe_add_cd([:binary, :exit_status, :stderr_to_stdout, :hide, args: args], working_dir)
-
     port = Port.open({:spawn_executable, bash}, opts)
 
     run = %{

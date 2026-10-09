@@ -176,6 +176,45 @@ defmodule Alloy.Tool.Core.BashTest do
     end
   end
 
+  describe "environment" do
+    setup do
+      # Unique names: the OS environment is global and tests run async.
+      suffix = System.unique_integer([:positive])
+      secret = "ALLOY_TEST_#{suffix}_API_KEY"
+      token = "alloy_test_#{suffix}_token"
+      plain = "ALLOY_TEST_#{suffix}_PLAIN"
+      System.put_env(%{secret => "sk-secret", token => "tok-secret", plain => "visible"})
+      on_exit(fn -> Enum.each([secret, token, plain], &System.delete_env/1) end)
+
+      {:ok, secret: secret, token: token, plain: plain}
+    end
+
+    test "secret-looking variables are not inherited by default", vars do
+      out = printenv([vars.secret, vars.token, vars.plain], %{})
+
+      assert out =~ "#{vars.secret}=unset"
+      assert out =~ "#{vars.token}=unset"
+      assert out =~ "#{vars.plain}=visible"
+      refute out =~ "secret"
+    end
+
+    test ":bash_env sets or removes variables explicitly", vars do
+      context = %{bash_env: %{vars.secret => "granted", vars.plain => nil}}
+      out = printenv([vars.secret, vars.token, vars.plain], context)
+
+      assert out =~ "#{vars.secret}=granted"
+      assert out =~ "#{vars.token}=unset"
+      assert out =~ "#{vars.plain}=unset"
+    end
+
+    test "bash_env: :inherit passes the whole environment", vars do
+      out = printenv([vars.secret, vars.plain], %{bash_env: :inherit})
+
+      assert out =~ "#{vars.secret}=sk-secret"
+      assert out =~ "#{vars.plain}=visible"
+    end
+  end
+
   describe "output limits" do
     test "keeps the head and the tail, where errors appear", %{tmp_dir: tmp_dir} do
       assert {:ok, result} =
@@ -265,6 +304,12 @@ defmodule Alloy.Tool.Core.BashTest do
       assert result =~ "truncated"
       assert String.length(result) <= Bash.max_result_chars()
     end
+  end
+
+  defp printenv(names, context) do
+    command = Enum.map_join(names, "; ", &~s(echo "#{&1}=${#{&1}-unset}"))
+    {:ok, out} = Bash.execute(%{"command" => command}, context)
+    out
   end
 
   defp sample_peak(base, parent, peak \\ 0) do
