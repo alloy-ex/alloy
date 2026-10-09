@@ -59,7 +59,9 @@ defmodule Alloy.Middleware do
   A halted run keeps the changes earlier middleware made to the state in
   that hook (for example, compaction and the usage of its summary
   request). Return `{:halt, reason, state}` to halt with changes of your
-  own.
+  own. `:before_tool_call` is the exception: it decides about one tool
+  call and never changes the loop's state, so a halt there keeps the
+  state as it was before the hook.
   """
   @callback call(hook(), State.t()) :: call_result()
 

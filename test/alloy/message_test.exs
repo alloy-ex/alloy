@@ -155,7 +155,7 @@ defmodule Alloy.MessageTest do
       other_model = %{own | model: "another-claude"}
 
       messages = [Message.user("hi"), own, hand_built, other_model]
-      assert Message.normalize_for(messages, @anthropic) == messages
+      assert Message.normalize_for(messages, @anthropic, %{}) == messages
     end
 
     # OpenAI ties encrypted reasoning to the organisation that issued it.
@@ -190,7 +190,7 @@ defmodule Alloy.MessageTest do
         ])
 
       assert [%Message{content: content, provider: @anthropic}] =
-               Message.normalize_for([message], @openai)
+               Message.normalize_for([message], @openai, %{})
 
       assert content == [
                %{type: "text", text: "I should read the file"},
@@ -201,7 +201,7 @@ defmodule Alloy.MessageTest do
     test "drops OpenAI raw items and a message left empty" do
       message = from(@openai, [%{type: "reasoning", raw: %{"type" => "reasoning"}}])
 
-      assert Message.normalize_for([Message.user("hi"), message], @anthropic) == [
+      assert Message.normalize_for([Message.user("hi"), message], @anthropic, %{}) == [
                Message.user("hi")
              ]
     end
@@ -221,7 +221,8 @@ defmodule Alloy.MessageTest do
       assert [%Message{content: [new_call]}, %Message{content: [new_result]}, ^unrelated] =
                Message.normalize_for(
                  [from(Alloy.Provider.OpenAICompat, [call]), result, unrelated],
-                 @anthropic
+                 @anthropic,
+                 %{}
                )
 
       assert %{type: "tool_use", id: "functions_read_0_" <> hash, name: "read", input: %{}} =
@@ -237,12 +238,12 @@ defmodule Alloy.MessageTest do
             do: %{type: "tool_use", id: id, name: "read", input: %{}}
 
       message = from(@openai, calls)
-      [%Message{content: rewritten}] = Message.normalize_for([message], @anthropic)
+      [%Message{content: rewritten}] = Message.normalize_for([message], @anthropic, %{})
       ids = Enum.map(rewritten, & &1.id)
 
       assert Enum.all?(ids, &Regex.match?(~r/^[a-zA-Z0-9_-]{1,64}$/, &1))
       assert ids == Enum.uniq(ids)
-      assert [%Message{content: ^rewritten}] = Message.normalize_for([message], @anthropic)
+      assert [%Message{content: ^rewritten}] = Message.normalize_for([message], @anthropic, %{})
     end
   end
 end

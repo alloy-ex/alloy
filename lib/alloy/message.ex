@@ -237,7 +237,7 @@ defmodule Alloy.Message do
   providers; call it yourself only when you call a provider directly.
   """
   @spec normalize_for([t()], module(), map()) :: [t()]
-  def normalize_for(messages, provider, config \\ %{})
+  def normalize_for(messages, provider, config)
       when is_list(messages) and is_atom(provider) and is_map(config) do
     target = origin(provider, config)
     {messages, _renamed_ids} = Enum.flat_map_reduce(messages, %{}, &normalize(&1, &2, target))

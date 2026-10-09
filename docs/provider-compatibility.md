@@ -107,9 +107,10 @@ Known limits:
   earlier) requires the turn in progress to start with a thinking block,
   which a turn written by another provider lacks. Adaptive thinking, the
   only mode on current models, has no such rule.
-- **`OpenAICompat`** is one provider module for many vendors, so switching
-  vendors behind it counts as the same provider. Reasoning there is plain
-  text, which every vendor accepts.
+- **`OpenAICompat`** reaches each vendor at its own `:api_url`, so
+  switching vendors is a change of origin: earlier `reasoning_content` is
+  sent as plain text in the assistant message, and Gemini signatures from
+  Google's compatibility endpoint are dropped.
 
 The provider tests check serialization, stream parsing, and opaque state
 round-trips using fixtures. Those checks do not certify every current model

@@ -137,7 +137,8 @@ puts it first in `:middleware`, so compaction behaves as before by default.
 - A middleware halt keeps the changes earlier middleware made in the same
   hook, so a halt after compaction keeps the compacted history and the
   summary request's usage. Return `{:halt, reason, state}` to halt with
-  your own changes too.
+  your own changes too (except in `:before_tool_call`, which never changes
+  the loop's state).
 
 If your middleware matches hooks exhaustively, add a catch-all clause,
 `def call(_hook, state), do: state`, for `:on_context_overflow`.

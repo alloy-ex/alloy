@@ -86,6 +86,11 @@ defmodule Alloy.Agent.ConfigTest do
       end
     end
 
+    test "a custom provider may use an option name a built-in one removed" do
+      config = Config.from_opts(provider: {Alloy.Provider.Test, auth_path: "/etc/sa.json"})
+      assert config.provider_config.auth_path == "/etc/sa.json"
+    end
+
     test "agent-server options point at alloy_agent" do
       assert_raise ArgumentError, ~r/\[:pubsub, :max_pending\].*alloy_agent/s, fn ->
         Config.from_opts(

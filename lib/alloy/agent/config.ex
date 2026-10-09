@@ -34,16 +34,19 @@ defmodule Alloy.Agent.Config do
 
   @runtime_options [:pubsub, :subscribe, :max_pending, :on_shutdown]
 
-  # Provider options removed in 0.13, checked for the primary and every
-  # fallback provider at startup: a fallback is first used during an outage,
-  # which is the wrong moment to find a config error.
+  # Built-in provider options removed in 0.13, checked for the primary and
+  # every fallback provider at startup: a fallback is first used during an
+  # outage, which is the wrong moment to find a config error. Keyed by the
+  # provider that had the option, since a custom provider may use the name.
   @removed_provider_options %{
-    extended_thinking:
-      ":extended_thinking was removed in Alloy 0.13; configure thinking through " <>
-        ~s(:extra_body, for example %{"thinking" => %{"type" => "adaptive"}}),
-    auth_path:
-      ":auth_path was removed in Alloy 0.13; set :codex_home to the directory " <>
-        "holding auth.json"
+    Alloy.Provider.Anthropic =>
+      {:extended_thinking,
+       ":extended_thinking was removed in Alloy 0.13; configure thinking through " <>
+         ~s(:extra_body, for example %{"thinking" => %{"type" => "adaptive"}})},
+    Alloy.Provider.Codex =>
+      {:auth_path,
+       ":auth_path was removed in Alloy 0.13; set :codex_home to the directory " <>
+         "holding auth.json"}
   }
 
   # The summary prompts are optional because a bare `%Config{}` omits them;
@@ -139,7 +142,10 @@ defmodule Alloy.Agent.Config do
   def from_opts(opts) when is_list(opts) do
     validate_option_names!(opts)
     {provider_mod, provider_config} = parse_provider(opts[:provider])
-    provider_config = provider_config |> normalize_provider_config() |> reject_removed!()
+
+    provider_config =
+      provider_config |> normalize_provider_config() |> reject_removed!(provider_mod)
+
     model_metadata_overrides = normalize_model_metadata_overrides(opts[:model_metadata_overrides])
 
     model_catalog =
@@ -233,12 +239,10 @@ defmodule Alloy.Agent.Config do
     if Compactor in middleware, do: middleware, else: [Compactor | middleware]
   end
 
-  defp reject_removed!(provider_config) do
-    case Enum.find(@removed_provider_options, fn {key, _message} ->
-           Map.has_key?(provider_config, key)
-         end) do
-      nil -> provider_config
-      {_key, message} -> raise ArgumentError, message
+  defp reject_removed!(provider_config, provider) do
+    case Map.get(@removed_provider_options, provider) do
+      {key, message} when is_map_key(provider_config, key) -> raise ArgumentError, message
+      _none -> provider_config
     end
   end
 
@@ -255,7 +259,9 @@ defmodule Alloy.Agent.Config do
   @spec with_provider(t(), module() | {module(), keyword() | map()}) :: t()
   def with_provider(%__MODULE__{} = config, provider) do
     {provider_mod, provider_config} = parse_provider(provider)
-    provider_config = provider_config |> normalize_provider_config() |> reject_removed!()
+
+    provider_config =
+      provider_config |> normalize_provider_config() |> reject_removed!(provider_mod)
 
     max_tokens =
       if config.max_tokens_explicit? do
@@ -308,7 +314,7 @@ defmodule Alloy.Agent.Config do
   end
 
   defp parse_fallback_provider({module, provider_config}) when is_atom(module) do
-    {module, provider_config |> normalize_provider_config() |> reject_removed!()}
+    {module, provider_config |> normalize_provider_config() |> reject_removed!(module)}
   end
 
   defp parse_fallback_provider(module) when is_atom(module) do
