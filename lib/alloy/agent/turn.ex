@@ -52,11 +52,7 @@ defmodule Alloy.Agent.Turn do
     deadline =
       System.monotonic_time(:millisecond) + state.config.timeout_ms - @deadline_headroom_ms
 
-    run_span(state.config.provider_config[:model], fn ->
-      state
-      |> loop(opts, deadline)
-      |> State.materialize()
-    end)
+    run_span(state.config.provider_config[:model], fn -> loop(state, opts, deadline) end)
   end
 
   # :telemetry.span/3 accepts extra stop measurements only from telemetry 1.3,

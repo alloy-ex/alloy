@@ -20,9 +20,38 @@ defmodule Alloy.Agent.OTPLifecycleTest do
     end
   end
 
-  # ── O(1) Message Append ────────────────────────────────────────────────────
+  # ── Message Append ─────────────────────────────────────────────────────────
 
-  describe "append_messages/2 uses O(1) prepend internally" do
+  describe "append_messages/2" do
+    test "state.messages holds every appended message, so middleware can read it" do
+      config = %Config{provider: TestProvider, provider_config: %{}}
+
+      state =
+        config
+        |> State.init([Message.user("first")])
+        |> State.append_messages([Message.assistant("reply")])
+        |> State.append_messages(Message.user("second"))
+
+      assert Enum.map(state.messages, & &1.content) == ["first", "reply", "second"]
+      assert state.messages_new == []
+    end
+
+    test "folds messages left in the deprecated accumulator" do
+      config = %Config{provider: TestProvider, provider_config: %{}}
+
+      legacy = %{
+        State.init(config, [Message.user("first")])
+        | messages_new: [Message.user("third"), Message.assistant("second")]
+      }
+
+      state = State.append_messages(legacy, [Message.assistant("fourth")])
+
+      assert Enum.map(state.messages, & &1.content) == ["first", "second", "third", "fourth"]
+      assert State.messages(legacy) == Enum.take(state.messages, 3)
+    end
+  end
+
+  describe "append_messages/2 keeps chronological order" do
     test "messages are returned in chronological order from state" do
       config = %Config{
         provider: TestProvider,
