@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `result.metadata.run.provider_error`. The struct implements `String.Chars`,
   so interpolating it still works; code that applies `=~` or binary
   patterns to a provider's raw error should use `Exception.message/1`.
+- **Anthropic default `max_tokens` is 16,000** (was 4,096). Adaptive
+  thinking is on by default on Claude 5.x and counts toward `max_tokens`, so
+  the old default truncated answers. Set `:max_tokens` to keep a lower cap.
+- **Anthropic code execution uses `code_execution_20260521`** (required for
+  programmatic tool calling), and Alloy no longer adds beta headers for
+  features that went GA on 2026-02-17 (memory, tool search, input examples,
+  code execution). `context-management-2025-06-27` is still added when the
+  body uses context editing; user-supplied `anthropic-beta` values are merged
+  into one header.
 - **OpenAI context limits are the documented maximum input**, not the
   advertised window (which includes output): `gpt-5.4`/`gpt-5.5` and the
   GPT-6 family budget 922,000 tokens, `gpt-5`/`5.1`/`5.2` 272,000. Compaction
@@ -66,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Custom providers that only return `:tool_use`/`:end_turn` are unaffected.
   A provider returning an unknown stop reason now fails the run with a clear
   error instead of crashing the loop.
+- **Anthropic `:server_tools`** — raw server tool definitions (web search,
+  web fetch, `mcp_toolset`, tool search) appended after the generated tools,
+  so local and server tools can be combined. Previously the only route was
+  `extra_body["tools"]`, which replaces every generated tool.
+- **Anthropic programmatic tool calling works.** `allowed_callers` atoms are
+  translated to the API's values (`:code_execution` →
+  `"code_execution_20260120"`, `:human`/`:direct` → `"direct"`), the
+  `caller` field is kept on `tool_use` blocks, and the code-execution
+  container is reused across turns via `provider_state` (skipped once its
+  `expires_at` has passed, so a resumed session gets a fresh container).
 - **Model catalog: current models.** Claude Opus 4.7, Opus 5/5.5, Sonnet
   5/5.5, Haiku 5.5, Fable 5.1 and Mythos (1M); GPT-6 Astra/Sol/Luna, GPT-6.1
   Sol and GPT-5.6 Sol/Terra/Luna; Gemini 3.1 Flash-Lite, 3.5–3.8 Flash and
@@ -79,6 +98,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
+- Anthropic `:extended_thinking`. It sends manual thinking
+  (`type: "enabled"` with `budget_tokens`), which Claude 4.7 and later
+  reject. It keeps working for older models; for current ones pass
+  `extra_body: %{"thinking" => %{"type" => "adaptive"}}` (see the provider
+  docs for effort and `display`).
 - `Alloy.ModelMetadata.catalog/0`. The built-in catalog is now a short list of
   family patterns; the function keeps its entry shape (one entry per family,
   empty `:name`, full-id pattern as the suffix pattern) and will be removed
@@ -88,6 +112,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Anthropic:**
+  - every stop reason is mapped (`max_tokens`,
+    `model_context_window_exceeded`, `refusal` with its `stop_details`,
+    `pause_turn`) instead of collapsing to `:end_turn`;
+  - streamed usage is no longer double-counted (`message_delta` usage is
+    cumulative; the docs' example reported 13,361 input tokens instead of
+    10,682);
+  - mid-stream `error` events, streams that end without a stop reason and
+    error bodies on a 200 response are errors, not partial successes; an
+    overload before any output is retried;
+  - with `cache: true`, `cache_control` is never put on a `defer_loading`
+    tool (HTTP 400).
 - **Gemini:**
   - streamed text no longer gains a newline between chunks
     (`"Hello\n world"`); consecutive text and thought pieces are merged and

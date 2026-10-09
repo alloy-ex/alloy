@@ -82,8 +82,10 @@ defmodule Alloy.Provider.Anthropic do
   `"direct"`, and strings pass through unchanged. Such calls arrive as
   ordinary tool calls with a `:caller` field, which Alloy sends back with the
   history. The response's container id is kept in `provider_state` as
-  `:container_id` and sent as `"container"` on the next request, which the
-  API requires while a programmatic call is waiting for its result. See
+  `:container_id` (with `:container_expires_at`) and sent as `"container"` on
+  the next request, which the API requires while a programmatic call is
+  waiting for its result. An expired container is not sent, so a session that
+  resumes after the container was reclaimed gets a fresh one. See
   <https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling>.
 
   ## Example
@@ -411,10 +413,24 @@ defmodule Alloy.Provider.Anthropic do
 
   # Reusing the container keeps code execution state between turns, and the
   # API rejects a continuation of a pending programmatic tool call without it.
-  defp maybe_put_container(body, %{provider_state: %{container_id: id}}) when is_binary(id),
-    do: Map.put(body, "container", id)
+  # Idle containers are reclaimed after about 5 minutes, so an expired one is
+  # not sent: the API then starts a fresh container instead of the session
+  # failing on every later request.
+  defp maybe_put_container(body, %{provider_state: %{container_id: id} = state})
+       when is_binary(id) do
+    if container_live?(state), do: Map.put(body, "container", id), else: body
+  end
 
   defp maybe_put_container(body, _config), do: body
+
+  defp container_live?(%{container_expires_at: expires_at}) when is_binary(expires_at) do
+    case DateTime.from_iso8601(expires_at) do
+      {:ok, expires, _offset} -> DateTime.compare(DateTime.utc_now(), expires) == :lt
+      {:error, _reason} -> true
+    end
+  end
+
+  defp container_live?(_state), do: true
 
   defp build_headers(config, body) do
     {user_betas, other_headers} =
@@ -654,7 +670,9 @@ defmodule Alloy.Provider.Anthropic do
 
   # Turn feeds provider_state back in config, so the next request reuses
   # the container (see maybe_put_container/2).
-  defp provider_state(%{"container" => %{"id" => id}}) when is_binary(id), do: %{container_id: id}
+  defp provider_state(%{"container" => %{"id" => id} = container}) when is_binary(id),
+    do: maybe_put(%{container_id: id}, :container_expires_at, container["expires_at"])
+
   defp provider_state(_resp), do: nil
 
   # https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons

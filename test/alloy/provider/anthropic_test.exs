@@ -599,7 +599,11 @@ defmodule Alloy.Provider.AnthropicTest do
 
       assert {:ok, result} = Anthropic.complete([Message.user("Top customers?")], [], config)
       assert result.stop_reason == :tool_use
-      assert result.provider_state == %{container_id: "container_xyz789"}
+
+      assert result.provider_state == %{
+               container_id: "container_xyz789",
+               container_expires_at: "2099-01-01T00:00:00Z"
+             }
 
       assert [%{type: "tool_use", id: "toolu_def456", caller: @caller}] =
                Message.tool_calls(hd(result.messages))
@@ -629,7 +633,7 @@ defmodule Alloy.Provider.AnthropicTest do
           ant_event("message_delta", %{
             "delta" => %{
               "stop_reason" => "tool_use",
-              "container" => %{"id" => "container_xyz789", "expires_at" => "2026-10-09T10:00:00Z"}
+              "container" => %{"id" => "container_xyz789", "expires_at" => "2099-01-01T00:00:00Z"}
             },
             "usage" => %{"output_tokens" => 9}
           }),
@@ -639,7 +643,10 @@ defmodule Alloy.Provider.AnthropicTest do
       assert {:ok, result} =
                Anthropic.stream([Message.user("Top customers?")], [], config, fn _ -> :ok end)
 
-      assert result.provider_state == %{container_id: "container_xyz789"}
+      assert result.provider_state == %{
+               container_id: "container_xyz789",
+               container_expires_at: "2099-01-01T00:00:00Z"
+             }
 
       assert [%{id: "toolu_def456", input: %{"sql" => "<sql>"}, caller: @caller}] =
                Message.tool_calls(hd(result.messages))
@@ -650,6 +657,37 @@ defmodule Alloy.Provider.AnthropicTest do
 
       assert {:ok, result} = Anthropic.complete([Message.user("Hi")], [], config)
       refute Map.has_key?(result, :provider_state)
+    end
+
+    # Idle containers are reclaimed after about 5 minutes; a session that
+    # resumes later must start a fresh container rather than fail.
+    test "does not send a stored container whose expires_at has passed" do
+      expired = DateTime.utc_now() |> DateTime.add(-60) |> DateTime.to_iso8601()
+
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{
+          container_id: "container_old",
+          container_expires_at: expired
+        })
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "container")
+    end
+
+    test "sends a stored container that has not expired" do
+      live = DateTime.utc_now() |> DateTime.add(240) |> DateTime.to_iso8601()
+
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{container_id: "container_live", container_expires_at: live})
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      assert Jason.decode!(body)["container"] == "container_live"
     end
 
     test "sends the stored container and the tool_use caller on the next request" do
@@ -1876,7 +1914,7 @@ defmodule Alloy.Provider.AnthropicTest do
           "caller" => %{"type" => "code_execution_20260120", "tool_id" => "srvtoolu_abc123"}
         }
       ],
-      "container" => %{"id" => "container_xyz789", "expires_at" => "2026-10-09T10:00:00Z"},
+      "container" => %{"id" => "container_xyz789", "expires_at" => "2099-01-01T00:00:00Z"},
       "stop_reason" => "tool_use",
       "usage" => %{"input_tokens" => 10, "output_tokens" => 20}
     }

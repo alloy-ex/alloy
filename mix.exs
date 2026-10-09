@@ -23,7 +23,7 @@ defmodule Alloy.MixProject do
       ],
       test_coverage: [
         # Ratchet: raise as coverage improves, never lower it.
-        summary: [threshold: 86],
+        summary: [threshold: 87],
         ignore_modules: [~r/^Alloy\.Test\./, Alloy.StreamTestHelpers]
       ],
       aliases: aliases(),
