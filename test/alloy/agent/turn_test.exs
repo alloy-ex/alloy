@@ -2476,7 +2476,7 @@ defmodule Alloy.Agent.TurnTest do
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
-        tools: [EchoTool],
+        tools: [EchoTool, submit_tool({:ok, "Received"})],
         until_tool: "submit"
       }
 
@@ -2485,6 +2485,57 @@ defmodule Alloy.Agent.TurnTest do
 
       assert result.status == :completed
       assert result.turn == 3
+    end
+
+    test "a failed call to the target tool does not satisfy until_tool" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tc_1", name: "submit", input: %{"answer" => "?"}}
+          ]),
+          TestProvider.text_response("I tried."),
+          TestProvider.text_response("Still done.")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [submit_tool({:error, "answer must be a number"})],
+        until_tool: "submit",
+        max_turns: 3
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Answer please")]))
+
+      assert result.status == :max_turns
+      assert [%{name: "submit", error: "answer must be a number"}] = result.tool_calls
+
+      assert Enum.any?(result.messages, fn message ->
+               message.content == "Continue. You must call the submit tool before finishing."
+             end)
+    end
+
+    test "a call to an unregistered target tool does not satisfy until_tool" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "tc_1", name: "submit", input: %{"answer" => "42"}}
+          ]),
+          TestProvider.text_response("Done."),
+          TestProvider.text_response("Done again.")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool],
+        until_tool: "submit",
+        max_turns: 3
+      }
+
+      result = Turn.run_loop(State.init(config, [Message.user("Answer please")]))
+
+      assert result.status == :max_turns
     end
 
     test "completes immediately when target tool is called on first pass" do
@@ -2499,7 +2550,7 @@ defmodule Alloy.Agent.TurnTest do
       config = %Config{
         provider: TestProvider,
         provider_config: %{agent_pid: pid},
-        tools: [EchoTool],
+        tools: [EchoTool, submit_tool({:ok, "Received"})],
         until_tool: "submit"
       }
 
@@ -2550,6 +2601,15 @@ defmodule Alloy.Agent.TurnTest do
       assert result.status == :completed
       assert result.turn == 1
     end
+  end
+
+  defp submit_tool(result) do
+    Alloy.Tool.inline(
+      name: "submit",
+      description: "Submit the final answer",
+      input_schema: %{type: "object", properties: %{answer: %{type: "string"}}},
+      execute: fn _input, _context -> result end
+    )
   end
 
   @loop_events [
