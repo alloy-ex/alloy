@@ -132,4 +132,84 @@ defmodule Alloy.MessageTest do
       assert Message.thinking(msg) == nil
     end
   end
+
+  describe "normalize_for/2" do
+    @anthropic Alloy.Provider.Anthropic
+    @openai Alloy.Provider.OpenAI
+
+    defp from(provider, blocks),
+      do: %{Message.assistant_blocks(blocks) | provider: provider, model: "m"}
+
+    test "leaves the target provider's own, user-built and user messages alone" do
+      own = from(@anthropic, [%{type: "thinking", thinking: "t", signature: "sig"}])
+
+      hand_built =
+        Message.assistant_blocks([%{type: "thinking", thinking: "t", signature: "sig"}])
+
+      other_model = %{own | model: "another-claude"}
+
+      messages = [Message.user("hi"), own, hand_built, other_model]
+      assert Message.normalize_for(messages, @anthropic) == messages
+    end
+
+    test "turns another provider's thinking into text and drops what only it can read" do
+      message =
+        from(@anthropic, [
+          %{type: "thinking", thinking: "I should read the file", signature: "sig"},
+          %{type: "thinking", thinking: "   ", signature: "sig2"},
+          %{type: "redacted_thinking", data: "opaque"},
+          %{type: "server_tool_use", id: "srv_1", name: "web_search", input: %{}},
+          %{type: "web_search_tool_result", tool_use_id: "srv_1", content: []},
+          %{type: "text", text: "Reading it.", signature: "gemini-sig"}
+        ])
+
+      assert [%Message{content: content, provider: @anthropic}] =
+               Message.normalize_for([message], @openai)
+
+      assert content == [
+               %{type: "text", text: "I should read the file"},
+               %{type: "text", text: "Reading it."}
+             ]
+    end
+
+    test "drops OpenAI raw items and a message left empty" do
+      message = from(@openai, [%{type: "reasoning", raw: %{"type" => "reasoning"}}])
+
+      assert Message.normalize_for([Message.user("hi"), message], @anthropic) == [
+               Message.user("hi")
+             ]
+    end
+
+    test "strips call signatures and rewrites ids the target would reject, with their results" do
+      call = %{
+        type: "tool_use",
+        id: "functions.read:0",
+        name: "read",
+        input: %{},
+        thought_signature: "sig"
+      }
+
+      result = Message.tool_results([Message.tool_result_block("functions.read:0", "ok")])
+      unrelated = Message.tool_results([Message.tool_result_block("toolu_1", "ok")])
+
+      assert [%Message{content: [new_call]}, %Message{content: [new_result]}, ^unrelated] =
+               Message.normalize_for(
+                 [from(Alloy.Provider.OpenAICompat, [call]), result, unrelated],
+                 @anthropic
+               )
+
+      assert new_call == %{type: "tool_use", id: "functions_read_0", name: "read", input: %{}}
+      assert new_result.tool_use_id == "functions_read_0"
+    end
+
+    test "caps tool-call ids at 64 characters" do
+      long_id = String.duplicate("a", 100)
+      call = %{type: "tool_use", id: long_id, name: "read", input: %{}}
+
+      assert [%Message{content: [%{id: id}]}] =
+               Message.normalize_for([from(@openai, [call])], @anthropic)
+
+      assert id == String.duplicate("a", 64)
+    end
+  end
 end

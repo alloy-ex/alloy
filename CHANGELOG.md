@@ -63,6 +63,43 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
     after that forced compaction.
 - **Tool names must be unique.** Two tools with the same name raise at
   startup instead of reaching the API, which rejects them.
+- **Assistant messages record their provider and model**
+  (`message.provider`, `message.model`), so code comparing whole messages
+  with `==` sees two new fields. Messages you build yourself leave them
+  `nil`.
+
+### Fixed
+
+- **Compaction in the middle of a tool loop on Claude 5.x.** Compaction
+  kept the turn in progress's signed thinking, but that thinking was
+  produced after the history compaction had just rewritten. Claude Fable
+  5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 reject such thinking for accounts
+  created on or after 2026-08-31. Compaction now removes all thinking it
+  keeps, which those models (adaptive thinking only) accept. The
+  `thinking-binding-controls-2026-08-01` beta is not needed. To opt into
+  `prefix_mismatch_behavior: "drop_block"` yourself, pass it through
+  `:extra_body` and `:extra_headers`.
+- **Switching provider mid-conversation** (a fallback provider, or changing
+  model) no longer sends one provider's signed reasoning to another, which
+  failed with HTTP 400s such as `invalid_encrypted_content` or an invalid
+  thinking signature. Before every request the loop applies
+  `Alloy.Message.normalize_for/2`, following pi's rules:
+  - another provider's thinking becomes text;
+  - its redacted thinking, raw OpenAI/xAI items and server tool records
+    are dropped;
+  - signatures are removed;
+  - tool-call ids Anthropic would reject (Kimi's `functions.read:0`, for
+    one) are rewritten together with their results.
+
+  Switching models within one provider keeps everything, as Anthropic,
+  OpenAI and Gemini document.
+- **Gemini tool calls written by another provider** get Google's
+  documented placeholder thought signature
+  (`skip_thought_signature_validator`) on the first call of each step, so
+  Gemini 3 accepts a tool loop that started elsewhere.
+- **Anthropic thinking without a signature** (written by hand, or by a
+  reasoning model behind OpenAICompat) is sent as text instead of failing
+  the request; empty unsigned thinking is dropped.
 
 ### Added
 
@@ -72,6 +109,8 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
 - The `:on_context_overflow` middleware hook.
 - `Alloy.Agent.State.deadline`: the monotonic deadline for the run's
   provider requests, for middleware that makes its own.
+- `Alloy.Message.normalize_for/2`, for callers who call a provider
+  directly.
 
 ## [0.12.5] - 2026-10-09
 

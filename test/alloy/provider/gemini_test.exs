@@ -264,6 +264,34 @@ defmodule Alloy.Provider.GeminiTest do
       assert first_part["thoughtSignature"] == "sig_123"
       assert second_part["text"] == "Answer"
     end
+
+    test "a step's first unsigned function call gets Google's placeholder signature" do
+      config = config_that_captures_request()
+      call = fn id -> %{type: "tool_use", id: id, name: "read", input: %{}} end
+
+      messages = [
+        Message.user("Read both"),
+        Message.assistant_blocks([%{type: "text", text: "Reading."}, call.("a"), call.("b")]),
+        Message.tool_results([
+          Message.tool_result_block("a", "one"),
+          Message.tool_result_block("b", "two")
+        ]),
+        Message.assistant_blocks([Map.put(call.("c"), :signature, "sig_real")]),
+        Message.tool_results([Message.tool_result_block("c", "three")])
+      ]
+
+      Gemini.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      [_user, first_step, results, second_step, _results] = Jason.decode!(body)["contents"]
+
+      assert [%{"text" => "Reading."} = text, first_call, second_call] = first_step["parts"]
+      refute Map.has_key?(text, "thoughtSignature")
+      assert first_call["thoughtSignature"] == "skip_thought_signature_validator"
+      refute Map.has_key?(second_call, "thoughtSignature")
+      refute Enum.any?(results["parts"], &Map.has_key?(&1, "thoughtSignature"))
+      assert [%{"thoughtSignature" => "sig_real"}] = second_step["parts"]
+    end
   end
 
   describe "stream/4" do

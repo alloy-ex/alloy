@@ -9,6 +9,7 @@ defmodule Alloy.Provider.Retry do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Message
   alias Alloy.Provider.Error
 
   require Logger
@@ -175,8 +176,8 @@ defmodule Alloy.Provider.Retry do
     )
 
     case result do
-      {:ok, _} = success ->
-        {success, chunks_emitted?}
+      {:ok, response} ->
+        {{:ok, record_origin(response, provider, provider_config)}, chunks_emitted?}
 
       {:error, reason} when retries_left > 0 ->
         if retryable?(reason) and not chunks_emitted? do
@@ -214,6 +215,16 @@ defmodule Alloy.Provider.Retry do
     end
   end
 
+  # Provenance lets a later request to a different provider (a fallback, or
+  # a model switch) rewrite blocks only this provider can read.
+  defp record_origin(%{messages: messages} = response, provider, provider_config) do
+    model = Map.get(provider_config, :model)
+    stamp = fn %Message{} = message -> %{message | provider: provider, model: model} end
+    %{response | messages: Enum.map(messages, stamp)}
+  end
+
+  defp record_origin(response, _provider, _provider_config), do: response
+
   defp retry_after_ms(%Error{retry_after_ms: ms}) when is_integer(ms), do: ms
   defp retry_after_ms(_reason), do: 0
 
@@ -239,13 +250,13 @@ defmodule Alloy.Provider.Retry do
 
     provider_config = Map.put(provider_config, :on_event, wrapped_on_event)
 
-    messages = State.messages(state)
+    messages = Message.normalize_for(state.messages, provider)
     result = provider.stream(messages, state.tool_defs, provider_config, wrapped_chunk)
     {result, :atomics.get(ref, 1) == 1}
   end
 
   defp call_provider(provider, state, provider_config, false = _streaming?, _on_chunk) do
-    messages = State.messages(state)
+    messages = Message.normalize_for(state.messages, provider)
     {provider.complete(messages, state.tool_defs, provider_config), false}
   end
 

@@ -108,7 +108,20 @@ puts it first in `:middleware`, so compaction behaves as before by default.
 If your middleware matches hooks exhaustively, add a catch-all clause,
 `def call(_hook, state), do: state`, for `:on_context_overflow`.
 
-## 6. Smaller changes
+## 6. Messages record their provider
+
+Assistant messages produced by the loop now carry `provider` and `model`
+fields, and the loop uses them to rewrite one provider's reasoning before
+sending it to another (see `Alloy.Message.normalize_for/2`). Pattern
+matches are unaffected, but a test that compares whole messages with
+`==` against `Message.assistant("...")` needs to match the fields it
+cares about instead:
+
+```elixir
+assert [%Message{role: :assistant, content: "Hello"}] = result.messages
+```
+
+## 7. Smaller changes
 
 - `Alloy.Agent.State` has a `deadline` field: the monotonic time by which
   the run's provider requests must finish. Middleware that makes its own

@@ -21,6 +21,22 @@ defmodule Alloy.Message do
 
   Alloy Core does not read, transcode, or base64-encode media. It expects callers
   (e.g. Anvil connectors) to supply pre-encoded data or provider-specific URIs.
+
+  ### Reasoning and provider-specific blocks
+
+  Assistant messages can also hold blocks only their own provider can read
+  back: `"thinking"` with a `:signature` (Anthropic, Gemini), `"redacted_thinking"`,
+  `"reasoning"` and `"output_item"` (OpenAI and xAI raw items), `"server_tool_use"`
+  and server tool results (Anthropic), and `:signature` or
+  `:thought_signature` on text and tool-call blocks (Gemini).
+
+  ## Provenance
+
+  The loop records which provider and model wrote each assistant message in
+  `:provider` and `:model` (`nil` for messages you build yourself). When a
+  conversation moves to a different provider — a fallback provider, or a
+  model switch — `normalize_for/2` rewrites the other provider's messages
+  so the new one can read them; see its docs.
   """
 
   @type role :: :user | :assistant
@@ -28,11 +44,25 @@ defmodule Alloy.Message do
 
   @type t :: %__MODULE__{
           role: role(),
-          content: String.t() | [content_block()]
+          content: String.t() | [content_block()],
+          provider: module() | nil,
+          model: String.t() | nil
         }
 
   @enforce_keys [:role, :content]
-  defstruct [:role, :content]
+  defstruct [:role, :content, provider: nil, model: nil]
+
+  # Blocks every provider can read. Anything else in another provider's
+  # message is that provider's own (signed reasoning, raw items, server tool
+  # records) and cannot be sent to a different one.
+  @portable_blocks ["text", "tool_use", "image", "audio", "video", "document"]
+
+  # Signatures bind a block to the model that produced it.
+  @signature_keys [:signature, :thought_signature]
+
+  # Anthropic accepts tool-use ids matching ^[a-zA-Z0-9_-]+$; OpenAI accepts
+  # at most 64 characters. Kimi, for one, uses ids like "functions.read:0".
+  @max_tool_id_length 64
 
   @doc """
   Creates a user message with text content.
@@ -153,4 +183,89 @@ defmodule Alloy.Message do
   """
   @spec document(String.t(), String.t()) :: content_block()
   def document(mime_type, uri), do: %{type: "document", mime_type: mime_type, uri: uri}
+
+  @doc """
+  Prepares a conversation for `provider`.
+
+  Assistant messages written by a different provider (see "Provenance")
+  are rewritten so `provider` can read them, following the rules the
+  providers document:
+
+    * thinking becomes plain text (empty thinking is dropped), so the new
+      model keeps the earlier reasoning without a signature it can't verify
+    * other provider-specific blocks are dropped: redacted thinking,
+      OpenAI and xAI raw items, server tool records
+    * signatures are removed from text and tool-call blocks
+    * tool-call ids outside `[a-zA-Z0-9_-]{1,64}` are rewritten, along
+      with the tool results that answer them
+    * a message left with no content is dropped
+
+  Messages from `provider` itself, user-built messages (no `:provider`) and
+  user messages are unchanged. Switching models within one provider changes
+  nothing: Anthropic, OpenAI and Gemini each document that their APIs
+  handle another model's reasoning themselves.
+
+  The loop applies this before every provider request, including fallback
+  providers; call it yourself only when you call a provider directly.
+  """
+  @spec normalize_for([t()], module()) :: [t()]
+  def normalize_for(messages, provider) when is_list(messages) and is_atom(provider) do
+    {messages, _renamed_ids} = Enum.flat_map_reduce(messages, %{}, &normalize(&1, &2, provider))
+    messages
+  end
+
+  defp normalize(%__MODULE__{role: :assistant, provider: from} = message, ids, provider)
+       when from in [nil, provider],
+       do: {[message], ids}
+
+  defp normalize(%__MODULE__{role: :assistant, content: text} = message, ids, _provider)
+       when is_binary(text),
+       do: {[message], ids}
+
+  defp normalize(%__MODULE__{role: :assistant, content: blocks} = message, ids, _provider) do
+    case Enum.flat_map_reduce(blocks, ids, &foreign_block/2) do
+      {[], ids} -> {[], ids}
+      {blocks, ids} -> {[%{message | content: blocks}], ids}
+    end
+  end
+
+  defp normalize(%__MODULE__{role: :user, content: blocks} = message, ids, _provider)
+       when is_list(blocks) and map_size(ids) > 0,
+       do: {[%{message | content: Enum.map(blocks, &rename_result(&1, ids))}], ids}
+
+  defp normalize(message, ids, _provider), do: {[message], ids}
+
+  defp foreign_block(%{type: "thinking", thinking: thinking}, ids) when is_binary(thinking) do
+    case String.trim(thinking) do
+      "" -> {[], ids}
+      _text -> {[%{type: "text", text: thinking}], ids}
+    end
+  end
+
+  defp foreign_block(%{type: "tool_use", id: id} = block, ids) when is_binary(id) do
+    case portable_tool_id(id) do
+      ^id -> {[Map.drop(block, @signature_keys)], ids}
+      new_id -> {[%{Map.drop(block, @signature_keys) | id: new_id}], Map.put(ids, id, new_id)}
+    end
+  end
+
+  defp foreign_block(%{type: type} = block, ids) when type in @portable_blocks,
+    do: {[Map.drop(block, @signature_keys)], ids}
+
+  defp foreign_block(_block, ids), do: {[], ids}
+
+  defp rename_result(%{type: "tool_result", tool_use_id: id} = block, ids) do
+    case ids do
+      %{^id => new_id} -> %{block | tool_use_id: new_id}
+      _ids -> block
+    end
+  end
+
+  defp rename_result(block, _ids), do: block
+
+  defp portable_tool_id(id) do
+    id
+    |> String.replace(~r/[^a-zA-Z0-9_-]/, "_")
+    |> String.slice(0, @max_tool_id_length)
+  end
 end

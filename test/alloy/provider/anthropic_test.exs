@@ -1623,6 +1623,34 @@ defmodule Alloy.Provider.AnthropicTest do
       assert thinking_wire["thinking"] == "My reasoning..."
       assert thinking_wire["signature"] == "sig_xyz"
     end
+
+    # The API rejects thinking without a signature; this thinking was written
+    # by hand or by an OpenAI-compatible reasoning model.
+    test "unsigned thinking is sent as text, and empty unsigned thinking is dropped" do
+      config = config_that_captures_request()
+
+      messages = [
+        Message.user("Question"),
+        Message.assistant_blocks([
+          %{type: "thinking", thinking: "Plain reasoning"},
+          %{type: "thinking", thinking: " ", signature: nil},
+          %{type: "thinking", thinking: "", signature: "sig_omitted_display"},
+          %{type: "text", text: "Answer"}
+        ]),
+        Message.user("Follow-up")
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      assistant = Enum.find(Jason.decode!(body)["messages"], &(&1["role"] == "assistant"))
+
+      assert assistant["content"] == [
+               %{"type" => "text", "text" => "Plain reasoning"},
+               %{"type" => "thinking", "thinking" => "", "signature" => "sig_omitted_display"},
+               %{"type" => "text", "text" => "Answer"}
+             ]
+    end
   end
 
   describe "stream/4 with thinking blocks" do

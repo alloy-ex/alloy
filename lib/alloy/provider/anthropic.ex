@@ -508,12 +508,23 @@ defmodule Alloy.Provider.Anthropic do
        when type in ["server_tool_result", "reasoning", "output_item"],
        do: true
 
+  defp unsendable_block?(%{type: "thinking", thinking: thinking} = block),
+    do: not signed?(block) and String.trim(thinking) == ""
+
   defp unsendable_block?(_block), do: false
 
-  defp format_content_block(%{type: "thinking", thinking: thinking} = block) do
-    %{"type" => "thinking", "thinking" => thinking}
-    |> maybe_put("signature", block[:signature])
-  end
+  defp signed?(%{signature: signature}) when is_binary(signature) and signature != "", do: true
+  defp signed?(_block), do: false
+
+  defp format_content_block(%{type: "thinking", thinking: thinking, signature: signature})
+       when is_binary(signature) and signature != "",
+       do: %{"type" => "thinking", "thinking" => thinking, "signature" => signature}
+
+  # The API requires a signature on every thinking block. Unsigned thinking
+  # (written by hand, or by a reasoning model behind OpenAICompat) is kept
+  # as text rather than failing the request.
+  defp format_content_block(%{type: "thinking", thinking: thinking}),
+    do: %{"type" => "text", "text" => thinking}
 
   defp format_content_block(%{type: "text", text: text}) do
     %{"type" => "text", "text" => text}

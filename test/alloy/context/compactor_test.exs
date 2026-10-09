@@ -657,7 +657,9 @@ defmodule Alloy.Context.CompactorTest do
       refute Enum.any?(compacted.messages, &has_thinking?/1)
     end
 
-    test "keeps the thinking of the turn still in progress" do
+    # The turn in progress was produced after the history compaction just
+    # rewrote, so its signed thinking is stale too (Claude 5.x prefix check).
+    test "removes the thinking of the turn still in progress, keeping its tool round" do
       in_flight_call =
         Message.assistant_blocks([
           signed_thinking("in-flight"),
@@ -688,8 +690,10 @@ defmodule Alloy.Context.CompactorTest do
 
       {:compacted, compacted} = Compactor.maybe_compact(state)
 
-      assert Enum.take(compacted.messages, -2) == [in_flight_call, in_flight_result]
-      assert Enum.count(compacted.messages, &has_thinking?/1) == 1
+      assert [%Message{content: [%{type: "tool_use", id: "t9"}]}, ^in_flight_result] =
+               Enum.take(compacted.messages, -2)
+
+      refute Enum.any?(compacted.messages, &has_thinking?/1)
     end
 
     test "truncation keeps the in-flight round whole and shrinks its oversized result" do
@@ -721,7 +725,14 @@ defmodule Alloy.Context.CompactorTest do
       end)
 
       assert_received {:compacted, compacted}
-      assert [_user, ^in_flight_call, %Message{content: [result]}] = compacted.messages
+
+      assert [
+               _user,
+               %Message{content: [%{type: "tool_use", id: "t1"}]},
+               %Message{content: [result]}
+             ] =
+               compacted.messages
+
       assert result.tool_use_id == "t1"
       assert byte_size(result.content) < 7_200
       assert result.content =~ ~r/\[tool result truncated: kept \d+ of 40000 bytes\]$/

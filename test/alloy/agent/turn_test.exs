@@ -1928,6 +1928,67 @@ defmodule Alloy.Agent.TurnTest do
     end
   end
 
+  defmodule CapturingFallback do
+    @behaviour Alloy.Provider
+
+    @impl true
+    def complete(messages, _tool_defs, %{test_pid: pid}) do
+      send(pid, {:fallback_sent, messages})
+      {:ok, %{stop_reason: :end_turn, messages: [Message.assistant("from fallback")], usage: %{}}}
+    end
+  end
+
+  describe "provenance" do
+    test "each assistant message records the provider and model that wrote it" do
+      {:ok, pid} = TestProvider.start_link([TestProvider.text_response("Hello")])
+
+      config = %Config{provider: TestProvider, provider_config: %{agent_pid: pid, model: "m1"}}
+      result = Turn.run_loop(State.init(config, [Message.user("hi")]))
+
+      assert [%Message{provider: nil}, %Message{provider: TestProvider, model: "m1"}] =
+               result.messages
+    end
+
+    test "a fallback provider gets the primary's reasoning as text, without signatures" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          {:error, %Alloy.Provider.Error{kind: :overloaded, message: "busy"}}
+        ])
+
+      earlier = %{
+        Message.assistant_blocks([
+          %{type: "thinking", thinking: "plan", signature: "sig"},
+          %{type: "text", text: "ok"}
+        ])
+        | provider: TestProvider,
+          model: "primary"
+      }
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid, model: "primary"},
+        max_retries: 0,
+        fallback_providers: [{CapturingFallback, %{test_pid: self(), model: "backup"}}]
+      }
+
+      result =
+        Turn.run_loop(State.init(config, [Message.user("hi"), earlier, Message.user("again")]))
+
+      assert result.status == :completed
+
+      assert_received {:fallback_sent,
+                       [
+                         _,
+                         %Message{
+                           content: [%{type: "text", text: "plan"}, %{type: "text", text: "ok"}]
+                         },
+                         _
+                       ]}
+
+      assert %Message{provider: CapturingFallback, model: "backup"} = List.last(result.messages)
+    end
+  end
+
   describe "fallback providers" do
     test "config parses fallback_providers from opts" do
       config =
