@@ -478,6 +478,140 @@ defmodule Alloy.Provider.CodexTest do
     end
   end
 
+  describe "CODEX_HOME and user config" do
+    test "runs against the inherited CODEX_HOME and ignores user config and rules by default" do
+      parent = self()
+
+      config = %{
+        model: "gpt-5.4",
+        command_runner:
+          fake_runner(fn args, opts, output_path ->
+            send(parent, {:codex_call, args, opts})
+            File.write!(output_path, ~s({"stop_reason":"end_turn","text":"OK","tool_calls":[]}))
+            ""
+          end)
+      }
+
+      assert {:ok, _result} = Codex.complete([Message.user("Hi")], [], config)
+      assert_receive {:codex_call, args, opts}
+
+      assert "--ignore-user-config" in args
+      assert "--ignore-rules" in args
+      refute "--profile" in args
+      refute List.keymember?(opts[:env], "CODEX_HOME", 0)
+    end
+
+    test ":codex_home is passed to codex as CODEX_HOME" do
+      parent = self()
+
+      config = %{
+        model: "gpt-5.4",
+        codex_home: "/srv/codex-home",
+        command_runner:
+          fake_runner(fn _args, opts, output_path ->
+            send(parent, {:codex_env, opts[:env]})
+            File.write!(output_path, ~s({"stop_reason":"end_turn","text":"OK","tool_calls":[]}))
+            ""
+          end)
+      }
+
+      assert {:ok, _result} = Codex.complete([Message.user("Hi")], [], config)
+      assert_receive {:codex_env, env}
+      assert {"CODEX_HOME", "/srv/codex-home"} in env
+    end
+
+    # Profiles live in $CODEX_HOME/<name>.config.toml and layer on the user
+    # config, and --ignore-user-config drops both, so a profile opts back in.
+    test ":profile selects the profile and loads the user config" do
+      parent = self()
+
+      config = %{
+        model: "gpt-5.4",
+        profile: "work",
+        command_runner:
+          fake_runner(fn args, _opts, output_path ->
+            send(parent, {:codex_args, args})
+            File.write!(output_path, ~s({"stop_reason":"end_turn","text":"OK","tool_calls":[]}))
+            ""
+          end)
+      }
+
+      assert {:ok, _result} = Codex.complete([Message.user("Hi")], [], config)
+      assert_receive {:codex_args, args}
+
+      assert ["--profile", "work"] ==
+               args |> Enum.drop_while(&(&1 != "--profile")) |> Enum.take(2)
+
+      refute "--ignore-user-config" in args
+    end
+
+    test ":config_overrides become -c flags" do
+      parent = self()
+
+      config = %{
+        model: "gpt-5.4",
+        config_overrides: [
+          ~s(cli_auth_credentials_store="keyring"),
+          ~s(model_reasoning_effort="high")
+        ],
+        command_runner:
+          fake_runner(fn args, _opts, output_path ->
+            send(parent, {:codex_args, args})
+            File.write!(output_path, ~s({"stop_reason":"end_turn","text":"OK","tool_calls":[]}))
+            ""
+          end)
+      }
+
+      assert {:ok, _result} = Codex.complete([Message.user("Hi")], [], config)
+      assert_receive {:codex_args, args}
+
+      assert args
+             |> Enum.chunk_every(2, 1, :discard)
+             |> Enum.filter(&match?(["-c", _], &1))
+             |> Enum.map(&List.last/1) == [
+               ~s(cli_auth_credentials_store="keyring"),
+               ~s(model_reasoning_effort="high")
+             ]
+    end
+
+    @tag :tmp_dir
+    test "tokens codex refreshes are kept in the auth_path home, not discarded", %{tmp_dir: dir} do
+      auth_path = Path.join(dir, "auth.json")
+      File.write!(auth_path, ~s({"tokens":"original"}))
+
+      script =
+        fake_codex!(dir, """
+        printf '%s' '{"tokens":"refreshed"}' > "$CODEX_HOME/auth.json"
+        """)
+
+      config = %{model: "gpt-5.4", codex_bin: script, auth_path: auth_path}
+
+      assert {:ok, _result} = Codex.complete([Message.user("Hi")], [], config)
+      assert File.read!(auth_path) == ~s({"tokens":"refreshed"})
+    end
+
+    # Keyring credential storage leaves no auth.json to copy.
+    @tag :tmp_dir
+    test "a CODEX_HOME without auth.json still runs", %{tmp_dir: dir} do
+      script = fake_codex!(dir, "")
+      config = %{model: "gpt-5.4", codex_bin: script, auth_path: Path.join(dir, "auth.json")}
+
+      assert {:ok, result} = Codex.complete([Message.user("Hi")], [], config)
+      assert result.messages == [Message.assistant("fake ok")]
+    end
+
+    test ":auth_path must name an auth.json file" do
+      config = %{
+        model: "gpt-5.4",
+        auth_path: "/secrets/codex-token.json",
+        command_runner: fn _cmd, _args, _opts -> flunk("codex must not run") end
+      }
+
+      assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
+      assert reason =~ ":codex_home"
+    end
+  end
+
   describe "stream/4" do
     test "replays the final assistant text through the callback" do
       parent = self()
@@ -520,5 +654,29 @@ defmodule Alloy.Provider.CodexTest do
   defp output_path!(args) do
     index = Enum.find_index(args, &(&1 == "--output-last-message"))
     Enum.at(args, index + 1)
+  end
+
+  # A stand-in `codex` executable for the real port path: runs `body`, then
+  # writes a fixed end_turn payload to the --output-last-message file.
+  defp fake_codex!(dir, body) do
+    path = Path.join(dir, "fake-codex")
+
+    File.write!(path, """
+    #!/bin/sh
+    output=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--output-last-message" ]; then
+        shift
+        output="$1"
+      fi
+      shift
+    done
+    cat > /dev/null
+    #{body}
+    printf '%s' '{"stop_reason":"end_turn","text":"fake ok","tool_calls":[]}' > "$output"
+    """)
+
+    File.chmod!(path, 0o755)
+    path
   end
 end

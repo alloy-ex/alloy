@@ -15,10 +15,15 @@ defmodule Alloy.Provider.Codex do
   Optional:
   - `:codex_bin` - Executable path (default: `"codex"`)
   - `:workdir` - Directory passed to `codex exec` (defaults to a temp dir)
-  - `:profile` - Optional Codex config profile
-  - `:codex_home` - Override `CODEX_HOME` instead of creating an isolated temp home
-  - `:auth_path` - Override source `auth.json` copied into the isolated home
-    (default: `~/.codex/auth.json`)
+  - `:codex_home` - `CODEX_HOME` for the subprocess. Defaults to the
+    inherited `CODEX_HOME`, or `~/.codex`.
+  - `:profile` - Codex profile: layers `$CODEX_HOME/<name>.config.toml` on
+    the user config (Codex CLI 0.134.0 and later). Selecting a profile loads
+    the user config, including its MCP servers and plugins.
+  - `:config_overrides` - `key=value` strings passed to `codex exec` as
+    `-c` flags, for example `[~s(model_reasoning_effort="high")]`
+  - `:auth_path` - Deprecated, use `:codex_home`. A path to an `auth.json`
+    file; its directory is used as `CODEX_HOME`.
   - `:tmp_dir` - Parent for the provider's temp working directory
     (default: `System.tmp_dir!/0`)
   - `:timeout_ms` - Timeout for a single `codex exec` invocation
@@ -29,11 +34,27 @@ defmodule Alloy.Provider.Codex do
   - `:command_runner` - Test hook matching `System.cmd/3`
   - `:system_prompt` - System prompt string
 
+  ## Authentication
+
+  Codex reads and refreshes its login in `CODEX_HOME`, so every call shares
+  the same credentials as the `codex` CLI and refreshed tokens are kept.
+  Requires Codex CLI 0.122.0 or later.
+
+  Unless `:profile` is set, calls run with `--ignore-user-config` and
+  `--ignore-rules`: `config.toml` (MCP servers, plugins, hooks, model
+  settings) and execpolicy rules are not loaded. Codex still reads
+  `$CODEX_HOME/AGENTS.md` and skills from `CODEX_HOME`. For full isolation,
+  log in to a dedicated home once (`CODEX_HOME=~/.codex-alloy codex login`)
+  and pass it as `:codex_home`. A dedicated home also keeps Alloy from
+  sharing a refresh token with your interactive Codex sessions.
+
+  If your credentials are in the OS keyring
+  (`cli_auth_credentials_store = "keyring"`), pass
+  `config_overrides: [~s(cli_auth_credentials_store="keyring")]`, since that
+  setting lives in the ignored `config.toml`.
+
   ## Notes
 
-  - Authentication is handled by the local `codex` CLI login state.
-  - By default the provider creates a minimal temporary `CODEX_HOME` containing
-    only `auth.json`, which avoids pulling in the user's full MCP/plugin config.
   - Usage accounting is not exposed by `codex exec` in a structured form yet,
     so this provider currently reports zero token counts.
   - Streaming is emulated by running a normal completion and replaying the final
@@ -90,6 +111,7 @@ defmodule Alloy.Provider.Codex do
           optional(:workdir) => String.t(),
           optional(:profile) => String.t(),
           optional(:codex_home) => String.t(),
+          optional(:config_overrides) => [String.t()],
           optional(:auth_path) => String.t(),
           optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
@@ -104,22 +126,19 @@ defmodule Alloy.Provider.Codex do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    case prepare_paths(config) do
-      {:ok, paths} ->
-        try do
-          with :ok <- File.write(paths.schema_path, @response_schema_json),
-               prompt = build_prompt(messages, tool_defs, config),
-               :ok <- File.write(paths.prompt_path, prompt),
-               {:ok, command_result} <- run_codex(prompt, paths, config),
-               {:ok, payload} <- read_payload_or_error(paths.last_message_path, command_result) do
-            parse_payload(payload, config, command_result)
-          end
-        after
-          cleanup_paths(paths)
+    with {:ok, codex_home} <- codex_home(config),
+         {:ok, paths} <- prepare_paths(codex_home, config) do
+      try do
+        with :ok <- File.write(paths.schema_path, @response_schema_json),
+             prompt = build_prompt(messages, tool_defs, config),
+             :ok <- File.write(paths.prompt_path, prompt),
+             {:ok, command_result} <- run_codex(prompt, paths, config),
+             {:ok, payload} <- read_payload_or_error(paths.last_message_path, command_result) do
+          parse_payload(payload, config, command_result)
         end
-
-      {:error, reason} ->
-        {:error, reason}
+      after
+        cleanup_paths(paths)
+      end
     end
   end
 
@@ -133,31 +152,34 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp prepare_paths(config) do
+  defp codex_home(%{codex_home: codex_home}) when is_binary(codex_home), do: {:ok, codex_home}
+
+  defp codex_home(%{auth_path: auth_path}) when is_binary(auth_path) do
+    case Path.basename(auth_path) do
+      "auth.json" ->
+        {:ok, Path.dirname(auth_path)}
+
+      _other ->
+        {:error,
+         "Codex reads auth.json from CODEX_HOME, so :auth_path must name an auth.json file " <>
+           "(got #{inspect(auth_path)}); set :codex_home to its directory instead"}
+    end
+  end
+
+  defp codex_home(_config), do: {:ok, nil}
+
+  defp prepare_paths(codex_home, config) do
     base_dir = build_base_dir(config)
 
-    with :ok <- mkdir_base(base_dir),
-         {:ok, codex_home} <- prepare_codex_home(base_dir, config) do
-      {:ok, build_paths(base_dir, codex_home, config)}
-    else
-      {:error, reason} ->
-        # `File.rm_rf/1` is a no-op if the directory was never created,
-        # so this is safe to run on both mkdir and prepare_codex_home failures.
-        _ = File.rm_rf(base_dir)
-        {:error, reason}
+    case File.mkdir_p(base_dir) do
+      :ok -> {:ok, build_paths(base_dir, codex_home, config)}
+      {:error, reason} -> {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
     end
   end
 
   defp build_base_dir(config) do
     parent = Map.get(config, :tmp_dir) || System.tmp_dir!()
     Path.join(parent, "alloy-codex-#{System.unique_integer([:positive])}")
-  end
-
-  defp mkdir_base(base_dir) do
-    case File.mkdir_p(base_dir) do
-      :ok -> :ok
-      {:error, reason} -> {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
-    end
   end
 
   defp build_paths(base_dir, codex_home, config) do
@@ -176,24 +198,6 @@ defmodule Alloy.Provider.Codex do
     :ok
   end
 
-  defp prepare_codex_home(_base_dir, %{command_runner: _runner}) do
-    {:ok, nil}
-  end
-
-  defp prepare_codex_home(_base_dir, %{codex_home: codex_home}) when is_binary(codex_home) do
-    {:ok, codex_home}
-  end
-
-  defp prepare_codex_home(base_dir, config) do
-    codex_home = Path.join(base_dir, "codex-home")
-    auth_source = Map.get(config, :auth_path, default_auth_path())
-
-    with :ok <- File.mkdir_p(codex_home),
-         :ok <- copy_file(auth_source, Path.join(codex_home, "auth.json")) do
-      maybe_copy_config(codex_home, config)
-    end
-  end
-
   defp run_codex(prompt, paths, config) do
     executable = Map.get(config, :codex_bin, @default_codex_bin)
     timeout = effective_timeout(config)
@@ -203,6 +207,7 @@ defmodule Alloy.Provider.Codex do
         "exec",
         "--skip-git-repo-check",
         "--ephemeral",
+        "--ignore-rules",
         "--sandbox",
         "read-only",
         "--output-schema",
@@ -210,7 +215,8 @@ defmodule Alloy.Provider.Codex do
         "--output-last-message",
         paths.last_message_path
       ]
-      |> maybe_append_profile(config)
+      |> append_user_config(config)
+      |> append_config_overrides(config)
       |> maybe_append_model(config)
       |> append_prompt_arg(prompt, config)
 
@@ -236,7 +242,7 @@ defmodule Alloy.Provider.Codex do
   # to rely on ExUnit's own timeout.
   defp run_injected(config, executable, args, paths) do
     runner = Map.fetch!(config, :command_runner)
-    opts = [cd: paths.workdir, stderr_to_stdout: true]
+    opts = [cd: paths.workdir, env: codex_env(paths), stderr_to_stdout: true]
 
     case runner.(executable, args, opts) do
       {output, status} when is_binary(output) and is_integer(status) ->
@@ -286,8 +292,8 @@ defmodule Alloy.Provider.Codex do
 
   defp build_port_command(executable, args, paths) do
     env_args =
-      [{"OTEL_SDK_DISABLED", "true"}, {"CODEX_HOME", paths.codex_home}]
-      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      paths
+      |> codex_env()
       |> Enum.map_join(" ", fn {key, value} -> shell_escape("#{key}=#{value}") end)
 
     "exec env " <>
@@ -297,6 +303,11 @@ defmodule Alloy.Provider.Codex do
       " < " <>
       shell_escape(paths.prompt_path)
   end
+
+  defp codex_env(%{codex_home: nil}), do: [{"OTEL_SDK_DISABLED", "true"}]
+
+  defp codex_env(%{codex_home: codex_home}),
+    do: [{"OTEL_SDK_DISABLED", "true"}, {"CODEX_HOME", codex_home}]
 
   defp collect_port(port, os_pid, timeout, deadline, acc) do
     remaining = deadline - System.monotonic_time(:millisecond)
@@ -633,11 +644,15 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
-  defp maybe_append_profile(args, config) do
-    case Map.get(config, :profile) do
-      nil -> args
-      profile -> args ++ ["--profile", profile]
-    end
+  # --ignore-user-config also skips the profile file, so a profile opts in
+  # to the user config.
+  defp append_user_config(args, %{profile: profile}) when is_binary(profile) and profile != "",
+    do: args ++ ["--profile", profile]
+
+  defp append_user_config(args, _config), do: args ++ ["--ignore-user-config"]
+
+  defp append_config_overrides(args, config) do
+    args ++ Enum.flat_map(Map.get(config, :config_overrides, []), &["-c", &1])
   end
 
   defp maybe_append_model(args, config) do
@@ -649,42 +664,6 @@ defmodule Alloy.Provider.Codex do
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
-  end
-
-  defp copy_file(source, destination) do
-    case File.cp(source, destination) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        {:error, "failed to copy #{Path.basename(source)} into Codex home: #{inspect(reason)}"}
-    end
-  end
-
-  defp maybe_copy_config(codex_home, %{profile: profile})
-       when is_binary(profile) and profile != "" do
-    config_source = default_config_path()
-
-    case File.exists?(config_source) do
-      true ->
-        case File.cp(config_source, Path.join(codex_home, "config.toml")) do
-          :ok -> {:ok, codex_home}
-          {:error, reason} -> {:error, "failed to copy Codex config: #{inspect(reason)}"}
-        end
-
-      false ->
-        {:error, "missing ~/.codex/config.toml required for Codex profile #{inspect(profile)}"}
-    end
-  end
-
-  defp maybe_copy_config(codex_home, _config), do: {:ok, codex_home}
-
-  defp default_auth_path do
-    Path.join(System.user_home!(), ".codex/auth.json")
-  end
-
-  defp default_config_path do
-    Path.join(System.user_home!(), ".codex/config.toml")
   end
 
   # `limit` is a character budget, not a byte budget — `String.slice/3`
