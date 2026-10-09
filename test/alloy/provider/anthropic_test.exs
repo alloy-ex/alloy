@@ -761,6 +761,23 @@ defmodule Alloy.Provider.AnthropicTest do
       assert Exception.message(reason) =~ "invalid_request_error"
     end
 
+    test "an error body on a 200 response becomes a classified error" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "type" => "error",
+              "error" => %{"type" => "overloaded_error", "message" => "Overloaded"}
+            })
+        })
+
+      assert {:error, %Error{kind: :overloaded} = error} =
+               Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(error) == "overloaded_error: Overloaded"
+    end
+
     test "returns error on overloaded response" do
       config =
         config_with_response(%{
