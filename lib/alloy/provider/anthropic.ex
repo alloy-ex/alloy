@@ -32,6 +32,20 @@ defmodule Alloy.Provider.Anthropic do
     Pass via `Server.stream_chat/4` opts: `on_event: fn event -> ... end`.
     Note: direct callers of `Alloy.Provider.Anthropic.stream/4` (without Turn)
     receive provider-native tuples (for example `{:thinking_delta, text}`).
+  - `:code_execution` - `true` adds the server-side code execution tool
+    (`code_execution_20260521`)
+
+  ## Programmatic tool calling
+
+  With `code_execution: true`, Claude can call your tools from code it runs
+  in the sandbox. Opt a tool in with `allowed_callers: [:code_execution]`
+  (sent as `"code_execution_20260120"`); `:human` and `:direct` are sent as
+  `"direct"`, and strings pass through unchanged. Such calls arrive as
+  ordinary tool calls with a `:caller` field, which Alloy sends back with the
+  history. The response's container id is kept in `provider_state` as
+  `:container_id` and sent as `"container"` on the next request, which the
+  API requires while a programmatic call is waiting for its result. See
+  <https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling>.
 
   ## Example
 
@@ -51,7 +65,12 @@ defmodule Alloy.Provider.Anthropic do
   @default_api_url "https://api.anthropic.com"
   @default_api_version "2023-06-01"
   @default_max_tokens 4096
-  @code_execution_tool_type "code_execution_20250825"
+  # code_execution_20260120 and later support programmatic tool calling;
+  # every model that has code execution accepts this version.
+  @code_execution_tool_type "code_execution_20260521"
+  # The caller name that lets code execution call a tool. The API accepts it
+  # with either newer tool version and tags programmatic calls with it.
+  @code_execution_caller "code_execution_20260120"
   @code_execution_beta "code-execution-2025-08-25"
   @memory_tool_type "memory_20250818"
   @memory_beta "context-management-2025-06-27"
@@ -74,7 +93,9 @@ defmodule Alloy.Provider.Anthropic do
           optional(:extended_thinking) => keyword(),
           optional(:on_event) => (term() -> :ok),
           optional(:cache) => boolean(),
-          optional(:memory) => {module(), term()}
+          optional(:memory) => {module(), term()},
+          optional(:code_execution) => boolean(),
+          optional(:provider_state) => map()
         }
 
   @impl true
@@ -305,6 +326,7 @@ defmodule Alloy.Provider.Anthropic do
       body
       |> maybe_add_code_execution(config)
       |> maybe_add_memory_tool(config)
+      |> maybe_put_container(config)
 
     body =
       case Map.get(config, :extended_thinking) do
@@ -363,6 +385,13 @@ defmodule Alloy.Provider.Anthropic do
         Map.put(body, "tools", existing_tools ++ [memory_tool])
     end
   end
+
+  # Reusing the container keeps code execution state between turns, and the
+  # API rejects a continuation of a pending programmatic tool call without it.
+  defp maybe_put_container(body, %{provider_state: %{container_id: id}}) when is_binary(id),
+    do: Map.put(body, "container", id)
+
+  defp maybe_put_container(body, _config), do: body
 
   defp build_headers(config, tool_defs) do
     extra_headers = Map.get(config, :extra_headers, [])
@@ -499,8 +528,9 @@ defmodule Alloy.Provider.Anthropic do
     %{"type" => "text", "text" => text}
   end
 
-  defp format_content_block(%{type: "tool_use", id: id, name: name, input: input}) do
+  defp format_content_block(%{type: "tool_use", id: id, name: name, input: input} = block) do
     %{"type" => "tool_use", "id" => id, "name" => name, "input" => input}
+    |> maybe_put("caller", block[:caller])
   end
 
   defp format_content_block(%{type: "tool_result", tool_use_id: id, content: content} = block) do
@@ -563,11 +593,18 @@ defmodule Alloy.Provider.Anthropic do
       |> maybe_put_input_examples(def_map)
       |> maybe_put_defer_loading(def_map)
 
-    case Map.get(def_map, :allowed_callers) do
-      nil -> base
-      callers -> Map.put(base, "allowed_callers", Enum.map(callers, &to_string/1))
-    end
+    maybe_put_allowed_callers(base, def_map)
   end
+
+  defp maybe_put_allowed_callers(tool, %{allowed_callers: callers}) when is_list(callers),
+    do: Map.put(tool, "allowed_callers", Enum.map(callers, &allowed_caller/1))
+
+  defp maybe_put_allowed_callers(tool, _def_map), do: tool
+
+  # Alloy's :human and :code_execution predate the API's caller names.
+  defp allowed_caller(caller) when caller in [:human, :direct], do: "direct"
+  defp allowed_caller(:code_execution), do: @code_execution_caller
+  defp allowed_caller(caller), do: to_string(caller)
 
   defp maybe_put_strict(tool, %{strict: true}), do: Map.put(tool, "strict", true)
   defp maybe_put_strict(tool, _def_map), do: tool
@@ -612,9 +649,15 @@ defmodule Alloy.Provider.Anthropic do
         usage: parse_usage(resp["usage"] || %{})
       }
       |> maybe_put(:response_metadata, response_metadata(resp))
+      |> maybe_put(:provider_state, provider_state(resp))
 
     {:ok, response}
   end
+
+  # Turn feeds provider_state back in config, so the next request reuses
+  # the container (see maybe_put_container/2).
+  defp provider_state(%{"container" => %{"id" => id}}) when is_binary(id), do: %{container_id: id}
+  defp provider_state(_resp), do: nil
 
   # https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
   defp parse_stop_reason("end_turn"), do: :end_turn
@@ -645,8 +688,12 @@ defmodule Alloy.Provider.Anthropic do
     %{type: "text", text: text}
   end
 
-  defp parse_content_block(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
+  # A programmatic call's `caller` must go back unchanged with the history.
+  defp parse_content_block(
+         %{"type" => "tool_use", "id" => id, "name" => name, "input" => input} = block
+       ) do
     %{type: "tool_use", id: id, name: name, input: input}
+    |> maybe_put(:caller, block["caller"])
   end
 
   defp parse_content_block(%{

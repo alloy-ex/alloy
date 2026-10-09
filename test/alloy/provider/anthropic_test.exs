@@ -220,7 +220,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
       assert [tool] = decoded["tools"]
       assert tool["name"] == "list_agents"
-      assert tool["allowed_callers"] == ["human", "code_execution"]
+      assert tool["allowed_callers"] == ["direct", "code_execution_20260120"]
     end
 
     test "includes strict true on strict tools" do
@@ -336,7 +336,7 @@ defmodule Alloy.Provider.AnthropicTest do
       tools = decoded["tools"]
       assert length(tools) == 2
 
-      code_exec_tool = Enum.find(tools, &(&1["type"] == "code_execution_20250825"))
+      code_exec_tool = Enum.find(tools, &(&1["type"] == "code_execution_20260521"))
       assert code_exec_tool != nil
       assert code_exec_tool["name"] == "code_execution"
     end
@@ -449,7 +449,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
       tools = decoded["tools"]
       assert length(tools) == 1
-      refute Enum.any?(tools, &(&1["type"] == "code_execution_20250825"))
+      refute Enum.any?(tools, &String.starts_with?(&1["type"] || "", "code_execution"))
     end
 
     test "parses server_tool_use response blocks" do
@@ -509,6 +509,177 @@ defmodule Alloy.Provider.AnthropicTest do
       [_user, assistant, results] = decoded["messages"]
       assert Enum.map(assistant["content"], & &1["type"]) == ["server_tool_use", "tool_use"]
       assert [%{"type" => "tool_result", "tool_use_id" => "toolu_01"}] = results["content"]
+    end
+  end
+
+  describe "programmatic tool calling" do
+    # https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling
+    @caller %{"type" => "code_execution_20260120", "tool_id" => "srvtoolu_abc123"}
+
+    test "translates allowed_callers to the API's caller names" do
+      config = config_that_captures_request()
+
+      tool_defs =
+        for {name, callers} <- [
+              {"legacy", [:human, :code_execution]},
+              {"direct", [:direct]},
+              {"raw", ["code_execution_20260521"]}
+            ] do
+          %{name: name, description: name, input_schema: %{}, allowed_callers: callers}
+        end
+
+      Anthropic.complete([Message.user("Hi")], tool_defs, config)
+
+      assert_received {:request_body, body}
+
+      assert Map.new(Jason.decode!(body)["tools"], &{&1["name"], &1["allowed_callers"]}) == %{
+               "legacy" => ["direct", "code_execution_20260120"],
+               "direct" => ["direct"],
+               "raw" => ["code_execution_20260521"]
+             }
+    end
+
+    test "complete/3 keeps the tool_use caller and stores the container in provider_state" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body: Jason.encode!(programmatic_call_message())
+        })
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Top customers?")], [], config)
+      assert result.stop_reason == :tool_use
+      assert result.provider_state == %{container_id: "container_xyz789"}
+
+      assert [%{type: "tool_use", id: "toolu_def456", caller: @caller}] =
+               Message.tool_calls(hd(result.messages))
+    end
+
+    test "stream/4 keeps the tool_use caller and stores the container in provider_state" do
+      config =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 1}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{
+              "type" => "tool_use",
+              "id" => "toolu_def456",
+              "name" => "query_database",
+              "input" => %{},
+              "caller" => @caller
+            }
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => ~s({"sql": "<sql>"})}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{
+              "stop_reason" => "tool_use",
+              "container" => %{"id" => "container_xyz789", "expires_at" => "2026-10-09T10:00:00Z"}
+            },
+            "usage" => %{"output_tokens" => 9}
+          }),
+          ant_event("message_stop", %{})
+        ])
+
+      assert {:ok, result} =
+               Anthropic.stream([Message.user("Top customers?")], [], config, fn _ -> :ok end)
+
+      assert result.provider_state == %{container_id: "container_xyz789"}
+
+      assert [%{id: "toolu_def456", input: %{"sql" => "<sql>"}, caller: @caller}] =
+               Message.tool_calls(hd(result.messages))
+    end
+
+    test "omits provider_state when the response has no container" do
+      config = config_with_response(%{status: 200, body: message_json("end_turn")})
+
+      assert {:ok, result} = Anthropic.complete([Message.user("Hi")], [], config)
+      refute Map.has_key?(result, :provider_state)
+    end
+
+    test "sends the stored container and the tool_use caller on the next request" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:provider_state, %{container_id: "container_xyz789"})
+
+      messages = [
+        Message.user("Top customers?"),
+        Message.assistant_blocks([
+          %{type: "tool_use", id: "toolu_def456", name: "q", input: %{}, caller: @caller}
+        ]),
+        Message.tool_results([Message.tool_result_block("toolu_def456", "[]")])
+      ]
+
+      Anthropic.complete(messages, [], config)
+
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert decoded["container"] == "container_xyz789"
+      assert [%{"caller" => @caller}] = Enum.at(decoded["messages"], 1)["content"]
+    end
+
+    test "sends no container before one exists" do
+      config = config_that_captures_request()
+
+      Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "container")
+    end
+
+    test "Alloy.run/2 continues a paused programmatic call in the same container" do
+      test_pid = self()
+      calls = :counters.new(1, [])
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, Jason.decode!(body)})
+        :counters.add(calls, 1, 1)
+
+        response =
+          case :counters.get(calls, 1) do
+            1 -> programmatic_call_message()
+            _ -> Jason.decode!(message_json("end_turn"))
+          end
+
+        Req.Test.json(conn, response)
+      end)
+
+      query_database =
+        Alloy.Tool.inline(
+          name: "query_database",
+          description: "Run SQL",
+          input_schema: %{type: "object", properties: %{sql: %{type: "string"}}},
+          allowed_callers: [:code_execution],
+          execute: fn _input, _context -> {:ok, "[]"} end
+        )
+
+      assert {:ok, result} =
+               Alloy.run("Top customers?",
+                 provider:
+                   {Anthropic,
+                    api_key: "sk-ant-test-key",
+                    model: "claude-sonnet-4-6",
+                    code_execution: true,
+                    req_options: [plug: {Req.Test, __MODULE__}]},
+                 tools: [query_database]
+               )
+
+      assert result.status == :completed
+      assert_received {:request_body, first}
+      assert_received {:request_body, second}
+
+      refute Map.has_key?(first, "container")
+      assert second["container"] == "container_xyz789"
+
+      [_user, assistant, results] = second["messages"]
+      assert Enum.find(assistant["content"], &(&1["type"] == "tool_use"))["caller"] == @caller
+      assert [%{"type" => "tool_result", "tool_use_id" => "toolu_def456"}] = results["content"]
     end
   end
 
@@ -1558,6 +1729,34 @@ defmodule Alloy.Provider.AnthropicTest do
         Plug.Conn.send_resp(conn, response.status, response.body)
       end)
     end)
+  end
+
+  # Step 2 of the programmatic tool calling workflow in
+  # https://platform.claude.com/docs/en/agents-and-tools/tool-use/programmatic-tool-calling
+  defp programmatic_call_message do
+    %{
+      "id" => "msg_ptc",
+      "type" => "message",
+      "role" => "assistant",
+      "content" => [
+        %{
+          "type" => "server_tool_use",
+          "id" => "srvtoolu_abc123",
+          "name" => "code_execution",
+          "input" => %{"code" => "rows = await query_database({'sql': '<sql>'})"}
+        },
+        %{
+          "type" => "tool_use",
+          "id" => "toolu_def456",
+          "name" => "query_database",
+          "input" => %{"sql" => "<sql>"},
+          "caller" => %{"type" => "code_execution_20260120", "tool_id" => "srvtoolu_abc123"}
+        }
+      ],
+      "container" => %{"id" => "container_xyz789", "expires_at" => "2026-10-09T10:00:00Z"},
+      "stop_reason" => "tool_use",
+      "usage" => %{"input_tokens" => 10, "output_tokens" => 20}
+    }
   end
 
   defp message_json(stop_reason, overrides \\ %{}) do
