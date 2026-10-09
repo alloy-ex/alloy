@@ -12,7 +12,9 @@ defmodule Alloy.Provider.Gemini do
   - `:model` - Model name (for example `"gemini-2.5-flash"`)
 
   Optional:
-  - `:max_tokens` - Max output tokens (default: `4096`)
+  - `:max_tokens` - Max output tokens, sent as `maxOutputTokens`. Thinking
+    tokens count against it. When unset, the model's own output limit
+    applies (Alloy 0.12.4 and earlier sent `4096`)
   - `:system_prompt` - System prompt string
   - `:api_url` - Base URL (default: `"https://generativelanguage.googleapis.com"`)
   - `:api_version` - API version path (default: `"v1beta"`)
@@ -39,7 +41,6 @@ defmodule Alloy.Provider.Gemini do
 
   @default_api_url "https://generativelanguage.googleapis.com"
   @default_api_version "v1beta"
-  @default_max_tokens 4096
 
   @typedoc """
   Configuration for the Gemini provider. See the module doc for field
@@ -134,12 +135,14 @@ defmodule Alloy.Provider.Gemini do
           body
       end
 
+    # No default maxOutputTokens: the budget includes thinking, so a fixed
+    # default truncates thinking models; each model's own limit is larger.
     generation_config =
       Map.get(config, :generation_config, %{})
       |> Alloy.Provider.stringify_keys()
-      |> Map.put_new("maxOutputTokens", Map.get(config, :max_tokens, @default_max_tokens))
+      |> maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
 
-    body = Map.put(body, "generationConfig", generation_config)
+    body = maybe_put(body, "generationConfig", generation_config)
 
     body =
       case tool_defs do
@@ -459,4 +462,7 @@ defmodule Alloy.Provider.Gemini do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, _key, value) when value == %{}, do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp maybe_put_new(map, _key, nil), do: map
+  defp maybe_put_new(map, key, value), do: Map.put_new(map, key, value)
 end

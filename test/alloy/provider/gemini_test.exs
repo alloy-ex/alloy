@@ -158,6 +158,33 @@ defmodule Alloy.Provider.GeminiTest do
       assert {"x-goog-api-key", "gem-test-key"} in headers
     end
 
+    test "leaves the output budget to the model when :max_tokens is not set" do
+      # The budget includes thinking, so a small fixed default truncates
+      # answers from thinking models.
+      config = Map.delete(config_that_captures_request(), :max_tokens)
+
+      Gemini.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+      refute Map.has_key?(Jason.decode!(body), "generationConfig")
+    end
+
+    test "sends :max_tokens as maxOutputTokens next to raw generation_config" do
+      config =
+        config_that_captures_request()
+        |> Map.put(:max_tokens, 1_234)
+        |> Map.put(:generation_config, %{thinkingConfig: %{thinkingLevel: "LOW"}})
+
+      Gemini.complete([Message.user("Hi")], [], config)
+
+      assert_received {:request_body, body}
+
+      assert Jason.decode!(body)["generationConfig"] == %{
+               "maxOutputTokens" => 1_234,
+               "thinkingConfig" => %{"thinkingLevel" => "LOW"}
+             }
+    end
+
     test "omits strict field because Gemini has no strict tool equivalent" do
       config = config_that_captures_request()
 
