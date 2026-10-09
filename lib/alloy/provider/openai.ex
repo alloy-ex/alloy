@@ -70,9 +70,10 @@ defmodule Alloy.Provider.OpenAI do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.HTTP
+  alias Alloy.Provider.{Error, HTTP}
 
   @default_api_url "https://api.openai.com"
+  @terminal_events ["response.completed", "response.incomplete", "response.failed"]
   @default_max_tokens 4096
 
   @typedoc """
@@ -125,7 +126,6 @@ defmodule Alloy.Provider.OpenAI do
 
     initial_acc = %{
       buffer: "",
-      content: "",
       response: nil,
       stream_error: nil,
       on_chunk: on_chunk
@@ -383,47 +383,38 @@ defmodule Alloy.Provider.OpenAI do
   defp process_stream_event(acc, "response.output_text.delta", %{"delta" => delta})
        when is_binary(delta) and delta != "" do
     acc.on_chunk.(delta)
-    %{acc | content: acc.content <> delta}
+    acc
   end
 
-  defp process_stream_event(acc, "response.completed", %{"response" => response})
-       when is_map(response) do
+  # Every terminal event carries the whole response, and parse_response/1
+  # reads its status, so completed, incomplete and failed share one path.
+  defp process_stream_event(acc, event_type, %{"response" => response})
+       when event_type in @terminal_events and is_map(response) do
     %{acc | response: response}
   end
 
-  defp process_stream_event(acc, "response.failed", payload) do
-    %{acc | stream_error: parse_stream_event_error(payload)}
+  # The documented event is flat ({"type": "error", "code", "message"});
+  # some compatible servers nest the details under "error".
+  defp process_stream_event(acc, "error", %{"error" => %{}} = payload) do
+    %{acc | stream_error: Error.from_body(payload)}
   end
 
   defp process_stream_event(acc, "error", payload) do
-    %{acc | stream_error: parse_stream_event_error(payload)}
+    %{acc | stream_error: Error.from_body(%{"error" => payload})}
   end
 
   defp process_stream_event(acc, _event_type, _payload), do: acc
 
-  defp build_stream_response(%{stream_error: error}) when is_binary(error) do
-    {:error, error}
-  end
+  defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
 
-  defp build_stream_response(%{response: response}) when is_map(response) do
-    parse_response(response)
-  end
+  defp build_stream_response(%{response: response}) when is_map(response),
+    do: parse_response(response)
 
-  defp build_stream_response(%{content: content}) do
-    content_blocks = if content == "", do: [], else: [%{type: "text", text: content}]
-
-    {:ok,
-     %{
-       stop_reason: :end_turn,
-       messages: [%Message{role: :assistant, content: content_blocks}],
-       usage: %{input_tokens: 0, output_tokens: 0}
-     }}
-  end
-
-  defp parse_stream_event_error(payload) do
-    payload
-    |> Map.get("error", payload)
-    |> format_error_payload()
+  # Without a terminal event the connection was cut mid-response; returning
+  # the text received so far would pass off a fragment as a complete answer.
+  defp build_stream_response(_acc) do
+    {:error,
+     %Error{kind: :network, message: "Responses stream ended before the response completed"}}
   end
 
   # --- Response Parsing ---
@@ -435,13 +426,15 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
+  defp parse_response(%{"status" => "failed"} = resp), do: {:error, Error.from_body(resp)}
+
   defp parse_response(%{"output" => output} = resp) when is_list(output) do
     usage = resp["usage"] || %{}
     provider_state = provider_state_from_response(resp)
 
     case parse_output_to_blocks(output) do
       {:ok, content_blocks} ->
-        stop_reason = parse_stop_reason(content_blocks)
+        stop_reason = parse_stop_reason(resp, content_blocks)
 
         alloy_msg = %Message{
           role: :assistant,
@@ -488,12 +481,12 @@ defmodule Alloy.Provider.OpenAI do
      }}
   end
 
-  defp parse_response(%{"error" => error}) do
-    {:error, format_error_payload(error)}
+  defp parse_response(%{"error" => error} = resp) when is_map(error) or is_binary(error) do
+    {:error, Error.from_body(resp)}
   end
 
   defp parse_response(resp) do
-    {:error, "Unexpected OpenAI response payload: #{inspect(resp)}"}
+    {:error, %Error{message: "Unexpected OpenAI response payload: #{inspect(resp)}"}}
   end
 
   defp parse_output_to_blocks(output) do
@@ -560,7 +553,17 @@ defmodule Alloy.Provider.OpenAI do
     end)
   end
 
-  defp parse_stop_reason(content_blocks) do
+  defp parse_stop_reason(
+         %{"status" => "incomplete", "incomplete_details" => %{"reason" => "content_filter"}},
+         _content_blocks
+       ),
+       do: :refusal
+
+  # Every other incomplete reason (max_output_tokens, max_messages) means the
+  # output was cut short.
+  defp parse_stop_reason(%{"status" => "incomplete"}, _content_blocks), do: :max_tokens
+
+  defp parse_stop_reason(_resp, content_blocks) do
     if Enum.any?(content_blocks, &(&1.type == "tool_use")), do: :tool_use, else: :end_turn
   end
 
@@ -585,14 +588,6 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp format_error_payload(error) when is_map(error) do
-    type = Map.get(error, "type", "error")
-    message = Map.get(error, "message", inspect(error))
-    "#{type}: #{message}"
-  end
-
-  defp format_error_payload(error), do: inspect(error)
-
   defp provider_state_from_response(%{"id" => id}) when is_binary(id) and id != "" do
     %{response_id: id}
   end
@@ -606,7 +601,11 @@ defmodule Alloy.Provider.OpenAI do
       :server_side_tool_usage,
       Map.get(resp, "server_side_tool_usage")
     )
+    |> maybe_put_response_metadata(:stop_details, stop_details(resp))
   end
+
+  defp stop_details(%{"status" => "incomplete"} = resp), do: resp["incomplete_details"]
+  defp stop_details(_resp), do: nil
 
   defp maybe_put_response_metadata(metadata, _key, nil), do: metadata
   defp maybe_put_response_metadata(metadata, _key, value) when value == [], do: metadata
