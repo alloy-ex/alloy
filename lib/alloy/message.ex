@@ -118,21 +118,6 @@ defmodule Alloy.Message do
     if is_error, do: Map.put(result, :is_error, true), else: result
   end
 
-  @doc deprecated:
-         "Server tools are executed by the provider and never answered by the " <>
-           "client; Alloy no longer produces this block. Removed in 0.13."
-  @doc """
-  Builds a `server_tool_result` content block.
-
-  No provider accepts this block type. It is kept only so existing callers
-  compile during 0.12.x.
-  """
-  @spec server_tool_result_block(String.t(), String.t(), boolean()) :: content_block()
-  def server_tool_result_block(tool_use_id, content, is_error \\ false) do
-    result = %{type: "server_tool_result", tool_use_id: tool_use_id, content: content}
-    if is_error, do: Map.put(result, :is_error, true), else: result
-  end
-
   @doc """
   Creates an inline image content block.
 

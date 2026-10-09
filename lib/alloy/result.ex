@@ -2,7 +2,7 @@ defmodule Alloy.Result do
   @moduledoc """
   Structured result from an agent run.
 
-  Returned by `Alloy.run/2` and `Alloy.Agent.Server.chat/3`.
+  Returned by `Alloy.run/2` and `Alloy.stream/3`.
   Implements `Access` for bracket-syntax compatibility (`result[:text]`).
 
   ## Fields
@@ -16,7 +16,7 @@ defmodule Alloy.Result do
     * `:usage` — accumulated `%Alloy.Usage{}` token counts
     * `:tool_calls` — list of tool execution metadata maps
     * `:metadata` — auxiliary result metadata such as provider-owned state
-    * `:status` — final run status (`:completed`, `:max_turns`, `:budget_exceeded`, `:error`, `:halted`)
+    * `:status` — final run status (`:completed`, `:max_turns`, `:error`, `:halted`)
     * `:stop_reason` — why the model stopped on the last provider response
       (`:end_turn`, `:tool_use`, `:max_tokens`, `:refusal`, `:pause_turn`), or
       `nil` if no response arrived. Check for `:max_tokens` to detect a
@@ -83,12 +83,10 @@ defmodule Alloy.Result do
   end
 
   @doc """
-  Tags a result the way `Alloy.run/2` and `Alloy.Agent.Server.chat/3`
-  return it.
+  Tags a result the way `Alloy.run/2` returns it.
 
   `{:ok, result}` when the run completed or stopped at `:max_turns`;
-  `{:error, result}` for every other status (`:error`, `:halted`,
-  `:budget_exceeded`).
+  `{:error, result}` for every other status (`:error`, `:halted`).
   """
   @spec wrap(t()) :: {:ok, t()} | {:error, t()}
   def wrap(%__MODULE__{status: status} = result) when status in [:completed, :max_turns],

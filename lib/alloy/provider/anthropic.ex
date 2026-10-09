@@ -35,20 +35,12 @@ defmodule Alloy.Provider.Anthropic do
     request fields or beta headers they need through `:extra_body` and
     `:extra_headers`.
   - `:req_options` - Additional options passed to Req (useful for testing)
-  - `:extended_thinking` - *Deprecated, removed in 0.13; configure thinking
-    through `:extra_body` instead (see "Thinking" below).* A keyword list with a
-    positive `:budget_tokens` (e.g., `[budget_tokens: 5000]`) sends
-    `"thinking": {"type": "enabled", "budget_tokens": ...}`. It still works on
-    the models that accept manual budgets (Claude Opus 4.5, Sonnet 4.5,
-    Haiku 4.5, and Opus 4.6 and Sonnet 4.6, where Anthropic deprecates it),
-    but Claude Opus 4.7 and later and every Claude 5.x model reject it with
-    HTTP 400.
   - `:on_event` - Streaming event callback `(event -> :ok)`. Called for each
-    streaming delta. When used via `Server.stream_chat/4`, `event` is a
+    streaming delta. When used via `Alloy.stream/3`, `event` is a
     normalized envelope map:
       - `%{v: 1, seq:, correlation_id:, turn:, ts_ms:, event: :text_delta, payload: text}`
       - `%{v: 1, seq:, correlation_id:, turn:, ts_ms:, event: :thinking_delta, payload: text}`
-    Pass via `Server.stream_chat/4` opts: `on_event: fn event -> ... end`.
+    Pass it as the `:on_event` option of `Alloy.stream/3`.
     Note: direct callers of `Alloy.Provider.Anthropic.stream/4` (without Turn)
     receive provider-native tuples (for example `{:thinking_delta, text}`).
   - `:code_execution` - `true` adds the server-side code execution tool
@@ -132,7 +124,6 @@ defmodule Alloy.Provider.Anthropic do
           optional(:extra_body) => map(),
           optional(:server_tools) => [map()],
           optional(:req_options) => keyword(),
-          optional(:extended_thinking) => keyword(),
           optional(:on_event) => (term() -> :ok),
           optional(:cache) => boolean(),
           optional(:memory) => {module(), term()},
@@ -362,28 +353,18 @@ defmodule Alloy.Provider.Anthropic do
       |> maybe_put_tools(tools)
       |> maybe_put_container(config)
 
-    body =
-      case Map.get(config, :extended_thinking) do
-        nil ->
-          body
-
-        opts when is_list(opts) ->
-          budget = Keyword.get(opts, :budget_tokens)
-
-          unless is_integer(budget) and budget > 0 do
-            raise ArgumentError,
-                  "extended_thinking requires a positive integer :budget_tokens, got: #{inspect(budget)}"
-          end
-
-          Map.put(body, "thinking", %{"type" => "enabled", "budget_tokens" => budget})
-
-        _opts ->
-          # Non-list value (e.g., extended_thinking: true) — silently ignore
-          body
-      end
-
+    reject_extended_thinking!(config)
     Map.merge(body, stringify_extra_body(Map.get(config, :extra_body, %{})))
   end
+
+  # Ignoring the removed option would silently turn thinking off.
+  defp reject_extended_thinking!(%{extended_thinking: _opts}) do
+    raise ArgumentError,
+          ":extended_thinking was removed in Alloy 0.13. Configure thinking through " <>
+            ":extra_body, for example extra_body: %{\"thinking\" => %{\"type\" => \"adaptive\"}}"
+  end
+
+  defp reject_extended_thinking!(_config), do: :ok
 
   defp stringify_extra_body(extra_body) when is_map(extra_body) do
     Map.new(extra_body, fn

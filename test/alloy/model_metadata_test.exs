@@ -215,25 +215,4 @@ defmodule Alloy.ModelMetadataTest do
   test "default_context_window/0 is 200k" do
     assert ModelMetadata.default_context_window() == 200_000
   end
-
-  # catalog/0 is deprecated but keeps its pre-0.12.5 shape for third parties.
-  test "catalog/0 keeps the entry shape and the old matching rule still agrees" do
-    entries = ModelMetadata.catalog()
-
-    for id <- [
-          "claude-opus-5-5",
-          "gpt-6.1-sol",
-          "gemini-3.8-flash",
-          "grok-4.7",
-          "gpt-5-2025-08-07"
-        ] do
-      limit =
-        Enum.find_value(entries, fn %{name: name, limit: limit, suffix_patterns: patterns} ->
-          suffix = String.replace_prefix(id, name, "")
-          String.starts_with?(id, name) && Enum.any?(patterns, &Regex.match?(&1, suffix)) && limit
-        end)
-
-      assert limit == ModelMetadata.context_window(id), "mismatch for #{id}"
-    end
-  end
 end

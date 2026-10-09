@@ -462,7 +462,7 @@ defmodule Alloy.Provider.CodexTest do
     end
 
     @tag :tmp_dir
-    test "tokens codex refreshes are kept in the auth_path home, not discarded", %{tmp_dir: dir} do
+    test "tokens codex refreshes are kept in the codex_home, not discarded", %{tmp_dir: dir} do
       auth_path = Path.join(dir, "auth.json")
       File.write!(auth_path, ~s({"tokens":"original"}))
 
@@ -471,46 +471,30 @@ defmodule Alloy.Provider.CodexTest do
         printf '%s' '{"tokens":"refreshed"}' > "$CODEX_HOME/auth.json"
         """)
 
-      config = %{model: "gpt-5.4", codex_bin: script, auth_path: auth_path}
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir}
 
       assert {:ok, _result} = Codex.complete([Message.user("Hi")], [], config)
       assert File.read!(auth_path) == ~s({"tokens":"refreshed"})
     end
 
-    # Keyring credential storage leaves no auth.json to copy.
+    # Keyring credential storage leaves no auth.json in CODEX_HOME.
     @tag :tmp_dir
     test "a CODEX_HOME without auth.json still runs", %{tmp_dir: dir} do
       script = fake_codex!(dir, "")
-      config = %{model: "gpt-5.4", codex_bin: script, auth_path: Path.join(dir, "auth.json")}
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir}
 
       assert {:ok, result} = Codex.complete([Message.user("Hi")], [], config)
       assert result.messages == [Message.assistant("fake ok")]
     end
 
-    # 0.12.4 copied any :auth_path file into a private CODEX_HOME; a file
-    # with another name still works that way until :auth_path is removed.
-    @tag :tmp_dir
-    test "an :auth_path not named auth.json is copied into a private CODEX_HOME",
-         %{tmp_dir: dir} do
-      token = Path.join(dir, "codex-token.json")
-      File.write!(token, ~s({"token":"t"}))
-      parent = self()
+    # Ignoring it would run Codex as whichever account ~/.codex holds.
+    test "the removed :auth_path is an error, not silently ignored" do
+      config = %{model: "gpt-5.4", auth_path: "/tmp/auth.json"}
 
-      config = %{
-        model: "gpt-5.4",
-        auth_path: token,
-        command_runner:
-          fake_runner(fn _args, opts, output_path ->
-            home = opts |> Keyword.fetch!(:env) |> List.keyfind("CODEX_HOME", 0) |> elem(1)
-            send(parent, {:home, home, File.read(Path.join(home, "auth.json"))})
-            File.write!(output_path, ~s({"stop_reason":"end_turn","text":"OK","tool_calls":[]}))
-            ""
-          end)
-      }
+      assert {:error, %Error{kind: :invalid_request, message: message}} =
+               Codex.complete([Message.user("Hi")], [], config)
 
-      assert {:ok, _result} = Codex.complete([Message.user("Hi")], [], config)
-      assert_receive {:home, home, {:ok, ~s({"token":"t"})}}
-      refute home == dir
+      assert message =~ ":auth_path was removed"
     end
   end
 

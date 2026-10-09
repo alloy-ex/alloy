@@ -206,7 +206,7 @@ defmodule Alloy.Context.Compactor do
       |> strip_settled_thinking()
       |> fit_tool_results(state)
 
-    %{state | messages: messages, messages_new: []}
+    %{state | messages: messages}
   end
 
   defp strip_settled_thinking(messages) do
@@ -585,7 +585,7 @@ defmodule Alloy.Context.Compactor do
     # The summary goes through Retry like any turn request, so it gets the
     # same retries, fallback providers and receive timeout, bounded by the
     # caller's deadline.
-    summary_state = %{state | messages: [Message.user(prompt)], messages_new: [], tool_defs: []}
+    summary_state = %{state | messages: [Message.user(prompt)], tool_defs: []}
 
     deadline =
       Keyword.get_lazy(opts, :deadline, fn ->

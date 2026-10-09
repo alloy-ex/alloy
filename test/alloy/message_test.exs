@@ -79,24 +79,6 @@ defmodule Alloy.MessageTest do
     end
   end
 
-  describe "server_tool_result_block/3" do
-    test "creates a server_tool_result block" do
-      block = Message.server_tool_result_block("srvtoolu_01", "file contents here")
-      assert block.type == "server_tool_result"
-      assert block.tool_use_id == "srvtoolu_01"
-      assert block.content == "file contents here"
-      refute Map.has_key?(block, :is_error)
-    end
-
-    test "creates a server_tool_result error block" do
-      block = Message.server_tool_result_block("srvtoolu_01", "something failed", true)
-      assert block.type == "server_tool_result"
-      assert block.tool_use_id == "srvtoolu_01"
-      assert block.content == "something failed"
-      assert block.is_error == true
-    end
-  end
-
   describe "text/1" do
     test "extracts text from a string-content message" do
       assert Message.text(Message.user("hello")) == "hello"

@@ -95,13 +95,9 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp loop(%State{} = state, opts, deadline) do
-    if budget_exceeded?(state) do
-      %{state | status: :budget_exceeded}
-    else
-      case run_turn(state, opts, deadline) do
-        {:continue, state} -> loop(state, opts, deadline)
-        {:halt, state} -> state
-      end
+    case run_turn(state, opts, deadline) do
+      {:continue, state} -> loop(state, opts, deadline)
+      {:halt, state} -> state
     end
   end
 
@@ -411,11 +407,5 @@ defmodule Alloy.Agent.Turn do
   # model has not produced the required output yet.
   defp until_tool_pending?(%State{config: %{until_tool: name}, tool_calls: calls}) do
     not Enum.any?(calls, fn call -> call[:name] == name and is_nil(call[:error]) end)
-  end
-
-  defp budget_exceeded?(%State{config: %{max_budget_cents: nil}}), do: false
-
-  defp budget_exceeded?(%State{config: %{max_budget_cents: max}, usage: usage}) do
-    usage.estimated_cost_cents >= max
   end
 end

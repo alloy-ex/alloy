@@ -47,7 +47,6 @@ defmodule Alloy.Context.CompactorTest do
     %State{
       config: config,
       messages: messages,
-      messages_new: [],
       tool_defs: Keyword.get(opts, :tool_defs, []),
       provider_state: Keyword.get(opts, :provider_state, %{})
     }
@@ -524,8 +523,7 @@ defmodule Alloy.Context.CompactorTest do
         first_compaction
         | messages:
             first_compaction.messages ++
-              [Message.assistant(String.duplicate("b", 900)), Message.user("new latest")],
-          messages_new: []
+              [Message.assistant(String.duplicate("b", 900)), Message.user("new latest")]
       }
 
       {:compacted, second_compaction} = Compactor.maybe_compact(second_state)

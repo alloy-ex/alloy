@@ -10,7 +10,30 @@ defmodule Alloy.Agent.Config do
   alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.ModelMetadata
 
-  require Logger
+  @options [
+    :provider,
+    :tools,
+    :system_prompt,
+    :max_turns,
+    :max_tokens,
+    :max_retries,
+    :retry_backoff_ms,
+    :timeout_ms,
+    :tool_timeout,
+    :middleware,
+    :compaction,
+    :working_directory,
+    :context,
+    :on_compaction,
+    :fallback_providers,
+    :code_execution,
+    :model_metadata_overrides,
+    :model_catalog,
+    :until_tool,
+    :memory
+  ]
+
+  @runtime_options [:pubsub, :subscribe, :max_pending, :on_shutdown]
 
   # The summary prompts are optional because a bare `%Config{}` omits them;
   # `from_opts/1` always fills them and the Compactor falls back to its
@@ -68,18 +91,11 @@ defmodule Alloy.Agent.Config do
           },
           working_directory: String.t(),
           context: map(),
-          # Accepts any session-shaped struct (%Alloy.Session{} or
-          # %AlloyAgent.Session{}) — see issue #40.
-          on_shutdown: (struct() -> any()) | nil,
           on_compaction: (list(), Alloy.Agent.State.t() -> any()) | nil,
-          pubsub: module() | nil,
-          subscribe: [String.t()],
-          max_pending: non_neg_integer(),
           fallback_providers: [{module(), map()}],
           code_execution: boolean(),
           model_metadata_overrides: map(),
           model_catalog: module(),
-          max_budget_cents: number() | nil,
           until_tool: String.t() | nil,
           memory: memory()
         }
@@ -110,16 +126,11 @@ defmodule Alloy.Agent.Config do
     compaction_explicit: %{reserve_tokens: false, keep_recent_tokens: false},
     working_directory: ".",
     context: %{},
-    on_shutdown: nil,
     on_compaction: nil,
-    pubsub: nil,
-    subscribe: [],
-    max_pending: 0,
     fallback_providers: [],
     code_execution: false,
     model_metadata_overrides: %{},
     model_catalog: ModelMetadata,
-    max_budget_cents: nil,
     until_tool: nil,
     memory: nil
   ]
@@ -128,7 +139,8 @@ defmodule Alloy.Agent.Config do
   Builds a config from `Alloy.run/2` options.
   """
   @spec from_opts(keyword()) :: t()
-  def from_opts(opts) do
+  def from_opts(opts) when is_list(opts) do
+    validate_option_names!(opts)
     {provider_mod, provider_config} = parse_provider(opts[:provider])
     provider_config = normalize_provider_config(provider_config)
     model_metadata_overrides = normalize_model_metadata_overrides(opts[:model_metadata_overrides])
@@ -167,11 +179,7 @@ defmodule Alloy.Agent.Config do
       compaction_explicit: compaction_explicit,
       working_directory: Keyword.get(opts, :working_directory, "."),
       context: Keyword.get(opts, :context, %{}),
-      on_shutdown: Keyword.get(opts, :on_shutdown, nil),
       on_compaction: Keyword.get(opts, :on_compaction, nil),
-      pubsub: Keyword.get(opts, :pubsub, nil),
-      subscribe: Keyword.get(opts, :subscribe, []),
-      max_pending: Keyword.get(opts, :max_pending, 0),
       fallback_providers:
         opts
         |> Keyword.get(:fallback_providers, [])
@@ -179,10 +187,35 @@ defmodule Alloy.Agent.Config do
       code_execution: Keyword.get(opts, :code_execution, false),
       model_metadata_overrides: model_metadata_overrides,
       model_catalog: model_catalog,
-      max_budget_cents: opts |> Keyword.get(:max_budget_cents) |> warn_max_budget_cents(),
       until_tool: Keyword.get(opts, :until_tool),
       memory: validate_memory(Keyword.get(opts, :memory), provider_mod, tools)
     }
+  end
+
+  # A misspelt or removed option used to be ignored silently, which hides
+  # mistakes such as a budget or tool list that never applies.
+  defp validate_option_names!(opts) do
+    case opts |> Keyword.keys() |> Enum.uniq() |> Kernel.--(@options) do
+      [] -> :ok
+      unknown -> raise ArgumentError, unknown_options_message(unknown)
+    end
+  end
+
+  defp unknown_options_message([:max_budget_cents]) do
+    ":max_budget_cents was removed in Alloy 0.13. Enforce a budget with " <>
+      ":before_completion middleware instead (see \"Budget limits\" in the Alloy docs)."
+  end
+
+  defp unknown_options_message(unknown) do
+    case Enum.filter(unknown, &(&1 in @runtime_options)) do
+      [] ->
+        "unknown options #{inspect(unknown)}. Valid options: #{inspect(@options)}"
+
+      runtime ->
+        "#{inspect(runtime)} belong to the agent server, which moved to the " <>
+          "alloy_agent package in Alloy 0.13; pass them to AlloyAgent.start_link/1. " <>
+          "All unknown options: #{inspect(unknown)}"
+    end
   end
 
   defp validate_memory(nil, _provider, _tools), do: nil
@@ -212,30 +245,6 @@ defmodule Alloy.Agent.Config do
     raise ArgumentError,
           ":memory must be a {module, store_opts} tuple where module implements " <>
             "Alloy.Memory. Got: #{inspect(bad)}"
-  end
-
-  defp warn_max_budget_cents(nil), do: nil
-
-  # Once per node: agents are started per request in many apps, and a
-  # warning per run would flood their logs.
-  defp warn_max_budget_cents(max_budget_cents) do
-    if :persistent_term.get({__MODULE__, :max_budget_cents_warned}, false) do
-      max_budget_cents
-    else
-      :persistent_term.put({__MODULE__, :max_budget_cents_warned}, true)
-      log_max_budget_cents_deprecation(max_budget_cents)
-    end
-  end
-
-  defp log_max_budget_cents_deprecation(max_budget_cents) do
-    Logger.warning(
-      ":max_budget_cents is deprecated and will be removed in Alloy 0.13. " <>
-        "It only stops a run when the provider reports usage.estimated_cost_cents, " <>
-        "which none of the built-in providers do. Enforce a budget with " <>
-        ":before_completion middleware instead (see the Alloy module docs)."
-    )
-
-    max_budget_cents
   end
 
   # Matches Alloy.Tool.Inline structs as plain maps so Config does not

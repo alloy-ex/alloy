@@ -52,6 +52,74 @@ defmodule Alloy.Agent.ConfigTest do
     end
   end
 
+  describe "option names" do
+    test "an unknown option raises instead of being ignored" do
+      assert_raise ArgumentError, ~r/unknown options \[:tols\]/, fn ->
+        Config.from_opts(provider: {Alloy.Provider.Test, []}, tols: [])
+      end
+    end
+
+    test "the removed :max_budget_cents points at the budget middleware" do
+      assert_raise ArgumentError, ~r/:max_budget_cents was removed.*:before_completion/s, fn ->
+        Config.from_opts(provider: {Alloy.Provider.Test, []}, max_budget_cents: 50)
+      end
+    end
+
+    test "agent-server options point at alloy_agent" do
+      assert_raise ArgumentError, ~r/\[:pubsub, :max_pending\].*alloy_agent/s, fn ->
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, []},
+          pubsub: MyApp.PubSub,
+          max_pending: 2
+        )
+      end
+    end
+  end
+
+  describe "with_provider/2" do
+    setup do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.OpenAI, [model: "gpt-5.4"]},
+          tools: [Alloy.Test.EchoTool],
+          system_prompt: "Be brief.",
+          max_turns: 7
+        )
+
+      %{config: config}
+    end
+
+    test "swaps the provider and keeps every other option", %{config: config} do
+      updated =
+        Config.with_provider(config, {Alloy.Provider.Anthropic, model: "claude-sonnet-5-5"})
+
+      assert updated.provider == Alloy.Provider.Anthropic
+      assert updated.provider_config == %{model: "claude-sonnet-5-5"}
+
+      assert {updated.tools, updated.system_prompt, updated.max_turns} ==
+               {config.tools, "Be brief.", 7}
+    end
+
+    test "accepts a bare provider module", %{config: config} do
+      updated = Config.with_provider(config, Alloy.Provider.Test)
+
+      assert updated.provider == Alloy.Provider.Test
+      assert updated.provider_config == %{}
+    end
+
+    test "re-derives max_tokens unless it was set explicitly", %{config: config} do
+      derived = Config.with_provider(config, {Alloy.Provider.OpenAI, model: "acme-reasoner"})
+      assert derived.max_tokens == ModelMetadata.default_context_window()
+
+      explicit =
+        [provider: {Alloy.Provider.OpenAI, [model: "gpt-5.4"]}, max_tokens: 123_456]
+        |> Config.from_opts()
+        |> Config.with_provider({Alloy.Provider.OpenAI, model: "acme-reasoner"})
+
+      assert explicit.max_tokens == 123_456
+    end
+  end
+
   describe "memory option" do
     @anthropic {Alloy.Provider.Anthropic, api_key: "sk-test", model: "claude-sonnet-4-6"}
 

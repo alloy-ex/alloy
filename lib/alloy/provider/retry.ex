@@ -190,7 +190,7 @@ defmodule Alloy.Provider.Retry do
 
           if remaining < backoff do
             # Not enough time left — return the error rather than sleeping
-            # past the GenServer.call timeout.
+            # past the turn deadline.
             {{:error, reason}, false}
           else
             Process.sleep(backoff)

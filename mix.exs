@@ -78,8 +78,7 @@ defmodule Alloy.MixProject do
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:plug, "~> 1.19.5 or ~> 1.20.3", only: :test},
-      {:phoenix_pubsub, "~> 2.1", optional: true}
+      {:plug, "~> 1.19.5 or ~> 1.20.3", only: :test}
     ]
   end
 
@@ -111,7 +110,6 @@ defmodule Alloy.MixProject do
         Core: [
           Alloy,
           Alloy.Agent.Config,
-          Alloy.Agent.Server,
           Alloy.Events,
           Alloy.ModelCatalog,
           Alloy.ModelMetadata,
@@ -119,7 +117,6 @@ defmodule Alloy.MixProject do
           Alloy.Agent.Turn,
           Alloy.Message,
           Alloy.Result,
-          Alloy.Session,
           Alloy.Usage
         ],
         Providers: [

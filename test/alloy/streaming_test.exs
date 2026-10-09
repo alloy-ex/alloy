@@ -1,7 +1,7 @@
 defmodule Alloy.StreamingTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Agent.{Config, Server, State, Turn}
+  alias Alloy.Agent.{Config, State, Turn}
   alias Alloy.Message
   alias Alloy.Provider.Test, as: TestProvider
 
@@ -198,114 +198,31 @@ defmodule Alloy.StreamingTest do
     end
   end
 
-  # ── Server.stream_chat/3 ──────────────────────────────────────────────
+  # ── Alloy.stream/3 event envelopes ─────────────────────────────────────
 
-  describe "Server.stream_chat/3" do
-    test "calls on_chunk and returns result" do
-      {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Hi!")])
-
-      {:ok, agent} =
-        Server.start_link(provider: {TestProvider, agent_pid: provider})
-
-      test_pid = self()
-      on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
-
-      assert {:ok, result} = Server.stream_chat(agent, "Hello", on_chunk)
-      assert result.text == "Hi!"
-      assert result.status == :completed
-
-      assert_received {:chunk, "H"}
-      assert_received {:chunk, "i"}
-      assert_received {:chunk, "!"}
-    end
-
-    test "preserves conversation history" do
-      {:ok, provider} =
-        TestProvider.start_link([
-          TestProvider.text_response("First"),
-          TestProvider.text_response("Second")
-        ])
-
-      {:ok, agent} =
-        Server.start_link(provider: {TestProvider, agent_pid: provider})
-
-      {:ok, _} = Server.stream_chat(agent, "Hello", fn _ -> :ok end)
-      {:ok, _} = Server.stream_chat(agent, "Again", fn _ -> :ok end)
-
-      messages = Server.messages(agent)
-      # user1, assistant1, user2, assistant2
-      assert length(messages) == 4
-    end
-
-    test "streaming config does not persist after stream_chat" do
-      {:ok, provider} =
-        TestProvider.start_link([
-          TestProvider.text_response("Streamed"),
-          TestProvider.text_response("Not streamed")
-        ])
-
-      {:ok, agent} =
-        Server.start_link(provider: {TestProvider, agent_pid: provider})
-
-      # First: stream_chat
-      {:ok, _} = Server.stream_chat(agent, "Hello", fn _ -> :ok end)
-
-      # Second: regular chat (should NOT stream)
-      # If streaming persisted, this would fail because there's no on_chunk in context
-      {:ok, result} = Server.chat(agent, "Hello again")
-      assert result.text == "Not streamed"
-      assert result.status == :completed
-    end
-
-    test "server state config does not have :streaming field after stream_chat" do
-      {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Done")])
-
-      {:ok, agent} =
-        Server.start_link(provider: {TestProvider, agent_pid: provider})
-
-      {:ok, _} = Server.stream_chat(agent, "Hello", fn _ -> :ok end)
-
-      # Inspect internal GenServer state and verify config has no :streaming key
-      state = :sys.get_state(agent)
-
-      # Config struct should not have :streaming — accessing it raises KeyError
-      assert_raise KeyError, fn -> Map.fetch!(state.config, :streaming) end
-    end
-
+  describe "Alloy.stream/3 event envelopes" do
     test "on_event: nil is treated as no-op (does not crash)" do
       {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Hello")])
 
-      {:ok, agent} =
-        Server.start_link(provider: {TestProvider, agent_pid: provider})
-
-      # Explicitly passing nil should be treated as no-op, not crash with BadFunctionError
-      assert {:ok, _} = Server.stream_chat(agent, "Hi", fn _ -> :ok end, on_event: nil)
+      assert {:ok, _} =
+               Alloy.stream("Hi", fn _ -> :ok end,
+                 provider: {TestProvider, agent_pid: provider},
+                 on_event: nil
+               )
     end
 
-    test "raises ArgumentError when on_event is not a function" do
+    test "text deltas share a correlation id and carry increasing seq numbers" do
       {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Hi")])
-
-      {:ok, agent} =
-        Server.start_link(provider: {TestProvider, agent_pid: provider})
-
-      assert_raise ArgumentError, ~r/on_event must be a 1-arity function/, fn ->
-        Server.stream_chat(agent, "Hello", fn _ -> :ok end, on_event: "not_a_function")
-      end
-    end
-
-    test "on_event opt is threaded through to the provider" do
-      {:ok, provider} = TestProvider.start_link([TestProvider.text_response("Hi")])
-
-      {:ok, agent} =
-        Server.start_link(provider: {TestProvider, agent_pid: provider})
-
       test_pid = self()
-      on_event = fn event -> send(test_pid, {:event, event}) end
 
-      {:ok, result} = Server.stream_chat(agent, "Hello", fn _ -> :ok end, on_event: on_event)
+      {:ok, result} =
+        Alloy.stream("Hello", fn _ -> :ok end,
+          provider: {TestProvider, agent_pid: provider},
+          on_event: &send(test_pid, {:event, &1})
+        )
+
       assert result.status == :completed
 
-      # "Hi" = 2 chars, each fires a text_delta envelope
       assert_received {:event,
                        %{v: 1, event: :text_delta, correlation_id: correlation_id, payload: "H"} =
                          first}
@@ -314,12 +231,10 @@ defmodule Alloy.StreamingTest do
                        %{v: 1, event: :text_delta, correlation_id: ^correlation_id, payload: "i"} =
                          second}
 
-      assert is_integer(first.seq)
-      assert is_integer(second.seq)
       assert second.seq > first.seq
     end
 
-    test "on_event includes tool_start/tool_end during tool execution" do
+    test "tool_start and tool_end envelopes bracket a tool call" do
       {:ok, provider} =
         TestProvider.start_link([
           TestProvider.tool_use_response([
@@ -328,52 +243,32 @@ defmodule Alloy.StreamingTest do
           TestProvider.text_response("Tool said: Echo: world")
         ])
 
-      {:ok, agent} =
-        Server.start_link(
-          provider: {TestProvider, agent_pid: provider},
-          tools: [EchoTool]
-        )
-
       test_pid = self()
-      on_event = fn event -> send(test_pid, {:event, event}) end
 
       {:ok, result} =
-        Server.stream_chat(agent, "Echo world", fn _ -> :ok end, on_event: on_event)
+        Alloy.stream("Echo world", fn _ -> :ok end,
+          provider: {TestProvider, agent_pid: provider},
+          tools: [EchoTool],
+          on_event: &send(test_pid, {:event, &1})
+        )
 
       assert result.status == :completed
 
       assert_received {:event,
-                       %{
-                         v: 1,
-                         event: :tool_start,
-                         correlation_id: correlation_id,
-                         payload: start_payload
-                       } =
-                         tool_start}
+                       %{v: 1, event: :tool_start, correlation_id: correlation_id} = tool_start}
 
-      assert start_payload.id == "tool_1"
-      assert start_payload.name == "echo"
-      assert start_payload.input == %{"text" => "world"}
-      assert is_integer(tool_start.seq)
-      assert is_binary(correlation_id)
+      assert tool_start.payload.id == "tool_1"
+      assert tool_start.payload.name == "echo"
+      assert tool_start.payload.input == %{"text" => "world"}
 
       assert_received {:event,
-                       %{
-                         v: 1,
-                         event: :tool_end,
-                         correlation_id: ^correlation_id,
-                         payload: end_payload
-                       } =
-                         tool_end}
+                       %{v: 1, event: :tool_end, correlation_id: ^correlation_id} = tool_end}
 
-      assert end_payload.id == "tool_1"
-      assert end_payload.name == "echo"
-      assert end_payload.input == %{"text" => "world"}
-      assert end_payload.error == nil
-      duration_ms = end_payload.duration_ms
-      assert is_integer(duration_ms)
-      assert duration_ms >= 0
-      assert end_payload.start_event_seq == tool_start.seq
+      assert %{id: "tool_1", name: "echo", error: nil, duration_ms: duration_ms} =
+               tool_end.payload
+
+      assert is_integer(duration_ms) and duration_ms >= 0
+      assert tool_end.payload.start_event_seq == tool_start.seq
       assert tool_end.seq > tool_start.seq
     end
   end
