@@ -70,18 +70,6 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
 
 ### Fixed
 
-- **Compaction in the middle of a tool loop on Claude 5.x.** Compaction
-  kept the turn in progress's signed thinking, but that thinking was
-  produced after the history compaction had just rewritten. Claude Fable
-  5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 reject such thinking for accounts
-  created on or after 2026-08-31. Compaction now removes all thinking it
-  keeps, which those models (adaptive thinking only) accept. Under manual
-  thinking (`"type" => "enabled"`), which requires the turn in progress to
-  start with thinking and whose models don't check history, that turn keeps
-  it. The
-  `thinking-binding-controls-2026-08-01` beta is not needed. To opt into
-  `prefix_mismatch_behavior: "drop_block"` yourself, pass it through
-  `:extra_body` and `:extra_headers`.
 - **Switching provider mid-conversation** (a fallback provider, or changing
   model) no longer sends one provider's signed reasoning to another, which
   failed with HTTP 400s such as `invalid_encrypted_content` or an invalid
@@ -180,12 +168,17 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
   `{:ok, result}`), and its default call timeout is the agent's
   `timeout_ms` plus 10 seconds instead of 30 seconds, so a caller no longer
   gives up while the turn is still running.
-- **Compaction strips reasoning from earlier turns.** After any compaction,
-  thinking blocks are removed from turns before the current one: Claude 5.x
-  rejects signed thinking whose earlier history changed, and removing all
-  thinking from earlier turns is the documented way to keep the transcript
-  valid. Truncation never splits a tool round, and oversized retained tool
-  results are shortened with a marker.
+- **Compaction strips stale reasoning.** Claude Fable 5.1, Opus 5.5,
+  Sonnet 5.5 and Haiku 5.5 reject signed thinking whose earlier history
+  changed, for accounts created on or after 2026-08-31. After any
+  compaction, every thinking block is removed, including the turn in
+  progress, which was produced before the rewrite. This is the documented
+  valid change, and those models think adaptively, which doesn't require the
+  turn to start with thinking. Under manual thinking (`:extended_thinking`,
+  or `"type" => "enabled"` in `:extra_body`), which does require it and
+  whose models don't check history, the turn in progress keeps its
+  thinking. Truncation never splits a tool round, and oversized retained
+  tool results are shortened with a marker.
 - `Alloy.Context.Compactor`: in `compact_messages/2`, `:keep_recent` is a
   minimum (whole tool rounds are kept) and `redacted_thinking` blocks are
   dropped with other earlier-turn thinking; `force_compact/1` always

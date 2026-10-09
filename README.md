@@ -309,11 +309,12 @@ clearing invalidates cached prefixes, so Alloy amortizes that cost instead of
 dripping changes across turns. The estimate counts the system prompt, tool
 definitions and every message block.
 
-Whenever compaction changes history, thinking blocks are removed from turns
-before the current one: Claude rejects signed thinking whose earlier history
-changed, and dropping all of it from earlier turns is the documented way to
-keep the transcript valid. Compaction never splits a tool call from its
-result.
+Whenever compaction changes history, every thinking block is removed,
+including the turn in progress: Claude 5.x rejects signed thinking whose
+earlier history changed, and removing all of it is the documented way to
+keep the transcript valid. Under manual thinking, which requires the turn in
+progress to start with thinking, that turn keeps it. Compaction never splits
+a tool call from its result.
 
 Set `summary_system_prompt:` and `summary_prompt:` inside `compaction:` when
 your application needs to own the handoff format. Both values must be strings;
