@@ -152,10 +152,17 @@ defmodule Alloy.Tool.Core.Read do
     width = number_width(max_num)
 
     Enum.map_join(numbered_lines, fn {line, num} ->
-      String.pad_leading(Integer.to_string(num), width) <>
-        "\t" <>
-        (line |> String.replace_suffix("\n", "") |> String.replace_suffix("\r", "")) <>
-        "\n"
+      String.pad_leading(Integer.to_string(num), width) <> "\t" <> display(line) <> "\n"
     end)
+  end
+
+  # Latin-1 and other non-UTF-8 text has no NUL byte, so it is not
+  # refused as binary; its invalid bytes become U+FFFD so the result is
+  # always valid UTF-8, even when read is called outside the executor.
+  defp display(line) do
+    line
+    |> String.replace_suffix("\n", "")
+    |> String.replace_suffix("\r", "")
+    |> String.replace_invalid()
   end
 end

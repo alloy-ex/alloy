@@ -92,6 +92,15 @@ defmodule Alloy.Tool.Core.ReadTest do
       assert String.valid?(msg)
     end
 
+    test "returns valid UTF-8 for non-UTF-8 text without a NUL byte", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "mixed.bin")
+      File.write!(file, <<0x89, "PNG\r\n", 0x1A, 0xFF, 0xFE, "\n", "caf", 0xE9, "\n">>)
+
+      assert {:ok, result} = Read.execute(%{"file_path" => file}, %{})
+      assert String.valid?(result)
+      assert result =~ "caf�"
+    end
+
     test "an unreadable file is an error, not a crash", %{tmp_dir: tmp_dir} do
       file = Path.join(tmp_dir, "secret.txt")
       File.write!(file, "hidden\n")
