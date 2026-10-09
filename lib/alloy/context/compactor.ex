@@ -27,6 +27,7 @@ defmodule Alloy.Context.Compactor do
   @truncate_length 200
 
   @summary_prefix "Previous analysis summary (from earlier in this session):"
+  @cleared_prefix "[tool result cleared: "
 
   @summary_system_prompt """
   You are performing CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
@@ -308,6 +309,11 @@ defmodule Alloy.Context.Compactor do
       blocks
       |> Enum.with_index()
       |> Enum.map_reduce(acc, fn
+        # Clearing it again would replace the original size with the size of
+        # the marker and change bytes the provider has already cached.
+        {%{content: @cleared_prefix <> _} = block, _block_index}, acc ->
+          {block, acc}
+
         {%{type: type} = block, block_index}, acc
         when type in ["tool_result", "server_tool_result"] ->
           position = {message_index, block_index}
@@ -318,7 +324,7 @@ defmodule Alloy.Context.Compactor do
             bytes = content_bytes(block)
 
             {
-              %{block | content: "[tool result cleared: #{bytes} bytes]"},
+              %{block | content: "#{@cleared_prefix}#{bytes} bytes]"},
               %{
                 results_cleared: acc.results_cleared + 1,
                 bytes_cleared: acc.bytes_cleared + bytes

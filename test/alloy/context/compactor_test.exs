@@ -253,6 +253,53 @@ defmodule Alloy.Context.CompactorTest do
       assert tool_result_content(compacted.messages, "t5") == String.duplicate("5", 400)
     end
 
+    test "leaves tool results cleared by an earlier compaction untouched" do
+      test_pid = self()
+      handler_id = "compaction-recleared-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        handler_id,
+        [:alloy, :compaction, :cleared],
+        fn _event, measurements, _metadata, _config ->
+          send(test_pid, {:cleared, measurements})
+        end,
+        nil
+      )
+
+      [first_call, first_result | rest] = bulky_tool_messages(5, 400)
+
+      already_cleared =
+        Message.tool_results([
+          %{type: "tool_result", tool_use_id: "t1", content: "[tool result cleared: 9000 bytes]"}
+        ])
+
+      messages =
+        [Message.user("original"), first_call, already_cleared] ++
+          rest ++ [Message.user("latest")]
+
+      refute first_result == already_cleared
+
+      state =
+        build_state(messages,
+          max_tokens: 540,
+          compaction: [reserve_tokens: 100, keep_recent_tokens: 10],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("unused")}, test_pid: self()}
+        )
+
+      try do
+        {:compacted, compacted} = Compactor.maybe_compact(state)
+
+        assert tool_result_content(compacted.messages, "t1") ==
+                 "[tool result cleared: 9000 bytes]"
+
+        assert tool_result_content(compacted.messages, "t2") == "[tool result cleared: 400 bytes]"
+        assert_received {:cleared, %{results_cleared: 1, bytes_cleared: 400}}
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "clears old tool results in a single-prompt tool loop before summarizing" do
       messages = [Message.user("task")] ++ bulky_tool_messages(6, 400)
 
