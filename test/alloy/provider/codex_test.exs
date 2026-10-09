@@ -704,6 +704,65 @@ defmodule Alloy.Provider.CodexTest do
     end
   end
 
+  describe "subprocess lifecycle" do
+    @tag :tmp_dir
+    test "killing the caller stops codex and its children and removes its files", %{
+      tmp_dir: dir
+    } do
+      {script, pids_path} = hanging_codex!(dir)
+      tmp_parent = Path.join(dir, "runs")
+      File.mkdir_p!(tmp_parent)
+
+      config = %{
+        model: "gpt-5.4",
+        codex_bin: script,
+        codex_home: dir,
+        tmp_dir: tmp_parent,
+        timeout_ms: 30_000
+      }
+
+      caller = spawn(fn -> Codex.complete([Message.user("Hi")], [], config) end)
+      pids = await_pids!(pids_path)
+
+      Process.exit(caller, :kill)
+
+      assert eventually(fn -> Enum.all?(pids, &(not os_alive?(&1))) end),
+             "codex processes #{inspect(pids)} outlived the caller"
+
+      assert eventually(fn -> File.ls!(tmp_parent) == [] end)
+    end
+
+    @tag :tmp_dir
+    test "shutting down the owning process stops codex", %{tmp_dir: dir} do
+      {script, pids_path} = hanging_codex!(dir)
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir, timeout_ms: 30_000}
+      test_pid = self()
+
+      caller =
+        spawn(fn ->
+          send(test_pid, {:result, Codex.complete([Message.user("Hi")], [], config)})
+        end)
+
+      pids = await_pids!(pids_path)
+      [owner] = owners_started_by(caller)
+
+      assert :ok = Task.Supervisor.terminate_child(Alloy.TaskSupervisor, owner)
+      assert Enum.all?(pids, &(not os_alive?(&1)))
+      assert_receive {:result, {:error, _reason}}, 10_000
+    end
+
+    @tag :tmp_dir
+    test "a timeout stops codex's child processes too", %{tmp_dir: dir} do
+      {script, pids_path} = hanging_codex!(dir)
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir, timeout_ms: 500}
+
+      assert {:error, _reason} = Codex.complete([Message.user("Hi")], [], config)
+
+      pids = await_pids!(pids_path)
+      assert eventually(fn -> Enum.all?(pids, &(not os_alive?(&1))) end)
+    end
+  end
+
   describe "stream/4" do
     test "replays the final assistant text through the callback" do
       parent = self()
@@ -770,5 +829,58 @@ defmodule Alloy.Provider.CodexTest do
 
     File.chmod!(path, 0o755)
     path
+  end
+
+  # A codex that starts a child process, records both OS pids, and hangs.
+  defp hanging_codex!(dir) do
+    pids_path = Path.join(dir, "pids")
+
+    script =
+      fake_codex!(dir, """
+      sleep 30 &
+      echo "$$ $!" > "#{pids_path}.tmp" && mv "#{pids_path}.tmp" "#{pids_path}"
+      wait
+      """)
+
+    {script, pids_path}
+  end
+
+  defp await_pids!(path) do
+    assert eventually(fn -> File.exists?(path) end), "fake codex never started"
+    path |> File.read!() |> String.split()
+  end
+
+  defp owners_started_by(caller) do
+    for pid <- Task.Supervisor.children(Alloy.TaskSupervisor),
+        {:dictionary, dictionary} <- [Process.info(pid, :dictionary)],
+        caller in Keyword.get(dictionary, :"$callers", []),
+        do: pid
+  end
+
+  # `kill -0` probes a pid without signalling it; it needs no environment.
+  defp os_alive?(os_pid) do
+    no_env = Enum.map(System.get_env(), fn {name, _value} -> {name, nil} end)
+
+    {_output, status} =
+      System.cmd("/bin/sh", ["-c", ~S(kill -0 "$1"), "probe", os_pid],
+        env: no_env,
+        stderr_to_stdout: true
+      )
+
+    status == 0
+  end
+
+  defp eventually(fun, attempts \\ 50) do
+    case fun.() do
+      true ->
+        true
+
+      false when attempts == 0 ->
+        false
+
+      false ->
+        Process.sleep(100)
+        eventually(fun, attempts - 1)
+    end
   end
 end

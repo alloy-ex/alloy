@@ -60,6 +60,9 @@ defmodule Alloy.Provider.Codex do
     reported as `:cache_read_input_tokens`; `:reasoning_output_tokens` is
     part of `:output_tokens`. Counts include Codex's own instructions and
     tool definitions, not just the transcript.
+  - Each call runs `codex exec` under `Alloy.TaskSupervisor`. A timeout, or
+    the calling process exiting (a cancelled turn), stops codex and every
+    process it started, and removes the call's temp files.
   - Streaming is emulated by running a normal completion and replaying the final
     text to the provided callback.
   """
@@ -73,6 +76,11 @@ defmodule Alloy.Provider.Codex do
   @output_truncation 4_000
   @error_truncation 2_000
   @zero_usage %{input_tokens: 0, output_tokens: 0}
+  # How long codex gets to exit after SIGTERM before the group is killed.
+  @term_grace_ms 100
+  # The owning task replies by its deadline plus the kill grace; this only
+  # bounds the wait if it stops responding.
+  @reply_grace_ms 5_000
 
   # Matches any `\X` where X is NOT a valid JSON single-character escape
   # (valid set: " \ / b f n r t u). Used by the decode repair pass.
@@ -136,19 +144,12 @@ defmodule Alloy.Provider.Codex do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
+    prompt = build_prompt(messages, tool_defs, config)
+
     with {:ok, codex_home} <- codex_home(config),
-         {:ok, paths} <- prepare_paths(codex_home, config) do
-      try do
-        with :ok <- File.write(paths.schema_path, @response_schema_json),
-             prompt = build_prompt(messages, tool_defs, config),
-             :ok <- File.write(paths.prompt_path, prompt),
-             {:ok, command_result} <- run_codex(prompt, paths, config),
-             {:ok, payload} <- read_payload_or_error(paths.last_message_path, command_result) do
-          parse_payload(payload, config, command_result)
-        end
-      after
-        cleanup_paths(paths)
-      end
+         {:ok, command_result} <- execute(prompt, codex_home, config),
+         {:ok, payload} <- decode_payload(command_result) do
+      parse_payload(payload, config, command_result)
     end
   end
 
@@ -178,24 +179,83 @@ defmodule Alloy.Provider.Codex do
 
   defp codex_home(_config), do: {:ok, nil}
 
-  defp prepare_paths(codex_home, config) do
-    base_dir = build_base_dir(config)
+  # Test hook: a synchronous function matching `System.cmd/3`, run in the
+  # caller with no timeout of its own.
+  defp execute(prompt, codex_home, %{command_runner: runner} = config) do
+    in_temp_dir(config, fn paths ->
+      with :ok <- write_inputs(paths, prompt) do
+        run_injected(runner, codex_args(paths, config) ++ [prompt], codex_home, paths, config)
+      end
+    end)
+  end
 
-    case File.mkdir_p(base_dir) do
-      :ok -> {:ok, build_paths(base_dir, codex_home, config)}
-      {:error, reason} -> {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
+  # The OS process belongs to a supervised task rather than the caller, so it
+  # is stopped and its files removed even when the caller is killed (the
+  # loop kills a cancelled turn, and `after` blocks do not run on a kill).
+  defp execute(prompt, codex_home, config) do
+    caller = self()
+    timeout = effective_timeout(config)
+
+    task =
+      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
+        own_run(caller, prompt, codex_home, config, timeout)
+      end)
+
+    case Task.yield(task, timeout + @reply_grace_ms) || Task.shutdown(task) do
+      {:ok, result} -> result
+      {:exit, reason} -> {:error, "codex exec failed: #{inspect(reason)}"}
+      nil -> {:error, timed_out(timeout)}
     end
   end
 
-  defp build_base_dir(config) do
-    parent = Map.get(config, :tmp_dir) || System.tmp_dir!()
-    Path.join(parent, "alloy-codex-#{System.unique_integer([:positive])}")
+  defp own_run(caller, prompt, codex_home, config, timeout) do
+    # Trapping exits lets a supervisor shutdown stop codex too.
+    Process.flag(:trap_exit, true)
+    caller_ref = Process.monitor(caller)
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    result =
+      in_temp_dir(config, fn paths ->
+        with :ok <- write_inputs(paths, prompt) do
+          port = open_port(codex_args(paths, config) ++ ["-"], codex_home, paths, config)
+
+          run = %{
+            port: port,
+            os_pid: os_pid(port),
+            caller_ref: caller_ref,
+            deadline: deadline,
+            timeout: timeout
+          }
+
+          with {:ok, output, status} <- collect(run, []) do
+            {:ok, command_result(output, read_stderr(paths), status, paths)}
+          end
+        end
+      end)
+
+    Process.demonitor(caller_ref, [:flush])
+    result
   end
 
-  defp build_paths(base_dir, codex_home, config) do
+  defp in_temp_dir(config, fun) do
+    parent = Map.get(config, :tmp_dir) || System.tmp_dir!()
+    base_dir = Path.join(parent, "alloy-codex-#{System.unique_integer([:positive])}")
+
+    case File.mkdir_p(base_dir) do
+      :ok ->
+        try do
+          fun.(paths(base_dir, config))
+        after
+          _ = File.rm_rf(base_dir)
+        end
+
+      {:error, reason} ->
+        {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
+    end
+  end
+
+  defp paths(base_dir, config) do
     %{
-      base_dir: base_dir,
-      codex_home: codex_home,
       prompt_path: Path.join(base_dir, "prompt.txt"),
       schema_path: Path.join(base_dir, "response_schema.json"),
       last_message_path: Path.join(base_dir, "last_message.json"),
@@ -204,38 +264,9 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
-  defp cleanup_paths(%{base_dir: base_dir}) do
-    _ = File.rm_rf(base_dir)
-    :ok
-  end
-
-  defp run_codex(prompt, paths, config) do
-    executable = Map.get(config, :codex_bin, @default_codex_bin)
-    timeout = effective_timeout(config)
-
-    args =
-      [
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--ignore-rules",
-        "--sandbox",
-        "read-only",
-        "--output-schema",
-        paths.schema_path,
-        "--output-last-message",
-        paths.last_message_path
-      ]
-      |> append_user_config(config)
-      |> append_config_overrides(config)
-      |> maybe_append_model(config)
-      |> append_prompt_arg(prompt, config)
-
-    if injected_runner?(config) do
-      run_injected(config, executable, args, paths)
-    else
-      run_port(executable, args, paths, timeout)
+  defp write_inputs(paths, prompt) do
+    with :ok <- File.write(paths.schema_path, @response_schema_json) do
+      File.write(paths.prompt_path, prompt)
     end
   end
 
@@ -249,16 +280,12 @@ defmodule Alloy.Provider.Codex do
     |> Enum.min()
   end
 
-  # Test path: the caller supplies a synchronous function matching
-  # `System.cmd/3`. No timeout enforcement — tests should be fast enough
-  # to rely on ExUnit's own timeout.
-  defp run_injected(config, executable, args, paths) do
-    runner = Map.fetch!(config, :command_runner)
-    opts = [cd: paths.workdir, env: codex_env(paths)]
+  defp run_injected(runner, args, codex_home, paths, config) do
+    opts = [cd: paths.workdir, env: codex_env(codex_home)]
 
-    case runner.(executable, args, opts) do
+    case runner.(codex_bin(config), args, opts) do
       {output, status} when is_binary(output) and is_integer(status) ->
-        {:ok, command_result(output, "", status)}
+        {:ok, command_result(output, "", status, paths)}
 
       other ->
         {:error, "codex exec returned unexpected result: #{inspect(other)}"}
@@ -268,36 +295,89 @@ defmodule Alloy.Provider.Codex do
       {:error, "codex exec failed to start: #{Exception.message(error)}"}
   end
 
-  defp run_port(executable, args, paths, timeout) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    env = Enum.map(codex_env(paths), fn {key, value} -> "#{key}=#{value}" end)
+  defp open_port(args, codex_home, paths, config) do
+    env = Enum.map(codex_env(codex_home), fn {key, value} -> "#{key}=#{value}" end)
 
     launch_args =
       ["-lc", @launch_script, "alloy-codex", paths.prompt_path, paths.stderr_path, "env"] ++
-        env ++ [executable | args]
+        env ++ [codex_bin(config) | args]
 
-    port =
-      Port.open(
-        {:spawn_executable, "/bin/sh"},
-        [{:args, launch_args}, {:cd, paths.workdir}, :binary, :exit_status, :use_stdio]
-      )
-
-    # Port.info/2 returns nil when the process already exited — its output
-    # and exit_status messages are still in the mailbox, so collect them;
-    # there is just no OS pid left to kill on timeout.
-    result =
-      case Port.info(port, :os_pid) do
-        {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, deadline, [])
-        nil -> collect_port(port, nil, timeout, deadline, [])
-      end
-
-    with {:ok, output, status} <- result do
-      {:ok, command_result(output, read_stderr(paths), status)}
-    end
-  rescue
-    error in ErlangError ->
-      {:error, "codex exec failed to start: #{Exception.message(error)}"}
+    Port.open(
+      {:spawn_executable, "/bin/sh"},
+      [{:args, launch_args}, {:cd, paths.workdir}, :binary, :exit_status, :use_stdio]
+    )
   end
+
+  # Port.info/2 returns nil when the process already exited — its output
+  # and exit_status messages are still in the mailbox, so collect them;
+  # there is just no OS pid left to kill.
+  defp os_pid(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> os_pid
+      nil -> nil
+    end
+  end
+
+  # The deadline is absolute: checking it before each receive keeps a
+  # steady stream of output from postponing the timeout.
+  defp collect(run, acc) do
+    case run.deadline - System.monotonic_time(:millisecond) do
+      remaining when remaining > 0 -> receive_output(run, acc, remaining)
+      _expired -> time_out(run)
+    end
+  end
+
+  defp receive_output(%{port: port, caller_ref: caller_ref} = run, acc, remaining) do
+    receive do
+      {^port, {:data, data}} ->
+        collect(run, [acc, data])
+
+      {^port, {:exit_status, status}} ->
+        {:ok, IO.iodata_to_binary(acc), status}
+
+      {:DOWN, ^caller_ref, :process, _pid, reason} ->
+        :ok = stop(run)
+        {:error, "codex exec cancelled: caller exited (#{inspect(reason)})"}
+
+      {:EXIT, from, reason} when is_pid(from) ->
+        :ok = stop(run)
+        exit(reason)
+    after
+      remaining -> time_out(run)
+    end
+  end
+
+  defp time_out(run) do
+    :ok = stop(run)
+    {:error, timed_out(run.timeout)}
+  end
+
+  # SIGTERM, a short grace for codex to exit, then SIGKILL for anything left
+  # in the group. The port's process leads its own process group
+  # (erl_child_setup calls setsid), so this reaches codex's children too.
+  defp stop(%{os_pid: nil}), do: :ok
+
+  defp stop(%{port: port, os_pid: os_pid}) do
+    :ok = signal_group(os_pid, "TERM")
+
+    receive do
+      {^port, {:exit_status, _status}} -> :ok
+    after
+      @term_grace_ms -> :ok
+    end
+
+    signal_group(os_pid, "KILL")
+  end
+
+  # kill is a shell builtin and needs no environment, so it inherits none.
+  defp signal_group(os_pid, signal) do
+    no_env = Enum.map(System.get_env(), fn {name, _value} -> {name, nil} end)
+    args = ["-c", ~S(kill -s "$1" -- "-$2"), "alloy-codex-kill", signal, "#{os_pid}"]
+    {_output, _status} = System.cmd("/bin/sh", args, env: no_env, stderr_to_stdout: true)
+    :ok
+  end
+
+  defp timed_out(timeout), do: "codex exec timed out after #{timeout}ms"
 
   defp read_stderr(paths) do
     case File.read(paths.stderr_path) do
@@ -306,8 +386,14 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp command_result(output, stderr, status) do
-    %{output: output, stderr: stderr, status: status, events: decode_events(output)}
+  defp command_result(output, stderr, status, paths) do
+    %{
+      output: output,
+      stderr: stderr,
+      status: status,
+      events: decode_events(output),
+      last_message: File.read(paths.last_message_path)
+    }
   end
 
   # `codex exec --json` writes one event object per line.
@@ -322,82 +408,10 @@ defmodule Alloy.Provider.Codex do
     end)
   end
 
-  defp codex_env(%{codex_home: nil}), do: [{"OTEL_SDK_DISABLED", "true"}]
+  defp codex_env(nil), do: [{"OTEL_SDK_DISABLED", "true"}]
+  defp codex_env(codex_home), do: [{"OTEL_SDK_DISABLED", "true"}, {"CODEX_HOME", codex_home}]
 
-  defp codex_env(%{codex_home: codex_home}),
-    do: [{"OTEL_SDK_DISABLED", "true"}, {"CODEX_HOME", codex_home}]
-
-  defp collect_port(port, os_pid, timeout, deadline, acc) do
-    remaining = deadline - System.monotonic_time(:millisecond)
-
-    if remaining <= 0 do
-      timeout_port(port, os_pid, timeout)
-    else
-      receive_port(port, os_pid, timeout, deadline, remaining, acc)
-    end
-  end
-
-  defp receive_port(port, os_pid, timeout, deadline, remaining, acc) do
-    receive do
-      {^port, {:data, data}} when is_binary(data) ->
-        collect_port(port, os_pid, timeout, deadline, [acc, data])
-
-      {^port, {:exit_status, status}} ->
-        {:ok, IO.iodata_to_binary(acc), status}
-    after
-      remaining ->
-        timeout_port(port, os_pid, timeout)
-    end
-  end
-
-  defp timeout_port(port, os_pid, timeout) do
-    _ = kill_os_process(os_pid)
-    _ = close_and_drain(port)
-    {:error, "codex exec timed out after #{timeout}ms"}
-  end
-
-  # SIGTERM with a 100ms grace window, then SIGKILL. Best-effort — if
-  # codex has already exited, the second kill is a no-op.
-  defp kill_os_process(nil), do: :ok
-
-  defp kill_os_process(os_pid) do
-    _ = System.cmd("/bin/kill", ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
-    Process.sleep(100)
-    _ = System.cmd("/bin/kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
-    :ok
-  end
-
-  defp close_and_drain(port) do
-    _ =
-      try do
-        Port.close(port)
-      rescue
-        ArgumentError -> :ok
-      end
-
-    drain_port_messages(port)
-  end
-
-  defp drain_port_messages(port) do
-    receive do
-      {^port, _} -> drain_port_messages(port)
-    after
-      0 -> :ok
-    end
-  end
-
-  defp append_prompt_arg(args, prompt, config) do
-    if injected_runner?(config) do
-      args ++ [prompt]
-    else
-      args ++ ["-"]
-    end
-  end
-
-  # An explicit `:command_runner` in config means the caller is driving
-  # process execution themselves (almost always a test). Real usage goes
-  # through the shell wrapper so we can inject env and stdin-feed the prompt.
-  defp injected_runner?(config), do: Map.has_key?(config, :command_runner)
+  defp codex_bin(config), do: Map.get(config, :codex_bin, @default_codex_bin)
 
   defp codex_error(%{status: status} = command_result) do
     message =
@@ -428,31 +442,28 @@ defmodule Alloy.Provider.Codex do
 
   defp event_error(_event), do: nil
 
-  defp read_payload_or_error(path, %{status: status} = command_result) do
-    case read_payload(path) do
+  # A payload counts even when codex exits non-zero; without one, a non-zero
+  # exit is the error worth reporting.
+  defp decode_payload(%{last_message: last_message, status: status} = command_result) do
+    case decode_last_message(last_message) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, reason} when status == 0 -> {:error, reason}
+      {:error, _reason} -> {:error, codex_error(command_result)}
+    end
+  end
+
+  defp decode_last_message({:ok, content}) do
+    case Jason.decode(content) do
       {:ok, payload} ->
         {:ok, payload}
 
-      {:error, reason} when status == 0 ->
-        {:error, reason}
-
-      {:error, _reason} ->
-        {:error, codex_error(command_result)}
-    end
-  end
-
-  defp read_payload(path) do
-    with {:ok, content} <- File.read(path),
-         {:ok, payload} <- Jason.decode(content) do
-      {:ok, payload}
-    else
-      {:error, reason} when is_atom(reason) ->
-        {:error, "failed to read Codex response file: #{inspect(reason)}"}
-
-      {:error, %Jason.DecodeError{} = error} ->
+      {:error, error} ->
         {:error, "failed to decode Codex response JSON: #{Exception.message(error)}"}
     end
   end
+
+  defp decode_last_message({:error, reason}),
+    do: {:error, "failed to read Codex response file: #{inspect(reason)}"}
 
   defp parse_payload(
          %{"stop_reason" => "end_turn", "text" => text, "tool_calls" => tool_calls},
@@ -698,6 +709,25 @@ defmodule Alloy.Provider.Codex do
       description: description,
       input_schema: input_schema
     }
+  end
+
+  defp codex_args(paths, config) do
+    [
+      "exec",
+      "--json",
+      "--skip-git-repo-check",
+      "--ephemeral",
+      "--ignore-rules",
+      "--sandbox",
+      "read-only",
+      "--output-schema",
+      paths.schema_path,
+      "--output-last-message",
+      paths.last_message_path
+    ]
+    |> append_user_config(config)
+    |> append_config_overrides(config)
+    |> maybe_append_model(config)
   end
 
   # --ignore-user-config also skips the profile file, so a profile opts in
