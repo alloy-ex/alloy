@@ -184,27 +184,11 @@ defmodule Alloy.Provider.CodexTest do
       assert result.response_metadata.command_status == 1
     end
 
-    test "passes the prompt via stdin for the real shell-backed runner" do
-      temp_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "alloy-codex-provider-test-#{System.unique_integer([:positive])}"
-        )
-
-      File.mkdir_p!(temp_dir)
-      on_exit(fn -> File.rm_rf(temp_dir) end)
-
-      auth_path = Path.join(temp_dir, "auth.json")
-      File.write!(auth_path, "{}")
-
-      script_path = Path.join(temp_dir, "fake-codex.sh")
-
-      File.write!(
-        script_path,
-        """
-        #!/bin/sh
+    @tag :tmp_dir
+    test "passes the prompt via stdin for the real shell-backed runner", %{tmp_dir: dir} do
+      script =
+        script!(dir, """
         set -eu
-
         output=""
         last=""
 
@@ -224,9 +208,7 @@ defmodule Alloy.Provider.CodexTest do
           exit 41
         fi
 
-        prompt="$(cat)"
-
-        case "$prompt" in
+        case "$(cat)" in
           *"Need a decision"*) ;;
           *)
             echo "missing prompt on stdin" >&2
@@ -235,108 +217,36 @@ defmodule Alloy.Provider.CodexTest do
         esac
 
         printf '%s' '{"stop_reason":"end_turn","text":"stdin ok","tool_calls":[]}' > "$output"
-        printf '%s\\n' '{"event":"done"}'
-        """
-      )
+        """)
 
-      File.chmod!(script_path, 0o755)
-
-      config = %{
-        model: "gpt-5.4",
-        codex_bin: script_path,
-        auth_path: auth_path
-      }
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir}
 
       assert {:ok, result} = Codex.complete([Message.user("Need a decision")], [], config)
       assert result.messages == [Message.assistant("stdin ok")]
     end
 
-    test "collects output even when the process exits before os_pid can be read" do
+    @tag :tmp_dir
+    test "collects output even when the process exits before os_pid can be read", %{
+      tmp_dir: dir
+    } do
       # Regression: Port.info(port, :os_pid) returns nil when the spawned
       # process has already exited. The output and exit_status messages are
       # still in the mailbox, so a fast-exiting codex must succeed, not
       # error with "port closed before os_pid was available". The race is
       # timing-dependent; the instant-exit script plus repetition makes it
       # likely under the old code and proves the nil branch under the new.
-      temp_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "alloy-codex-provider-fastexit-#{System.unique_integer([:positive])}"
-        )
-
-      File.mkdir_p!(temp_dir)
-      on_exit(fn -> File.rm_rf(temp_dir) end)
-
-      auth_path = Path.join(temp_dir, "auth.json")
-      File.write!(auth_path, "{}")
-
-      script_path = Path.join(temp_dir, "fast-codex.sh")
-
-      File.write!(
-        script_path,
-        """
-        #!/bin/sh
-        output=""
-
-        while [ "$#" -gt 0 ]; do
-          if [ "$1" = "--output-last-message" ]; then
-            shift
-            output="$1"
-          fi
-
-          shift
-        done
-
-        cat > /dev/null
-        printf '%s' '{"stop_reason":"end_turn","text":"fast exit","tool_calls":[]}' > "$output"
-        printf '%s\\n' '{"event":"done"}'
-        """
-      )
-
-      File.chmod!(script_path, 0o755)
-
-      config = %{
-        model: "gpt-5.4",
-        codex_bin: script_path,
-        auth_path: auth_path
-      }
+      config = %{model: "gpt-5.4", codex_bin: fake_codex!(dir, ""), codex_home: dir}
 
       for _run <- 1..20 do
         assert {:ok, result} = Codex.complete([Message.user("Hi")], [], config)
-        assert result.messages == [Message.assistant("fast exit")]
+        assert result.messages == [Message.assistant("fake ok")]
       end
     end
 
-    test "returns a timeout error instead of hanging when the real shell-backed run exceeds timeout_ms" do
-      temp_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "alloy-codex-provider-timeout-#{System.unique_integer([:positive])}"
-        )
-
-      File.mkdir_p!(temp_dir)
-      on_exit(fn -> File.rm_rf(temp_dir) end)
-
-      auth_path = Path.join(temp_dir, "auth.json")
-      File.write!(auth_path, "{}")
-
-      script_path = Path.join(temp_dir, "slow-codex.sh")
-
-      File.write!(script_path, """
-      #!/bin/sh
-      # Drain stdin so the shell redirect completes, then hang.
-      cat > /dev/null
-      sleep 30
-      """)
-
-      File.chmod!(script_path, 0o755)
-
-      config = %{
-        model: "gpt-5.4",
-        codex_bin: script_path,
-        auth_path: auth_path,
-        timeout_ms: 200
-      }
+    @tag :tmp_dir
+    test "returns a timeout error instead of hanging when the real shell-backed run exceeds timeout_ms",
+         %{tmp_dir: dir} do
+      config = %{model: "gpt-5.4", codex_bin: slow_codex!(dir), codex_home: dir, timeout_ms: 200}
 
       # If the Port-based timeout path is broken, this call hangs for 30s
       # and ExUnit's own timeout would catch it — the assertion below
@@ -352,37 +262,23 @@ defmodule Alloy.Provider.CodexTest do
              "expected timeout to fire within ~200ms + grace, took #{elapsed}ms"
     end
 
-    test "progress output cannot extend the real shell-backed run's deadline" do
-      temp_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "alloy-codex-provider-progress-#{System.unique_integer([:positive])}"
-        )
-
-      File.mkdir_p!(temp_dir)
-      on_exit(fn -> File.rm_rf(temp_dir) end)
-
-      auth_path = Path.join(temp_dir, "auth.json")
-      File.write!(auth_path, "{}")
-      script_path = Path.join(temp_dir, "chatty-codex.sh")
-
-      File.write!(script_path, """
-      #!/bin/sh
-      cat > /dev/null
-      tick=0
-      while [ "$tick" -lt 80 ]; do
-        printf '%s\\n' '{"event":"progress"}'
-        tick=$((tick + 1))
-        sleep 0.05
-      done
-      """)
-
-      File.chmod!(script_path, 0o755)
+    @tag :tmp_dir
+    test "progress output cannot extend the real shell-backed run's deadline", %{tmp_dir: dir} do
+      script =
+        script!(dir, """
+        cat > /dev/null
+        tick=0
+        while [ "$tick" -lt 80 ]; do
+          printf '%s\\n' '{"event":"progress"}'
+          tick=$((tick + 1))
+          sleep 0.05
+        done
+        """)
 
       config = %{
         model: "gpt-5.4",
-        codex_bin: script_path,
-        auth_path: auth_path,
+        codex_bin: script,
+        codex_home: dir,
         timeout_ms: 30_000,
         receive_timeout: 1_000
       }
@@ -396,33 +292,14 @@ defmodule Alloy.Provider.CodexTest do
       assert elapsed < 3_000, "progress reset the turn deadline: #{elapsed}ms"
     end
 
-    test "receive_timeout caps a larger timeout_ms for the real shell-backed run" do
-      temp_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "alloy-codex-provider-receive-timeout-#{System.unique_integer([:positive])}"
-        )
-
-      File.mkdir_p!(temp_dir)
-      on_exit(fn -> File.rm_rf(temp_dir) end)
-
-      auth_path = Path.join(temp_dir, "auth.json")
-      File.write!(auth_path, "{}")
-
-      script_path = Path.join(temp_dir, "slow-codex.sh")
-
-      File.write!(script_path, """
-      #!/bin/sh
-      cat > /dev/null
-      sleep 30
-      """)
-
-      File.chmod!(script_path, 0o755)
-
+    @tag :tmp_dir
+    test "receive_timeout caps a larger timeout_ms for the real shell-backed run", %{
+      tmp_dir: dir
+    } do
       config = %{
         model: "gpt-5.4",
-        codex_bin: script_path,
-        auth_path: auth_path,
+        codex_bin: slow_codex!(dir),
+        codex_home: dir,
         timeout_ms: 30_000,
         receive_timeout: 150
       }
@@ -440,33 +317,12 @@ defmodule Alloy.Provider.CodexTest do
 
     # Alloy.Provider.Retry injects the turn deadline into :req_options (the
     # shape HTTP providers hand to Req), not as a top-level key.
-    test "the turn deadline injected into :req_options caps the port timeout" do
-      temp_dir =
-        Path.join(
-          System.tmp_dir!(),
-          "alloy-codex-provider-req-options-timeout-#{System.unique_integer([:positive])}"
-        )
-
-      File.mkdir_p!(temp_dir)
-      on_exit(fn -> File.rm_rf(temp_dir) end)
-
-      auth_path = Path.join(temp_dir, "auth.json")
-      File.write!(auth_path, "{}")
-
-      script_path = Path.join(temp_dir, "slow-codex.sh")
-
-      File.write!(script_path, """
-      #!/bin/sh
-      cat > /dev/null
-      sleep 30
-      """)
-
-      File.chmod!(script_path, 0o755)
-
+    @tag :tmp_dir
+    test "the turn deadline injected into :req_options caps the port timeout", %{tmp_dir: dir} do
       config = %{
         model: "gpt-5.4",
-        codex_bin: script_path,
-        auth_path: auth_path,
+        codex_bin: slow_codex!(dir),
+        codex_home: dir,
         timeout_ms: 30_000,
         req_options: [receive_timeout: 150]
       }
@@ -690,16 +546,13 @@ defmodule Alloy.Provider.CodexTest do
 
     @tag :tmp_dir
     test "a startup failure with no events reports stderr", %{tmp_dir: dir} do
-      script = Path.join(dir, "broken-codex")
+      script =
+        script!(dir, """
+        cat > /dev/null
+        echo 'Error: failed to parse config.toml' >&2
+        exit 1
+        """)
 
-      File.write!(script, """
-      #!/bin/sh
-      cat > /dev/null
-      echo 'Error: failed to parse config.toml' >&2
-      exit 1
-      """)
-
-      File.chmod!(script, 0o755)
       config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir}
 
       assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
@@ -864,13 +717,18 @@ defmodule Alloy.Provider.CodexTest do
     Enum.at(args, index + 1)
   end
 
-  # A stand-in `codex` executable for the real port path: runs `body`, then
-  # writes a fixed end_turn payload to the --output-last-message file.
-  defp fake_codex!(dir, body) do
+  # A stand-in `codex` executable for the real port path.
+  defp script!(dir, body) do
     path = Path.join(dir, "fake-codex")
+    File.write!(path, "#!/bin/sh\n" <> body)
+    File.chmod!(path, 0o755)
+    path
+  end
 
-    File.write!(path, """
-    #!/bin/sh
+  # Runs `body`, then writes a fixed end_turn payload to the
+  # --output-last-message file.
+  defp fake_codex!(dir, body) do
+    script!(dir, """
     output=""
     while [ "$#" -gt 0 ]; do
       if [ "$1" = "--output-last-message" ]; then
@@ -883,10 +741,10 @@ defmodule Alloy.Provider.CodexTest do
     #{body}
     printf '%s' '{"stop_reason":"end_turn","text":"fake ok","tool_calls":[]}' > "$output"
     """)
-
-    File.chmod!(path, 0o755)
-    path
   end
+
+  # Drains stdin so the shell redirect completes, then hangs.
+  defp slow_codex!(dir), do: script!(dir, "cat > /dev/null\nsleep 30\n")
 
   # A codex that starts a child process, records both OS pids, and hangs.
   defp hanging_codex!(dir) do

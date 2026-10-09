@@ -737,41 +737,22 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp codex_args(paths, config) do
-    [
-      "exec",
-      "--json",
-      "--skip-git-repo-check",
-      "--ephemeral",
-      "--ignore-rules",
-      "--sandbox",
-      "read-only",
-      "--output-schema",
-      paths.schema_path,
-      "--output-last-message",
-      paths.last_message_path
-    ]
-    |> append_user_config(config)
-    |> append_config_overrides(config)
-    |> maybe_append_model(config)
+    ~w(exec --json --skip-git-repo-check --ephemeral --ignore-rules --sandbox read-only) ++
+      ["--output-schema", paths.schema_path, "--output-last-message", paths.last_message_path] ++
+      user_config_args(config) ++
+      Enum.flat_map(Map.get(config, :config_overrides, []), &["-c", &1]) ++
+      model_args(config)
   end
 
   # --ignore-user-config also skips the profile file, so a profile opts in
   # to the user config.
-  defp append_user_config(args, %{profile: profile}) when is_binary(profile) and profile != "",
-    do: args ++ ["--profile", profile]
+  defp user_config_args(%{profile: profile}) when is_binary(profile) and profile != "",
+    do: ["--profile", profile]
 
-  defp append_user_config(args, _config), do: args ++ ["--ignore-user-config"]
+  defp user_config_args(_config), do: ["--ignore-user-config"]
 
-  defp append_config_overrides(args, config) do
-    args ++ Enum.flat_map(Map.get(config, :config_overrides, []), &["-c", &1])
-  end
-
-  defp maybe_append_model(args, config) do
-    case Map.get(config, :model) do
-      nil -> args
-      model -> args ++ ["--model", model]
-    end
-  end
+  defp model_args(%{model: model}) when is_binary(model), do: ["--model", model]
+  defp model_args(_config), do: []
 
   # `limit` is a character budget, not a byte budget — `String.slice/3`
   # respects grapheme boundaries so we never split a multibyte codepoint
