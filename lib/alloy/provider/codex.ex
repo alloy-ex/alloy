@@ -77,7 +77,7 @@ defmodule Alloy.Provider.Codex do
 
   @behaviour Alloy.Provider
 
-  alias Alloy.Message
+  alias Alloy.{Message, OSProcess}
   alias Alloy.Provider.Error
 
   @default_timeout_ms 120_000
@@ -369,7 +369,7 @@ defmodule Alloy.Provider.Codex do
   defp stop(%{os_pid: nil}), do: :ok
 
   defp stop(%{port: port, os_pid: os_pid}) do
-    :ok = signal_group(os_pid, "TERM")
+    :ok = OSProcess.signal_group(os_pid, "TERM")
 
     receive do
       {^port, {:exit_status, _status}} -> :ok
@@ -377,15 +377,7 @@ defmodule Alloy.Provider.Codex do
       @term_grace_ms -> :ok
     end
 
-    signal_group(os_pid, "KILL")
-  end
-
-  # kill is a shell builtin and needs no environment, so it inherits none.
-  defp signal_group(os_pid, signal) do
-    no_env = Enum.map(System.get_env(), fn {name, _value} -> {name, nil} end)
-    args = ["-c", ~S(kill -s "$1" -- "-$2"), "alloy-codex-kill", signal, "#{os_pid}"]
-    {_output, _status} = System.cmd("/bin/sh", args, env: no_env, stderr_to_stdout: true)
-    :ok
+    OSProcess.signal_group(os_pid, "KILL")
   end
 
   defp timed_out(timeout),

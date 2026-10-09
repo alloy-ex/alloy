@@ -965,6 +965,44 @@ defmodule Alloy.Tool.ExecutorTest do
       assert Enum.take(log, -2) == [{:start, "seq4"}, {:done, "seq4"}]
     end
 
+    # 0.12.4 ran concurrent calls through async_stream's default cap; a model
+    # that fans out dozens of calls must not start them all at once.
+    test "a large concurrent batch runs at most schedulers_online at a time" do
+      cap = System.schedulers_online()
+      running = :atomics.new(2, signed: true)
+
+      tool =
+        Alloy.Tool.inline(
+          name: "counted",
+          description: "Tracks how many copies run at once",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, _ctx ->
+            now = :atomics.add_get(running, 1, 1)
+            # Record the peak with a compare-and-swap loop.
+            peak = fn peak ->
+              seen = :atomics.get(running, 2)
+
+              if now > seen and :atomics.compare_exchange(running, 2, seen, now) != :ok,
+                do: peak.(peak)
+            end
+
+            peak.(peak)
+            Process.sleep(30)
+            :atomics.sub(running, 1, 1)
+            {:ok, "done"}
+          end
+        )
+
+      state = build_state([tool])
+      calls = for i <- 1..(cap + 4), do: %{id: "c#{i}", name: "counted", input: %{}}
+
+      assert {:ok, %Message{content: blocks}, _meta} =
+               Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
+
+      assert length(blocks) == cap + 4
+      assert :atomics.get(running, 2) <= cap
+    end
+
     test "result order matches original call order" do
       state = build_state([ParallelTool, SequentialTool])
 

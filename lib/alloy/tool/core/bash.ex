@@ -67,6 +67,8 @@ defmodule Alloy.Tool.Core.Bash do
 
   @behaviour Alloy.Tool
 
+  alias Alloy.OSProcess
+
   @typedoc """
   A custom command executor. Receives the shell command string and the working
   directory path, and must return `{output, exit_code}`.
@@ -232,26 +234,13 @@ defmodule Alloy.Tool.Core.Bash do
         {:exited, status, render(output)}
 
       {:DOWN, ^caller_ref, :process, _pid, _reason} ->
-        kill_group(run.os_pid)
+        OSProcess.signal_group(run.os_pid, "KILL")
         :caller_down
     after
       max(run.deadline - System.monotonic_time(:millisecond), 0) ->
-        kill_group(run.os_pid)
+        OSProcess.signal_group(run.os_pid, "KILL")
         {:timeout, render(output)}
     end
-  end
-
-  # Every port program is a session and process-group leader (OTP's
-  # erl_child_setup calls setsid()), so signalling the negative pid kills
-  # the shell and every process it started, background jobs included.
-  # bash's builtin kill avoids depending on a separate kill binary.
-  defp kill_group(nil), do: :ok
-
-  defp kill_group(os_pid) do
-    {_output, _status} =
-      System.cmd("bash", ["-c", "kill -KILL -- -#{os_pid}"], stderr_to_stdout: true)
-
-    :ok
   end
 
   defp run_custom_executor(executor, command, working_dir, timeout) do

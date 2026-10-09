@@ -13,8 +13,6 @@
 # VariableRebinding, ModuleDependencies, ABCSize (CyclomaticComplexity and
 # Nesting already bound function size).
 #
-# Pending, enabled alongside the fix that clears it:
-#   - Warning.LeakyEnvironment — subprocess environment handling (bash, codex)
 %{
   configs: [
     %{
@@ -111,6 +109,10 @@
           {Credo.Check.Warning.ExpensiveEmptyEnumCheck, []},
           {Credo.Check.Warning.IExPry, []},
           {Credo.Check.Warning.IoInspect, []},
+          # Subprocesses get an explicit environment so API keys in the
+          # BEAM's environment don't leak to commands the model runs.
+          # Test helpers shell out to inspect fixtures, not to run model input.
+          {Credo.Check.Warning.LeakyEnvironment, [files: %{excluded: ["test/"]}]},
           {Credo.Check.Warning.MapGetUnsafePass, []},
           {Credo.Check.Warning.MissedMetadataKeyInLoggerConfig, []},
           {Credo.Check.Warning.MixEnv, []},

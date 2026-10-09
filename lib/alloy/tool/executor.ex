@@ -81,8 +81,10 @@ defmodule Alloy.Tool.Executor do
   # instead of taking down the agent process that called the executor.
   #
   # tool_start is emitted here, before the task exists, and tool_end after
-  # it finishes, so the pair matches with a real duration even when the
-  # task is killed on timeout.
+  # it finishes, so the pair matches even when the task is killed on
+  # timeout. At most schedulers_online calls run at once (async_stream's
+  # default, which tools calling rate-limited APIs rely on); a queued call's
+  # duration includes its wait.
   defp run_batch(batch, run) do
     started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
 
@@ -90,7 +92,7 @@ defmodule Alloy.Tool.Executor do
     |> Task.Supervisor.async_stream_nolink(started, &{&1, invoke(&1.tag, run)},
       timeout: run.timeout,
       on_timeout: :kill_task,
-      max_concurrency: length(batch),
+      max_concurrency: min(length(batch), System.schedulers_online()),
       ordered: false,
       zip_input_on_exit: true
     )

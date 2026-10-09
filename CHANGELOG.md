@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`:allowed_paths` is enforced on a directory boundary.** It was a string
+  prefix match, so allowing `/proj` also admitted `/proj-secrets/key.txt`. The
+  path that was checked (symlinks resolved) is now the path that is opened,
+  and a symlink loop returns an error instead of hanging the tool.
+- **The bash tool no longer passes secrets to commands.** Variables whose
+  names contain `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or `CREDENTIAL` are
+  removed from the command's environment by default, so a prompt-injected
+  `printenv` can't read your API keys. Pass `:bash_env` in the tool context
+  (a map of the variables to set, or `:inherit` for the previous behaviour)
+  if a command needs one.
+- **Bash timeouts kill the command.** A timeout stopped only the Elixir task,
+  so the command kept running; the whole process group (including background
+  jobs) is now killed. Output is capped while it streams (the first 8 KB and
+  last 20 KB are kept), so a command printing hundreds of megabytes no longer
+  exhausts memory, and the model-requested timeout is capped (10 minutes, or
+  `:bash_max_timeout`).
+- **Memory tool paths are validated strictly.** `/memories_evil/...`,
+  `/memories..` and percent-encoded `..` were accepted, and the model could
+  delete or rename the `/memories` root.
 - **Codex no longer copies `auth.json` into temp directories**, and the temp
   directory holding the prompt (the whole conversation) is created `0700`
   instead of the default mode, which left it readable on a shared `/tmp`.
@@ -33,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `result.metadata.run.provider_error`. The struct implements `String.Chars`,
   so interpolating it still works; code that applies `=~` or binary
   patterns to a provider's raw error should use `Exception.message/1`.
+- **Every tool call runs in a supervised, unlinked task** (previously
+  sequential tools ran in the agent process). `self()` and the process
+  dictionary inside a tool differ for sequential tools; Ecto's SQL sandbox
+  still works through `$callers`. Event and telemetry handlers for tool
+  start/end now run in the agent process.
+- `Alloy.Testing.tool_response/2` gives tools string-keyed input, as real
+  providers do. Tests that relied on atom keys were passing for the wrong
+  reason; update the tool or the test.
 - **Codex runs against your real `CODEX_HOME`** (or `:codex_home`) with
   `--ignore-user-config --ignore-rules`, and requires Codex CLI 0.122.0 or
   later. Your `$CODEX_HOME/AGENTS.md` and skills now reach Alloy runs; for
@@ -104,6 +131,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Codex reports token usage** from `codex exec --json` `turn.completed`
   events (it reported zero), and a `:config_overrides` option passes `-c`
   settings to the CLI.
+- **Tool input is checked before `execute/2`:** a non-map input or missing
+  `required` keys return an error result naming them, instead of a
+  `FunctionClauseError` the model can't act on. No type checking or coercion.
+- **Read pages large files**: output ends with
+  `[Showing lines X-Y of N. Use offset=Z to continue.]` when cut, and binary
+  files are refused.
 - `Alloy.Provider.Error.from_body/1` for errors a provider reports inside a
   200 response (mid-stream `error` events, failed responses).
 - **OpenAI Responses replay keeps every output item.** Assistant `phase`
@@ -149,6 +182,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tool that calls `exit/1` or `throw/1` no longer kills the agent**, and
+  `:tool_timeout` now applies to sequential tools too.
+- **Tools run in the order the model called them.** Sequential tools used to
+  run before every concurrent one, so `[read f, edit f]` read the file after
+  editing it. Consecutive concurrency-safe calls still run in parallel (at
+  most `System.schedulers_online/0` at once, as before).
+- **Invalid UTF-8 in a tool result no longer breaks the session.** Reading a
+  binary file put bytes in the transcript that failed JSON encoding on every
+  later request; results are now sanitised.
+- **Tool start/end events and telemetry pair up** when a tool times out or
+  crashes (the end event had no start sequence and a zero duration).
+- **Edit** rejects an empty `old_string` (with `replace_all` it inserted the
+  replacement between every character) and no-op edits, matches LF text in
+  CRLF files and keeps their line endings and BOM.
+- **Read** validates `offset`/`limit` (an `offset` of 0 dropped the last
+  line; a negative `limit` returned the file's tail) and reports the line
+  count when the offset is past the end.
+- **Memory tool:** `view_range` is honoured and `new_str` is optional, as
+  the tool contract specifies.
+- `Alloy.Testing.assert_tool_called/3` works with `require` as well as `use`.
 - **Codex keeps your login.** Each call copied `auth.json` into a temp
   `CODEX_HOME` and deleted it afterwards, discarding refreshed tokens; since
   Codex CLI 0.136.0 a reused refresh token forces a re-login. Keyring

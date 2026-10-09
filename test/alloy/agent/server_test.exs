@@ -334,6 +334,7 @@ defmodule Alloy.Agent.ServerTest do
         )
 
       Process.unlink(agent)
+      ref = Process.monitor(agent)
 
       # Simulate BEAM delivering an {:EXIT, linked_pid, :shutdown} message to
       # the agent mailbox — this is exactly what happens when a process that
@@ -345,8 +346,10 @@ defmodule Alloy.Agent.ServerTest do
       # and NOT swallowed by a {:noreply, state} catch-all.
       assert_receive {:shutdown_ran, _session}, 1000
 
-      # The server must actually be dead — {:noreply, state} would leave it alive.
-      refute Process.alive?(agent)
+      # The server must actually stop — {:noreply, state} would leave it
+      # alive. on_shutdown runs inside terminate/2, before the process has
+      # exited, so wait for the DOWN rather than checking Process.alive?/1.
+      assert_receive {:DOWN, ^ref, :process, ^agent, :shutdown}, 1000
     end
 
     test "on_shutdown receives a valid Session with messages" do
