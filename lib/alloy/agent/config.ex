@@ -10,6 +10,8 @@ defmodule Alloy.Agent.Config do
   alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.ModelMetadata
 
+  require Logger
+
   # The summary prompts are optional because a bare `%Config{}` omits them;
   # `from_opts/1` always fills them and the Compactor falls back to its
   # defaults when they are absent.
@@ -166,7 +168,7 @@ defmodule Alloy.Agent.Config do
       code_execution: Keyword.get(opts, :code_execution, false),
       model_metadata_overrides: model_metadata_overrides,
       model_catalog: model_catalog,
-      max_budget_cents: Keyword.get(opts, :max_budget_cents),
+      max_budget_cents: opts |> Keyword.get(:max_budget_cents) |> warn_max_budget_cents(),
       until_tool: Keyword.get(opts, :until_tool),
       memory: validate_memory(Keyword.get(opts, :memory), provider_mod, tools)
     }
@@ -199,6 +201,19 @@ defmodule Alloy.Agent.Config do
     raise ArgumentError,
           ":memory must be a {module, store_opts} tuple where module implements " <>
             "Alloy.Memory. Got: #{inspect(bad)}"
+  end
+
+  defp warn_max_budget_cents(nil), do: nil
+
+  defp warn_max_budget_cents(max_budget_cents) do
+    Logger.warning(
+      ":max_budget_cents is deprecated and will be removed in Alloy 0.13. " <>
+        "It only stops a run when the provider reports usage.estimated_cost_cents, " <>
+        "which none of the built-in providers do. Enforce a budget with " <>
+        ":before_completion middleware instead (see the Alloy module docs)."
+    )
+
+    max_budget_cents
   end
 
   # Matches Alloy.Tool.Inline structs as plain maps so Config does not

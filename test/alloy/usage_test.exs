@@ -47,6 +47,16 @@ defmodule Alloy.UsageTest do
     end
   end
 
+  describe "estimate_cost/3 fractional-cent rates" do
+    test "does not round per-million rates to whole cents" do
+      # $0.075/M is 7.5 cents per million tokens; rounding the rate gave 8.
+      usage = %Usage{input_tokens: 1_000_000, output_tokens: 1_000_000}
+      result = Usage.estimate_cost(usage, 0.075, 0.3)
+
+      assert_in_delta result.estimated_cost_cents, 37.5, 0.000001
+    end
+  end
+
   describe "estimate_cost/3 small token counts" do
     test "does not truncate cost to zero for small token counts" do
       # 1000 input tokens at $3/M = 0.3 cents (not 0)

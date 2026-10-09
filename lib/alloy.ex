@@ -54,7 +54,47 @@ defmodule Alloy do
   - `:model_catalog` - module implementing `Alloy.ModelCatalog`, consulted for model context windows after `:model_metadata_overrides` (default: `Alloy.ModelMetadata`)
   - `:code_execution` - `true` enables Anthropic's server-side code execution tool; the same as setting `code_execution: true` in the provider config (default: `false`)
   - `:on_event` - 1-arity function called with each `Alloy.Events` envelope (tool events, plus text and thinking deltas when streaming) (default: `nil`)
+  - `:max_budget_cents` - **deprecated, removed in 0.13.** Stops the run with status `:budget_exceeded` once `usage.estimated_cost_cents` reaches this value. None of the built-in providers report `estimated_cost_cents`, so it only works with custom providers that do; Alloy logs a warning when it is set. Use a budget middleware instead (see "Budget limits" below). (default: `nil`)
   - `:until_tool` - tool name (string) that must be called successfully before the loop completes. If the model signals `:end_turn` without a call to this tool that succeeded (a failed, blocked or unknown call does not count), the loop continues with a prompt to call it. Useful for structured output enforcement. (default: `nil`)
+
+  ## Budget limits
+
+  Price the accumulated usage yourself in `:before_completion` middleware,
+  which runs before every provider request, and halt when the run reaches
+  its limit:
+
+      defmodule MyApp.BudgetGuard do
+        @behaviour Alloy.Middleware
+
+        # USD per million tokens for the model you run.
+        @input_per_m 3.0
+        @output_per_m 15.0
+
+        @impl true
+        def call(:before_completion, state) do
+          limit = Map.fetch!(state.config.context, :max_budget_cents)
+          usage = Alloy.Usage.estimate_cost(state.usage, @input_per_m, @output_per_m)
+
+          if usage.estimated_cost_cents >= limit do
+            {:halt, "budget of \#{limit} cents reached"}
+          else
+            state
+          end
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      Alloy.run(prompt,
+        provider: provider,
+        middleware: [MyApp.BudgetGuard],
+        context: %{max_budget_cents: 50}
+      )
+
+  A halted run returns `{:error, result}` with `status: :halted` and
+  `error: "Halted by middleware: budget of 50 cents reached"`.
+  `Alloy.Usage.estimate_cost/3` prices input and output tokens only; add
+  your provider's cache read and write prices if you use prompt caching.
   """
 
   alias Alloy.Agent.{Config, Server, State, Turn}

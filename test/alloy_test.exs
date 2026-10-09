@@ -339,6 +339,52 @@ defmodule AlloyTest do
     end
   end
 
+  describe "the budget middleware recipe in the Alloy docs" do
+    defmodule BudgetGuard do
+      @behaviour Alloy.Middleware
+
+      @input_per_m 3.0
+      @output_per_m 15.0
+
+      @impl true
+      def call(:before_completion, state) do
+        limit = Map.fetch!(state.config.context, :max_budget_cents)
+        usage = Alloy.Usage.estimate_cost(state.usage, @input_per_m, @output_per_m)
+
+        if usage.estimated_cost_cents >= limit do
+          {:halt, "budget of #{limit} cents reached"}
+        else
+          state
+        end
+      end
+
+      def call(_hook, state), do: state
+    end
+
+    test "halts before the request that would exceed the budget" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t1", name: "uppercase", input: %{"text" => "hi"}}
+          ]),
+          TestProvider.text_response("Should not reach")
+        ])
+
+      # The first response (10 in, 5 out) costs 0.0105 cents at $3/$15 per M.
+      assert {:error, result} =
+               Alloy.run("Uppercase hi",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [UpperTool],
+                 middleware: [BudgetGuard],
+                 context: %{max_budget_cents: 0.01}
+               )
+
+      assert result.status == :halted
+      assert result.error == "Halted by middleware: budget of 0.01 cents reached"
+      assert result.turns == 1
+    end
+  end
+
   describe "Alloy.run/2 usage tracking" do
     test "accumulates usage across turns" do
       {:ok, pid} =

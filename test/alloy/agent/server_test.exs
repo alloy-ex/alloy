@@ -62,6 +62,7 @@ defmodule Alloy.Agent.ServerTest do
       assert Enum.at(messages, 2).content == "Second message"
     end
 
+    @tag :capture_log
     test "returns {:error, result} when the budget is exceeded, like Alloy.run/2" do
       pid = start_provider([TestProvider.text_response("Should not reach")])
       {:ok, agent} = Server.start_link(opts(pid, max_budget_cents: 0))
