@@ -658,6 +658,42 @@ defmodule Alloy.Tool.ExecutorTest do
     State.init(config)
   end
 
+  # Each call logs {:start, id} and {:done, id} so the tests can see what
+  # overlapped. A sequential tool must observe everything the model asked
+  # for before it, and nothing it asked for after it.
+  defp logging_tool(name, log, concurrent?) do
+    Alloy.Tool.inline(
+      name: name,
+      description: name,
+      input_schema: %{type: "object", properties: %{}},
+      concurrent?: concurrent?,
+      execute: fn %{"id" => id}, _ctx ->
+        Agent.update(log, &[{:start, id} | &1])
+        Process.sleep(30)
+        Agent.update(log, &[{:done, id} | &1])
+        {:ok, id}
+      end
+    )
+  end
+
+  defp run_logged(names) do
+    {:ok, log} = Agent.start_link(fn -> [] end)
+    state = build_state([logging_tool("par", log, true), logging_tool("seq", log, false)])
+
+    calls =
+      names
+      |> Enum.with_index(1)
+      |> Enum.map(fn {name, i} ->
+        id = "#{name}#{i}"
+        %{id: id, name: name, type: "tool_use", input: %{"id" => id}}
+      end)
+
+    %Message{content: blocks} = Executor.execute_all(calls, state.tool_fns, state)
+    assert Enum.map(blocks, & &1.tool_use_id) == Enum.map(calls, & &1.id)
+
+    log |> Agent.get(& &1) |> Enum.reverse()
+  end
+
   # --- Test Tools for max_result_chars ---
 
   defmodule VerboseTool do
@@ -740,28 +776,27 @@ defmodule Alloy.Tool.ExecutorTest do
     end
   end
 
-  describe "execute_all — concurrency safety partitioning" do
-    test "sequential tools complete before parallel tools start" do
-      state = build_state([SequentialTool, ParallelTool])
+  describe "execute_all — execution order" do
+    test "a sequential call runs after the concurrent calls the model made before it" do
+      # e.g. [read f, edit f] must read the file before editing it
+      assert run_logged(["par", "seq"]) ==
+               [{:start, "par1"}, {:done, "par1"}, {:start, "seq2"}, {:done, "seq2"}]
+    end
 
-      calls = [
-        %{id: "c_seq", name: "sequential", type: "tool_use", input: %{}},
-        %{id: "c_par", name: "parallel", type: "tool_use", input: %{}}
-      ]
+    test "concurrent calls after a sequential call wait for it" do
+      log = run_logged(["par", "seq", "par"])
 
-      assert {:ok, %Message{role: :user, content: blocks}, _meta} =
-               Executor.execute_all(calls, state.tool_fns, state, on_event: fn _ -> :ok end)
+      assert Enum.take(log, 2) == [{:start, "par1"}, {:done, "par1"}]
+      assert Enum.slice(log, 2, 2) == [{:start, "seq2"}, {:done, "seq2"}]
+      assert Enum.drop(log, 4) == [{:start, "par3"}, {:done, "par3"}]
+    end
 
-      seq_block = Enum.find(blocks, &(&1.tool_use_id == "c_seq"))
-      par_block = Enum.find(blocks, &(&1.tool_use_id == "c_par"))
+    test "consecutive concurrent calls still run in parallel" do
+      log = run_logged(["seq", "par", "par", "seq"])
 
-      assert seq_block.content =~ "seq:"
-      assert par_block.content =~ "par:"
-
-      "seq:" <> seq_ts = seq_block.content
-      "par:" <> par_ts = par_block.content
-
-      assert String.to_integer(seq_ts) <= String.to_integer(par_ts)
+      assert Enum.take(log, 2) == [{:start, "seq1"}, {:done, "seq1"}]
+      assert log |> Enum.slice(2, 2) |> Enum.sort() == [{:start, "par2"}, {:start, "par3"}]
+      assert Enum.take(log, -2) == [{:start, "seq4"}, {:done, "seq4"}]
     end
 
     test "result order matches original call order" do

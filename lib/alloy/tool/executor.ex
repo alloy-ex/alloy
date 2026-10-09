@@ -2,9 +2,16 @@ defmodule Alloy.Tool.Executor do
   @moduledoc """
   Executes tool calls and returns result messages.
 
-  Supports parallel execution via `Task.Supervisor.async_stream` -
-  multiple tool calls in a single assistant response are
-  executed concurrently under `Alloy.TaskSupervisor`.
+  Calls run in the order the model made them. Consecutive calls to tools
+  that are safe to run concurrently (the default; see
+  `c:Alloy.Tool.concurrent?/0`) run in parallel; a call to a tool that
+  returns `concurrent?: false` waits for everything before it and runs
+  alone.
+
+  Each call runs in an unlinked task under `Alloy.TaskSupervisor`, bounded
+  by the agent's `:tool_timeout`. A tool that raises, exits, throws or
+  times out produces an `is_error` tool result instead of crashing the
+  agent.
   """
 
   alias Alloy.Agent.State
@@ -39,37 +46,52 @@ defmodule Alloy.Tool.Executor do
         h
 
       {:ok, tagged} ->
-        {sequential, concurrent} = partition_by_concurrency(tagged, tool_fns)
         run = &run_tagged(&1, tool_fns, context, on_event, seq_ref, corr_id, turn)
         crash = &crashed(call_from(&1), &2, tool_timeout, on_event, seq_ref, corr_id, turn)
 
-        seq_results = run_supervised(sequential, run, crash, tool_timeout, 1)
-
-        par_results =
-          run_supervised(concurrent, run, crash, tool_timeout, System.schedulers_online())
-
-        # Reassemble in original call order
-        all = reassemble_ordered(tagged, sequential, seq_results, concurrent, par_results)
-        {results, meta} = Enum.unzip(all)
+        {results, meta} =
+          tagged
+          |> batches(tool_fns)
+          |> Enum.flat_map(&run_batch(&1, run, crash, tool_timeout))
+          |> Enum.unzip()
 
         {:ok, Message.tool_results(results), meta}
     end
   end
 
+  # Calls run in the order the model made them, so a sequential call sees
+  # the effects of every call before it ([read f, edit f] reads first).
+  # Consecutive concurrency-safe calls share a parallel batch; each
+  # sequential call is a batch of its own.
+  defp batches(tagged, tool_fns) do
+    tagged
+    |> Enum.chunk_by(&concurrent?(&1, tool_fns))
+    |> Enum.flat_map(fn [first | _] = batch ->
+      if concurrent?(first, tool_fns), do: [batch], else: Enum.map(batch, &[&1])
+    end)
+  end
+
+  defp concurrent?({:execute, call}, tool_fns) do
+    case Map.fetch(tool_fns, call[:name]) do
+      {:ok, tool} -> not tool_sequential?(tool)
+      :error -> true
+    end
+  end
+
+  defp concurrent?({:blocked, _call, _reason}, _tool_fns), do: true
+
   # Every tool runs in an unlinked, supervised task: a tool that raises,
   # exits or throws, or overruns :tool_timeout, becomes an error result
   # instead of taking down the agent process that called the executor.
-  defp run_supervised([], _run, _crash, _timeout, _max_concurrency), do: []
-
-  defp run_supervised(tags, run, crash, timeout, max_concurrency) do
+  defp run_batch(batch, run, crash, timeout) do
     Alloy.TaskSupervisor
-    |> Task.Supervisor.async_stream_nolink(tags, run,
+    |> Task.Supervisor.async_stream_nolink(batch, run,
       timeout: timeout,
       on_timeout: :kill_task,
-      max_concurrency: max_concurrency,
+      max_concurrency: length(batch),
       ordered: true
     )
-    |> Enum.zip(tags)
+    |> Enum.zip(batch)
     |> Enum.map(fn
       {{:ok, pair}, _tag} -> pair
       {{:exit, reason}, tag} -> crash.(tag, reason)
@@ -320,25 +342,6 @@ defmodule Alloy.Tool.Executor do
   end
 
   defp maybe_truncate(text, _tool), do: text
-
-  defp partition_by_concurrency(tagged, tool_fns) do
-    Enum.split_with(tagged, fn
-      {:execute, call} ->
-        case Map.fetch(tool_fns, call[:name]) do
-          {:ok, tool} -> tool_sequential?(tool)
-          :error -> false
-        end
-
-      {:blocked, _, _} ->
-        false
-    end)
-  end
-
-  defp reassemble_ordered(tagged, seq_tags, seq_results, par_tags, par_results) do
-    seq_map = Map.new(Enum.zip(seq_tags, seq_results))
-    par_map = Map.new(Enum.zip(par_tags, par_results))
-    Enum.map(tagged, fn tag -> Map.get(seq_map, tag) || Map.get(par_map, tag) end)
-  end
 
   defp build_context(%State{} = state) do
     Map.merge(state.config.context, %{
