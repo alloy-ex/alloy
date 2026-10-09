@@ -64,13 +64,26 @@ defmodule Alloy.Provider.OpenAIStream do
       %{
         stop_reason: stop_reason(finish_reason),
         messages: [%Message{role: :assistant, content: content_blocks}],
-        usage: %{
-          input_tokens: Map.get(usage, "prompt_tokens", 0),
-          output_tokens: Map.get(usage, "completion_tokens", 0)
-        }
+        usage: parse_usage(usage)
       },
       finish_reason
     )
+  end
+
+  # Alloy.Usage follows Anthropic: input_tokens excludes cache reads and
+  # writes, which have their own fields. OpenAI-style servers count both
+  # inside prompt_tokens, so they are taken out here.
+  defp parse_usage(usage) do
+    details = usage["prompt_tokens_details"] || %{}
+    cache_read = details["cached_tokens"] || 0
+    cache_write = details["cache_write_tokens"] || 0
+
+    %{
+      input_tokens: max((usage["prompt_tokens"] || 0) - cache_read - cache_write, 0),
+      output_tokens: usage["completion_tokens"] || 0,
+      cache_read_input_tokens: cache_read,
+      cache_creation_input_tokens: cache_write
+    }
   end
 
   # Request usage by default, but preserve custom options and omit the field

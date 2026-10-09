@@ -635,6 +635,31 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
+  describe "complete/3 usage" do
+    test "reports cache reads and writes apart from uncached input, like Anthropic" do
+      usage = %{
+        "input_tokens" => 100,
+        "input_tokens_details" => %{"cached_tokens" => 60, "cache_write_tokens" => 10},
+        "output_tokens" => 5
+      }
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body: Jason.encode!(response_payload([assistant_text_item("Hi")], usage))
+        })
+
+      assert {:ok, %{usage: result_usage}} = OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert result_usage == %{
+               input_tokens: 30,
+               output_tokens: 5,
+               cache_read_input_tokens: 60,
+               cache_creation_input_tokens: 10
+             }
+    end
+  end
+
   describe "complete/3 with missing usage field" do
     test "returns zero counts when usage is absent from response" do
       config =

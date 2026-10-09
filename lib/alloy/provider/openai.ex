@@ -427,7 +427,6 @@ defmodule Alloy.Provider.OpenAI do
   defp parse_response(%{"status" => "failed"} = resp), do: {:error, Error.from_body(resp)}
 
   defp parse_response(%{"output" => output} = resp) when is_list(output) do
-    usage = resp["usage"] || %{}
     provider_state = provider_state_from_response(resp)
 
     case parse_output_to_blocks(output) do
@@ -443,10 +442,7 @@ defmodule Alloy.Provider.OpenAI do
          %{
            stop_reason: stop_reason,
            messages: [alloy_msg],
-           usage: %{
-             input_tokens: Map.get(usage, "input_tokens", 0),
-             output_tokens: Map.get(usage, "output_tokens", 0)
-           },
+           usage: parse_usage(resp["usage"]),
            provider_state: provider_state,
            response_metadata: response_metadata_from_response(resp)
          }}
@@ -457,7 +453,6 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp parse_response(%{"output_text" => text} = resp) when is_binary(text) do
-    usage = resp["usage"] || %{}
     provider_state = provider_state_from_response(resp)
 
     content_blocks =
@@ -470,10 +465,7 @@ defmodule Alloy.Provider.OpenAI do
      %{
        stop_reason: :end_turn,
        messages: [%Message{role: :assistant, content: content_blocks}],
-       usage: %{
-         input_tokens: Map.get(usage, "input_tokens", 0),
-         output_tokens: Map.get(usage, "output_tokens", 0)
-       },
+       usage: parse_usage(resp["usage"]),
        provider_state: provider_state,
        response_metadata: response_metadata_from_response(resp)
      }}
@@ -585,6 +577,24 @@ defmodule Alloy.Provider.OpenAI do
         {:error, "Invalid tool call arguments payload for #{name}"}
     end
   end
+
+  # Alloy.Usage follows Anthropic: input_tokens excludes cache reads and
+  # writes, which have their own fields. OpenAI counts both inside
+  # input_tokens, so they are taken out here.
+  defp parse_usage(%{} = usage) do
+    details = usage["input_tokens_details"] || %{}
+    cache_read = details["cached_tokens"] || 0
+    cache_write = details["cache_write_tokens"] || 0
+
+    %{
+      input_tokens: max((usage["input_tokens"] || 0) - cache_read - cache_write, 0),
+      output_tokens: usage["output_tokens"] || 0,
+      cache_read_input_tokens: cache_read,
+      cache_creation_input_tokens: cache_write
+    }
+  end
+
+  defp parse_usage(nil), do: parse_usage(%{})
 
   defp provider_state_from_response(%{"id" => id}) when is_binary(id) and id != "" do
     %{response_id: id}

@@ -304,6 +304,36 @@ defmodule Alloy.Provider.OpenAIStreamTest do
       assert {:error, _reason} = result
     end
 
+    test "cached prompt tokens are reported apart from uncached input" do
+      usage = %{
+        "id" => "chatcmpl-test",
+        "choices" => [],
+        "usage" => %{
+          "prompt_tokens" => 20,
+          "completion_tokens" => 10,
+          "prompt_tokens_details" => %{"cached_tokens" => 8, "cache_write_tokens" => 2}
+        }
+      }
+
+      chunks = [
+        sse_chunk(text_delta("hi")),
+        sse_chunk(finish_chunk("stop")),
+        sse_chunk(usage),
+        sse_done()
+      ]
+
+      {_collected, result} = collect_stream(chunks, test_name: :usage_cached)
+
+      assert {:ok, response} = result
+
+      assert response.usage == %{
+               input_tokens: 10,
+               output_tokens: 10,
+               cache_read_input_tokens: 8,
+               cache_creation_input_tokens: 2
+             }
+    end
+
     test "usage event with empty choices array is captured correctly" do
       # Some providers send choices: [] alongside usage
       usage_with_empty_choices = %{
