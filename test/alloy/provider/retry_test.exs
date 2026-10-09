@@ -225,6 +225,69 @@ defmodule Alloy.Provider.RetryTest do
   # ── Helpers ───────────────────────────────────────────────────────────────
 
   # A provider that returns `responses` in order; `:ok` is a plain success.
+  describe "streaming callbacks that raise" do
+    import ExUnit.CaptureLog
+    import Alloy.StreamTestHelpers
+
+    setup do
+      Req.Test.stub(
+        __MODULE__,
+        sse_chunks_plug([
+          sse_text_delta("A"),
+          sse_text_delta("B"),
+          sse_text_delta("C"),
+          sse_finish("stop"),
+          "data: [DONE]\n\n"
+        ])
+      )
+
+      provider =
+        {Alloy.Provider.OpenAICompat,
+         api_url: "http://localhost",
+         model: "test-model",
+         req_options: [plug: {Req.Test, __MODULE__}, retry: false]}
+
+      %{provider: provider}
+    end
+
+    test "a raising on_chunk is logged and the full text is kept", %{provider: provider} do
+      on_chunk = fn
+        "B" -> raise "UI went away"
+        _chunk -> :ok
+      end
+
+      log =
+        capture_log(fn ->
+          send(self(), {:result, Alloy.stream("hi", on_chunk, provider: provider)})
+        end)
+
+      assert_received {:result, {:ok, result}}
+      assert result.text == "ABC"
+      assert log =~ "on_chunk callback failed"
+      assert log =~ "UI went away"
+    end
+
+    test "a raising on_event is logged and the full text is kept", %{provider: provider} do
+      on_event = fn
+        %{event: :text_delta, payload: "B"} -> exit(:liveview_down)
+        _envelope -> :ok
+      end
+
+      log =
+        capture_log(fn ->
+          send(
+            self(),
+            {:result, Alloy.stream("hi", fn _ -> :ok end, provider: provider, on_event: on_event)}
+          )
+        end)
+
+      assert_received {:result, {:ok, result}}
+      assert result.text == "ABC"
+      assert log =~ "on_event callback failed"
+      assert log =~ "liveview_down"
+    end
+  end
+
   defp scripted_provider(responses) do
     {:ok, agent} = Agent.start_link(fn -> responses end)
 

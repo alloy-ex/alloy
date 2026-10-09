@@ -11,6 +11,8 @@ defmodule Alloy.Provider.Retry do
   alias Alloy.Agent.State
   alias Alloy.Provider.Error
 
+  require Logger
+
   @doc """
   Call a provider with retry, backoff, and fallback logic.
 
@@ -226,13 +228,13 @@ defmodule Alloy.Provider.Retry do
 
     wrapped_chunk = fn chunk ->
       :atomics.put(ref, 1, 1)
-      on_chunk.(chunk)
-      original_on_event.({:text_delta, chunk})
+      notify(:on_chunk, on_chunk, chunk)
+      notify(:on_event, original_on_event, {:text_delta, chunk})
     end
 
     wrapped_on_event = fn event ->
       :atomics.put(ref, 1, 1)
-      original_on_event.(event)
+      notify(:on_event, original_on_event, event)
     end
 
     provider_config = Map.put(provider_config, :on_event, wrapped_on_event)
@@ -245,6 +247,25 @@ defmodule Alloy.Provider.Retry do
   defp call_provider(provider, state, provider_config, false = _streaming?, _on_chunk) do
     messages = State.messages(state)
     {provider.complete(messages, state.tool_defs, provider_config), false}
+  end
+
+  # The caller's streaming callbacks run inside the provider's stream
+  # handler. If one fails there, the handler loses the delta it was
+  # accumulating, so the stored message silently misses text. A broken UI
+  # callback is logged and the stream carries on.
+  defp notify(name, callback, payload) do
+    callback.(payload)
+    :ok
+  rescue
+    exception ->
+      log_callback_failure(name, Exception.format(:error, exception, __STACKTRACE__))
+  catch
+    kind, reason ->
+      log_callback_failure(name, Exception.format(kind, reason, __STACKTRACE__))
+  end
+
+  defp log_callback_failure(name, formatted) do
+    Logger.warning("[Alloy] #{name} callback failed; the stream continues.\n#{formatted}")
   end
 
   # Sets receive_timeout in the provider's req_options based on remaining deadline.
