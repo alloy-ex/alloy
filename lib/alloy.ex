@@ -52,6 +52,7 @@ defmodule Alloy do
   - `:max_pending` - max queued async `send_message/3` requests while one is running (default: `0`)
   - `:model_metadata_overrides` - overrides for model context windows used to derive `:max_tokens` when not set explicitly (default: `%{}`)
   - `:model_catalog` - module implementing `Alloy.ModelCatalog`, consulted for model context windows after `:model_metadata_overrides` (default: `Alloy.ModelMetadata`)
+  - `:on_event` - 1-arity function called with each `Alloy.Events` envelope (tool events, plus text and thinking deltas when streaming) (default: `nil`)
   - `:until_tool` - tool name (string) that must be called successfully before the loop completes. If the model signals `:end_turn` without a call to this tool that succeeded (a failed, blocked or unknown call does not count), the loop continues with a prompt to call it. Useful for structured output enforcement. (default: `nil`)
   """
 
@@ -84,11 +85,14 @@ defmodule Alloy do
   The first argument can be a string (converted to a user message)
   or ignored if `:messages` option provides conversation history.
 
+  Accepts `:on_event` like `stream/3`. Without streaming, the callback
+  receives the tool events (`:tool_start`, `:tool_end`) but no text deltas.
+
   Returns `{:ok, result}` on completion or `{:error, result}` on failure.
   """
   @spec run(String.t() | nil, keyword()) :: {:ok, result()} | {:error, result()}
   def run(message \\ nil, opts) do
-    do_run(message, opts, [])
+    do_run(message, opts, maybe_put([], :on_event, validate_on_event(opts[:on_event])))
   end
 
   @doc """

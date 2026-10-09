@@ -141,6 +141,34 @@ defmodule AlloyTest do
       assert result.status == :completed
     end
 
+    test "forwards on_event callbacks for tool events" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t1", name: "uppercase", input: %{"text" => "hello"}}
+          ]),
+          TestProvider.text_response("HELLO")
+        ])
+
+      test_pid = self()
+
+      assert {:ok, _result} =
+               Alloy.run("Uppercase hello",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [UpperTool],
+                 on_event: fn event -> send(test_pid, {:event, event}) end
+               )
+
+      assert_received {:event, %{v: 1, event: :tool_start, payload: %{name: "uppercase"}}}
+      assert_received {:event, %{v: 1, event: :tool_end, payload: %{name: "uppercase"}}}
+    end
+
+    test "raises when on_event is not a function" do
+      assert_raise ArgumentError, ~r/on_event must be a 1-arity function/, fn ->
+        Alloy.run("Hi", provider: {TestProvider, agent_pid: self()}, on_event: :invalid)
+      end
+    end
+
     test "handles multi-turn tool usage" do
       {:ok, pid} =
         TestProvider.start_link([
