@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Code mode recipe** (`docs/recipes/code-mode.md`): one `run_script` tool
+  that runs a sandboxed Lua script with your tools bound as functions, so an
+  agent composes several calls in one turn instead of carrying every tool
+  definition. Tested verbatim; `lua` is a test-only dependency.
+
 ## [0.12.5] - 2026-10-09
 
 ### Security
