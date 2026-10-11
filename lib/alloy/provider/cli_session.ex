@@ -32,6 +32,21 @@ defmodule Alloy.Provider.CliSession do
     end
   end
 
+  # `plan/2` with the reason a turn goes out fresh, for a caller that reports
+  # it. A fresh turn after the first is a new thread and a cold cache, and it
+  # used to happen without a word.
+  @type explained ::
+          {:resume, String.t(), [Message.t()]} | {:fresh, :no_session | :history_rewritten}
+
+  @spec explain(map(), [Message.t()]) :: explained()
+  def explain(config, messages) do
+    case {Map.get(config, :provider_state), plan(config, messages)} do
+      {_state, {:resume, _id, _new} = resume} -> resume
+      {%{session_id: id}, :fresh} when is_binary(id) and id != "" -> {:fresh, :history_rewritten}
+      {_state, :fresh} -> {:fresh, :no_session}
+    end
+  end
+
   # What the next call needs to resume: the id, how many messages (as Alloy will
   # see them — this reply included, since the CLI's session already recorded its
   # version of this turn) it reflects, and a hash of that exact prefix.

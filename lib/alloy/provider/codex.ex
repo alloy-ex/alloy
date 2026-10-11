@@ -19,7 +19,8 @@ defmodule Alloy.Provider.Codex do
     inherited `CODEX_HOME`, or `~/.codex`.
   - `:profile` - Codex profile: layers `$CODEX_HOME/<name>.config.toml` on
     the user config (Codex CLI 0.134.0 and later). Selecting a profile loads
-    the user config, including its MCP servers and plugins.
+    the user config, including its MCP servers and plugins. A profiled turn
+    is not resumed (see below).
   - `:config_overrides` - `key=value` strings passed to `codex exec` as
     `-c` flags, for example `[~s(model_reasoning_effort="high")]`
   - `:auth_path` - Deprecated, removed in 0.13; use `:codex_home`. A path to
@@ -55,6 +56,32 @@ defmodule Alloy.Provider.Codex do
   `config_overrides: [~s(cli_auth_credentials_store="keyring")]`, since that
   setting lives in the ignored `config.toml`.
 
+  ## Session continuation (`exec resume`)
+
+  Codex keeps its own conversation history, so only the first turn sends the
+  whole transcript. Every later turn resumes the thread with `codex exec resume
+  <thread_id>` and sends just the messages Codex has not seen, plus the tool
+  definitions and system prompt when they changed. That is what lets the
+  prefix come back as `cache_read_input_tokens`.
+
+  Each turn returns `:provider_state` with the thread id, and resumption uses
+  the same prefix-hash check as `Alloy.Provider.ClaudeCode`: a transcript
+  rewritten by compaction goes out fresh with the full history. A resumed run
+  that finishes without a response (the thread is gone) is retried fresh
+  once; a timeout is not. `response_metadata.session` says whether the turn
+  resumed and, when it went out fresh, why (`:no_session`,
+  `:history_rewritten`, `:resume_failed`).
+
+  Threads are recorded in `CODEX_HOME`, so they appear in that home's
+  `codex resume` list; a dedicated `:codex_home` keeps them out of your own.
+  `exec resume` takes no `--profile`, and an `:auth_path` copied into a
+  per-call home leaves no thread behind, so those turns run `--ephemeral` and
+  are never resumed (reason `:ephemeral`).
+
+  Codex is the model here, not an agent: its own shell tools are disabled
+  (`--disable shell_tool --disable unified_exec`), and the outer loop's tools
+  run every command.
+
   ## Errors
 
   Failures of the `codex exec` process return `%Alloy.Provider.Error{}`
@@ -73,14 +100,16 @@ defmodule Alloy.Provider.Codex do
   - Each call runs `codex exec` under `Alloy.TaskSupervisor`. A timeout, or
     the calling process exiting (a cancelled turn), stops codex and every
     process it started, and removes the call's temp files.
-  - Streaming is emulated by running a normal completion and replaying the final
-    text to the provided callback.
+  - `stream/4` reads `--json` as Codex writes it and hands the callback each
+    message as it completes and each command as it starts, in the calling
+    process. Codex emits whole items, not tokens, so a message arrives in one
+    piece. A reply that never went out as an event is replayed at the end.
   """
 
   @behaviour Alloy.Provider
 
   alias Alloy.{Message, OSProcess}
-  alias Alloy.Provider.Error
+  alias Alloy.Provider.{CliSession, Error}
 
   require Logger
 
@@ -94,6 +123,11 @@ defmodule Alloy.Provider.Codex do
   # The owning task replies by its deadline plus the kill grace; this only
   # bounds the wait if it stops responding.
   @reply_grace_ms 5_000
+
+  # Codex is the model here; the outer loop's tools run the commands. Left on,
+  # its own shell answered for them inside the read-only sandbox: `mix test`
+  # died on `:eperm` and the outer loop never saw a tool call.
+  @no_own_commands ["--disable", "shell_tool", "--disable", "unified_exec"]
 
   # Matches any `\X` where X is NOT a valid JSON single-character escape
   # (valid set: " \ / b f n r t u). Used by the decode repair pass.
@@ -150,21 +184,17 @@ defmodule Alloy.Provider.Codex do
           optional(:req_options) => keyword(),
           optional(:system_prompt) => String.t(),
           optional(:command_runner) => (String.t(), [String.t()], keyword() ->
-                                          {String.t(), integer()})
+                                          {String.t(), integer()}),
+          optional(:provider_state) => map()
         }
 
   @impl true
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    prompt = build_prompt(messages, tool_defs, config)
-
-    with {:ok, codex_home} <- codex_home(config),
-         {:ok, command_result} <- execute(prompt, codex_home, config),
-         {:ok, payload} <- decode_payload(command_result, config) do
-      parse_payload(payload, config, command_result)
+    with {:ok, result, _streamed} <- run(messages, tool_defs, config, nil) do
+      {:ok, result}
     end
-    |> to_provider_error()
   end
 
   # Every built-in provider fails with %Alloy.Provider.Error{}; the response
@@ -178,11 +208,137 @@ defmodule Alloy.Provider.Codex do
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
-    with {:ok, result} <- complete(messages, tool_defs, config),
-         :ok <- emit_chunks(result, on_chunk) do
+    with {:ok, result, streamed} <- run(messages, tool_defs, config, on_chunk),
+         :ok <- replay_unless_streamed(streamed, result, on_chunk) do
       {:ok, result}
     end
   end
+
+  # A reply that never went out as an event (a decode that only succeeded
+  # after repair, say) is replayed whole.
+  defp replay_unless_streamed(true, _result, _on_chunk), do: :ok
+  defp replay_unless_streamed(false, result, on_chunk), do: emit_chunks(result, on_chunk)
+
+  defp run(messages, tool_defs, config, on_chunk) do
+    with {:ok, codex_home} <- codex_home(config) do
+      codex_home
+      |> turn_plan(config, messages)
+      |> report_plan(on_chunk)
+      |> run_turn(messages, tool_defs, codex_home, config, on_chunk)
+    end
+    |> to_provider_error()
+  end
+
+  defp turn_plan(codex_home, config, messages) do
+    if resumable?(codex_home, config),
+      do: CliSession.explain(config, messages),
+      else: {:fresh, :ephemeral}
+  end
+
+  # `exec resume` takes no `--profile`, so a resumed turn would run without
+  # it; a copied `:auth_path` home is deleted with the call, threads and all.
+  defp resumable?({:copy_auth, _auth_path}, _config), do: false
+
+  defp resumable?(_codex_home, %{profile: profile}) when is_binary(profile) and profile != "",
+    do: false
+
+  defp resumable?(_codex_home, _config), do: true
+
+  # An agent's first turn has no thread to resume, so it says nothing. Any
+  # other fresh turn starts a new thread and re-sends the whole transcript, and
+  # a streaming caller is told so as the turn begins: the callback's text is a
+  # live draft, never the stored reply.
+  defp report_plan({:fresh, :history_rewritten} = plan, on_chunk) do
+    Logger.info(
+      "Alloy.Provider.Codex starting a new thread: earlier history changed " <>
+        "since the last turn (compaction), so the full transcript goes out"
+    )
+
+    notify(on_chunk, "earlier history changed (compaction)")
+    plan
+  end
+
+  defp report_plan(plan, _on_chunk), do: plan
+
+  defp notify(nil, _why), do: :ok
+
+  defp notify(on_chunk, why),
+    do: on_chunk.("[new Codex thread: #{why}; the whole transcript goes out uncached]\n")
+
+  defp run_turn(plan, messages, tool_defs, codex_home, config, on_chunk) do
+    prompt = build_turn_prompt(plan, messages, tool_defs, config)
+
+    with {:ok, command_result} <- execute(prompt, codex_home, config, plan, on_chunk),
+         {:ok, payload} <- turn_payload(plan, command_result, config),
+         {:ok, result} <- parse_payload(payload, config, command_result, plan, messages) do
+      {:ok, result |> remember_tools(tool_defs) |> remember_system(config),
+       command_result.streamed_reply}
+    else
+      {:resume_failed, thread_id, reason} ->
+        Logger.warning(
+          "Alloy.Provider.Codex could not resume thread #{thread_id}, " <>
+            "sending the full transcript instead: #{reason}"
+        )
+
+        notify(on_chunk, "the previous thread could not be resumed")
+        run_turn({:fresh, :resume_failed}, messages, tool_defs, codex_home, config, on_chunk)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  # A resumed run that finished without a response most likely named a thread
+  # the home no longer has. Only a *finished* run: a timeout is `{:error, _}`
+  # from `execute/5` and is not retried, since a second full-length attempt
+  # would double the wait for the same outcome.
+  defp turn_payload({:resume, thread_id, _new_messages}, command_result, config) do
+    case decode_payload(command_result, config) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, reason} -> {:resume_failed, thread_id, error_text(reason)}
+    end
+  end
+
+  defp turn_payload({:fresh, _reason}, command_result, config),
+    do: decode_payload(command_result, config)
+
+  defp error_text(%Error{} = error), do: Exception.message(error)
+  defp error_text(reason) when is_binary(reason), do: reason
+
+  defp build_turn_prompt({:resume, _thread_id, new_messages}, _messages, tool_defs, config) do
+    state = Map.get(config, :provider_state) || %{}
+    tools = if Map.get(state, :tools_hash) == tools_hash(tool_defs), do: nil, else: tool_defs
+    system = Map.get(config, :system_prompt)
+    system = if Map.get(state, :system_hash) == :erlang.phash2(system), do: nil, else: system
+    build_incremental_prompt(new_messages, tools, system)
+  end
+
+  defp build_turn_prompt({:fresh, _reason}, messages, tool_defs, config),
+    do: build_prompt(messages, tool_defs, config)
+
+  # The thread already holds the tool definitions it was last sent, so a
+  # resumed turn repeats them only when they changed. Every resume used to
+  # append the full list again: on two agents' threads that was 77% of what
+  # was appended, and the copies are what filled them to compaction.
+  defp remember_tools(%{provider_state: %{session_id: id} = state} = completion, tool_defs)
+       when is_binary(id),
+       do: %{completion | provider_state: Map.put(state, :tools_hash, tools_hash(tool_defs))}
+
+  defp remember_tools(%{provider_state: %{} = state} = completion, _tool_defs),
+    do: %{completion | provider_state: Map.put(state, :tools_hash, nil)}
+
+  defp remember_tools(completion, _tool_defs), do: completion
+
+  # Same for the system prompt: a brief changed after the thread began never
+  # reached it, because a resume sent only new messages.
+  defp remember_system(%{provider_state: %{} = state} = completion, config) do
+    system_hash = :erlang.phash2(Map.get(config, :system_prompt))
+    %{completion | provider_state: Map.put(state, :system_hash, system_hash)}
+  end
+
+  defp remember_system(completion, _config), do: completion
+
+  defp tools_hash(tool_defs), do: :erlang.phash2(Enum.map(tool_defs, &serialize_tool_def/1))
 
   defp codex_home(%{codex_home: codex_home}) when is_binary(codex_home), do: {:ok, codex_home}
 
@@ -227,11 +383,12 @@ defmodule Alloy.Provider.Codex do
 
   # Test hook: a synchronous function matching `System.cmd/3`, run in the
   # caller with no timeout of its own.
-  defp execute(prompt, codex_home, %{command_runner: runner} = config) do
+  defp execute(prompt, codex_home, %{command_runner: runner} = config, plan, on_chunk) do
     in_temp_dir(config, fn paths ->
       with :ok <- write_inputs(paths, prompt),
            {:ok, home} <- resolve_home(codex_home, paths) do
-        run_injected(runner, codex_args(paths, config) ++ [prompt], home, paths, config)
+        args = codex_args(paths, config, plan) ++ [prompt]
+        run_injected(runner, args, home, paths, config, on_chunk)
       end
     end)
   end
@@ -239,21 +396,81 @@ defmodule Alloy.Provider.Codex do
   # The OS process belongs to a supervised task rather than the caller, so it
   # is stopped and its files removed even when the caller is killed (the
   # loop kills a cancelled turn, and `after` blocks do not run on a kill).
-  defp execute(prompt, codex_home, config) do
+  # Streamed text and the result come back to the caller as messages, so
+  # `on_chunk` runs in the calling process, as it does for every provider.
+  defp execute(prompt, codex_home, config, plan, on_chunk) do
     with :ok <- check_workdir(config) do
       caller = self()
+      tag = make_ref()
       timeout = effective_timeout(config)
+      emit = if on_chunk, do: fn text -> send(caller, {tag, {:chunk, text}}) end
+      run_opts = %{timeout: timeout, plan: plan, emit: emit}
 
-      task =
-        Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-          own_run(caller, prompt, codex_home, config, timeout)
+      {:ok, pid} =
+        Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
+          send(caller, {tag, {:result, own_run(caller, prompt, codex_home, config, run_opts)}})
         end)
 
-      case Task.yield(task, timeout + @reply_grace_ms) || Task.shutdown(task) do
+      run = %{
+        pid: pid,
+        monitor: Process.monitor(pid),
+        tag: tag,
+        wait_until: System.monotonic_time(:millisecond) + timeout + @reply_grace_ms
+      }
+
+      case await_run(run, on_chunk) do
         {:ok, result} -> result
         {:exit, reason} -> {:error, %Error{message: "codex exec failed: #{inspect(reason)}"}}
-        nil -> {:error, timed_out(timeout)}
+        :timeout -> {:error, timed_out(timeout)}
       end
+    end
+  end
+
+  # The owner's messages arrive in order, so every chunk is handed on before
+  # the result.
+  defp await_run(%{tag: tag, monitor: monitor} = run, on_chunk) do
+    remaining = max(run.wait_until - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^tag, {:chunk, text}} ->
+        hand_on(run, on_chunk, text)
+        await_run(run, on_chunk)
+
+      {^tag, {:result, result}} ->
+        Process.demonitor(monitor, [:flush])
+        {:ok, result}
+
+      {:DOWN, ^monitor, :process, _pid, reason} ->
+        flush_owner(run)
+        {:exit, reason}
+    after
+      remaining ->
+        stop_owner(run)
+        :timeout
+    end
+  end
+
+  # A callback that raises stops codex before the error propagates.
+  defp hand_on(run, on_chunk, text) do
+    on_chunk.(text)
+  catch
+    kind, reason ->
+      stop_owner(run)
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  # A supervisor shutdown, which the owner traps to stop codex first.
+  defp stop_owner(run) do
+    _ = Task.Supervisor.terminate_child(Alloy.TaskSupervisor, run.pid)
+    Process.demonitor(run.monitor, [:flush])
+    flush_owner(run)
+  end
+
+  defp flush_owner(%{tag: tag} = run) do
+    receive do
+      {^tag, _message} -> flush_owner(run)
+    after
+      0 -> :ok
     end
   end
 
@@ -267,7 +484,7 @@ defmodule Alloy.Provider.Codex do
 
   defp check_workdir(_config), do: :ok
 
-  defp own_run(caller, prompt, codex_home, config, timeout) do
+  defp own_run(caller, prompt, codex_home, config, %{timeout: timeout} = opts) do
     # Trapping exits lets a supervisor shutdown stop codex too.
     Process.flag(:trap_exit, true)
     caller_ref = Process.monitor(caller)
@@ -277,18 +494,19 @@ defmodule Alloy.Provider.Codex do
       in_temp_dir(config, fn paths ->
         with :ok <- write_inputs(paths, prompt),
              {:ok, home} <- resolve_home(codex_home, paths) do
-          port = open_port(codex_args(paths, config) ++ ["-"], home, paths, config)
+          port = open_port(codex_args(paths, config, opts.plan) ++ ["-"], home, paths, config)
 
           run = %{
             port: port,
             os_pid: OSProcess.os_pid(port),
             caller_ref: caller_ref,
             deadline: deadline,
-            timeout: timeout
+            timeout: timeout,
+            emit: opts.emit
           }
 
-          with {:ok, output, status} <- collect(run, []) do
-            {:ok, command_result(output, read_stderr(paths), status, paths)}
+          with {:ok, output, status, streamed} <- collect(run, [], {"", false}) do
+            {:ok, command_result(output, read_stderr(paths), status, paths, streamed)}
           end
         end
       end)
@@ -344,12 +562,13 @@ defmodule Alloy.Provider.Codex do
     |> Enum.min()
   end
 
-  defp run_injected(runner, args, codex_home, paths, config) do
+  defp run_injected(runner, args, codex_home, paths, config, on_chunk) do
     opts = [cd: paths.workdir, env: codex_env(codex_home)]
 
     case runner.(codex_bin(config), args, opts) do
       {output, status} when is_binary(output) and is_integer(status) ->
-        {:ok, command_result(output, "", status, paths)}
+        {_rest, streamed} = stream_output(output <> "\n", {"", false}, on_chunk)
+        {:ok, command_result(output, "", status, paths, streamed)}
 
       other ->
         {:error, "codex exec returned unexpected result: #{inspect(other)}"}
@@ -373,20 +592,21 @@ defmodule Alloy.Provider.Codex do
 
   # The deadline is absolute: checking it before each receive keeps a
   # steady stream of output from postponing the timeout.
-  defp collect(run, acc) do
+  defp collect(run, acc, stream) do
     case run.deadline - System.monotonic_time(:millisecond) do
-      remaining when remaining > 0 -> receive_output(run, acc, remaining)
+      remaining when remaining > 0 -> receive_output(run, acc, stream, remaining)
       _expired -> time_out(run)
     end
   end
 
-  defp receive_output(%{port: port, caller_ref: caller_ref} = run, acc, remaining) do
+  defp receive_output(%{port: port, caller_ref: caller_ref} = run, acc, stream, remaining) do
     receive do
       {^port, {:data, data}} ->
-        collect(run, [acc, data])
+        collect(run, [acc, data], stream_output(data, stream, run.emit))
 
       {^port, {:exit_status, status}} ->
-        {:ok, IO.iodata_to_binary(acc), status}
+        {_rest, streamed} = stream_output("\n", stream, run.emit)
+        {:ok, IO.iodata_to_binary(acc), status, streamed}
 
       {:DOWN, ^caller_ref, :process, _pid, reason} ->
         :ok = stop(run)
@@ -397,6 +617,52 @@ defmodule Alloy.Provider.Codex do
         exit(reason)
     after
       remaining -> time_out(run)
+    end
+  end
+
+  # `--json` events, handed on as each line completes: a message when Codex
+  # finishes writing it, a command when it starts. The state is the partial
+  # line so far and whether the turn's structured reply went out, in which case
+  # `stream/4` does not replay it.
+  defp stream_output(_data, state, nil), do: state
+
+  defp stream_output(data, {partial, streamed}, emit) do
+    [rest | lines] = Enum.reverse(String.split(partial <> data, "\n"))
+    streamed = lines |> Enum.reverse() |> Enum.reduce(streamed, &stream_event(&1, &2, emit))
+    {rest, streamed}
+  end
+
+  defp stream_event(line, streamed, emit) do
+    case Jason.decode(line) do
+      {:ok,
+       %{
+         "type" => "item.started",
+         "item" => %{"type" => "command_execution", "command" => command}
+       }}
+      when is_binary(command) ->
+        emit.("\n$ #{command}\n")
+        streamed
+
+      {:ok, %{"type" => "item.completed", "item" => %{"type" => "agent_message", "text" => text}}}
+      when is_binary(text) ->
+        stream_message(text, streamed, emit)
+
+      _other ->
+        streamed
+    end
+  end
+
+  # The last message is the structured reply, whose `text` is what the model
+  # said; anything before it is Codex narrating its own work.
+  defp stream_message(text, streamed, emit) do
+    case Jason.decode(text) do
+      {:ok, %{"text" => reply}} when is_binary(reply) ->
+        if reply != "", do: emit.(reply)
+        true
+
+      _other ->
+        emit.(String.trim_trailing(text) <> "\n")
+        streamed
     end
   end
 
@@ -432,13 +698,14 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp command_result(output, stderr, status, paths) do
+  defp command_result(output, stderr, status, paths, streamed) do
     %{
       output: output,
       stderr: stderr,
       status: status,
       events: decode_events(output),
-      last_message: File.read(paths.last_message_path)
+      last_message: File.read(paths.last_message_path),
+      streamed_reply: streamed
     }
   end
 
@@ -530,17 +797,14 @@ defmodule Alloy.Provider.Codex do
   defp parse_payload(
          %{"stop_reason" => "end_turn", "text" => text, "tool_calls" => tool_calls},
          config,
-         command_result
+         command_result,
+         plan,
+         messages
        )
        when is_binary(text) and is_list(tool_calls) do
     if tool_calls == [] do
-      {:ok,
-       %{
-         stop_reason: :end_turn,
-         messages: [Message.assistant(text)],
-         usage: usage(command_result),
-         response_metadata: response_metadata(config, command_result)
-       }}
+      reply = Message.assistant(text)
+      {:ok, completion(:end_turn, reply, config, command_result, plan, messages)}
     else
       {:error, "Codex returned tool_calls for an end_turn response"}
     end
@@ -549,23 +813,60 @@ defmodule Alloy.Provider.Codex do
   defp parse_payload(
          %{"stop_reason" => "tool_use", "text" => text, "tool_calls" => tool_calls},
          config,
-         command_result
+         command_result,
+         plan,
+         messages
        )
        when is_binary(text) and is_list(tool_calls) do
     with {:ok, blocks} <- parse_tool_blocks(text, tool_calls) do
-      {:ok,
-       %{
-         stop_reason: :tool_use,
-         messages: [Message.assistant_blocks(blocks)],
-         usage: usage(command_result),
-         response_metadata: response_metadata(config, command_result)
-       }}
+      reply = Message.assistant_blocks(blocks)
+      {:ok, completion(:tool_use, reply, config, command_result, plan, messages)}
     end
   end
 
-  defp parse_payload(payload, _config, _command_result) do
+  defp parse_payload(payload, _config, _command_result, _plan, _messages) do
     {:error, "unexpected Codex response payload: #{inspect(payload)}"}
   end
+
+  defp completion(stop_reason, reply, config, command_result, plan, messages) do
+    thread_id = thread_id(command_result.events, plan)
+
+    completion = %{
+      stop_reason: stop_reason,
+      messages: [reply],
+      usage: usage(command_result),
+      response_metadata:
+        config
+        |> response_metadata(command_result)
+        |> Map.put(:session, session(plan, thread_id))
+    }
+
+    case plan do
+      {:fresh, :ephemeral} ->
+        completion
+
+      _recorded ->
+        Map.put(completion, :provider_state, CliSession.next_state(messages, reply, thread_id))
+    end
+  end
+
+  defp session({:resume, _thread_id, _new_messages}, thread_id),
+    do: %{mode: :resumed, reason: nil, thread_id: thread_id}
+
+  defp session({:fresh, reason}, thread_id),
+    do: %{mode: :fresh, reason: reason, thread_id: thread_id}
+
+  # `thread.started` names the thread; a resumed run is still on the thread it
+  # resumed if it does not repeat it.
+  defp thread_id(events, plan) do
+    Enum.find_value(events, resumed_thread(plan), fn
+      %{"type" => "thread.started", "thread_id" => id} when is_binary(id) and id != "" -> id
+      _event -> nil
+    end)
+  end
+
+  defp resumed_thread({:resume, thread_id, _new_messages}), do: thread_id
+  defp resumed_thread({:fresh, _reason}), do: nil
 
   defp parse_tool_blocks(text, tool_calls) do
     tool_calls
@@ -643,7 +944,7 @@ defmodule Alloy.Provider.Codex do
         ok
 
       {:error, %Jason.DecodeError{}} ->
-        case json |> repair_backslash_escapes() |> Jason.decode() do
+        case json |> repair_backslash_escapes() |> escape_raw_controls() |> Jason.decode() do
           {:ok, _} = ok ->
             ok
 
@@ -659,6 +960,33 @@ defmodule Alloy.Provider.Codex do
   defp repair_backslash_escapes(json) do
     Regex.replace(@invalid_json_escape_re, json, fn match -> "\\" <> match end)
   end
+
+  # Codex also writes multi-line scripts into a JSON string with raw newlines
+  # (`unexpected byte ... 0xA`), which failed the whole turn. Inside a string
+  # they can only mean the escaped character; outside one they are whitespace
+  # and stay as they are.
+  defp escape_raw_controls(json), do: escape_raw_controls(json, false, [])
+
+  defp escape_raw_controls(<<>>, _in_string, acc),
+    do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp escape_raw_controls(<<"\\", c, rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, [<<"\\", c>> | acc])
+
+  defp escape_raw_controls(<<"\"", rest::binary>>, in_string, acc),
+    do: escape_raw_controls(rest, not in_string, ["\"" | acc])
+
+  defp escape_raw_controls(<<"\n", rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, ["\\n" | acc])
+
+  defp escape_raw_controls(<<"\r", rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, ["\\r" | acc])
+
+  defp escape_raw_controls(<<"\t", rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, ["\\t" | acc])
+
+  defp escape_raw_controls(<<c, rest::binary>>, in_string, acc),
+    do: escape_raw_controls(rest, in_string, [<<c>> | acc])
 
   defp emit_chunks(%{messages: [%Message{content: text}]}, on_chunk) when is_binary(text) do
     on_chunk.(text)
@@ -738,6 +1066,34 @@ defmodule Alloy.Provider.Codex do
     """
   end
 
+  # Sent instead of `build_prompt/3` when resuming: the thread already holds the
+  # framing, the response rules and every earlier message. Tool definitions and
+  # the system prompt go in only when they changed (nil otherwise).
+  defp build_incremental_prompt(new_messages, tool_defs, system_prompt) do
+    payload =
+      %{conversation: Enum.map(new_messages, &serialize_message/1)}
+      |> put_tools(tool_defs)
+      |> put_system_prompt(system_prompt)
+
+    """
+    Continuing the same conversation. Produce exactly one JSON object
+    matching the schema and response rules already given, based on the new
+    transcript entries below.
+
+    New transcript entries:
+    #{Jason.encode!(payload)}
+    """
+  end
+
+  # A changed system prompt replaces the one the thread started with.
+  defp put_system_prompt(payload, nil), do: payload
+  defp put_system_prompt(payload, prompt), do: Map.put(payload, :system_prompt, prompt)
+
+  defp put_tools(payload, nil), do: payload
+
+  defp put_tools(payload, tool_defs),
+    do: Map.put(payload, :available_tools, Enum.map(tool_defs, &serialize_tool_def/1))
+
   defp serialize_message(%Message{role: role, content: content}) when is_binary(content) do
     %{role: Atom.to_string(role), content: content}
   end
@@ -778,13 +1134,33 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
-  defp codex_args(paths, config) do
-    ~w(exec --json --skip-git-repo-check --ephemeral --ignore-rules --sandbox read-only) ++
+  defp codex_args(paths, config, plan) do
+    exec_args(plan) ++
+      @no_own_commands ++
       ["--output-schema", paths.schema_path, "--output-last-message", paths.last_message_path] ++
       user_config_args(config) ++
       Enum.flat_map(Map.get(config, :config_overrides, []), &["-c", &1]) ++
-      model_args(config)
+      model_args(config) ++
+      thread_args(plan)
   end
+
+  # Not `--ephemeral` unless the thread can never be resumed: it stops Codex
+  # recording the thread, and the thread is what the next turn resumes.
+  # `exec resume` has no `--sandbox`, so there it is a config override.
+  defp exec_args({:resume, _thread_id, _new_messages}),
+    do:
+      ~w(exec resume --json --skip-git-repo-check --ignore-rules -c) ++
+        [~s(sandbox_mode="read-only")]
+
+  defp exec_args({:fresh, :ephemeral}),
+    do: ~w(exec --json --skip-git-repo-check --ephemeral --ignore-rules --sandbox read-only)
+
+  defp exec_args({:fresh, _reason}),
+    do: ~w(exec --json --skip-git-repo-check --ignore-rules --sandbox read-only)
+
+  # The thread id is positional, ahead of the prompt.
+  defp thread_args({:resume, thread_id, _new_messages}), do: [thread_id]
+  defp thread_args({:fresh, _reason}), do: []
 
   # --ignore-user-config also skips the profile file, so a profile opts in
   # to the user config.

@@ -20,6 +20,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including the cached halves Claude Code reports separately, and failures
   return `%Alloy.Provider.Error{}` like the other built-in providers.
 
+### Changed
+
+- **Codex resumes its own thread.** The first turn starts a thread; later
+  turns run `codex exec resume <thread_id>` with only the messages Codex has
+  not seen, and the tool definitions and system prompt only when they
+  changed, so the prefix is read from cache instead of re-sent. Each turn
+  returns `:provider_state` with the thread id, checked by the same
+  prefix hash as `ClaudeCode`: history rewritten by compaction goes out
+  fresh, and a resume that finishes without a response is retried fresh once.
+  `response_metadata.session` says whether a turn resumed and, if not, why.
+  Threads are recorded in `CODEX_HOME` (no more `--ephemeral`), so they
+  appear in that home's `codex resume` list; use a dedicated `:codex_home` to
+  keep them out of your own. Turns with `:profile` (which `exec resume` does
+  not take) or a copied `:auth_path` still run `--ephemeral` and are never
+  resumed.
+- **Codex streams as it works.** `stream/4` reads `--json` as Codex writes it
+  and hands the callback each message as it completes and each command as it
+  starts, in the calling process, instead of replaying the reply at the end.
+  A streaming caller is told when a turn after the first starts a new thread.
+- **Codex runs no command of its own.** Its `shell_tool` and `unified_exec`
+  features are disabled, so tool work comes back as tool calls for the outer
+  loop instead of being attempted inside the read-only sandbox.
+
+### Fixed
+
+- A Codex `arguments_json` string holding raw newlines (multi-line scripts)
+  is read as if they were escaped, instead of failing the turn.
+
 ## [0.12.5] - 2026-10-09
 
 ### Security

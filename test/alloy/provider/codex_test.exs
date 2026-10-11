@@ -165,6 +165,32 @@ defmodule Alloy.Provider.CodexTest do
       assert Exception.message(reason) =~ "arguments_json"
     end
 
+    test "a raw newline inside an arguments_json string is read as an escaped one" do
+      script = "local a = 1\nreturn a"
+      raw = ~s({"script":") <> script <> ~s("})
+
+      config = %{
+        model: "gpt-5.4",
+        command_runner:
+          fake_runner(fn _args, _opts, output_path ->
+            payload = %{
+              stop_reason: "tool_use",
+              text: "",
+              tool_calls: [%{call_id: "call_1", name: "run_script", arguments_json: raw}]
+            }
+
+            File.write!(output_path, Jason.encode!(payload))
+            "codex\n#{Jason.encode!(payload)}\n"
+          end)
+      }
+
+      assert {:ok, %{messages: [%Message{content: blocks}]}} =
+               Codex.complete([Message.user("Hi")], [], config)
+
+      assert [%{type: "tool_use", input: %{"script" => ^script}}] =
+               Enum.filter(blocks, &match?(%{type: "tool_use"}, &1))
+    end
+
     test "accepts a parsed payload even if codex exits non-zero" do
       config = %{
         model: "gpt-5.4",
@@ -742,6 +768,315 @@ defmodule Alloy.Provider.CodexTest do
     end
   end
 
+  describe "session continuation" do
+    @thread "01a0e329-c415-74d3-a094-f28ef64e03cc"
+    @earlier [Message.user("Remember PLUM"), Message.assistant("OK")]
+
+    test "reports the thread to resume from --json events" do
+      config = %{model: "gpt-5.4", command_runner: fake_runner(json_reply("Hi back"))}
+      messages = [Message.user("Hi")]
+
+      assert {:ok, result} = Codex.complete(messages, [], config)
+
+      assert result.usage == %{
+               input_tokens: 26_486,
+               output_tokens: 11,
+               cache_read_input_tokens: 20_864,
+               cache_creation_input_tokens: 0,
+               reasoning_output_tokens: 0
+             }
+
+      prefix = messages ++ [Message.assistant("Hi back")]
+
+      assert result.provider_state == %{
+               session_id: @thread,
+               sent_upto: 2,
+               prefix_hash: :erlang.phash2(prefix),
+               tools_hash: :erlang.phash2([]),
+               system_hash: :erlang.phash2(nil)
+             }
+    end
+
+    test "resumes the thread and sends only the messages it has not seen" do
+      parent = self()
+      messages = @earlier ++ [Message.user("What was it?")]
+
+      config =
+        resumed_config(
+          fake_runner(fn args, opts, path ->
+            send(parent, {:args, args})
+            json_reply("PLUM").(args, opts, path)
+          end)
+        )
+
+      assert {:ok, result} = Codex.complete(messages, [], config)
+      assert_receive {:args, ["exec", "resume" | _] = args}
+
+      prompt = List.last(args)
+      assert Enum.at(args, -2) == @thread
+      assert prompt =~ "What was it?"
+      refute prompt =~ "Remember PLUM"
+      assert result.provider_state.sent_upto == 4
+    end
+
+    # A fresh turn records its thread; only one that can never be resumed is
+    # --ephemeral. `exec resume` has no --sandbox, so it is a -c override.
+    test "fresh and resumed turns run under the same configuration" do
+      parent = self()
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:args, args})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      assert {:ok, _} = Codex.complete(@earlier, [], %{model: "gpt-5.4", command_runner: runner})
+      assert_receive {:args, ["exec", "--json" | _] = fresh}
+
+      assert {:ok, _} =
+               Codex.complete(@earlier ++ [Message.user("What?")], [], resumed_config(runner))
+
+      assert_receive {:args, ["exec", "resume" | _] = resume}
+
+      for args <- [fresh, resume], flag <- ["--json", "--ignore-user-config", "--ignore-rules"] do
+        assert flag in args, "#{flag} missing from #{inspect(args)}"
+      end
+
+      refute "--ephemeral" in fresh
+      refute "--ephemeral" in resume
+
+      assert ["--sandbox", "read-only"] ==
+               fresh |> Enum.drop_while(&(&1 != "--sandbox")) |> Enum.take(2)
+
+      refute "--sandbox" in resume
+      assert ~s(sandbox_mode="read-only") in resume
+    end
+
+    test "codex runs no command of its own, fresh or resumed" do
+      parent = self()
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:args, args})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      assert {:ok, _} = Codex.complete(@earlier, [], %{model: "gpt-5.4", command_runner: runner})
+
+      assert {:ok, _} =
+               Codex.complete(@earlier ++ [Message.user("What?")], [], resumed_config(runner))
+
+      assert_receive {:args, ["exec", "--json" | _] = fresh}
+      assert_receive {:args, ["exec", "resume" | _] = resume}
+
+      for args <- [fresh, resume], feature <- ["shell_tool", "unified_exec"] do
+        assert feature in disabled(args), "codex kept #{feature} in #{inspect(args)}"
+      end
+    end
+
+    # `exec resume` takes no --profile, and a copied :auth_path home is
+    # deleted with the call, so neither leaves a thread to resume.
+    test "a profiled turn runs --ephemeral and keeps no thread" do
+      parent = self()
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:args, args})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      config =
+        runner
+        |> resumed_config()
+        |> Map.put(:profile, "work")
+
+      assert {:ok, result} = Codex.complete(@earlier ++ [Message.user("What?")], [], config)
+      assert_receive {:args, ["exec", "--json" | _] = args}
+      assert "--ephemeral" in args
+      assert List.last(args) =~ "Remember PLUM"
+      refute Map.has_key?(result, :provider_state)
+      assert result.response_metadata.session.reason == :ephemeral
+    end
+
+    @tag :tmp_dir
+    test "a copied :auth_path home runs --ephemeral", %{tmp_dir: dir} do
+      token = Path.join(dir, "codex-token.json")
+      File.write!(token, ~s({"token":"t"}))
+      parent = self()
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:args, args})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      config = Map.put(resumed_config(runner), :auth_path, token)
+
+      assert {:ok, result} = Codex.complete(@earlier ++ [Message.user("What?")], [], config)
+      assert_receive {:args, ["exec", "--json" | _] = args}
+      assert "--ephemeral" in args
+      refute Map.has_key?(result, :provider_state)
+    end
+
+    test "a resumed turn sends the tool list only when it changed" do
+      parent = self()
+      messages = @earlier ++ [Message.user("What was it?")]
+      tools = [%{name: "read_file", description: "Read a file", input_schema: %{type: "object"}}]
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:prompt, List.last(args)})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      # The first turn's full prompt carried these tools, so the thread has them.
+      assert {:ok, first} =
+               Codex.complete([Message.user("Hi")], tools, %{
+                 model: "gpt-5.4",
+                 command_runner: runner
+               })
+
+      assert_receive {:prompt, _fresh}
+      known = first.provider_state.tools_hash
+
+      unchanged = resumed_config(runner, %{tools_hash: known})
+      assert {:ok, _} = Codex.complete(messages, tools, unchanged)
+      assert_receive {:prompt, resumed}
+      refute resumed =~ "available_tools"
+      assert resumed =~ "What was it?"
+
+      changed = resumed_config(runner, %{tools_hash: :erlang.phash2([])})
+      assert {:ok, _} = Codex.complete(messages, tools, changed)
+      assert_receive {:prompt, resent}
+      assert resent =~ "available_tools"
+      assert resent =~ "read_file"
+    end
+
+    test "a resumed turn sends the system prompt only when it changed" do
+      parent = self()
+      messages = @earlier ++ [Message.user("What was it?")]
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:prompt, List.last(args)})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      assert {:ok, first} =
+               Codex.complete([Message.user("Hi")], [], %{
+                 model: "gpt-5.4",
+                 system_prompt: "Brief v1",
+                 command_runner: runner
+               })
+
+      assert_receive {:prompt, _fresh}
+
+      same =
+        runner
+        |> resumed_config(Map.take(first.provider_state, [:tools_hash, :system_hash]))
+        |> Map.put(:system_prompt, "Brief v1")
+
+      assert {:ok, _} = Codex.complete(messages, [], same)
+      assert_receive {:prompt, resumed}
+      refute resumed =~ "Brief v1"
+
+      assert {:ok, _} = Codex.complete(messages, [], %{same | system_prompt: "Brief v2"})
+      assert_receive {:prompt, resent}
+      assert resent =~ "Brief v2"
+    end
+
+    test "sends the full transcript when earlier history was rewritten" do
+      parent = self()
+      messages = [Message.user("Compacted summary"), Message.assistant("OK"), Message.user("Go")]
+
+      config = %{
+        model: "gpt-5.4",
+        provider_state: %{session_id: @thread, sent_upto: 2, prefix_hash: 0},
+        command_runner:
+          fake_runner(fn args, opts, path ->
+            send(parent, {:args, args})
+            json_reply("Going").(args, opts, path)
+          end)
+      }
+
+      {result, log} = ExUnit.CaptureLog.with_log(fn -> Codex.complete(messages, [], config) end)
+
+      assert {:ok, %{response_metadata: %{session: %{mode: :fresh, reason: :history_rewritten}}}} =
+               result
+
+      assert log =~ "starting a new thread"
+      assert_receive {:args, ["exec", "--json" | _] = args}
+      assert List.last(args) =~ "Compacted summary"
+    end
+
+    test "falls back to the full transcript when the thread cannot be resumed" do
+      parent = self()
+      messages = @earlier ++ [Message.user("What was it?")]
+
+      config =
+        resumed_config(
+          fake_runner(fn args, opts, path ->
+            send(parent, {:args, args})
+
+            case args do
+              ["exec", "resume" | _] -> {"Error: thread not found", 1}
+              _ -> json_reply("PLUM").(args, opts, path)
+            end
+          end)
+        )
+
+      {result, log} = ExUnit.CaptureLog.with_log(fn -> Codex.complete(messages, [], config) end)
+
+      assert {:ok, %{messages: [%Message{content: "PLUM"}]} = completion} = result
+      assert completion.response_metadata.session.reason == :resume_failed
+      assert log =~ "could not resume thread #{@thread}"
+      assert_receive {:args, ["exec", "resume" | _]}
+      assert_receive {:args, ["exec", "--json" | _] = fresh}
+      assert List.last(fresh) =~ "Remember PLUM"
+    end
+
+    test "says whether a turn resumed, and which thread" do
+      config = resumed_config(fake_runner(json_reply("PLUM")))
+
+      assert {:ok, resumed} = Codex.complete(@earlier ++ [Message.user("What?")], [], config)
+
+      assert resumed.response_metadata.session ==
+               %{mode: :resumed, reason: nil, thread_id: @thread}
+
+      first = %{model: "gpt-5.4", command_runner: fake_runner(json_reply("Hi"))}
+
+      assert {:ok, %{response_metadata: %{session: %{mode: :fresh, reason: :no_session}}}} =
+               Codex.complete([Message.user("Hi")], [], first)
+    end
+
+    defp resumed_config(runner, state \\ %{}) do
+      %{
+        model: "gpt-5.4",
+        command_runner: runner,
+        provider_state:
+          Map.merge(
+            %{session_id: @thread, sent_upto: 2, prefix_hash: :erlang.phash2(@earlier)},
+            state
+          )
+      }
+    end
+
+    defp json_reply(text) do
+      fn _args, _opts, output_path ->
+        File.write!(
+          output_path,
+          Jason.encode!(%{stop_reason: "end_turn", text: text, tool_calls: []})
+        )
+
+        """
+        {"type":"thread.started","thread_id":"#{@thread}"}
+        {"type":"turn.started"}
+        {"type":"turn.completed","usage":{"input_tokens":47350,"cached_input_tokens":20864,"cache_write_input_tokens":0,"output_tokens":11}}
+        """
+      end
+    end
+  end
+
   describe "stream/4" do
     test "replays the final assistant text through the callback" do
       parent = self()
@@ -768,6 +1103,135 @@ defmodule Alloy.Provider.CodexTest do
       assert_receive {:chunk, "Chunk me"}
       assert result.messages == [Message.assistant("Chunk me")]
     end
+
+    test "hands on each message and command as Codex writes it, and does not replay the reply" do
+      parent = self()
+      reply = Jason.encode!(%{stop_reason: "end_turn", text: "Rivers flow.", tool_calls: []})
+
+      config = %{
+        model: "gpt-5.4",
+        command_runner:
+          fake_runner(fn _args, _opts, output_path ->
+            File.write!(output_path, reply)
+
+            Enum.map_join(
+              [
+                %{type: "thread.started", thread_id: "t-1"},
+                %{
+                  type: "item.completed",
+                  item: %{type: "agent_message", text: "I'll look first.\n"}
+                },
+                %{type: "item.started", item: %{type: "command_execution", command: "ls"}},
+                %{type: "item.completed", item: %{type: "agent_message", text: reply}},
+                %{type: "turn.completed", usage: %{input_tokens: 10, output_tokens: 2}}
+              ],
+              "\n",
+              &Jason.encode!/1
+            )
+          end)
+      }
+
+      assert {:ok, result} =
+               Codex.stream([Message.user("Rivers?")], [], config, fn chunk ->
+                 send(parent, {:chunk, chunk})
+                 :ok
+               end)
+
+      assert_receive {:chunk, "I'll look first.\n"}
+      assert_receive {:chunk, "\n$ ls\n"}
+      assert_receive {:chunk, "Rivers flow."}
+      refute_receive {:chunk, "Rivers flow."}
+      assert result.messages == [Message.assistant("Rivers flow.")]
+    end
+
+    test "tells a streaming caller when a turn starts a new thread" do
+      parent = self()
+      reply = Jason.encode!(%{stop_reason: "end_turn", text: "Going", tool_calls: []})
+
+      config = %{
+        model: "gpt-5.4",
+        provider_state: %{session_id: "t-1", sent_upto: 2, prefix_hash: 0},
+        command_runner:
+          fake_runner(fn _args, _opts, output_path ->
+            File.write!(output_path, reply)
+            ~s({"type":"thread.started","thread_id":"t-2"})
+          end)
+      }
+
+      messages = [Message.user("Compacted summary"), Message.assistant("OK"), Message.user("Go")]
+
+      ExUnit.CaptureLog.with_log(fn ->
+        Codex.stream(messages, [], config, fn chunk ->
+          send(parent, {:chunk, chunk})
+          :ok
+        end)
+      end)
+
+      assert_receive {:chunk, notice}
+      assert notice =~ "new Codex thread"
+      assert notice =~ "compaction"
+    end
+
+    # The fake codex prints its first message and then waits for a file that
+    # only the callback creates. Chunks handed on at exit would never create
+    # it, and the turn would time out instead of finishing.
+    @tag :tmp_dir
+    test "hands on a message while codex is still running, in the calling process", %{
+      tmp_dir: dir
+    } do
+      go_path = Path.join(dir, "go")
+
+      script =
+        script!(dir, """
+        output=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--output-last-message" ]; then shift; output="$1"; fi
+          shift
+        done
+        cat > /dev/null
+        printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"working on it"}}'
+        while [ ! -f "#{go_path}" ]; do sleep 0.05; done
+        printf '%s' '{"stop_reason":"end_turn","text":"done","tool_calls":[]}' > "$output"
+        printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"stop_reason\\":\\"end_turn\\",\\"text\\":\\"done\\",\\"tool_calls\\":[]}"}}'
+        """)
+
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir, timeout_ms: 10_000}
+      parent = self()
+
+      assert {:ok, result} =
+               Codex.stream([Message.user("Go")], [], config, fn chunk ->
+                 if chunk =~ "working on it", do: File.write!(go_path, "")
+                 send(parent, {:chunk, self(), chunk})
+                 :ok
+               end)
+
+      assert_receive {:chunk, ^parent, "working on it\n"}
+      assert_receive {:chunk, ^parent, "done"}
+      assert result.messages == [Message.assistant("done")]
+    end
+
+    @tag :tmp_dir
+    test "a callback that raises stops codex", %{tmp_dir: dir} do
+      pids_path = Path.join(dir, "pids")
+
+      script =
+        script!(dir, """
+        cat > /dev/null
+        sleep 30 &
+        echo "$$ $!" > "#{pids_path}.tmp" && mv "#{pids_path}.tmp" "#{pids_path}"
+        printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}'
+        wait
+        """)
+
+      config = %{model: "gpt-5.4", codex_bin: script, codex_home: dir, timeout_ms: 30_000}
+
+      assert_raise RuntimeError, "callback failed", fn ->
+        Codex.stream([Message.user("Go")], [], config, fn _chunk -> raise "callback failed" end)
+      end
+
+      pids = await_pids!(pids_path)
+      assert eventually(fn -> Enum.all?(pids, &(not os_alive?(&1))) end)
+    end
   end
 
   defp fake_runner(fun) do
@@ -779,6 +1243,15 @@ defmodule Alloy.Provider.CodexTest do
         output when is_binary(output) -> {output, 0}
       end
     end
+  end
+
+  defp disabled(args) do
+    args
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.flat_map(fn
+      ["--disable", feature] -> [feature]
+      _other -> []
+    end)
   end
 
   defp output_path!(args) do
