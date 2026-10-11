@@ -712,7 +712,11 @@ defmodule Alloy.Provider.ClaudeCode do
        )
        when is_binary(text) do
     if String.trim(text) == "" do
-      {:error, "malformed_reply: Claude Code returned tool_use without any tool calls"}
+      {:error,
+       %Error{
+         kind: :server_error,
+         message: "malformed_reply: Claude Code returned tool_use without any tool calls"
+       }}
     else
       parse_payload(%{payload | "stop_reason" => "end_turn"}, config, envelope, messages)
     end

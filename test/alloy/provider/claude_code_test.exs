@@ -4,6 +4,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
   alias Alloy.Message
   alias Alloy.Provider.ClaudeCode
   alias Alloy.Provider.Error
+  alias Alloy.Provider.Retry
 
   describe "complete/3" do
     test "returns an end_turn assistant message from Claude Code JSON output" do
@@ -98,7 +99,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       }
 
       assert {:error, reason} = ClaudeCode.complete([Message.user("Hi")], [], config)
-      assert Alloy.Provider.Retry.retryable?(reason)
+      assert Retry.retryable?(reason)
     end
 
     test "a reply with real line breaks keeps a literal \\n it quotes" do

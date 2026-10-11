@@ -551,14 +551,17 @@ defmodule Alloy.Provider.Codex do
   defp parse_payload(
          %{"stop_reason" => "tool_use", "text" => text, "tool_calls" => []} = payload,
          config,
-         command_result,
-         messages
+         command_result
        )
        when is_binary(text) do
     if String.trim(text) == "" do
-      {:error, "malformed_reply: Codex returned tool_use without any tool calls"}
+      {:error,
+       %Error{
+         kind: :server_error,
+         message: "malformed_reply: Codex returned tool_use without any tool calls"
+       }}
     else
-      parse_payload(%{payload | "stop_reason" => "end_turn"}, config, command_result, messages)
+      parse_payload(%{payload | "stop_reason" => "end_turn"}, config, command_result)
     end
   end
 

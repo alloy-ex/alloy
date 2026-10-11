@@ -2,7 +2,7 @@ defmodule Alloy.Provider.CodexTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
-  alias Alloy.Provider.{Codex, Error}
+  alias Alloy.Provider.{Codex, Error, Retry}
 
   describe "complete/3" do
     test "returns an end_turn assistant message from Codex JSON output" do
@@ -46,7 +46,7 @@ defmodule Alloy.Provider.CodexTest do
       assert result.messages == [Message.assistant("Done.")]
 
       assert {:error, reason} = Codex.complete([Message.user("Hi")], [], reply.(""))
-      assert Alloy.Provider.Retry.retryable?(reason)
+      assert Retry.retryable?(reason)
     end
 
     test "returns tool_use blocks when Codex requests tools" do
