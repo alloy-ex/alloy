@@ -34,10 +34,6 @@ Lua runs through the [`lua`](https://hex.pm/packages/lua) package, a Lua VM
 written in Elixir with no native code and no dependencies. Add
 `{:lua, "~> 1.0"}` to your deps.
 
-> The module below is tested verbatim in
-> `test/alloy/recipes/code_mode_recipe_test.exs`. If the API drifts, that
-> test fails before this doc lies to you.
-
 ## The tool
 
 ```elixir

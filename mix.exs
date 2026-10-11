@@ -77,8 +77,6 @@ defmodule Alloy.MixProject do
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      # Only for the code mode recipe test (docs/recipes/code-mode.md).
-      {:lua, "~> 1.0", only: :test},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:plug, "~> 1.19.5 or ~> 1.20.3", only: :test},
       {:phoenix_pubsub, "~> 2.1", optional: true}
