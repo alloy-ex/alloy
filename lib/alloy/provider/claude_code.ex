@@ -146,9 +146,8 @@ defmodule Alloy.Provider.ClaudeCode do
   - `stream/4` streams for real: it runs `--output-format stream-json
     --include-partial-messages` and passes the reply's `text` to the callback
     as it arrives. Under `--json-schema` the reply streams as fragments of the
-    StructuredOutput tool's JSON input rather than as text, so
-    `Alloy.Provider.ClaudeCode.StreamJson` decodes the growing `text` value out
-    of it. The chunks always add up to the final `text`.
+    StructuredOutput tool's JSON input rather than as text, so the
+    provider decodes the growing `text` value out of it. The chunks always add up to the final `text`.
   """
 
   @behaviour Alloy.Provider
