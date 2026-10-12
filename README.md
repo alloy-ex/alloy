@@ -59,7 +59,7 @@ application layer. The library stays small so those choices remain yours.
 
 ## What's in the box
 
-- **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
+- **7 providers** — Anthropic, Gemini, OpenAI, Codex, ClaudeCode, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
 - **4 built-in tools** — read, write, edit, bash — plus inline tools defined as data with `Alloy.Tool.inline/1`
 - **GenServer agents** — supervised, stateful, message-passing (moving to the optional `alloy_agent` runtime package in 0.13)
 - **Streaming** — incremental HTTP provider output; Codex replays final text through the same interface

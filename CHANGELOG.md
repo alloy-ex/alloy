@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Alloy.Provider.ClaudeCode`**: a new provider that uses the local `claude`
+  CLI in headless print mode (`claude -p --output-format json --json-schema
+  ...`) as a structured completion backend, mirroring `Alloy.Provider.Codex`.
+  Every invocation runs with `--tools ""`, `--strict-mcp-config`, and
+  `--safe-mode` so Claude Code cannot execute its own tools, pick up ambient
+  `CLAUDE.md`/skills/plugins/hooks, or reach MCP servers - Alloy keeps sole
+  ownership of the tool loop. Unlike Codex, real usage numbers
+  (`usage.input_tokens` / `usage.output_tokens`) come back from the CLI
+  including the cached halves Claude Code reports separately, and failures
+  return `%Alloy.Provider.Error{}` like the other built-in providers.
+
 ## [0.12.5] - 2026-10-09
 
 ### Security
