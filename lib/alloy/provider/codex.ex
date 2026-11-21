@@ -441,30 +441,28 @@ defmodule Alloy.Provider.Codex do
 
     result =
       in_temp_dir(config, fn paths ->
-        with :ok <- write_inputs(paths, prompt) do
-          port = open_port(codex_args(paths, config) ++ ["-"], codex_home, paths, config)
-
-          run = %{
-            port: port,
-            os_pid: OSProcess.os_pid(port),
-            caller_ref: caller_ref,
-            deadline: deadline,
-            timeout: timeout,
-            emit: Map.get(config, :alloy_emit),
-            stream_buffer: [],
-            stream_candidate: nil,
-            streamed_text: nil,
-            config: config
-          }
-
-          with {:ok, output, status, streamed_text} <- collect(run, []) do
-            {:ok,
-             Map.put(
-               command_result(output, read_stderr(paths), status, paths),
-               :streamed_text,
-               streamed_text
-             )}
-          end
+        with :ok <- write_inputs(paths, prompt),
+             {:ok, port} <-
+               open_port(codex_args(paths, config) ++ ["-"], codex_home, paths, config),
+             run = %{
+               port: port,
+               os_pid: OSProcess.os_pid(port),
+               caller_ref: caller_ref,
+               deadline: deadline,
+               timeout: timeout,
+               emit: Map.get(config, :alloy_emit),
+               stream_buffer: [],
+               stream_candidate: nil,
+               streamed_text: nil,
+               config: config
+             },
+             {:ok, output, status, streamed_text} <- collect(run, []) do
+          {:ok,
+           Map.put(
+             command_result(output, read_stderr(paths), status, paths),
+             :streamed_text,
+             streamed_text
+           )}
         end
       end)
 
@@ -534,16 +532,37 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp open_port(args, codex_home, paths, config) do
+    with {:ok, {name, opts}} <- port_spec(:os.type(), args, codex_home, paths, config) do
+      {:ok, Port.open(name, opts)}
+    end
+  end
+
+  @doc false
+  # How codex is launched, per OS. Pure, so both branches are tested anywhere.
+  # On Windows cmd.exe wires the same redirects (`Alloy.CmdLine`) and the
+  # environment goes through the port.
+  @spec port_spec({:unix | :win32, atom()}, [String.t()], String.t() | nil, map(), map()) ::
+          {:ok, {term(), list()}} | {:error, String.t()}
+  def port_spec({:win32, _}, args, codex_home, paths, config) do
+    with {:ok, line} <-
+           Alloy.CmdLine.command(codex_bin(config), args, paths.prompt_path, paths.stderr_path) do
+      env = Enum.map(codex_env(codex_home), fn {key, value} -> {~c"#{key}", ~c"#{value}"} end)
+
+      {:ok,
+       {{:spawn, line}, [{:cd, paths.workdir}, :binary, :exit_status, :use_stdio, {:env, env}]}}
+    end
+  end
+
+  def port_spec({:unix, _}, args, codex_home, paths, config) do
     env = Enum.map(codex_env(codex_home), fn {key, value} -> "#{key}=#{value}" end)
 
     launch_args =
       ["-lc", @launch_script, "alloy-codex", paths.prompt_path, paths.stderr_path, "env"] ++
         env ++ [codex_bin(config) | args]
 
-    Port.open(
-      {:spawn_executable, "/bin/sh"},
-      [{:args, launch_args}, {:cd, paths.workdir}, :binary, :exit_status, :use_stdio]
-    )
+    {:ok,
+     {{:spawn_executable, "/bin/sh"},
+      [{:args, launch_args}, {:cd, paths.workdir}, :binary, :exit_status, :use_stdio]}}
   end
 
   # The deadline is absolute: checking it before each receive keeps a

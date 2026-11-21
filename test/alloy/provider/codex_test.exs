@@ -1058,6 +1058,46 @@ defmodule Alloy.Provider.CodexTest do
     end
   end
 
+  describe "port_spec/5" do
+    @paths %{prompt_path: "/t/prompt.txt", stderr_path: "/t/stderr.log", workdir: "/work"}
+
+    test "on unix, runs codex through the sh launcher" do
+      assert {:ok, {{:spawn_executable, "/bin/sh"}, opts}} =
+               Codex.port_spec({:unix, :darwin}, ["exec", "-"], "/h", @paths, %{
+                 codex_bin: "codex"
+               })
+
+      assert [
+               {:args,
+                ["-lc", _script, "alloy-codex", "/t/prompt.txt", "/t/stderr.log", "env" | rest]}
+               | tail
+             ] =
+               opts
+
+      assert rest == ["OTEL_SDK_DISABLED=true", "CODEX_HOME=/h", "codex", "exec", "-"]
+      assert tail == [{:cd, "/work"}, :binary, :exit_status, :use_stdio]
+    end
+
+    test "on Windows, runs codex through cmd.exe with its env on the port" do
+      paths = %{prompt_path: ~S(C:\t\p.txt), stderr_path: ~S(C:\t\e.log), workdir: ~S(C:\w)}
+
+      assert {:ok, {{:spawn, line}, opts}} =
+               Codex.port_spec({:win32, :nt}, ["exec", "-"], ~S(C:\h), paths, %{
+                 codex_bin: "codex"
+               })
+
+      assert line == ~S(cmd.exe /d /s /c ""codex" exec - < "C:\t\p.txt" 2> "C:\t\e.log"")
+
+      assert opts == [
+               {:cd, ~S(C:\w)},
+               :binary,
+               :exit_status,
+               :use_stdio,
+               {:env, [{~c"OTEL_SDK_DISABLED", ~c"true"}, {~c"CODEX_HOME", ~c"C:\\h"}]}
+             ]
+    end
+  end
+
   describe "subprocess lifecycle" do
     @tag :tmp_dir
     test "killing the caller stops codex and its children and removes its files", %{
