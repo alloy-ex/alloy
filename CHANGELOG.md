@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The Codex provider runs on Windows. The CLI is launched through `cmd.exe`
+  with its arguments quoted for it (npm installs `codex` as a `.cmd` shim,
+  which a port cannot spawn directly), and a run is ended with
+  `taskkill /T /F` so the whole process tree goes. The Unix path is unchanged.
+
 ## [0.13.0] - 2026-10-14
 
 ### Changed
