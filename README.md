@@ -234,6 +234,10 @@ Citation metadata is exposed in two places:
 - `result.metadata.provider_response.citations` for provider-level citation data
 - assistant text blocks may include `:annotations` for inline citation spans
 
+On Anthropic, for example with the `web_search_20250305` server tool, a cited
+text block carries `:citations` instead: the sources for that whole block, each
+as the API sent it (string keys such as `"url"`, `"title"`, `"cited_text"`).
+
 ### Overriding model metadata
 
 Alloy derives the compaction budget from the configured provider model when it

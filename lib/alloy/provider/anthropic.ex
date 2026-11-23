@@ -244,6 +244,15 @@ defmodule Alloy.Provider.Anthropic do
 
   defp handle_sse_event(acc, "content_block_delta", %{
          "index" => index,
+         "delta" => %{"type" => "citations_delta", "citation" => citation}
+       }) do
+    current = Map.get(acc.content_blocks, index, %{"type" => "text", "text" => ""})
+    citations = Map.get(current, "citations") || []
+    put_in(acc.content_blocks[index], Map.put(current, "citations", citations ++ [citation]))
+  end
+
+  defp handle_sse_event(acc, "content_block_delta", %{
+         "index" => index,
          "delta" => %{"type" => "input_json_delta", "partial_json" => json}
        }) do
     # Accumulate partial JSON for tool_use input
@@ -692,8 +701,11 @@ defmodule Alloy.Provider.Anthropic do
     |> maybe_put(:signature, block["signature"])
   end
 
-  defp parse_content_block(%{"type" => "text", "text" => text}) do
+  # Citations stay as the API sent them (string keys), like OpenAI's
+  # :annotations. They are not sent back with the history.
+  defp parse_content_block(%{"type" => "text", "text" => text} = block) do
     %{type: "text", text: text}
+    |> maybe_put_citations(block["citations"])
   end
 
   # A programmatic call's `caller` must go back unchanged with the history.
@@ -719,6 +731,9 @@ defmodule Alloy.Provider.Anthropic do
     type = Map.get(block, "type", "unknown")
     %{type: type} |> Map.merge(Map.delete(block, "type"))
   end
+
+  defp maybe_put_citations(block, [_ | _] = citations), do: Map.put(block, :citations, citations)
+  defp maybe_put_citations(block, _citations), do: block
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, val), do: Map.put(map, key, val)
