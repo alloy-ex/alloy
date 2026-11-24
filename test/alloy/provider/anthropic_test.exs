@@ -34,6 +34,103 @@ defmodule Alloy.Provider.AnthropicTest do
     end
   end
 
+  describe "citations" do
+    # Shape from the web search tool docs:
+    # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+    @citation %{
+      "type" => "web_search_result_location",
+      "url" => "https://example.com/report",
+      "title" => "Report",
+      "encrypted_index" => "Eo8BCioIAhgBIiQyYjQ0OWJmZi1lNm",
+      "cited_text" => "Revenue grew 16% in 2025."
+    }
+
+    test "complete/3 keeps a text block's citations" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            message_json("end_turn", %{
+              "content" => [
+                %{"type" => "text", "text" => "Revenue grew "},
+                %{"type" => "text", "text" => "16% last year", "citations" => [@citation]},
+                %{"type" => "text", "text" => ".", "citations" => nil}
+              ]
+            })
+        })
+
+      assert {:ok, %{messages: [message]}} = Anthropic.complete([Message.user("Hi")], [], config)
+
+      assert message.content == [
+               %{type: "text", text: "Revenue grew "},
+               %{type: "text", text: "16% last year", citations: [@citation]},
+               %{type: "text", text: "."}
+             ]
+
+      assert Message.text(message) == "Revenue grew \n16% last year\n."
+    end
+
+    test "stream/4 collects citations_delta events on their text block" do
+      second = %{@citation | "cited_text" => "Margins rose."}
+
+      # The block may start with an empty list, null or no citations key.
+      for start_fields <- [%{"citations" => []}, %{"citations" => nil}, %{}] do
+        config =
+          config_with_sse_stream([
+            ant_event("message_start", %{
+              "message" => %{"usage" => %{"input_tokens" => 10, "output_tokens" => 0}}
+            }),
+            ant_event("content_block_start", %{
+              "index" => 0,
+              "content_block" => Map.merge(%{"type" => "text", "text" => ""}, start_fields)
+            }),
+            ant_event("content_block_delta", %{
+              "index" => 0,
+              "delta" => %{"type" => "citations_delta", "citation" => @citation}
+            }),
+            ant_event("content_block_delta", %{
+              "index" => 0,
+              "delta" => %{"type" => "citations_delta", "citation" => second}
+            }),
+            ant_event("content_block_delta", %{
+              "index" => 0,
+              "delta" => %{"type" => "text_delta", "text" => "16% last year"}
+            }),
+            ant_event("content_block_stop", %{"index" => 0}),
+            ant_event("message_delta", %{
+              "delta" => %{"stop_reason" => "end_turn"},
+              "usage" => %{"output_tokens" => 5}
+            }),
+            ant_event("message_stop", %{})
+          ])
+
+        assert {:ok, %{messages: [message]}} =
+                 Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+        assert message.content == [
+                 %{type: "text", text: "16% last year", citations: [@citation, second]}
+               ]
+      end
+    end
+
+    test "are not sent back with the history" do
+      config = config_that_captures_request()
+
+      cited = %Message{
+        role: :assistant,
+        content: [%{type: "text", text: "16%", citations: [@citation]}]
+      }
+
+      Anthropic.complete([Message.user("Hi"), cited, Message.user("Source?")], [], config)
+
+      assert_received {:request_body, body}
+
+      assert Enum.at(Jason.decode!(body)["messages"], 1)["content"] == [
+               %{"type" => "text", "text" => "16%"}
+             ]
+    end
+  end
+
   describe "complete/3 with tool_use response" do
     test "returns normalized tool_use response with tool calls" do
       config =

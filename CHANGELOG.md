@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-24
+
+### Fixed
+
+- Anthropic keeps the `citations` of text blocks, for example web search
+  sources. A cited text block is now `%{type: "text", text: ..., citations: [...]}`
+  with each citation as the API sent it, in `complete/3` and in `stream/4`
+  (from `citations_delta` events). Citations are not sent back with the history.
+
 ## [0.13.0] - 2026-10-14
 
 ### Changed

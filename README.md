@@ -17,7 +17,7 @@ Alloy is a harness, not a framework. Four runtime dependencies, ~10,000 lines â€
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.13.0"
+result.text #=> "The version is 0.13.1"
 ```
 
 ## Why Alloy?
@@ -233,6 +233,10 @@ For xAI search tools:
 Citation metadata is exposed in two places:
 - `result.metadata.provider_response.citations` for provider-level citation data
 - assistant text blocks may include `:annotations` for inline citation spans
+
+On Anthropic, for example with the `web_search_20250305` server tool, a cited
+text block carries `:citations` instead: the sources for that whole block, each
+as the API sent it (string keys such as `"url"`, `"title"`, `"cited_text"`).
 
 ### Overriding model metadata
 

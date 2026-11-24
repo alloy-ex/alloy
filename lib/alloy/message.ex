@@ -9,7 +9,8 @@ defmodule Alloy.Message do
   ## Content Block Types
 
   ### Text and tool blocks
-  - `%{type: "text", text: "..."}` - Plain text
+  - `%{type: "text", text: "..."}` - Plain text. Assistant text may also carry
+    `:annotations` (OpenAI, xAI) or `:citations` (Anthropic) with its sources.
   - `%{type: "tool_use", id: "...", name: "...", input: %{}}` - Tool call from assistant
   - `%{type: "tool_result", tool_use_id: "...", content: "..."}` - Tool execution result
 
