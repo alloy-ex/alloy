@@ -26,9 +26,10 @@ decoded into `Alloy.Result.output`:
 1. **Top-level ownership:** `:output_schema` is validated at startup in
    `Alloy.Agent.Config.from_opts/1` (and rejected inside provider config tuples
    so `Turn` always owns decoding and `State.prepare(state, output_schema: nil)`
-   clears it cleanly). Built-in HTTP providers consume `spec.schema` through an
-   O(1) wire helper without re-normalizing or re-resolving per request (and
-   `Codex` embeds it into its prompt).
+   clears it cleanly). The normalized struct caches its preflighted schema
+   resolution so repeated `State.prepare/2` calls, provider wire translations,
+   and final response validation do not re-normalize or re-resolve per request
+   (while `Codex` embeds the normalized schema into its prompt).
 2. **Provider wire translation & `extra_body` preservation:** Each built-in
    HTTP provider translates `:output_schema` into its native wire field and
    merges one level deep on the enclosing container (`output_config`, `text`,
@@ -68,8 +69,11 @@ decoded into `Alloy.Result.output`:
      so host repair loops can branch without parsing error strings or
      re-decoding mismatched JSON). The assistant reply stays in
      `result.messages` and `result.text` (note `result.text` joins multiple
-     text blocks with `"\n"` while decoding joins with `""`). Alloy does not
-     run an automatic repair turn.
+     text blocks with `"\n"` while decoding joins with `""`). If
+     `:after_completion` middleware halts the run, `result.status` is `:halted`
+     and `result.output` is `nil` (the validated value was available inside
+     `:after_completion` on `state.run_metadata.output`). Alloy does not run an
+     automatic repair turn.
 5. **Portability limits:** `:output_schema` is sent on every completion turn.
    Gemini models prior to Gemini 3 and some OpenAI-compatible servers reject
    combining tool declarations with native JSON Schema output; hosts targeting

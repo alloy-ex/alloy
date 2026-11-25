@@ -285,7 +285,20 @@ defmodule Alloy.Agent.Turn do
 
     state
     |> account_response(response)
+    |> maybe_record_refusal_output_error(reason)
     |> fail(reason)
+  end
+
+  defp maybe_record_refusal_output_error(%State{config: %{output_schema: nil}} = state, _reason),
+    do: state
+
+  defp maybe_record_refusal_output_error(%State{run_metadata: %{final_tool: _}} = state, _reason),
+    do: state
+
+  defp maybe_record_refusal_output_error(state, reason) do
+    State.merge_run_metadata(state, %{
+      output_error: %{kind: :refusal, message: reason, decoded: nil}
+    })
   end
 
   # Answers every unanswered tool call with an error so the transcript stays

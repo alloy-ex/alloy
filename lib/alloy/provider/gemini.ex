@@ -180,11 +180,13 @@ defmodule Alloy.Provider.Gemini do
 
     output_schema = OutputSchema.wire(Map.get(config, :output_schema))
 
+    raw_generation_config =
+      config |> Map.get(:generation_config, %{}) |> Provider.stringify_keys()
+
     # No default maxOutputTokens: the budget includes thinking, so a fixed
     # default truncates thinking models; each model's own limit is larger.
     generation_config =
-      Map.get(config, :generation_config, %{})
-      |> Alloy.Provider.stringify_keys()
+      raw_generation_config
       |> maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
       |> maybe_put_output_schema(output_schema)
 
@@ -218,7 +220,7 @@ defmodule Alloy.Provider.Gemini do
         "generationConfig"
       )
 
-    validate_output_schema_conflicts(body, output_schema)
+    validate_output_schema_conflicts(body, raw_generation_config, output_schema)
   end
 
   defp build_contents(messages) do
@@ -806,11 +808,20 @@ defmodule Alloy.Provider.Gemini do
     |> maybe_put_new("responseJsonSchema", schema)
   end
 
-  defp validate_output_schema_conflicts(body, nil), do: {:ok, body}
+  defp validate_output_schema_conflicts(body, _raw_generation_config, nil), do: {:ok, body}
 
-  defp validate_output_schema_conflicts(body, _spec) do
-    generation_config = Map.get(body, "generationConfig", %{})
-    validate_gemini_generation_config(body, generation_config)
+  defp validate_output_schema_conflicts(body, raw_generation_config, _spec) do
+    if Map.has_key?(raw_generation_config, "responseJsonSchema") do
+      {:error,
+       %Error{
+         kind: :invalid_request,
+         message:
+           "cannot combine :output_schema with generation_config[\"responseJsonSchema\"] on Gemini (use :output_schema alone, or override via :extra_body)"
+       }}
+    else
+      generation_config = Map.get(body, "generationConfig", %{})
+      validate_gemini_generation_config(body, generation_config)
+    end
   end
 
   defp validate_gemini_generation_config(body, generation_config)

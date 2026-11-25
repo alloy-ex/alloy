@@ -24,7 +24,17 @@ defmodule Alloy.OutputSchemaTest do
       assert %OutputSchema{name: "alloy_output", strict: true} = spec
       assert spec.schema["type"] == "object"
       assert spec.schema["required"] == ["answer", "confidence"]
+      assert OutputSchema.normalize!(spec) == spec
       assert OutputSchema.wire(spec) == spec
+
+      hand_built = %OutputSchema{
+        name: "hand",
+        schema: spec.schema,
+        strict: true
+      }
+
+      assert {:ok, %{"answer" => "ok", "confidence" => 1}} =
+               OutputSchema.decode_and_validate(~s({"answer":"ok","confidence":1}), hand_built)
     end
 
     test "normalizes wrapper maps with custom name and strict flag" do
@@ -158,6 +168,14 @@ defmodule Alloy.OutputSchemaTest do
 
       assert Exception.message(err) =~ "output_schema"
       refute Exception.message(err) =~ "tool schema"
+
+      # Remote $ref under a property literally named "default" is also rejected.
+      assert_raise ArgumentError, ~r/output_schema.*local \$ref/, fn ->
+        OutputSchema.normalize!(%{
+          type: "object",
+          properties: %{default: %{"$ref" => "https://example.com/default.json"}}
+        })
+      end
 
       # Local $ref inside literal example/const keywords is ignored.
       spec =
@@ -477,6 +495,20 @@ defmodule Alloy.OutputSchemaTest do
                )
 
       assert msg7 =~ "snake_case generationConfig keys"
+
+      assert {:error, %Error{kind: :invalid_request, message: msg8}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3-flash",
+                   generation_config: %{responseJsonSchema: %{type: "object"}},
+                   output_schema: @answer_schema
+                 }
+               )
+
+      assert msg8 =~ ~s(generation_config["responseJsonSchema"])
     end
 
     test "atom-keyed nested extra_body merges without duplicate JSON keys and lets caller win" do
@@ -1103,6 +1135,194 @@ defmodule Alloy.OutputSchemaTest do
                  provider: {Alloy.Provider.Test, agent_pid: empty_pid},
                  output_schema: @answer_schema
                )
+    end
+
+    test "stop_reason: :refusal sets metadata.run.output_error across Anthropic, Gemini, OpenAI, and OpenAICompat" do
+      # Anthropic non-streaming refusal
+      Req.Test.stub(:output_schema_anthropic_refusal, fn conn ->
+        Req.Test.json(conn, %{
+          "id" => "msg_refuse",
+          "type" => "message",
+          "role" => "assistant",
+          "content" => [%{"type" => "text", "text" => "partial"}],
+          "stop_reason" => "refusal",
+          "usage" => %{"input_tokens" => 5, "output_tokens" => 2}
+        })
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                stop_reason: :refusal,
+                output: nil,
+                error: anth_err,
+                metadata: %{
+                  run: %{output_error: %{kind: :refusal, message: anth_err, decoded: nil}}
+                }
+              }} =
+               Alloy.run("disallowed",
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    req_options: [plug: {Req.Test, :output_schema_anthropic_refusal}]},
+                 output_schema: @answer_schema
+               )
+
+      assert anth_err =~ "refusal"
+
+      # Without :output_schema, a refusal does not attach output_error.
+      assert {:error, %Result{status: :error, stop_reason: :refusal, metadata: plain_meta}} =
+               Alloy.run("disallowed",
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    req_options: [plug: {Req.Test, :output_schema_anthropic_refusal}]}
+               )
+
+      refute Map.has_key?(Map.get(plain_meta, :run, %{}), :output_error)
+
+      # Anthropic SSE streaming refusal
+      anth_sse =
+        Enum.join(
+          [
+            "event: message_start",
+            ~s(data: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","content":[],"usage":{"input_tokens":5,"output_tokens":0}}}),
+            "",
+            "event: message_delta",
+            ~s(data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":1}}),
+            "",
+            "event: message_stop",
+            ~s(data: {"type":"message_stop"}),
+            ""
+          ],
+          "\n"
+        )
+
+      Req.Test.stub(:output_schema_anthropic_stream_refusal, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, anth_sse)
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                stop_reason: :refusal,
+                output: nil,
+                error: anth_sse_err,
+                metadata: %{
+                  run: %{output_error: %{kind: :refusal, message: anth_sse_err, decoded: nil}}
+                }
+              }} =
+               Alloy.stream("disallowed", fn _ -> :ok end,
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    req_options: [plug: {Req.Test, :output_schema_anthropic_stream_refusal}]},
+                 output_schema: @answer_schema
+               )
+
+      assert anth_sse_err =~ "refusal"
+
+      # Gemini SAFETY refusal
+      Req.Test.stub(:output_schema_gemini_refusal, fn conn ->
+        Req.Test.json(conn, %{
+          "candidates" => [
+            %{"content" => %{"parts" => []}, "finishReason" => "SAFETY"}
+          ],
+          "usageMetadata" => %{"promptTokenCount" => 3, "candidatesTokenCount" => 0}
+        })
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                stop_reason: :refusal,
+                output: nil,
+                error: gem_err,
+                metadata: %{
+                  run: %{output_error: %{kind: :refusal, message: gem_err, decoded: nil}}
+                }
+              }} =
+               Alloy.run("disallowed",
+                 provider:
+                   {Gemini,
+                    api_key: "k",
+                    model: "gemini-3-flash",
+                    req_options: [plug: {Req.Test, :output_schema_gemini_refusal}]},
+                 output_schema: @answer_schema
+               )
+
+      assert gem_err =~ "SAFETY"
+
+      # OpenAICompat content_filter refusal
+      Req.Test.stub(:output_schema_compat_filter, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "content_filter",
+              "message" => %{"role" => "assistant", "content" => ""}
+            }
+          ],
+          "usage" => %{"prompt_tokens" => 3, "completion_tokens" => 0}
+        })
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                stop_reason: :refusal,
+                output: nil,
+                error: compat_err,
+                metadata: %{
+                  run: %{output_error: %{kind: :refusal, message: compat_err, decoded: nil}}
+                }
+              }} =
+               Alloy.run("disallowed",
+                 provider:
+                   {OpenAICompat,
+                    api_url: "http://localhost",
+                    model: "m",
+                    req_options: [plug: {Req.Test, :output_schema_compat_filter}]},
+                 output_schema: @answer_schema
+               )
+
+      assert compat_err =~ "refusal"
+
+      # OpenAI Responses content_filter refusal
+      Req.Test.stub(:output_schema_openai_filter, fn conn ->
+        Req.Test.json(conn, %{
+          "id" => "resp_filter",
+          "status" => "incomplete",
+          "incomplete_details" => %{"reason" => "content_filter"},
+          "output" => [],
+          "usage" => %{"input_tokens" => 3, "output_tokens" => 0}
+        })
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                stop_reason: :refusal,
+                output: nil,
+                error: oai_err,
+                metadata: %{
+                  run: %{output_error: %{kind: :refusal, message: oai_err, decoded: nil}}
+                }
+              }} =
+               Alloy.run("disallowed",
+                 provider:
+                   {OpenAI,
+                    api_key: "k",
+                    model: "gpt-5.4",
+                    req_options: [plug: {Req.Test, :output_schema_openai_filter}]},
+                 output_schema: @answer_schema
+               )
+
+      assert oai_err =~ "content_filter"
     end
 
     test "does not duplicate :output inside result.metadata.run and skips validation on stop_after_tool" do

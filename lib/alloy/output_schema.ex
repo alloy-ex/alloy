@@ -17,12 +17,13 @@ defmodule Alloy.OutputSchema do
   @wrapper_keys [:name, :schema, :strict, "name", "schema", "strict"]
 
   @enforce_keys [:name, :schema, :strict]
-  defstruct [:name, :schema, :strict]
+  defstruct [:name, :schema, :strict, :resolved]
 
   @type t :: %__MODULE__{
           name: String.t(),
           schema: map(),
-          strict: boolean()
+          strict: boolean(),
+          resolved: {:ok, term()} | :fallback | nil
         }
 
   @type output_error_kind ::
@@ -37,14 +38,18 @@ defmodule Alloy.OutputSchema do
   @doc """
   Normalizes `:output_schema` into `%Alloy.OutputSchema{}` or `nil`.
 
-  Accepts `nil`, a `%Alloy.OutputSchema{}` struct (re-validated), a plain JSON
-  Schema map (defaulting `name: "alloy_output"` and `strict: true`), or a
-  wrapper map `%{schema: map, name: ..., strict: ...}`. Raises `ArgumentError`
-  on invalid shapes, non-JSON-encodable schemas, or invalid local `$ref`s /
-  schemas when `:ex_json_schema` is loaded.
+  Accepts `nil`, a `%Alloy.OutputSchema{}` struct (returned as-is if already
+  normalized, or validated if hand-built), a plain JSON Schema map (defaulting
+  `name: "alloy_output"` and `strict: true`), or a wrapper map
+  `%{schema: map, name: ..., strict: ...}`. Raises `ArgumentError` on invalid
+  shapes, non-JSON-encodable schemas, remote `$ref`s, or invalid schemas when
+  `:ex_json_schema` is loaded.
   """
   @spec normalize!(term()) :: t() | nil
   def normalize!(nil), do: nil
+
+  def normalize!(%__MODULE__{resolved: {:ok, _}} = spec), do: spec
+  def normalize!(%__MODULE__{resolved: :fallback} = spec), do: spec
 
   def normalize!(%__MODULE__{name: name, schema: schema, strict: strict}) do
     normalize_wrapper!(%{name: name, schema: schema, strict: strict})
@@ -59,10 +64,13 @@ defmodule Alloy.OutputSchema do
     if wrapper_map?(spec) do
       normalize_wrapper!(spec)
     else
+      {normalized, resolved} = normalize_schema!(spec, @default_name)
+
       %__MODULE__{
         name: @default_name,
-        schema: normalize_schema!(spec, @default_name),
-        strict: true
+        schema: normalized,
+        strict: true,
+        resolved: resolved
       }
     end
   end
@@ -96,11 +104,15 @@ defmodule Alloy.OutputSchema do
   @doc false
   @spec decode_and_validate_detailed(String.t() | nil, t()) ::
           {:ok, term()} | {:error, output_error()}
-  def decode_and_validate_detailed(text, %__MODULE__{name: name, schema: schema})
+  def decode_and_validate_detailed(text, %__MODULE__{
+        name: name,
+        schema: schema,
+        resolved: resolved
+      })
       when is_binary(text) and text != "" do
     case Jason.decode(text) do
       {:ok, decoded} ->
-        case validate_decoded(decoded, schema, name) do
+        case validate_decoded(decoded, schema, name, resolved) do
           {:ok, value} ->
             {:ok, value}
 
@@ -153,10 +165,13 @@ defmodule Alloy.OutputSchema do
     validate_strict!(strict)
 
     if is_map(raw_schema) and not is_struct(raw_schema) and map_size(raw_schema) > 0 do
+      {normalized, resolved} = normalize_schema!(raw_schema, name)
+
       %__MODULE__{
         name: name,
-        schema: normalize_schema!(raw_schema, name),
-        strict: strict
+        schema: normalized,
+        strict: strict,
+        resolved: resolved
       }
     else
       raise ArgumentError,
@@ -216,13 +231,24 @@ defmodule Alloy.OutputSchema do
                   __STACKTRACE__
       end
 
-    Validation.preflight_output_schema!(normalized, name)
-    normalized
+    resolved = Validation.prepare_output_schema!(normalized, name)
+    {normalized, resolved}
   end
 
   # ── Validation ───────────────────────────────────────────────────────────
 
-  defp validate_decoded(decoded, schema, name) do
+  defp validate_decoded(decoded, _schema, _name, {:ok, resolved}) do
+    case Validation.validate_resolved_output(resolved, decoded) do
+      :ok -> {:ok, decoded}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_decoded(decoded, schema, _name, :fallback) do
+    validate_basic(decoded, schema)
+  end
+
+  defp validate_decoded(decoded, schema, name, nil) do
     case Validation.validate_output(schema, decoded, name) do
       :ok -> {:ok, decoded}
       {:error, reason} -> {:error, reason}

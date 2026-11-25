@@ -235,7 +235,7 @@ defmodule Alloy.Provider.Codex do
 
     case OutputSchema.wire(Map.get(config, :output_schema)) do
       nil -> base
-      spec -> Map.put(base, :output_schema, spec)
+      spec -> Map.put(base, :output_schema, {spec.name, spec.schema, spec.strict})
     end
   end
 

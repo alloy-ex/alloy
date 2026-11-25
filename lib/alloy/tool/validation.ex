@@ -50,14 +50,26 @@ defmodule Alloy.Tool.Validation do
   end
 
   @doc false
-  # Preflights an `:output_schema` at config/prepare time when `:ex_json_schema`
-  # is available: always rejects external `$ref`s so the remote resolver is never
-  # invoked, and validates Draft 4/6/7 schemas eagerly (allowing newer dialects
-  # such as Draft 2020-12 to pass through to native provider enforcement).
-  @spec preflight_output_schema!(map(), String.t()) :: :ok
-  def preflight_output_schema!(schema, name) when is_map(schema) do
-    _ = resolve_output_schema(schema, name)
-    :ok
+  # Preflights an `:output_schema` at config/prepare time: always rejects
+  # external `$ref`s (even without `:ex_json_schema`), and resolves Draft 4/6/7
+  # schemas eagerly when `:ex_json_schema` is loaded (returning `:fallback` for
+  # newer dialects such as Draft 2020-12 or when `:ex_json_schema` is absent).
+  @spec prepare_output_schema!(map(), String.t()) :: {:ok, term()} | :fallback
+  def prepare_output_schema!(schema, name) when is_map(schema) do
+    resolve_output_schema(schema, name)
+  end
+
+  @doc false
+  # Validates decoded structured output against an already-resolved schema.
+  @spec validate_resolved_output(term(), term()) :: :ok | {:error, String.t()}
+  def validate_resolved_output(resolved, decoded) do
+    case Validator.validate(resolved, decoded) do
+      :ok ->
+        :ok
+
+      {:error, errors} ->
+        {:error, "Structured output failed schema validation: #{format_output_errors(errors)}"}
+    end
   end
 
   @doc false
@@ -67,22 +79,14 @@ defmodule Alloy.Tool.Validation do
   @spec validate_output(map(), term(), String.t()) :: :ok | {:error, String.t()} | :fallback
   def validate_output(schema, decoded, name) when is_map(schema) do
     case resolve_output_schema(schema, name) do
-      {:ok, resolved} ->
-        case Validator.validate(resolved, decoded) do
-          :ok ->
-            :ok
-
-          {:error, errors} ->
-            {:error,
-             "Structured output failed schema validation: #{format_output_errors(errors)}"}
-        end
-
-      :fallback ->
-        :fallback
+      {:ok, resolved} -> validate_resolved_output(resolved, decoded)
+      :fallback -> :fallback
     end
   end
 
   defp resolve_output_schema(schema, name) do
+    local_refs_basic!(schema, :output)
+
     if Code.ensure_loaded?(Schema) do
       local_refs!(schema, :output)
 
@@ -108,22 +112,65 @@ defmodule Alloy.Tool.Validation do
           end
       end
     else
-      local_refs_basic!(schema, :output)
       :fallback
     end
   end
 
   defp local_refs_basic!(schema, subject) do
-    {_defined_ids, refs} = collect_scopes_and_refs(schema, "", MapSet.new(), [])
+    {defined_ids, refs} = collect_basic_scopes_and_refs(schema, "", MapSet.new(), [])
+    Enum.each(refs, &validate_basic_ref!(&1, defined_ids, subject))
+  end
 
-    Enum.each(refs, fn
-      {"#" <> _local, _scope} ->
-        :ok
+  defp collect_basic_scopes_and_refs(map, scope, defined_ids, refs) when is_map(map) do
+    {next_scope, defined_ids} = advance_scope(map, scope, defined_ids)
 
-      {ref, _scope} ->
-        raise ArgumentError,
-              "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)}"
+    Enum.reduce(map, {defined_ids, refs}, fn
+      {key, _value}, acc when key in @literal_keywords ->
+        acc
+
+      {key, value}, acc when key in @schema_map_keywords and is_map(value) ->
+        Enum.reduce(value, acc, fn {_prop, subschema}, {ids, r} ->
+          collect_basic_scopes_and_refs(subschema, next_scope, ids, r)
+        end)
+
+      {"$ref", ref}, {ids, r} when is_binary(ref) ->
+        {ids, [{ref, next_scope} | r]}
+
+      {_key, value}, {ids, r} when is_map(value) ->
+        collect_basic_scopes_and_refs(value, next_scope, ids, r)
+
+      {_key, values}, acc when is_list(values) ->
+        Enum.reduce(values, acc, fn
+          item, {ids, r} when is_map(item) ->
+            collect_basic_scopes_and_refs(item, next_scope, ids, r)
+
+          _non_map, inner ->
+            inner
+        end)
+
+      {_key, _value}, acc ->
+        acc
     end)
+  end
+
+  defp collect_basic_scopes_and_refs(_other, _scope, defined_ids, refs), do: {defined_ids, refs}
+
+  defp validate_basic_ref!({"#" <> _ref, ""}, _defined_ids, _subject), do: :ok
+
+  defp validate_basic_ref!({"#" <> _ = ref, ref_scope}, defined_ids, subject) do
+    scoped_str = scoped_ref_string(ref, ref_scope)
+    base = scoped_str |> URI.parse() |> Map.put(:fragment, nil) |> to_string()
+
+    unless base == "" or MapSet.member?(defined_ids, base) do
+      raise ArgumentError,
+            "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)} " <>
+              "(resolves to uncached #{inspect(scoped_str)} under $id scope #{inspect(ref_scope)})"
+    end
+  end
+
+  defp validate_basic_ref!({ref, _ref_scope}, _defined_ids, subject) do
+    raise ArgumentError,
+          "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)}"
   end
 
   defp format_output_errors(errors) do

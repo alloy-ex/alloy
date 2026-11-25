@@ -119,14 +119,15 @@ Known limits:
   `response_format`). On those endpoints, use Gemini 3+ (`gemini-3-flash`), use
   `until_tool` / `stop_after_tool`, or run a separate host-driven no-tools turn
   with `:output_schema` to format the final answer. On Gemini, combining
-  `:output_schema` with legacy `generation_config` / `extra_body["generationConfig"]`
-  `responseSchema` (`response_schema`), snake_case `response_json_schema` /
-  `response_mime_type`, or a non-JSON `responseMimeType` returns a non-retryable
-  `{:error, %Alloy.Provider.Error{kind: :invalid_request}}`, so the run ends
-  with `{:error, result}` unless a fallback provider succeeds. Overriding a
-  provider's wire schema key via `:extra_body` replaces what is sent on the wire
-  only — Alloy still validates the reply against top-level `:output_schema`.
-  OpenAI and xAI strict
+  `:output_schema` with `generation_config["responseJsonSchema"]`, legacy
+  `generation_config` / `extra_body["generationConfig"]` `responseSchema`
+  (`response_schema`), snake_case `response_json_schema` /
+  `response_mime_type`, or a non-JSON `responseMimeType` returns a
+  non-retryable `{:error, %Alloy.Provider.Error{kind: :invalid_request}}`, so
+  the run ends with `{:error, result}` unless a fallback provider succeeds.
+  Overriding a provider's wire schema key via `:extra_body` replaces what is
+  sent on the wire only — Alloy still validates the reply against top-level
+  `:output_schema`. OpenAI and xAI strict
   mode (`strict: true`, the default) requires every property in `"required"`
   and `"additionalProperties" => false` on every object; pass
   `%{schema: schema, strict: false}` to opt out.
