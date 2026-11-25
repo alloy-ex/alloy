@@ -548,7 +548,7 @@ defmodule Alloy.Agent.Turn do
             {:halt, state} -> {:halt, state}
           end
 
-        {:error, reason} ->
+        {:error, state, reason} ->
           {:halt, fail(state, reason)}
       end
     end
@@ -558,50 +558,54 @@ defmodule Alloy.Agent.Turn do
 
   defp decode_structured_output(%State{run_metadata: %{final_tool: _}} = state), do: {:ok, state}
 
-  defp decode_structured_output(%State{config: %{output_schema: spec}} = state) do
-    if last_assistant_refusal?(state) do
-      {:error, "The model refused to produce structured output"}
+  defp decode_structured_output(
+         %State{config: %{output_schema: spec}, messages: messages} = state
+       ) do
+    last_assistant = messages |> Enum.reverse() |> Enum.find(&(&1.role == :assistant))
+
+    if refusal_message?(last_assistant) do
+      message = "The model refused to produce structured output"
+      error = %{kind: :refusal, message: message, decoded: nil}
+      {:error, State.merge_run_metadata(state, %{output_error: error}), message}
     else
-      case OutputSchema.decode_and_validate(last_assistant_raw_text(state), spec) do
+      case OutputSchema.decode_and_validate_detailed(raw_assistant_text(last_assistant), spec) do
         {:ok, decoded} ->
           {:ok, State.merge_run_metadata(state, %{output: decoded})}
 
-        {:error, reason} when state.stop_reason == :max_tokens ->
-          {:error, "Structured output was truncated at :max_tokens (#{reason})"}
+        {:error, %{message: reason, decoded: decoded}} when state.stop_reason == :max_tokens ->
+          message = "Structured output was truncated at :max_tokens (#{reason})"
+          error = %{kind: :truncated, message: message, decoded: decoded}
+          {:error, State.merge_run_metadata(state, %{output_error: error}), message}
 
-        {:error, reason} ->
-          {:error, reason}
+        {:error, %{message: message} = error} ->
+          {:error, State.merge_run_metadata(state, %{output_error: error}), message}
       end
     end
   end
 
-  defp last_assistant_refusal?(%State{messages: messages}) do
-    case messages |> Enum.reverse() |> Enum.find(&(&1.role == :assistant)) do
-      %Message{content: blocks} when is_list(blocks) ->
-        Enum.any?(blocks, &match?(%{refusal: true}, &1))
-
-      _other ->
-        false
-    end
+  defp refusal_message?(%Message{content: blocks}) when is_list(blocks) do
+    Enum.any?(blocks, &match?(%{refusal: true}, &1))
   end
+
+  defp refusal_message?(_other), do: false
 
   # Join text blocks with "" (not "\n" like Message.text/1) so JSON strings
   # split across multiple text blocks (e.g. Gemini thought-signature chunks)
-  # do not gain an illegal raw newline inside a JSON string literal.
-  defp last_assistant_raw_text(%State{messages: messages}) do
-    case messages |> Enum.reverse() |> Enum.find(&(&1.role == :assistant)) do
-      nil ->
-        nil
+  # do not gain an illegal raw newline inside a JSON string literal. Returns
+  # nil when the final assistant message has no text content so decode reports
+  # :missing_text instead of "unexpected end of input".
+  defp raw_assistant_text(nil), do: nil
+  defp raw_assistant_text(%Message{content: ""}), do: nil
+  defp raw_assistant_text(%Message{content: content}) when is_binary(content), do: content
 
-      %Message{content: content} when is_binary(content) ->
-        content
+  defp raw_assistant_text(%Message{content: blocks}) when is_list(blocks) do
+    joined =
+      Enum.map_join(blocks, "", fn
+        %{type: "text", text: text} when is_binary(text) -> text
+        _other -> ""
+      end)
 
-      %Message{content: blocks} when is_list(blocks) ->
-        Enum.map_join(blocks, "", fn
-          %{type: "text", text: text} when is_binary(text) -> text
-          _other -> ""
-        end)
-    end
+    if joined == "", do: nil, else: joined
   end
 
   defp check_deadline(state) do

@@ -349,6 +349,7 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_message_to_blocks(message, finish_reason) when is_map(message) do
     with {:ok, reasoning_field} <-
            parse_optional_reasoning_field(Map.get(message, "reasoning_content")),
+         {:ok, refusal_field} <- parse_optional_refusal_field(Map.get(message, "refusal")),
          {:ok, content_text, content_thinking} <-
            parse_message_content(Map.get(message, "content")),
          {:ok, tool_blocks} <- parse_tool_calls(Map.get(message, "tool_calls"), finish_reason) do
@@ -363,7 +364,14 @@ defmodule Alloy.Provider.OpenAICompat do
           else: []
 
       text_blocks = if content_text != "", do: [%{type: "text", text: content_text}], else: []
-      {:ok, reasoning_blocks ++ content_thinking_blocks ++ text_blocks ++ tool_blocks}
+
+      refusal_blocks =
+        if refusal_field != "",
+          do: [%{type: "text", text: refusal_field, refusal: true}],
+          else: []
+
+      {:ok,
+       reasoning_blocks ++ content_thinking_blocks ++ text_blocks ++ refusal_blocks ++ tool_blocks}
     end
   end
 
@@ -383,6 +391,17 @@ defmodule Alloy.Provider.OpenAICompat do
      %Error{
        kind: :protocol_error,
        message: "Invalid reasoning_content in Chat Completions response"
+     }}
+  end
+
+  defp parse_optional_refusal_field(nil), do: {:ok, ""}
+  defp parse_optional_refusal_field(text) when is_binary(text), do: {:ok, text}
+
+  defp parse_optional_refusal_field(_invalid) do
+    {:error,
+     %Error{
+       kind: :protocol_error,
+       message: "Invalid refusal in Chat Completions response"
      }}
   end
 

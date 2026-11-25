@@ -108,8 +108,22 @@ defmodule Alloy.Tool.Validation do
           end
       end
     else
+      local_refs_basic!(schema, :output)
       :fallback
     end
+  end
+
+  defp local_refs_basic!(schema, subject) do
+    {_defined_ids, refs} = collect_scopes_and_refs(schema, "", MapSet.new(), [])
+
+    Enum.each(refs, fn
+      {"#" <> _local, _scope} ->
+        :ok
+
+      {ref, _scope} ->
+        raise ArgumentError,
+              "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)}"
+    end)
   end
 
   defp format_output_errors(errors) do

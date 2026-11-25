@@ -51,17 +51,25 @@ decoded into `Alloy.Result.output`:
    (before `:after_completion`, skipped when `:stop_after_tool` finishes a run),
    Alloy concatenates the final assistant message's text blocks with `""` (not
    `"\n"`), decodes JSON, and validates it:
+   - Remote (non-`#`) `$ref`s are always rejected at startup — with full `$id`
+     scope validation when `:ex_json_schema` is loaded and a dependency-free
+     local-only `$ref` scan when it is absent.
    - When optional `:ex_json_schema` is loaded and the schema uses Draft 4/6/7,
-     full validation runs with the same local-only `$ref` SSRF guard used by
-     `tool_validation: :schema`. Validation error output is bounded (first 10
-     errors, capped at 1,000 bytes).
+     full validation runs with bounded error output (first 10 errors, capped at
+     1,000 bytes).
    - When `:ex_json_schema` is absent or the schema declares a newer dialect
      (Draft 2019-09 / 2020-12), Alloy falls back to **top-level `type` and
      `required` checks only**.
-   - Invalid JSON, `:max_tokens`-truncated JSON (reported with an explicit
-     truncation message), or schema violations fail the run terminally
-     (`{:error, result}` with `status: :error`, `output: nil`, raw reply kept
-     in `result.text`). Alloy does not run an automatic repair turn.
+   - Invalid JSON, `:max_tokens`-truncated JSON, refusals, missing text, or
+     schema violations fail the run terminally (`{:error, result}` with
+     `status: :error`, `output: nil`, human-readable `result.error`, and
+     machine-readable `result.metadata.run.output_error` carrying
+     `%{kind: :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text, message: String.t(), decoded: term() | nil}`
+     so host repair loops can branch without parsing error strings or
+     re-decoding mismatched JSON). The assistant reply stays in
+     `result.messages` and `result.text` (note `result.text` joins multiple
+     text blocks with `"\n"` while decoding joins with `""`). Alloy does not
+     run an automatic repair turn.
 5. **Portability limits:** `:output_schema` is sent on every completion turn.
    Gemini models prior to Gemini 3 and some OpenAI-compatible servers reject
    combining tool declarations with native JSON Schema output; hosts targeting

@@ -19,7 +19,12 @@ defmodule Alloy.Result do
     * `:messages` — full conversation history
     * `:usage` — accumulated `%Alloy.Usage{}` token counts
     * `:tool_calls` — list of tool execution metadata maps
-    * `:metadata` — auxiliary result metadata such as provider-owned state
+    * `:metadata` — auxiliary result metadata such as provider-owned state,
+      `metadata.run.provider_error` (`%Alloy.Provider.Error{}` on provider
+      failures), and `metadata.run.output_error` (`%{kind: :invalid_json |
+      :schema_mismatch | :truncated | :refusal | :missing_text, message:
+      String.t(), decoded: term() | nil}` when `:output_schema` decoding or
+      validation fails)
     * `:status` — final run status (`:completed`, `:max_turns`, `:error`, `:halted`)
     * `:stop_reason` — why the model stopped on the last provider response
       (`:end_turn`, `:tool_use`, `:max_tokens`, `:refusal`, `:pause_turn`), or

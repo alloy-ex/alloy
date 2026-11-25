@@ -178,13 +178,15 @@ defmodule Alloy.Provider.Gemini do
           body
       end
 
+    output_schema = OutputSchema.wire(Map.get(config, :output_schema))
+
     # No default maxOutputTokens: the budget includes thinking, so a fixed
     # default truncates thinking models; each model's own limit is larger.
     generation_config =
       Map.get(config, :generation_config, %{})
       |> Alloy.Provider.stringify_keys()
       |> maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
-      |> maybe_put_output_schema(config)
+      |> maybe_put_output_schema(output_schema)
 
     body = maybe_put(body, "generationConfig", generation_config)
 
@@ -216,7 +218,7 @@ defmodule Alloy.Provider.Gemini do
         "generationConfig"
       )
 
-    validate_output_schema_conflicts(body, config)
+    validate_output_schema_conflicts(body, output_schema)
   end
 
   defp build_contents(messages) do
@@ -796,27 +798,19 @@ defmodule Alloy.Provider.Gemini do
   defp maybe_put_new(map, _key, nil), do: map
   defp maybe_put_new(map, key, value), do: Map.put_new(map, key, value)
 
-  defp maybe_put_output_schema(generation_config, config) do
-    case OutputSchema.wire(Map.get(config, :output_schema)) do
-      nil ->
-        generation_config
+  defp maybe_put_output_schema(generation_config, nil), do: generation_config
 
-      %{schema: schema} ->
-        generation_config
-        |> maybe_put_new("responseMimeType", "application/json")
-        |> maybe_put_new("responseJsonSchema", schema)
-    end
+  defp maybe_put_output_schema(generation_config, %{schema: schema}) do
+    generation_config
+    |> maybe_put_new("responseMimeType", "application/json")
+    |> maybe_put_new("responseJsonSchema", schema)
   end
 
-  defp validate_output_schema_conflicts(body, config) do
-    case OutputSchema.wire(Map.get(config, :output_schema)) do
-      nil ->
-        {:ok, body}
+  defp validate_output_schema_conflicts(body, nil), do: {:ok, body}
 
-      _spec ->
-        generation_config = Map.get(body, "generationConfig", %{})
-        validate_gemini_generation_config(body, generation_config)
-    end
+  defp validate_output_schema_conflicts(body, _spec) do
+    generation_config = Map.get(body, "generationConfig", %{})
+    validate_gemini_generation_config(body, generation_config)
   end
 
   defp validate_gemini_generation_config(body, generation_config)

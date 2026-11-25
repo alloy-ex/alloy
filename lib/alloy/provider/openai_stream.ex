@@ -49,6 +49,7 @@ defmodule Alloy.Provider.OpenAIStream do
       content: "",
       reasoning_content: "",
       content_thinking: "",
+      refusal: "",
       tool_calls: %{},
       last_tool_call_index: nil,
       finish_reason: nil,
@@ -249,6 +250,11 @@ defmodule Alloy.Provider.OpenAIStream do
            validate_optional_delta_text(
              Map.get(delta, "reasoning_content"),
              "Invalid delta reasoning_content in Chat Completions SSE chunk"
+           ),
+         {:ok, refusal} <-
+           validate_optional_delta_text(
+             Map.get(delta, "refusal"),
+             "Invalid delta refusal in Chat Completions SSE chunk"
            ) do
       acc = accumulate_tool_calls(acc, Map.get(delta, "tool_calls", []))
 
@@ -271,6 +277,11 @@ defmodule Alloy.Provider.OpenAIStream do
         acc =
           if content_thinking != "",
             do: %{acc | content_thinking: acc.content_thinking <> content_thinking},
+            else: acc
+
+        acc =
+          if refusal != "",
+            do: %{acc | refusal: acc.refusal <> refusal},
             else: acc
 
         acc
@@ -488,7 +499,11 @@ defmodule Alloy.Provider.OpenAIStream do
         else: []
 
     text_blocks = if acc.content != "", do: [%{type: "text", text: acc.content}], else: []
-    prefix_blocks = reasoning_blocks ++ content_thinking_blocks ++ text_blocks
+
+    refusal_blocks =
+      if acc.refusal != "", do: [%{type: "text", text: acc.refusal, refusal: true}], else: []
+
+    prefix_blocks = reasoning_blocks ++ content_thinking_blocks ++ text_blocks ++ refusal_blocks
 
     case build_streamed_tool_blocks(acc.tool_calls, acc.finish_reason) do
       {:error, reason} ->

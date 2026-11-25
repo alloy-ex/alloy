@@ -127,11 +127,16 @@ automatically during compaction summaries, decodes the final JSON into
   falls back to **top-level JSON `type` and `required` checks only** (nested
   properties, enums, and formats are not validated locally).
 - **Failure semantics:** Invalid JSON, `:max_tokens`-truncated JSON (reported
-  explicitly as truncated), or schema violations fail the run terminally
-  (`{:error, result}` with `status: :error`, `output: nil`, and the raw reply
-  preserved in `result.text`; no automatic repair turn). When
-  `:stop_after_tool` finishes a run, `:output_schema` decoding is skipped and
-  `result.output` is `nil`.
+  explicitly as truncated), model refusals, missing assistant text, or schema
+  violations fail the run terminally (`{:error, result}` with `status: :error`,
+  `output: nil`, `result.error`, and machine-readable
+  `result.metadata.run.output_error` with
+  `%{kind: :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text, message: ..., decoded: ...}`
+  so host repair loops can inspect `kind` and any `decoded` value directly; no
+  automatic repair turn). The assistant reply stays in `result.messages` and
+  `result.text` (`result.text` joins multiple text blocks with `"\n"` whereas
+  JSON decoding joins them with `""`). When `:stop_after_tool` finishes a run,
+  `:output_schema` decoding is skipped and `result.output` is `nil`.
 - **Strict mode & provider portability:** Pass `:output_schema` as a top-level
   `Alloy.run/2` / `Alloy.stream/3` option (passing it inside provider config
   raises `ArgumentError`). `:strict` defaults to `true`, which on OpenAI/xAI

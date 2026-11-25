@@ -549,11 +549,14 @@ result.output
 ```
 
 A few details to keep in mind:
-- Invalid JSON, truncated `:max_tokens` output, or non-conforming JSON fails
-  the run terminally (`{:error, result}` with `status: :error`, `output: nil`,
-  and the raw reply preserved in `result.text`; Alloy does not run an
-  automatic repair turn). When `:stop_after_tool` finishes the run,
-  `result.output` stays `nil`.
+- Invalid JSON, truncated `:max_tokens` output, refusals, missing text, or
+  non-conforming JSON fails the run terminally (`{:error, result}` with
+  `status: :error`, `output: nil`, and machine-readable
+  `result.metadata.run.output_error` containing `:kind`, `:message`, and any
+  `:decoded` value; the reply stays in `result.messages` / `result.text` — note
+  `result.text` joins multiple text blocks with `"\n"` while decoding joins
+  with `""` — and Alloy does not run an automatic repair turn). When
+  `:stop_after_tool` finishes the run, `result.output` stays `nil`.
 - Full Draft 4/6/7 validation runs when optional `:ex_json_schema` is loaded;
   without it (or for unsupported dialects like Draft 2019-09/2020-12), Alloy
   falls back to **top-level `type` and `required` checks only**.

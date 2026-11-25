@@ -25,6 +25,15 @@ defmodule Alloy.OutputSchema do
           strict: boolean()
         }
 
+  @type output_error_kind ::
+          :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text
+
+  @type output_error :: %{
+          kind: output_error_kind(),
+          message: String.t(),
+          decoded: term() | nil
+        }
+
   @doc """
   Normalizes `:output_schema` into `%Alloy.OutputSchema{}` or `nil`.
 
@@ -77,18 +86,45 @@ defmodule Alloy.OutputSchema do
   and `"required"` checks otherwise.
   """
   @spec decode_and_validate(String.t() | nil, t()) :: {:ok, term()} | {:error, String.t()}
-  def decode_and_validate(text, %__MODULE__{name: name, schema: schema}) when is_binary(text) do
-    case Jason.decode(text) do
-      {:ok, decoded} ->
-        validate_decoded(decoded, schema, name)
-
-      {:error, reason} ->
-        {:error, "Structured output is not valid JSON: #{Exception.message(reason)}"}
+  def decode_and_validate(text, %__MODULE__{} = spec) do
+    case decode_and_validate_detailed(text, spec) do
+      {:ok, decoded} -> {:ok, decoded}
+      {:error, %{message: message}} -> {:error, message}
     end
   end
 
-  def decode_and_validate(_other, _spec) do
-    {:error, "Structured output is missing assistant text"}
+  @doc false
+  @spec decode_and_validate_detailed(String.t() | nil, t()) ::
+          {:ok, term()} | {:error, output_error()}
+  def decode_and_validate_detailed(text, %__MODULE__{name: name, schema: schema})
+      when is_binary(text) and text != "" do
+    case Jason.decode(text) do
+      {:ok, decoded} ->
+        case validate_decoded(decoded, schema, name) do
+          {:ok, value} ->
+            {:ok, value}
+
+          {:error, message} ->
+            {:error, %{kind: :schema_mismatch, message: message, decoded: decoded}}
+        end
+
+      {:error, reason} ->
+        {:error,
+         %{
+           kind: :invalid_json,
+           message: "Structured output is not valid JSON: #{Exception.message(reason)}",
+           decoded: nil
+         }}
+    end
+  end
+
+  def decode_and_validate_detailed(_other, _spec) do
+    {:error,
+     %{
+       kind: :missing_text,
+       message: "Structured output is missing assistant text",
+       decoded: nil
+     }}
   end
 
   # ── Normalization ────────────────────────────────────────────────────────

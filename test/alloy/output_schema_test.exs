@@ -147,8 +147,7 @@ defmodule Alloy.OutputSchemaTest do
       assert missing_msg =~ "missing assistant text"
     end
 
-    @tag :ex_json_schema
-    test "rejects remote $ref with output_schema wording and bounds large validation error lists" do
+    test "rejects remote $ref with output_schema wording even without :ex_json_schema" do
       err =
         assert_raise ArgumentError, fn ->
           OutputSchema.normalize!(%{
@@ -160,6 +159,18 @@ defmodule Alloy.OutputSchemaTest do
       assert Exception.message(err) =~ "output_schema"
       refute Exception.message(err) =~ "tool schema"
 
+      # Local $ref inside literal example/const keywords is ignored.
+      spec =
+        OutputSchema.normalize!(%{
+          type: "object",
+          examples: [%{"$ref" => "https://example.com/example-only.json"}]
+        })
+
+      assert spec.schema["type"] == "object"
+    end
+
+    @tag :ex_json_schema
+    test "bounds large validation error lists" do
       array_spec =
         OutputSchema.normalize!(%{
           type: "array",
@@ -880,7 +891,16 @@ defmodule Alloy.OutputSchemaTest do
                 status: :error,
                 output: nil,
                 text: "I cannot comply with that request.",
-                error: "The model refused to produce structured output"
+                error: "The model refused to produce structured output",
+                metadata: %{
+                  run: %{
+                    output_error: %{
+                      kind: :refusal,
+                      message: "The model refused to produce structured output",
+                      decoded: nil
+                    }
+                  }
+                }
               }} =
                Alloy.run("disallowed",
                  provider:
@@ -888,6 +908,199 @@ defmodule Alloy.OutputSchemaTest do
                     api_key: "k",
                     model: "gpt-5.4",
                     req_options: [plug: {Req.Test, :output_schema_openai_refusal}]},
+                 output_schema: @answer_schema
+               )
+    end
+
+    test "OpenAICompat non-streaming and streaming refusals report :refusal output_error" do
+      Req.Test.stub(:output_schema_compat_refusal, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "stop",
+              "message" => %{
+                "role" => "assistant",
+                "content" => nil,
+                "refusal" => "Cannot answer that."
+              }
+            }
+          ],
+          "usage" => %{"prompt_tokens" => 3, "completion_tokens" => 4}
+        })
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                text: "Cannot answer that.",
+                error: "The model refused to produce structured output",
+                metadata: %{
+                  run: %{
+                    output_error: %{
+                      kind: :refusal,
+                      message: "The model refused to produce structured output",
+                      decoded: nil
+                    }
+                  }
+                }
+              }} =
+               Alloy.run("disallowed",
+                 provider:
+                   {OpenAICompat,
+                    api_url: "http://localhost",
+                    model: "m",
+                    req_options: [plug: {Req.Test, :output_schema_compat_refusal}]},
+                 output_schema: @answer_schema
+               )
+
+      sse =
+        Enum.join(
+          [
+            ~s(data: {"choices":[{"delta":{"role":"assistant","content":null,"refusal":"Cannot "}}]}),
+            "",
+            ~s(data: {"choices":[{"delta":{"refusal":"stream that."},"finish_reason":"stop"}]}),
+            "",
+            "data: [DONE]",
+            ""
+          ],
+          "\n"
+        )
+
+      Req.Test.stub(:output_schema_compat_stream_refusal, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                text: "Cannot stream that.",
+                error: "The model refused to produce structured output",
+                metadata: %{
+                  run: %{
+                    output_error: %{
+                      kind: :refusal,
+                      message: "The model refused to produce structured output",
+                      decoded: nil
+                    }
+                  }
+                }
+              }} =
+               Alloy.stream("disallowed", fn _ -> :ok end,
+                 provider:
+                   {OpenAICompat,
+                    api_url: "http://localhost",
+                    model: "m",
+                    req_options: [plug: {Req.Test, :output_schema_compat_stream_refusal}]},
+                 output_schema: @answer_schema
+               )
+    end
+
+    test "populates machine-readable metadata.run.output_error across failure kinds" do
+      # :invalid_json
+      {:ok, bad_json_pid} =
+        Alloy.Provider.Test.start_link([Alloy.Testing.text_response("not json")])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                error: err_json,
+                metadata: %{
+                  run: %{output_error: %{kind: :invalid_json, message: err_json, decoded: nil}}
+                }
+              }} =
+               Alloy.run("hi",
+                 provider: {Alloy.Provider.Test, agent_pid: bad_json_pid},
+                 output_schema: @answer_schema
+               )
+
+      assert err_json =~ "not valid JSON"
+
+      # :schema_mismatch (preserves decoded JSON for host repair prompts)
+      {:ok, mismatch_pid} =
+        Alloy.Provider.Test.start_link([Alloy.Testing.text_response(~s({"answer":"only"}))])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                error: err_mismatch,
+                metadata: %{
+                  run: %{
+                    output_error: %{
+                      kind: :schema_mismatch,
+                      message: err_mismatch,
+                      decoded: %{"answer" => "only"}
+                    }
+                  }
+                }
+              }} =
+               Alloy.run("hi",
+                 provider: {Alloy.Provider.Test, agent_pid: mismatch_pid},
+                 output_schema: @answer_schema
+               )
+
+      assert is_binary(err_mismatch)
+
+      # :truncated
+      {:ok, trunc_pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :max_tokens,
+             messages: [Message.assistant(~s({"answer":"cut))],
+             usage: %{input_tokens: 1, output_tokens: 1}
+           }}
+        ])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                error: err_trunc,
+                metadata: %{
+                  run: %{output_error: %{kind: :truncated, message: err_trunc, decoded: nil}}
+                }
+              }} =
+               Alloy.run("hi",
+                 provider: {Alloy.Provider.Test, agent_pid: trunc_pid},
+                 output_schema: @answer_schema
+               )
+
+      assert err_trunc =~ "truncated at :max_tokens"
+
+      # :missing_text (text-less assistant reply)
+      {:ok, empty_pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [%Message{role: :assistant, content: []}],
+             usage: %{input_tokens: 1, output_tokens: 1}
+           }}
+        ])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                error: "Structured output is missing assistant text",
+                metadata: %{
+                  run: %{
+                    output_error: %{
+                      kind: :missing_text,
+                      message: "Structured output is missing assistant text",
+                      decoded: nil
+                    }
+                  }
+                }
+              }} =
+               Alloy.run("hi",
+                 provider: {Alloy.Provider.Test, agent_pid: empty_pid},
                  output_schema: @answer_schema
                )
     end
