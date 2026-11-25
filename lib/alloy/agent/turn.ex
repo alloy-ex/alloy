@@ -68,7 +68,9 @@ defmodule Alloy.Agent.Turn do
       state
       | deadline: deadline,
         run_deadline: hard_deadline,
-        run_metadata: Map.drop(state.run_metadata, [:output, :output_error])
+        error: nil,
+        stop_reason: nil,
+        run_metadata: %{}
     }
 
     run_span(state.config.provider_config[:model], fn -> loop(state, opts) end)
@@ -585,6 +587,11 @@ defmodule Alloy.Agent.Turn do
       {:error, State.merge_run_metadata(state, %{output_error: error}), message}
     else
       case OutputSchema.decode_and_validate_detailed(raw_assistant_text(last_assistant), spec) do
+        {:ok, decoded} when state.stop_reason == :max_tokens ->
+          message = "Structured output was truncated at :max_tokens"
+          error = %{kind: :truncated, message: message, decoded: decoded}
+          {:error, State.merge_run_metadata(state, %{output_error: error}), message}
+
         {:ok, decoded} ->
           {:ok, State.merge_run_metadata(state, %{output: decoded})}
 

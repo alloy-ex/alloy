@@ -1194,6 +1194,22 @@ defmodule Alloy.Context.CompactorTest do
 
       assert log =~ "on_compaction callback crashed"
       refute log =~ "sk-secret-compactor-key"
+
+      key_error_state = %{
+        state
+        | config: %{
+            state.config
+            | on_compaction: fn _middle, s -> s.config.provider_config.missing_field end
+          }
+      }
+
+      key_log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {:compacted, _} = Compactor.maybe_compact(key_error_state)
+        end)
+
+      assert key_log =~ "on_compaction callback crashed (KeyError)"
+      refute key_log =~ "sk-secret-compactor-key"
     end
 
     test "logs stacktrace when on_compaction throws" do

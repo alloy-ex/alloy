@@ -116,7 +116,7 @@ Known limits:
   every completion turn (including fallback providers). Gemini models prior to
   Gemini 3 and some OpenAI-compatible servers reject requests that combine tool
   declarations with native JSON Schema output (`responseJsonSchema` /
-  `response_format`). On those endpoints, use Gemini 3+ (`gemini-3-flash`), use
+  `response_format`). On those endpoints, use Gemini 3+ (`gemini-3.8-flash`), use
   `until_tool` / `stop_after_tool`, or run a separate host-driven no-tools turn
   with `:output_schema` to format the final answer. On Gemini, combining
   `:output_schema` with `generation_config["responseJsonSchema"]`, legacy

@@ -226,6 +226,73 @@ defmodule Alloy.Tool.ExecutorTest do
       end
     end
 
+    test "does not leak context secrets on KeyError in tool_result, logs, tool_calls, or telemetry" do
+      key_tool =
+        Alloy.Tool.inline(
+          name: "fetch_missing_key",
+          description: "Raises KeyError on context",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, ctx -> {:ok, Map.fetch!(ctx, :missing_db_url)} end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          Alloy.Testing.tool_response("fetch_missing_key", %{}),
+          Alloy.Testing.text_response("done")
+        ])
+
+      test_pid = self()
+      stop_handler_id = "tool-keyerror-telemetry-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        stop_handler_id,
+        [:alloy, :tool, :stop],
+        fn _event, _measurements, metadata, _config ->
+          if metadata.tool_name == "fetch_missing_key" do
+            send(test_pid, {:tool_stop_key_error, metadata})
+          end
+        end,
+        nil
+      )
+
+      try do
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:ok, result} =
+                     Alloy.run("call it",
+                       provider: {TestProvider, agent_pid: pid},
+                       tools: [key_tool],
+                       context: %{api_secret: "ctx-keyerror-secret-777"}
+                     )
+
+            tool_result_text =
+              result.messages
+              |> Enum.flat_map(fn
+                %Message{content: blocks} when is_list(blocks) -> blocks
+                _ -> []
+              end)
+              |> Enum.filter(&(&1.type == "tool_result"))
+              |> Enum.map_join("\n", & &1.content)
+
+            assert tool_result_text =~ "KeyError"
+            refute tool_result_text =~ "ctx-keyerror-secret-777"
+
+            assert [meta] = result.tool_calls
+            assert meta.error =~ "KeyError"
+            refute meta.error =~ "ctx-keyerror-secret-777"
+          end)
+
+        assert log =~ "Tool fetch_missing_key crashed"
+        refute log =~ "ctx-keyerror-secret-777"
+
+        assert_received {:tool_stop_key_error, stop_meta}
+        assert stop_meta.error =~ "KeyError"
+        refute stop_meta.error =~ "ctx-keyerror-secret-777"
+      after
+        :telemetry.detach(stop_handler_id)
+      end
+    end
+
     test "exception telemetry keeps full stacktrace while model-visible result is short" do
       state = build_state([CrashingTool])
       tool_call = %{id: "call_crash", name: "crasher", type: "tool_use", input: %{}}

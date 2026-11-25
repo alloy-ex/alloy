@@ -568,7 +568,7 @@ A few details to keep in mind:
 - `:output_schema` is sent on every completion turn (including fallback
   providers). Gemini models before Gemini 3 and some OpenAICompat servers
   reject combining `tools` with JSON Schema output — use Gemini 3+
-  (`gemini-3-flash`), `until_tool` / `stop_after_tool`, or a separate
+  (`gemini-3.8-flash`), `until_tool` / `stop_after_tool`, or a separate
   host-driven no-tools `Alloy.run/2` turn for final formatting.
 
 Or force the model to call a specific tool before the loop completes using

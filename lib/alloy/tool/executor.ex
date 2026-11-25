@@ -398,13 +398,13 @@ defmodule Alloy.Tool.Executor do
   rescue
     e ->
       stacktrace = Sanitize.stacktrace(__STACKTRACE__)
+      summary = Sanitize.exception_summary(e, 500)
+      formatted_trace = Exception.format_stacktrace(stacktrace)
 
-      Logger.error(
-        "Tool #{call[:name]} crashed: #{Exception.message(e)}\n#{Exception.format_stacktrace(stacktrace)}"
-      )
+      Logger.error("Tool #{call[:name]} crashed: #{summary}\n#{formatted_trace}")
 
-      {:error, tool_crash_message(call[:name], e, stacktrace),
-       Exception.format(:error, e, stacktrace)}
+      {:error, tool_crash_message(call[:name], summary, stacktrace),
+       "** (#{inspect(e.__struct__)}) #{summary}\n#{formatted_trace}"}
   end
 
   defp exit_outcome(call, :killed, run, _deadline_capped?, true = _deadline_hit?) do
@@ -537,23 +537,26 @@ defmodule Alloy.Tool.Executor do
   defp call_from({:execute, c}), do: c
   defp call_from({:blocked, c, _}), do: c
 
-  defp tool_crash_message(tool_name, exception, stacktrace) do
-    "Tool #{tool_name} crashed: #{Exception.message(exception)} " <>
+  defp tool_crash_message(tool_name, summary, stacktrace) do
+    "Tool #{tool_name} crashed: #{summary} " <>
       "(#{format_top_stack_frame(stacktrace)}). Check the input and try again."
   end
 
-  defp format_top_stack_frame([{module, function, arity_or_args, info} | _]) do
-    arity = stack_arity(arity_or_args)
+  defp format_top_stack_frame([{module, function, arity, info} | _]) when is_integer(arity) do
     file = info |> Keyword.get(:file, "unknown") |> to_string() |> Path.basename()
     line = Keyword.get(info, :line, "?")
 
     "#{inspect(module)}.#{function}/#{arity} at #{file}:#{line}"
   end
 
-  defp format_top_stack_frame(_stacktrace), do: "unknown location"
+  defp format_top_stack_frame([{fun, arity, info} | _]) when is_integer(arity) do
+    file = info |> Keyword.get(:file, "unknown") |> to_string() |> Path.basename()
+    line = Keyword.get(info, :line, "?")
 
-  defp stack_arity(arity) when is_integer(arity), do: arity
-  defp stack_arity(args) when is_list(args), do: length(args)
+    "#{inspect(fun)}/#{arity} at #{file}:#{line}"
+  end
+
+  defp format_top_stack_frame(_stacktrace), do: "unknown location"
 
   defp maybe_put_structured_data(meta, nil), do: meta
   defp maybe_put_structured_data(meta, data), do: Map.put(meta, :structured_data, data)

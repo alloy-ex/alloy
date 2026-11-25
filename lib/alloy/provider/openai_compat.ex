@@ -175,7 +175,7 @@ defmodule Alloy.Provider.OpenAICompat do
   end
 
   defp maybe_put_output_schema(body, config) do
-    case OutputSchema.wire(Map.get(config, :output_schema)) do
+    case OutputSchema.normalize!(Map.get(config, :output_schema)) do
       nil ->
         body
 

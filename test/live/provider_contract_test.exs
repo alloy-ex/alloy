@@ -15,7 +15,7 @@ defmodule Alloy.Live.ProviderContractTest do
   Optional model overrides:
   - `ALLOY_LIVE_ANTHROPIC_MODEL` (default: `"claude-haiku-4-5"`)
   - `ALLOY_LIVE_OPENAI_MODEL` (default: `"gpt-5-mini"`)
-  - `ALLOY_LIVE_GEMINI_MODEL` (default: `"gemini-3-flash"`)
+  - `ALLOY_LIVE_GEMINI_MODEL` (default: `"gemini-3.8-flash"`)
   - `ALLOY_LIVE_XAI_MODEL` (default: `"grok-4.3"`)
   - `ALLOY_LIVE_CODEX_MODEL` (default: `"gpt-5.4"`)
   """
@@ -52,7 +52,7 @@ defmodule Alloy.Live.ProviderContractTest do
   @tag :live_gemini
   test "Gemini contract: complete, stream, tool use, output_schema, and tools + output_schema" do
     api_key = require_env!("GEMINI_API_KEY", :live_gemini)
-    model = env_or_default("ALLOY_LIVE_GEMINI_MODEL", "gemini-3-flash")
+    model = env_or_default("ALLOY_LIVE_GEMINI_MODEL", "gemini-3.8-flash")
     assert_provider_contract({Gemini, api_key: api_key, model: model})
   end
 

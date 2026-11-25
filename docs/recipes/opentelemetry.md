@@ -161,6 +161,8 @@ end
 - **Telemetry metadata hygiene:** Alloy's `:telemetry` metadata omits prompt
   bodies, tool arguments, and normal assistant text, and strips function
   arguments from `[:alloy, :run, :exception]` and `[:alloy, :turn, :exception]`
-  stacktraces. Note that `[:alloy, :tool, :stop]` carries `:error` (tool
-  diagnostic text) and exception events carry `:reason`, so sanitize or omit
-  those attributes if your tools or exceptions can include sensitive data.
+  stacktraces. Structural tool crashes (`KeyError`, `MatchError`, etc.) omit
+  raw context/map values and `RuntimeError` crash messages are capped, while
+  `[:alloy, :tool, :stop]` still carries explicit `{:error, reason}` tool text
+  and exception events carry `:reason`, so sanitize or omit those attributes if
+  your tools or exceptions can include sensitive data.

@@ -95,8 +95,8 @@ defmodule Alloy.Events do
         sanitized_trace = Sanitize.stacktrace(__STACKTRACE__)
 
         Logger.warning(
-          "[Alloy] on_event callback failed; the run continues (further failures in this run suppressed).\n" <>
-            Exception.format(:error, exception, sanitized_trace)
+          "[Alloy] on_event callback failed (#{Sanitize.exception_summary(exception, 500)}); the run continues (further failures in this run suppressed).\n" <>
+            Exception.format_stacktrace(sanitized_trace)
         )
       end
 

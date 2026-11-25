@@ -371,8 +371,8 @@ defmodule Alloy.Provider.Retry do
         sanitized_trace = Sanitize.stacktrace(__STACKTRACE__)
 
         Logger.warning(
-          "[Alloy] #{name} callback failed; the stream continues (further failures in this stream suppressed).\n" <>
-            Exception.format(:error, exception, sanitized_trace)
+          "[Alloy] #{name} callback failed (#{Sanitize.exception_summary(exception, 500)}); the stream continues (further failures in this stream suppressed).\n" <>
+            Exception.format_stacktrace(sanitized_trace)
         )
       end
 

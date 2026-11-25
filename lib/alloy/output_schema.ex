@@ -88,11 +88,6 @@ defmodule Alloy.OutputSchema do
           "output_schema must be a non-empty JSON Schema map or nil, got: #{inspect(other)}"
   end
 
-  @doc false
-  @spec wire(term()) :: t() | nil
-  def wire(nil), do: nil
-  def wire(raw), do: normalize!(raw)
-
   @doc """
   Decodes final assistant text as JSON and validates it against `spec`.
 
@@ -100,8 +95,8 @@ defmodule Alloy.OutputSchema do
   and the schema dialect is supported; falls back to top-level JSON `"type"`
   and `"required"` checks otherwise.
   """
-  @spec decode_and_validate(String.t() | nil, t()) :: {:ok, term()} | {:error, String.t()}
-  def decode_and_validate(text, %__MODULE__{} = spec) do
+  @spec decode_and_validate(String.t() | nil, t() | map()) :: {:ok, term()} | {:error, String.t()}
+  def decode_and_validate(text, spec) do
     case decode_and_validate_detailed(text, spec) do
       {:ok, decoded} -> {:ok, decoded}
       {:error, %{message: message}} -> {:error, message}
@@ -109,10 +104,10 @@ defmodule Alloy.OutputSchema do
   end
 
   @doc false
-  @spec decode_and_validate_detailed(String.t() | nil, t()) ::
+  @spec decode_and_validate_detailed(String.t() | nil, t() | map()) ::
           {:ok, term()} | {:error, output_error()}
-  def decode_and_validate_detailed(text, %__MODULE__{} = spec)
-      when is_binary(text) and text != "" do
+  def decode_and_validate_detailed(text, spec)
+      when is_binary(text) and text != "" and is_map(spec) do
     %__MODULE__{schema: schema, resolved: {:cached, _key, resolution}} = normalize!(spec)
 
     case Jason.decode(text) do

@@ -179,7 +179,7 @@ defmodule Alloy.Provider.Gemini do
           body
       end
 
-    output_schema = OutputSchema.wire(Map.get(config, :output_schema))
+    output_schema = OutputSchema.normalize!(Map.get(config, :output_schema))
 
     raw_generation_config =
       config |> Map.get(:generation_config, %{}) |> Provider.stringify_keys()

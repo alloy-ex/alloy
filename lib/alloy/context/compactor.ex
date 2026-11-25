@@ -477,23 +477,10 @@ defmodule Alloy.Context.Compactor do
   defp shrink_results_in_message(message, _message_index, _targets), do: message
 
   defp truncate_result(content, keep_bytes) do
-    head = content |> binary_part(0, keep_bytes) |> trim_partial_codepoint(3)
+    head = Sanitize.cap_bytes(content, keep_bytes)
 
     head <>
       "\n\n[tool result truncated: kept #{byte_size(head)} of #{byte_size(content)} bytes]"
-  end
-
-  # A byte cut can split a multi-byte UTF-8 character; drop its leading bytes.
-  defp trim_partial_codepoint(binary, 0), do: binary
-
-  defp trim_partial_codepoint(binary, attempts) do
-    if String.valid?(binary) do
-      binary
-    else
-      binary
-      |> binary_part(0, byte_size(binary) - 1)
-      |> trim_partial_codepoint(attempts - 1)
-    end
   end
 
   defp maybe_clear_tool_results(
@@ -553,7 +540,7 @@ defmodule Alloy.Context.Compactor do
 
           {:error, reason} ->
             Logger.warning(
-              "summary compaction failed, falling back to truncation: #{inspect(reason)}"
+              "summary compaction failed, falling back to truncation: #{Sanitize.inspect_bounded(reason)}"
             )
 
             {state, fallback_compact(state, messages)}
@@ -981,7 +968,7 @@ defmodule Alloy.Context.Compactor do
       stacktrace = Sanitize.stacktrace(__STACKTRACE__)
 
       Logger.warning(
-        "on_compaction callback crashed: #{Exception.message(e)}\n" <>
+        "on_compaction callback crashed (#{inspect(e.__struct__)})\n" <>
           "Stacktrace: #{Exception.format_stacktrace(stacktrace)}"
       )
 

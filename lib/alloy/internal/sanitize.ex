@@ -53,6 +53,28 @@ defmodule Alloy.Internal.Sanitize do
   end
 
   @doc """
+  Returns a bounded, value-safe exception summary.
+
+  Structural Elixir exceptions (`KeyError`, `MatchError`, `CaseClauseError`,
+  `BadMapError`, `WithClauseError`, etc.) embed raw inspected terms — potentially
+  whole config or context maps carrying API keys — inside `Exception.message/1`.
+  Only explicit `RuntimeError` messages (capped to `max_bytes`) and atom key
+  names on `KeyError` are kept; all other exceptions report only their module.
+  """
+  @spec exception_summary(Exception.t(), pos_integer()) :: String.t()
+  def exception_summary(exception, max_bytes \\ 500)
+
+  def exception_summary(%RuntimeError{message: msg}, max_bytes) when is_binary(msg) do
+    cap_bytes(msg, max_bytes)
+  end
+
+  def exception_summary(%KeyError{key: key}, _max_bytes) when is_atom(key) do
+    "KeyError (key #{inspect(key)} not found)"
+  end
+
+  def exception_summary(%mod{}, _max_bytes), do: inspect(mod)
+
+  @doc """
   Replaces argument lists in stacktrace entries with their arity so secrets
   captured in function arguments never leak into logs or error reports.
   """

@@ -234,7 +234,7 @@ defmodule Alloy.Provider.Codex do
       tools: tools
     }
 
-    case OutputSchema.wire(Map.get(config, :output_schema)) do
+    case OutputSchema.normalize!(Map.get(config, :output_schema)) do
       nil -> base
       spec -> Map.put(base, :output_schema, {spec.name, spec.schema, spec.strict})
     end
@@ -435,7 +435,7 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp decode_last_message({:error, reason}),
-    do: {:error, "failed to read Codex response file: #{inspect(reason)}"}
+    do: {:error, "failed to read Codex response file: #{Sanitize.inspect_bounded(reason)}"}
 
   defp parse_payload(
          %{"stop_reason" => "end_turn", "text" => text, "tool_calls" => tool_calls},
@@ -623,7 +623,7 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp build_prompt(messages, tool_defs, config) do
-    output_schema = OutputSchema.wire(Map.get(config, :output_schema))
+    output_schema = OutputSchema.normalize!(Map.get(config, :output_schema))
 
     payload = %{
       system_prompt: Map.get(config, :system_prompt),

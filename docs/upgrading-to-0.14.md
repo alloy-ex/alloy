@@ -149,7 +149,7 @@ automatically during compaction summaries, decodes the final JSON into
   `:output_schema` is sent on every completion turn (including fallback
   providers), Gemini models prior to Gemini 3 and some OpenAICompat servers
   reject combining `tools` with native JSON Schema output; use Gemini 3+
-  (`gemini-3-flash`), use `until_tool` / `stop_after_tool`, or drive a separate
+  (`gemini-3.8-flash`), use `until_tool` / `stop_after_tool`, or drive a separate
   follow-up no-tools `Alloy.run/2` turn with `:output_schema`. On Gemini,
   combining `:output_schema` with `generation_config["responseJsonSchema"]`,
   legacy `generation_config` / `extra_body["generationConfig"]`

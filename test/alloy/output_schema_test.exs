@@ -25,7 +25,6 @@ defmodule Alloy.OutputSchemaTest do
       assert spec.schema["type"] == "object"
       assert spec.schema["required"] == ["answer", "confidence"]
       assert OutputSchema.normalize!(spec) == spec
-      assert OutputSchema.wire(spec) == spec
 
       hand_built = %OutputSchema{
         name: "hand",
@@ -458,7 +457,7 @@ defmodule Alloy.OutputSchemaTest do
                  provider:
                    {Gemini,
                     api_key: "k",
-                    model: "gemini-3-flash",
+                    model: "gemini-3.8-flash",
                     extra_body: %{"generationConfig" => %{"temperature" => 0.2}},
                     req_options: [plug: {Req.Test, :output_schema_gemini}]},
                  output_schema: @answer_schema
@@ -475,7 +474,7 @@ defmodule Alloy.OutputSchemaTest do
                  [],
                  %{
                    api_key: "k",
-                   model: "gemini-3-flash",
+                   model: "gemini-3.8-flash",
                    generation_config: %{responseSchema: %{type: "OBJECT"}},
                    output_schema: @answer_schema
                  }
@@ -489,7 +488,7 @@ defmodule Alloy.OutputSchemaTest do
                  [],
                  %{
                    api_key: "k",
-                   model: "gemini-3-flash",
+                   model: "gemini-3.8-flash",
                    generation_config: %{responseMimeType: "text/plain"},
                    output_schema: @answer_schema
                  }
@@ -503,7 +502,7 @@ defmodule Alloy.OutputSchemaTest do
                  [],
                  %{
                    api_key: "k",
-                   model: "gemini-3-flash",
+                   model: "gemini-3.8-flash",
                    extra_body: %{
                      "generationConfig" => %{"responseSchema" => %{"type" => "OBJECT"}}
                    },
@@ -519,7 +518,7 @@ defmodule Alloy.OutputSchemaTest do
                  [],
                  %{
                    api_key: "k",
-                   model: "gemini-3-flash",
+                   model: "gemini-3.8-flash",
                    extra_body: %{generationConfig: %{responseMimeType: "text/plain"}},
                    output_schema: @answer_schema
                  }
@@ -533,7 +532,7 @@ defmodule Alloy.OutputSchemaTest do
                  [],
                  %{
                    api_key: "k",
-                   model: "gemini-3-flash",
+                   model: "gemini-3.8-flash",
                    generation_config: %{response_schema: %{type: "OBJECT"}},
                    output_schema: @answer_schema
                  }
@@ -547,7 +546,7 @@ defmodule Alloy.OutputSchemaTest do
                  [],
                  %{
                    api_key: "k",
-                   model: "gemini-3-flash",
+                   model: "gemini-3.8-flash",
                    generation_config: %{response_mime_type: "application/json"},
                    output_schema: @answer_schema
                  }
@@ -561,7 +560,7 @@ defmodule Alloy.OutputSchemaTest do
                  [],
                  %{
                    api_key: "k",
-                   model: "gemini-3-flash",
+                   model: "gemini-3.8-flash",
                    extra_body: %{generationConfig: %{response_json_schema: %{type: "object"}}},
                    output_schema: @answer_schema
                  }
@@ -575,7 +574,7 @@ defmodule Alloy.OutputSchemaTest do
                  [],
                  %{
                    api_key: "k",
-                   model: "gemini-3-flash",
+                   model: "gemini-3.8-flash",
                    generation_config: %{responseJsonSchema: %{type: "object"}},
                    output_schema: @answer_schema
                  }
@@ -691,7 +690,7 @@ defmodule Alloy.OutputSchemaTest do
                  provider:
                    {Gemini,
                     api_key: "k",
-                    model: "gemini-3-flash",
+                    model: "gemini-3.8-flash",
                     max_tokens: 1024,
                     extra_body: %{generationConfig: %{maxOutputTokens: 512}},
                     req_options: [plug: {Req.Test, :atom_extra_gemini}]}
@@ -925,7 +924,7 @@ defmodule Alloy.OutputSchemaTest do
                  fallback_providers: [
                    {Gemini,
                     api_key: "k",
-                    model: "gemini-3-flash",
+                    model: "gemini-3.8-flash",
                     generation_config: %{responseMimeType: "text/plain"}}
                  ],
                  max_retries: 0,
@@ -1324,7 +1323,7 @@ defmodule Alloy.OutputSchemaTest do
                  provider:
                    {Gemini,
                     api_key: "k",
-                    model: "gemini-3-flash",
+                    model: "gemini-3.8-flash",
                     req_options: [plug: {Req.Test, :output_schema_gemini_refusal}]},
                  output_schema: @answer_schema
                )
@@ -1450,8 +1449,114 @@ defmodule Alloy.OutputSchemaTest do
 
       result4 = Result.from_state(state4)
       assert result4.status == :completed
+      assert result4.error == nil
       assert result4.output == %{"answer" => "recovered", "confidence" => 0.9}
       refute Map.has_key?(Map.get(result4.metadata, :run, %{}), :output_error)
+
+      # Reused State after :stop_after_tool (final_tool) and provider_error must
+      # reset run_metadata, error, and stop_reason so subsequent runs still decode
+      # :output_schema and do not leak prior tool output or provider_error.
+      finish_tool =
+        Alloy.Tool.inline(
+          name: "finish",
+          description: "Done",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> {:ok, "run 1 tool output"} end
+        )
+
+      {:ok, reused_pid} =
+        Alloy.Provider.Test.start_link([
+          Alloy.Testing.tool_response("finish", %{}),
+          {:error, %Error{kind: :auth, status: 401, message: "bad key"}},
+          Alloy.Testing.text_response(~s({"answer":"fresh","confidence":1}))
+        ])
+
+      reused_cfg =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, agent_pid: reused_pid},
+          tools: [finish_tool],
+          stop_after_tool: "finish",
+          output_schema: @answer_schema
+        )
+
+      s1 = State.init(reused_cfg, [Message.user("step 1")]) |> Turn.run_loop()
+      r1 = Result.from_state(s1)
+      assert r1.status == :completed
+      assert r1.text == "run 1 tool output"
+      assert r1.metadata.final_tool.name == "finish"
+
+      s2 =
+        s1
+        |> State.append_messages([Message.user("step 2")])
+        |> Turn.run_loop()
+
+      r2 = Result.from_state(s2)
+      assert r2.status == :error
+      assert %Error{kind: :auth} = r2.metadata.run.provider_error
+
+      s3 =
+        s2
+        |> State.append_messages([Message.user("step 3")])
+        |> Turn.run_loop()
+
+      r3 = Result.from_state(s3)
+      assert r3.status == :completed
+      assert r3.error == nil
+      assert r3.text == ~s({"answer":"fresh","confidence":1})
+      assert r3.output == %{"answer" => "fresh", "confidence" => 1}
+      refute Map.has_key?(r3.metadata, :final_tool)
+      refute Map.has_key?(Map.get(r3.metadata, :run, %{}), :provider_error)
+    end
+
+    test "fails unconditionally with :truncated when :max_tokens cuts off a valid JSON prefix" do
+      {:ok, pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :max_tokens,
+             messages: [Message.assistant("123")],
+             usage: %{input_tokens: 1, output_tokens: 1}
+           }}
+        ])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                stop_reason: :max_tokens,
+                output: nil,
+                error: "Structured output was truncated at :max_tokens",
+                metadata: %{
+                  run: %{
+                    output_error: %{
+                      kind: :truncated,
+                      message: "Structured output was truncated at :max_tokens",
+                      decoded: 123
+                    }
+                  }
+                }
+              }} =
+               Alloy.run("give me a large integer",
+                 provider: {Alloy.Provider.Test, agent_pid: pid},
+                 output_schema: %{type: "integer"}
+               )
+    end
+
+    test "accepts raw map output_schema on struct-literal %Config{}" do
+      {:ok, pid} =
+        Alloy.Provider.Test.start_link([
+          Alloy.Testing.text_response(~s({"answer":"literal","confidence":1}))
+        ])
+
+      config = %Config{
+        provider: Alloy.Provider.Test,
+        provider_config: %{agent_pid: pid},
+        output_schema: @answer_schema
+      }
+
+      state = State.init(config, [Message.user("hi")]) |> Turn.run_loop()
+      result = Result.from_state(state)
+      assert result.status == :completed
+      assert result.output == %{"answer" => "literal", "confidence" => 1}
     end
 
     test "does not duplicate :output inside result.metadata.run and skips validation on stop_after_tool" do
