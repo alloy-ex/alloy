@@ -37,9 +37,9 @@ defmodule Alloy.Tool.Validation do
 
             _ ->
               schema = json(source)
-              local_refs!(schema)
+              local_refs!(schema, :tool)
               resolved = resolve_schema!(schema, name)
-              resolved = normalize_literal_property_schemas!(resolved)
+              resolved = normalize_literal_property_schemas!(resolved, :tool)
               {source, resolved}
           end
 
@@ -56,21 +56,44 @@ defmodule Alloy.Tool.Validation do
   # such as Draft 2020-12 to pass through to native provider enforcement).
   @spec preflight_output_schema!(map(), String.t()) :: :ok
   def preflight_output_schema!(schema, name) when is_map(schema) do
-    if Code.ensure_loaded?(Schema) do
-      try do
-        local_refs!(schema)
-        _resolved = schema |> Schema.resolve() |> normalize_literal_property_schemas!()
-        :ok
-      rescue
-        error in ArgumentError ->
-          reraise ArgumentError,
-                  relabel_output_schema_error(Exception.message(error)),
-                  __STACKTRACE__
+    _ = resolve_output_schema(schema, name)
+    :ok
+  end
 
+  @doc false
+  # Validates decoded structured output against `schema` using `:ex_json_schema`
+  # when available and supported, or returns `:fallback` for basic structural
+  # validation when the optional dep is absent or the dialect is unsupported.
+  @spec validate_output(map(), term(), String.t()) :: :ok | {:error, String.t()} | :fallback
+  def validate_output(schema, decoded, name) when is_map(schema) do
+    case resolve_output_schema(schema, name) do
+      {:ok, resolved} ->
+        case Validator.validate(resolved, decoded) do
+          :ok ->
+            :ok
+
+          {:error, errors} ->
+            {:error,
+             "Structured output failed schema validation: #{format_output_errors(errors)}"}
+        end
+
+      :fallback ->
+        :fallback
+    end
+  end
+
+  defp resolve_output_schema(schema, name) do
+    if Code.ensure_loaded?(Schema) do
+      local_refs!(schema, :output)
+
+      try do
+        resolved = schema |> Schema.resolve() |> normalize_literal_property_schemas!(:output)
+        {:ok, resolved}
+      rescue
         error ->
           cond do
             error.__struct__ == ExJsonSchema.Schema.UnsupportedSchemaVersionError ->
-              :ok
+              :fallback
 
             error.__struct__ in [
               ExJsonSchema.Schema.InvalidReferenceError,
@@ -82,43 +105,6 @@ defmodule Alloy.Tool.Validation do
 
             true ->
               reraise error, __STACKTRACE__
-          end
-      end
-    else
-      :ok
-    end
-  end
-
-  @doc false
-  # Validates decoded structured output against `schema` using `:ex_json_schema`
-  # when available and supported, or returns `:fallback` for basic structural
-  # validation when the optional dep is absent or the dialect is unsupported.
-  @spec validate_output(map(), term(), String.t()) :: :ok | {:error, String.t()} | :fallback
-  def validate_output(schema, decoded, _name) when is_map(schema) do
-    if Code.ensure_loaded?(Schema) do
-      try do
-        local_refs!(schema)
-        resolved = schema |> Schema.resolve() |> normalize_literal_property_schemas!()
-
-        case Validator.validate(resolved, decoded) do
-          :ok ->
-            :ok
-
-          {:error, errors} ->
-            {:error,
-             "Structured output failed schema validation: #{format_output_errors(errors)}"}
-        end
-      rescue
-        error in ArgumentError ->
-          reraise ArgumentError,
-                  relabel_output_schema_error(Exception.message(error)),
-                  __STACKTRACE__
-
-        error ->
-          if error.__struct__ == ExJsonSchema.Schema.UnsupportedSchemaVersionError do
-            :fallback
-          else
-            reraise error, __STACKTRACE__
           end
       end
     else
@@ -142,12 +128,6 @@ defmodule Alloy.Tool.Validation do
       end
 
     Sanitize.cap_bytes(summary, @max_output_validation_bytes)
-  end
-
-  defp relabel_output_schema_error(message) do
-    message
-    |> String.replace("tool schemas", "output_schema")
-    |> String.replace("tool schema", "output_schema")
   end
 
   @spec check(map(), String.t(), map()) :: :ok | {:error, String.t(), nil}
@@ -200,11 +180,11 @@ defmodule Alloy.Tool.Validation do
       end
   end
 
-  defp local_refs!(schema) do
+  defp local_refs!(schema, subject) do
     {defined_ids, refs} = collect_scopes_and_refs(schema, "", MapSet.new(), [])
     # Dynamic struct!/2 avoids a compile-time dependency on optional ex_json_schema.
     root = struct!(Root, refs: Map.new(defined_ids, &{&1, true}))
-    Enum.each(refs, &validate_local_ref!(&1, root))
+    Enum.each(refs, &validate_local_ref!(&1, root, subject))
   end
 
   # Mirrors ExJsonSchema.Schema.resolve_with_root/3 and resolve_property/3
@@ -245,14 +225,14 @@ defmodule Alloy.Tool.Validation do
   # additionalProperties: false). Resolve skipped $refs against their inherited
   # scope, reject unsupported nested $id/id and non-schema $ref targets, and
   # apply the same attribute sanitization across resolved.schema and resolved.refs.
-  defp normalize_literal_property_schemas!(%{schema: root_schema, refs: refs} = resolved) do
-    normalized = normalize_node!(root_schema, resolved, "", false)
+  defp normalize_literal_property_schemas!(%{schema: root_schema, refs: refs} = resolved, subject) do
+    normalized = normalize_node!(root_schema, resolved, "", false, subject)
 
     normalized_refs =
       Map.new(refs, fn
         # Each resolved.refs key is already the post-$id scope for its value.
         {url, v} when is_map(v) and not is_struct(v) ->
-          {url, normalize_map_entries!(v, resolved, url, false)}
+          {url, normalize_map_entries!(v, resolved, url, false, subject)}
 
         {url, v} ->
           {url, v}
@@ -261,25 +241,26 @@ defmodule Alloy.Tool.Validation do
     %{resolved | schema: normalized, refs: normalized_refs}
   end
 
-  defp normalize_node!(value, _resolved, _scope, _skipped?) when is_struct(value), do: value
+  defp normalize_node!(value, _resolved, _scope, _skipped?, _subject) when is_struct(value),
+    do: value
 
-  defp normalize_node!(map, resolved, scope, skipped?) when is_map(map) do
+  defp normalize_node!(map, resolved, scope, skipped?, subject) when is_map(map) do
     if skipped? and has_nested_id?(map) do
       raise ArgumentError,
-            "tool schemas do not support $id/id inside properties named const/enum/default/examples"
+            "#{schema_subject(subject, :do_not)} support $id/id inside properties named const/enum/default/examples"
     end
 
     next_scope = advance_scope_only(map, scope)
-    normalize_map_entries!(map, resolved, next_scope, skipped?)
+    normalize_map_entries!(map, resolved, next_scope, skipped?, subject)
   end
 
-  defp normalize_node!(values, resolved, scope, skipped?) when is_list(values) do
-    Enum.map(values, &normalize_node!(&1, resolved, scope, skipped?))
+  defp normalize_node!(values, resolved, scope, skipped?, subject) when is_list(values) do
+    Enum.map(values, &normalize_node!(&1, resolved, scope, skipped?, subject))
   end
 
-  defp normalize_node!(other, _resolved, _scope, _skipped?), do: other
+  defp normalize_node!(other, _resolved, _scope, _skipped?, _subject), do: other
 
-  defp normalize_map_entries!(map, resolved, scope, skipped?) do
+  defp normalize_map_entries!(map, resolved, scope, skipped?, subject) do
     updated =
       Map.new(map, fn
         {key, value} when key in @literal_keywords ->
@@ -287,33 +268,40 @@ defmodule Alloy.Tool.Validation do
 
         {key, value}
         when key in @schema_map_keywords and is_map(value) and not is_struct(value) ->
-          {key, normalize_schema_map!(value, resolved, scope, skipped?)}
+          {key, normalize_schema_map!(value, resolved, scope, skipped?, subject)}
 
         {"$ref", ref} when is_struct(ref) ->
-          assert_valid_ref_target!(ref, to_string(ref), resolved)
+          assert_valid_ref_target!(ref, to_string(ref), resolved, subject)
           {"$ref", ref}
 
         {"$ref", ref} when skipped? and is_binary(ref) ->
-          {"$ref", resolve_skipped_ref!(ref, scope, resolved)}
+          {"$ref", resolve_skipped_ref!(ref, scope, resolved, subject)}
 
         {key, value} ->
-          {key, normalize_node!(value, resolved, scope, skipped?)}
+          {key, normalize_node!(value, resolved, scope, skipped?, subject)}
       end)
 
     if skipped?, do: sanitize_ex_json_schema_attributes(updated), else: updated
   end
 
-  defp normalize_schema_map!(map, resolved, scope, skipped?) do
+  defp normalize_schema_map!(map, resolved, scope, skipped?, subject) do
     if skipped? and has_nested_id?(map) do
       raise ArgumentError,
-            "tool schemas do not support $id/id inside properties named const/enum/default/examples"
+            "#{schema_subject(subject, :do_not)} support $id/id inside properties named const/enum/default/examples"
     end
 
     next_scope = advance_scope_only(map, scope)
 
     Map.new(map, fn
       {key, value} ->
-        {key, normalize_node!(value, resolved, next_scope, skipped? or key in @literal_keywords)}
+        {key,
+         normalize_node!(
+           value,
+           resolved,
+           next_scope,
+           skipped? or key in @literal_keywords,
+           subject
+         )}
     end)
   end
 
@@ -356,36 +344,37 @@ defmodule Alloy.Tool.Validation do
     end
   end
 
-  defp resolve_skipped_ref!("#" <> _ = ref, scope, resolved) do
+  defp resolve_skipped_ref!("#" <> _ = ref, scope, resolved, subject) do
     scoped_str = scoped_ref_string(ref, scope)
     parsed_ref = Ref.from_string(scoped_str, resolved)
 
     unless Ref.cached?(parsed_ref, resolved) do
       raise ArgumentError,
-            "tool schemas require local $ref values, got: #{inspect(ref)} " <>
+            "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)} " <>
               "(resolves to uncached #{inspect(scoped_str)} under $id scope #{inspect(scope)})"
     end
 
-    assert_valid_ref_target!(parsed_ref, ref, resolved)
+    assert_valid_ref_target!(parsed_ref, ref, resolved, subject)
     parsed_ref
   end
 
-  defp resolve_skipped_ref!(ref, _scope, _resolved) do
-    raise ArgumentError, "tool schemas require local $ref values, got: #{inspect(ref)}"
+  defp resolve_skipped_ref!(ref, _scope, _resolved, subject) do
+    raise ArgumentError,
+          "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)}"
   end
 
-  defp assert_valid_ref_target!(parsed_ref, display_ref, resolved) do
+  defp assert_valid_ref_target!(parsed_ref, display_ref, resolved, subject) do
     case Schema.get_fragment(resolved, parsed_ref) do
       {:ok, target} when is_map(target) or is_boolean(target) ->
         :ok
 
       {:ok, target} ->
         raise ArgumentError,
-              "tool schema $ref #{inspect(display_ref)} must target a schema object or boolean, got: #{inspect(target)}"
+              "#{schema_subject(subject, :singular)} $ref #{inspect(display_ref)} must target a schema object or boolean, got: #{inspect(target)}"
 
       {:error, _reason} ->
         raise ArgumentError,
-              "tool schema contains unresolved local $ref: #{inspect(display_ref)}"
+              "#{schema_subject(subject, :singular)} contains unresolved local $ref: #{inspect(display_ref)}"
     end
   end
 
@@ -421,20 +410,28 @@ defmodule Alloy.Tool.Validation do
 
   # Mirrors ExJsonSchema.Schema.resolve_property/3 and delegates cache-key
   # matching to ExJsonSchema.Schema.Ref so preflight and resolution cannot drift.
-  defp validate_local_ref!({"#" <> _ = ref, ref_scope}, root) do
+  defp validate_local_ref!({"#" <> _ = ref, ref_scope}, root, subject) do
     scoped_str = scoped_ref_string(ref, ref_scope)
     parsed_ref = Ref.from_string(scoped_str, root)
 
     unless Ref.cached?(parsed_ref, root) do
       raise ArgumentError,
-            "tool schemas require local $ref values, got: #{inspect(ref)} " <>
+            "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)} " <>
               "(resolves to uncached #{inspect(scoped_str)} under $id scope #{inspect(ref_scope)})"
     end
   end
 
-  defp validate_local_ref!({ref, _ref_scope}, _root) do
-    raise ArgumentError, "tool schemas require local $ref values, got: #{inspect(ref)}"
+  defp validate_local_ref!({ref, _ref_scope}, _root, subject) do
+    raise ArgumentError,
+          "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)}"
   end
+
+  defp schema_subject(:tool, :require), do: "tool schemas require"
+  defp schema_subject(:output, :require), do: "output_schema requires"
+  defp schema_subject(:tool, :do_not), do: "tool schemas do not"
+  defp schema_subject(:output, :do_not), do: "output_schema does not"
+  defp schema_subject(:tool, :singular), do: "tool schema"
+  defp schema_subject(:output, :singular), do: "output_schema"
 
   defp scoped_ref_string(ref, ref_scope) do
     ref_uri = URI.parse(ref)

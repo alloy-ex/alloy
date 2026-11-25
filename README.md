@@ -528,8 +528,8 @@ copy-pasteable GenAI OTel bridge.
 ### Structured output with `:output_schema` or `until_tool`
 
 Pass `:output_schema` to request native JSON Schema output across Anthropic,
-OpenAI, xAI, OpenAICompat, Gemini, and Codex and decode/validate the result
-into `result.output`:
+OpenAI, xAI, OpenAICompat, and Gemini (and schema-guided JSON instructions on
+Codex) and decode/validate the result into `result.output`:
 
 ```elixir
 schema = %{
@@ -560,11 +560,11 @@ A few details to keep in mind:
 - `:strict` defaults to `true` (OpenAI/xAI strict mode requires every property
   in `"required"` and `"additionalProperties" => false` on every object; pass
   `%{schema: schema, strict: false}` to opt out).
-- `:output_schema` is sent on every completion turn. Gemini models before
-  Gemini 3 and some OpenAICompat servers reject combining `tools` with JSON
-  Schema output — use Gemini 3+ (`gemini-3-flash`), attach `:output_schema` on
-  the final turn via `Alloy.Agent.State.prepare/2`, or use `until_tool` /
-  `stop_after_tool`.
+- `:output_schema` is sent on every completion turn (including fallback
+  providers). Gemini models before Gemini 3 and some OpenAICompat servers
+  reject combining `tools` with JSON Schema output — use Gemini 3+
+  (`gemini-3-flash`), `until_tool` / `stop_after_tool`, or a separate
+  host-driven no-tools `Alloy.run/2` turn for final formatting.
 
 Or force the model to call a specific tool before the loop completes using
 `until_tool` (optionally paired with `stop_after_tool`):

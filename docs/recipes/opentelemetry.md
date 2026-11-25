@@ -145,6 +145,9 @@ end
   `cache_read_input_tokens`, `cache_creation_input_tokens`) at the `Alloy.run/2`
   call site or inside `:after_completion` middleware to record token totals on
   the root span.
-- **No prompt/PII leakage:** Alloy's `:telemetry` metadata intentionally omits
-  prompt bodies, tool arguments, and model outputs. Attach redacting middleware
-  only if you explicitly want content attributes in traces.
+- **Telemetry metadata hygiene:** Alloy's `:telemetry` metadata omits prompt
+  bodies, tool arguments, and normal assistant text, and strips function
+  arguments from `[:alloy, :run, :exception]` stacktraces. Note that
+  `[:alloy, :tool, :stop]` carries `:error` (tool diagnostic text) and
+  `[:alloy, :run, :exception]` carries the exception `:reason`, so sanitize or
+  omit those attributes if your tools or exceptions can include sensitive data.

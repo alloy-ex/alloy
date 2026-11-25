@@ -37,7 +37,7 @@ structured outputs. See [Upgrading to 0.14](docs/upgrading-to-0.14.md).
 - **Opt-in live provider contract test suite (`@tag :live`):** Excluded by default in `test/test_helper.exs`; runnable via `mix test --only live` (or per-provider `@tag :live_anthropic`, `:live_openai`, `:live_gemini`, `:live_xai`, `:live_openai_compat`, `:live_codex`) against real API credentials.
 - **OpenTelemetry tracing recipe & 0.14 upgrade guide:** Added `docs/recipes/opentelemetry.md` and `docs/upgrading-to-0.14.md`.
 - `Alloy.Provider.OpenAI` and `Alloy.Provider.XAI` now accept `:extra_headers`.
-- `Alloy.Provider.Gemini` now accepts `:extra_body` (shallow-merged last with stringified keys).
+- `Alloy.Provider.Gemini` now accepts `:extra_body` (merged last with stringified keys, merging `generationConfig` one level deep so caller keys coexist with `:output_schema`).
 - CI now verifies compilation and tests without the optional `:ex_json_schema` dependency.
 
 ### Changed

@@ -126,6 +126,7 @@ defmodule Alloy.MixProject do
           Alloy.Agent.State,
           Alloy.Agent.Turn,
           Alloy.Message,
+          Alloy.OutputSchema,
           Alloy.Result,
           Alloy.Transcript,
           Alloy.Usage

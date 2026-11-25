@@ -222,7 +222,7 @@ defmodule Alloy.Provider.Codex do
   defp session_result(result, _plan), do: result
 
   defp session_scope(config, home, tools) do
-    %{
+    base = %{
       home: home || System.get_env("CODEX_HOME") || Path.expand("~/.codex"),
       workdir: Map.get(config, :workdir),
       model: Map.get(config, :model),
@@ -230,9 +230,13 @@ defmodule Alloy.Provider.Codex do
       overrides: Map.get(config, :config_overrides, []),
       executable: CodexRunner.codex_bin(config),
       generation: Map.get(config, :session_generation),
-      output_schema: OutputSchema.wire(Map.get(config, :output_schema)),
       tools: tools
     }
+
+    case OutputSchema.wire(Map.get(config, :output_schema)) do
+      nil -> base
+      spec -> Map.put(base, :output_schema, spec)
+    end
   end
 
   defp validate_session_workdir(%{persist_session: true} = config, home) do

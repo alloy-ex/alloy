@@ -1,8 +1,13 @@
 defmodule Alloy.OutputSchema do
-  @moduledoc false
-  # Normalizes, wire-formats, decodes, and validates portable `:output_schema`
-  # structured outputs across Alloy's built-in providers without adding runtime
-  # dependencies.
+  @moduledoc """
+  Normalized representation of a portable `:output_schema` option.
+
+  Built by `Alloy.Agent.Config.from_opts/1` and `Alloy.Agent.State.prepare/2`
+  from either a plain JSON Schema map or a wrapper map
+  `%{name: ..., schema: ..., strict: ...}`. Stored on `state.config.output_schema`
+  so middleware can inspect it and built-in providers can translate it into
+  their wire formats without re-normalizing per request.
+  """
 
   alias Alloy.Provider
   alias Alloy.Tool.Validation
@@ -23,15 +28,18 @@ defmodule Alloy.OutputSchema do
   @doc """
   Normalizes `:output_schema` into `%Alloy.OutputSchema{}` or `nil`.
 
-  Accepts either an already-normalized struct, a plain JSON Schema map
-  (defaulting `name: "alloy_output"` and `strict: true`), or a wrapper map
-  `%{schema: map, name: ..., strict: ...}`. Raises `ArgumentError` on invalid
-  shapes, non-JSON-encodable schemas, or invalid local `$ref`s / schemas when
-  `:ex_json_schema` is loaded.
+  Accepts `nil`, a `%Alloy.OutputSchema{}` struct (re-validated), a plain JSON
+  Schema map (defaulting `name: "alloy_output"` and `strict: true`), or a
+  wrapper map `%{schema: map, name: ..., strict: ...}`. Raises `ArgumentError`
+  on invalid shapes, non-JSON-encodable schemas, or invalid local `$ref`s /
+  schemas when `:ex_json_schema` is loaded.
   """
   @spec normalize!(term()) :: t() | nil
   def normalize!(nil), do: nil
-  def normalize!(%__MODULE__{} = spec), do: spec
+
+  def normalize!(%__MODULE__{name: name, schema: schema, strict: strict}) do
+    normalize_wrapper!(%{name: name, schema: schema, strict: strict})
+  end
 
   def normalize!(%_{} = struct) do
     raise ArgumentError,
@@ -55,23 +63,13 @@ defmodule Alloy.OutputSchema do
           "output_schema must be a non-empty JSON Schema map or nil, got: #{inspect(other)}"
   end
 
-  @doc """
-  Fast-path accessor for providers: returns an already-normalized struct without
-  re-running JSON encoding or schema resolution, normalizing raw maps only when
-  a provider module is called directly outside `Alloy.run/2`.
-  """
+  @doc false
   @spec wire(term()) :: t() | nil
   def wire(nil), do: nil
   def wire(%__MODULE__{} = spec), do: spec
   def wire(raw), do: normalize!(raw)
 
-  @doc """
-  Merges `extra_body` into `body`, shallow-merging the nested map at
-  `nested_key` when both sides contain a map so sibling caller fields (such as
-  Anthropic `output_config.effort`, OpenAI `text.verbosity`, or Gemini
-  `generationConfig.temperature`) are preserved alongside `:output_schema`
-  while explicit caller overrides for the same nested key still win.
-  """
+  @doc false
   @spec merge_extra_body(map(), map(), String.t()) :: map()
   def merge_extra_body(body, extra_body, nested_key)
       when is_map(body) and is_map(extra_body) and is_binary(nested_key) do
@@ -93,9 +91,8 @@ defmodule Alloy.OutputSchema do
   and the schema dialect is supported; falls back to top-level JSON `"type"`
   and `"required"` checks otherwise.
   """
-  @spec decode_and_validate(String.t() | nil, map()) ::
-          {:ok, term()} | {:error, String.t()}
-  def decode_and_validate(text, %{name: name, schema: schema}) when is_binary(text) do
+  @spec decode_and_validate(String.t() | nil, t()) :: {:ok, term()} | {:error, String.t()}
+  def decode_and_validate(text, %__MODULE__{name: name, schema: schema}) when is_binary(text) do
     case Jason.decode(text) do
       {:ok, decoded} ->
         validate_decoded(decoded, schema, name)

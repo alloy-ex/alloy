@@ -132,7 +132,10 @@ automatically during compaction summaries, decodes the final JSON into
   raises `ArgumentError`). `:strict` defaults to `true`, which on OpenAI/xAI
   requires every property in `"required"` and `"additionalProperties" => false`
   on every object (pass `%{schema: schema, strict: false}` to opt out). Because
-  `:output_schema` is sent on every completion turn, Gemini models prior to
-  Gemini 3 and some OpenAICompat servers reject combining `tools` with native
-  JSON Schema output; use Gemini 3+ (`gemini-3-flash`), attach `:output_schema`
-  on the final turn with `Alloy.Agent.State.prepare/2`, or use `until_tool`.
+  `:output_schema` is sent on every completion turn (including fallback
+  providers), Gemini models prior to Gemini 3 and some OpenAICompat servers
+  reject combining `tools` with native JSON Schema output; use Gemini 3+
+  (`gemini-3-flash`), use `until_tool` / `stop_after_tool`, or drive a separate
+  follow-up no-tools `Alloy.run/2` turn with `:output_schema`. On Gemini,
+  combining `:output_schema` with legacy `generation_config["responseSchema"]`
+  or a non-JSON `responseMimeType` raises `ArgumentError`.

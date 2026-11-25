@@ -4,7 +4,7 @@ defmodule Alloy.OutputSchemaTest do
   alias Alloy.Agent.{Config, State}
   alias Alloy.Context.Compactor
   alias Alloy.{Message, OutputSchema, Result}
-  alias Alloy.Provider.{Anthropic, Codex, Gemini, OpenAI, OpenAICompat, XAI}
+  alias Alloy.Provider.{Anthropic, Codex, CodexSession, Gemini, OpenAI, OpenAICompat, XAI}
 
   @answer_schema %{
     type: "object",
@@ -72,6 +72,14 @@ defmodule Alloy.OutputSchemaTest do
           provider:
             {Anthropic, api_key: "k", model: "claude-sonnet-5-5", output_schema: @answer_schema}
         )
+      end
+
+      assert_raise ArgumentError, ~r/:name must match/, fn ->
+        OutputSchema.normalize!(%OutputSchema{
+          name: "bad name!",
+          schema: @answer_schema,
+          strict: true
+        })
       end
     end
 
@@ -349,6 +357,32 @@ defmodule Alloy.OutputSchemaTest do
       assert body["generationConfig"]["temperature"] == 0.2
       assert body["generationConfig"]["responseMimeType"] == "application/json"
       assert body["generationConfig"]["responseJsonSchema"]["type"] == "object"
+
+      assert_raise ArgumentError, ~r/legacy generation_config\["responseSchema"\]/, fn ->
+        Gemini.complete(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "k",
+            model: "gemini-3-flash",
+            generation_config: %{responseSchema: %{type: "OBJECT"}},
+            output_schema: @answer_schema
+          }
+        )
+      end
+
+      assert_raise ArgumentError, ~r/non-JSON generation_config\["responseMimeType"\]/, fn ->
+        Gemini.complete(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "k",
+            model: "gemini-3-flash",
+            generation_config: %{responseMimeType: "text/plain"},
+            output_schema: @answer_schema
+          }
+        )
+      end
     end
 
     test "Codex embeds output_schema rules into its prompt" do
@@ -522,6 +556,172 @@ defmodule Alloy.OutputSchemaTest do
 
       assert_received {:summary_body, body}
       refute Map.has_key?(body, "output_config")
+    end
+
+    test "forwards :output_schema to fallback_providers and decodes fallback output" do
+      test_pid = self()
+
+      Req.Test.stub(:output_schema_primary_down, fn conn ->
+        Plug.Conn.send_resp(conn, 503, ~s({"error":{"type":"overloaded_error","message":"busy"}}))
+      end)
+
+      Req.Test.stub(:output_schema_fallback_ok, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:fallback_body, Jason.decode!(raw)})
+
+        Req.Test.json(conn, %{
+          "id" => "resp_fb",
+          "status" => "completed",
+          "output" => [
+            %{
+              "type" => "message",
+              "role" => "assistant",
+              "content" => [
+                %{"type" => "output_text", "text" => ~s({"answer":"fallback","confidence":0.95})}
+              ]
+            }
+          ],
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3}
+        })
+      end)
+
+      assert {:ok, %Result{output: %{"answer" => "fallback", "confidence" => 0.95}}} =
+               Alloy.run("answer",
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    req_options: [plug: {Req.Test, :output_schema_primary_down}]},
+                 fallback_providers: [
+                   {OpenAI,
+                    api_key: "k2",
+                    model: "gpt-5.4",
+                    req_options: [plug: {Req.Test, :output_schema_fallback_ok}]}
+                 ],
+                 output_schema: @answer_schema,
+                 max_retries: 0
+               )
+
+      assert_received {:fallback_body, body}
+      assert body["text"]["format"]["type"] == "json_schema"
+      assert body["text"]["format"]["schema"]["type"] == "object"
+    end
+
+    test "decodes structured output during streaming and across split assistant text blocks" do
+      {:ok, stream_pid} =
+        Alloy.Provider.Test.start_link([
+          Alloy.Testing.text_response(~s({"answer":"streamed","confidence":0.7}))
+        ])
+
+      test_pid = self()
+
+      assert {:ok, %Result{output: %{"answer" => "streamed", "confidence" => 0.7}}} =
+               Alloy.stream(
+                 "go",
+                 fn chunk -> send(test_pid, {:chunk, chunk}) end,
+                 provider: {Alloy.Provider.Test, agent_pid: stream_pid},
+                 output_schema: @answer_schema
+               )
+
+      assert_received {:chunk, _}
+
+      # JSON string split across two text blocks (e.g. Gemini thought-signature chunks)
+      # must be concatenated without injecting "\n" inside the string literal.
+      {:ok, split_pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [
+               %Message{
+                 role: :assistant,
+                 content: [
+                   %{type: "text", text: ~s({"answer":"hel)},
+                   %{type: "text", text: ~s(lo","confidence":1})}
+                 ]
+               }
+             ],
+             usage: %{input_tokens: 2, output_tokens: 2}
+           }}
+        ])
+
+      assert {:ok, %Result{output: %{"answer" => "hello", "confidence" => 1}}} =
+               Alloy.run("go",
+                 provider: {Alloy.Provider.Test, agent_pid: split_pid},
+                 output_schema: @answer_schema
+               )
+    end
+
+    test "halting in :after_completion leaves result.output as nil" do
+      defmodule HaltAfterCompletion do
+        @behaviour Alloy.Middleware
+        def call(:after_completion, _state), do: {:halt, "policy rejected"}
+        def call(_hook, state), do: state
+      end
+
+      {:ok, pid} =
+        Alloy.Provider.Test.start_link([
+          Alloy.Testing.text_response(~s({"answer":"ok","confidence":1}))
+        ])
+
+      assert {:error,
+              %Result{
+                status: :halted,
+                output: nil,
+                error: "Halted by middleware: policy rejected"
+              }} =
+               Alloy.run("go",
+                 provider: {Alloy.Provider.Test, agent_pid: pid},
+                 middleware: [HaltAfterCompletion],
+                 output_schema: @answer_schema
+               )
+    end
+
+    test "Codex omits :output_schema from session scope when nil so 0.13 persisted sessions resume" do
+      workdir = System.tmp_dir!()
+
+      runner = fn _bin, args, _opts ->
+        out_idx = Enum.find_index(args, &(&1 == "--output-last-message"))
+        out_path = Enum.at(args, out_idx + 1)
+
+        File.write!(
+          out_path,
+          Jason.encode!(%{stop_reason: "end_turn", text: "ok", tool_calls: []})
+        )
+
+        {~s({"type":"thread.started","thread_id":"thread-legacy"}\n), 0}
+      end
+
+      legacy_scope = %{
+        home: System.get_env("CODEX_HOME") || Path.expand("~/.codex"),
+        workdir: workdir,
+        model: "gpt-5.4",
+        system_prompt: nil,
+        overrides: [],
+        executable: "codex",
+        generation: nil,
+        tools: []
+      }
+
+      legacy_state =
+        CodexSession.remember(
+          [%{"role" => "user", "content" => "hi"}, %{"role" => "assistant", "content" => "hey"}],
+          legacy_scope,
+          "thread-legacy"
+        )
+
+      assert {:ok, %{response_metadata: %{session: %{mode: :resumed}}}} =
+               Codex.complete(
+                 [Message.user("hi"), Message.assistant("hey"), Message.user("next")],
+                 [],
+                 %{
+                   model: "gpt-5.4",
+                   persist_session: true,
+                   workdir: workdir,
+                   provider_state: legacy_state,
+                   command_runner: runner
+                 }
+               )
     end
   end
 end

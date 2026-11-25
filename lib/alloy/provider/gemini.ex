@@ -801,9 +801,21 @@ defmodule Alloy.Provider.Gemini do
         generation_config
 
       %{schema: schema} ->
-        generation_config
-        |> maybe_put_new("responseMimeType", "application/json")
-        |> maybe_put_new("responseJsonSchema", schema)
+        if Map.has_key?(generation_config, "responseSchema") do
+          raise ArgumentError,
+                "cannot combine :output_schema with legacy generation_config[\"responseSchema\"] on Gemini"
+        end
+
+        case Map.get(generation_config, "responseMimeType") do
+          mime when mime in [nil, "application/json"] ->
+            generation_config
+            |> Map.put("responseMimeType", "application/json")
+            |> maybe_put_new("responseJsonSchema", schema)
+
+          other ->
+            raise ArgumentError,
+                  "cannot combine :output_schema with non-JSON generation_config[\"responseMimeType\"] (#{inspect(other)}) on Gemini"
+        end
     end
   end
 end

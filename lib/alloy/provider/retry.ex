@@ -125,7 +125,12 @@ defmodule Alloy.Provider.Retry do
          last_error
        ) do
     runtime_overrides =
-      Map.take(provider_config, [:system_prompt, :on_event, :alloy_request_deadline])
+      Map.take(provider_config, [
+        :system_prompt,
+        :on_event,
+        :alloy_request_deadline,
+        :output_schema
+      ])
 
     primary_origin = Message.origin(state.config.provider, provider_config)
 

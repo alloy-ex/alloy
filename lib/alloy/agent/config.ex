@@ -78,13 +78,6 @@ defmodule Alloy.Agent.Config do
           keep_recent_tool_results: non_neg_integer()
         }
 
-  @type output_schema :: %{
-          required(:name) => String.t(),
-          required(:schema) => map(),
-          required(:strict) => boolean(),
-          optional(:__struct__) => module()
-        }
-
   @type t :: %__MODULE__{
           provider: module(),
           provider_config: map(),
@@ -100,7 +93,7 @@ defmodule Alloy.Agent.Config do
           tool_concurrency: pos_integer() | nil,
           tool_validation: :required | :schema,
           stop_after_tool: String.t() | nil,
-          output_schema: output_schema() | nil,
+          output_schema: OutputSchema.t() | nil,
           middleware: [module()],
           compaction: compaction(),
           compaction_explicit: %{

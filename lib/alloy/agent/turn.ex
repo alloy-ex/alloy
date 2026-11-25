@@ -10,6 +10,7 @@ defmodule Alloy.Agent.Turn do
 
   alias Alloy.Agent.State
   alias Alloy.Events
+  alias Alloy.Internal.Sanitize
   alias Alloy.{Message, Middleware, OutputSchema}
   alias Alloy.Provider.{Error, Retry}
   alias Alloy.Tool.{Executor, Validation}
@@ -93,7 +94,12 @@ defmodule Alloy.Agent.Turn do
         :telemetry.execute(
           [:alloy, :run, :exception],
           %{duration_ms: System.monotonic_time(:millisecond) - started},
-          %{model: model, kind: kind, reason: reason, stacktrace: __STACKTRACE__}
+          %{
+            model: model,
+            kind: kind,
+            reason: reason,
+            stacktrace: Sanitize.stacktrace(__STACKTRACE__)
+          }
         )
 
         :erlang.raise(kind, reason, __STACKTRACE__)
@@ -515,7 +521,7 @@ defmodule Alloy.Agent.Turn do
   defp decode_structured_output(%State{run_metadata: %{final_tool: _}} = state), do: {:ok, state}
 
   defp decode_structured_output(%State{config: %{output_schema: spec}} = state) do
-    case OutputSchema.decode_and_validate(State.last_assistant_text(state), spec) do
+    case OutputSchema.decode_and_validate(last_assistant_raw_text(state), spec) do
       {:ok, decoded} ->
         {:ok, State.merge_run_metadata(state, %{output: decoded})}
 
@@ -524,6 +530,25 @@ defmodule Alloy.Agent.Turn do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # Join text blocks with "" (not "\n" like Message.text/1) so JSON strings
+  # split across multiple text blocks (e.g. Gemini thought-signature chunks)
+  # do not gain an illegal raw newline inside a JSON string literal.
+  defp last_assistant_raw_text(%State{messages: messages}) do
+    case messages |> Enum.reverse() |> Enum.find(&(&1.role == :assistant)) do
+      nil ->
+        nil
+
+      %Message{content: content} when is_binary(content) ->
+        content
+
+      %Message{content: blocks} when is_list(blocks) ->
+        Enum.map_join(blocks, "", fn
+          %{type: "text", text: text} when is_binary(text) -> text
+          _other -> ""
+        end)
     end
   end
 
