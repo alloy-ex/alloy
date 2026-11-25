@@ -137,5 +137,8 @@ automatically during compaction summaries, decodes the final JSON into
   reject combining `tools` with native JSON Schema output; use Gemini 3+
   (`gemini-3-flash`), use `until_tool` / `stop_after_tool`, or drive a separate
   follow-up no-tools `Alloy.run/2` turn with `:output_schema`. On Gemini,
-  combining `:output_schema` with legacy `generation_config["responseSchema"]`
-  or a non-JSON `responseMimeType` raises `ArgumentError`.
+  combining `:output_schema` with legacy `generation_config` /
+  `extra_body["generationConfig"]` `responseSchema` (`response_schema`) or a
+  non-JSON `responseMimeType` (`response_mime_type`) returns a non-retryable
+  `{:error, %Alloy.Provider.Error{kind: :invalid_request}}`, so the run ends
+  with `{:error, result}` unless a fallback provider succeeds.

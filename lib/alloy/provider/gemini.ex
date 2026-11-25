@@ -815,30 +815,41 @@ defmodule Alloy.Provider.Gemini do
 
       _spec ->
         generation_config = Map.get(body, "generationConfig", %{})
-
-        cond do
-          is_map(generation_config) and Map.has_key?(generation_config, "responseSchema") ->
-            {:error,
-             %Error{
-               kind: :invalid_request,
-               message:
-                 "cannot combine :output_schema with legacy generationConfig[\"responseSchema\"] on Gemini"
-             }}
-
-          is_map(generation_config) and
-              Map.get(generation_config, "responseMimeType") not in [nil, "application/json"] ->
-            mime = Map.get(generation_config, "responseMimeType")
-
-            {:error,
-             %Error{
-               kind: :invalid_request,
-               message:
-                 "cannot combine :output_schema with non-JSON generationConfig[\"responseMimeType\"] (#{inspect(mime)}) on Gemini"
-             }}
-
-          true ->
-            {:ok, body}
-        end
+        validate_gemini_generation_config(body, generation_config)
     end
   end
+
+  defp validate_gemini_generation_config(body, generation_config)
+       when is_map(generation_config) do
+    invalid_mime =
+      [
+        Map.get(generation_config, "responseMimeType"),
+        Map.get(generation_config, "response_mime_type")
+      ]
+      |> Enum.find(&(&1 not in [nil, "application/json"]))
+
+    cond do
+      Map.has_key?(generation_config, "responseSchema") or
+          Map.has_key?(generation_config, "response_schema") ->
+        {:error,
+         %Error{
+           kind: :invalid_request,
+           message:
+             "cannot combine :output_schema with legacy generationConfig[\"responseSchema\"] on Gemini"
+         }}
+
+      not is_nil(invalid_mime) ->
+        {:error,
+         %Error{
+           kind: :invalid_request,
+           message:
+             "cannot combine :output_schema with non-JSON generationConfig[\"responseMimeType\"] (#{inspect(invalid_mime)}) on Gemini"
+         }}
+
+      true ->
+        {:ok, body}
+    end
+  end
+
+  defp validate_gemini_generation_config(body, _other), do: {:ok, body}
 end

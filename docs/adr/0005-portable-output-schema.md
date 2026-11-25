@@ -40,8 +40,12 @@ decoded into `Alloy.Result.output`:
    `nil` to preserve 0.13 persisted sessions).
 3. **Fallback & compaction integration:** `Alloy.Provider.Retry` forwards
    `:output_schema` into fallback provider configs so fallback calls still carry
-   the schema. `Alloy.Context.Compactor` strips `:output_schema` from summary
-   requests so handoff summaries remain plain text.
+   the schema. Compaction summary requests never carry `:output_schema` by
+   construction: `Config.from_opts/1` rejects `:output_schema` in
+   `provider_config`, and only `Turn.build_provider_config/1` injects
+   `config.output_schema` on main completion turns (while `Compactor` strips
+   raw `extra_body` schema keys and the Compactor test acts as a structural
+   regression guard).
 4. **Decoding, validation tiers, and terminal failure:** In `Turn.finish/1`
    (before `:after_completion`, skipped when `:stop_after_tool` finishes a run),
    Alloy concatenates the final assistant message's text blocks with `""` (not

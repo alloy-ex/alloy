@@ -424,6 +424,34 @@ defmodule Alloy.OutputSchemaTest do
                )
 
       assert msg4 =~ ~s(non-JSON generationConfig["responseMimeType"])
+
+      assert {:error, %Error{kind: :invalid_request, message: msg5}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3-flash",
+                   generation_config: %{response_schema: %{type: "OBJECT"}},
+                   output_schema: @answer_schema
+                 }
+               )
+
+      assert msg5 =~ ~s(legacy generationConfig["responseSchema"])
+
+      assert {:error, %Error{kind: :invalid_request, message: msg6}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3-flash",
+                   generation_config: %{response_mime_type: "text/plain"},
+                   output_schema: @answer_schema
+                 }
+               )
+
+      assert msg6 =~ ~s(non-JSON generationConfig["responseMimeType"])
     end
 
     test "atom-keyed nested extra_body merges without duplicate JSON keys and lets caller win" do
