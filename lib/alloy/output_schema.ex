@@ -98,36 +98,36 @@ defmodule Alloy.OutputSchema do
   @spec decode_and_validate(String.t() | nil, t() | map()) ::
           {:ok, term()} | {:error, output_error()}
   def decode_and_validate(text, spec)
-      when is_binary(text) and text != "" and is_map(spec) do
+      when (is_nil(text) or is_binary(text)) and is_map(spec) do
     %__MODULE__{schema: schema, resolved: {:cached, _key, resolution}} = normalize!(spec)
 
-    case Jason.decode(text) do
-      {:ok, decoded} ->
-        case validate_decoded(decoded, schema, resolution) do
-          {:ok, value} ->
-            {:ok, value}
+    if is_nil(text) or String.trim(text) == "" do
+      {:error,
+       %{
+         kind: :missing_text,
+         message: "Structured output is missing assistant text",
+         decoded: nil
+       }}
+    else
+      case Jason.decode(text) do
+        {:ok, decoded} ->
+          case validate_decoded(decoded, schema, resolution) do
+            {:ok, value} ->
+              {:ok, value}
 
-          {:error, message} ->
-            {:error, %{kind: :schema_mismatch, message: message, decoded: decoded}}
-        end
+            {:error, message} ->
+              {:error, %{kind: :schema_mismatch, message: message, decoded: decoded}}
+          end
 
-      {:error, reason} ->
-        {:error,
-         %{
-           kind: :invalid_json,
-           message: "Structured output is not valid JSON: #{Exception.message(reason)}",
-           decoded: nil
-         }}
+        {:error, reason} ->
+          {:error,
+           %{
+             kind: :invalid_json,
+             message: "Structured output is not valid JSON: #{Exception.message(reason)}",
+             decoded: nil
+           }}
+      end
     end
-  end
-
-  def decode_and_validate(_other, _spec) do
-    {:error,
-     %{
-       kind: :missing_text,
-       message: "Structured output is missing assistant text",
-       decoded: nil
-     }}
   end
 
   # ── Normalization ────────────────────────────────────────────────────────

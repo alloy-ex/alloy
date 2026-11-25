@@ -14,10 +14,10 @@ defmodule Alloy.Result do
       its metadata is in `metadata.final_tool`
     * `:output` — decoded JSON value when `:output_schema` is configured and
       the run completes normally (`status: :completed`), or `nil` otherwise
-      (including when `:after_completion` middleware returns `{:halt, state}`,
-      where the validated value was available on `state.run_metadata.output`
-      inside `:after_completion` and the raw reply remains in `:text` /
-      `:messages`)
+      (including when `:after_completion` middleware returns `{:halt, reason}`
+      or `{:halt, reason, state}`, where the validated value was available on
+      `state.run_metadata.output` inside `:after_completion` and the raw reply
+      remains in `:text` / `:messages`)
     * `:thinking` — the final assistant thinking/reasoning text (or `nil` if none),
       so callers need not dig it out of the last message's content blocks
     * `:messages` — full conversation history

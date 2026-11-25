@@ -88,10 +88,10 @@ defmodule Alloy.Middleware do
   def run_hook(hook, %State{} = state) do
     Enum.reduce_while(state.config.middleware, state, fn middleware, acc ->
       case middleware.call(hook, acc) do
-        {:halt, reason} ->
+        {:halt, reason} when is_binary(reason) ->
           {:halt, {:halted, reason, acc}}
 
-        {:halt, reason, %State{} = halted} ->
+        {:halt, reason, %State{} = halted} when is_binary(reason) ->
           {:halt, {:halted, reason, halted}}
 
         %State{} = new_state ->
@@ -137,10 +137,10 @@ defmodule Alloy.Middleware do
           {:block, reason} ->
             {:halt, {:block, reason}}
 
-          {:halt, reason} ->
+          {:halt, reason} when is_binary(reason) ->
             {:halt, {:halted, reason}}
 
-          {:halt, reason, %State{}} ->
+          {:halt, reason, %State{}} when is_binary(reason) ->
             {:halt, {:halted, reason}}
 
           {:edit, modified_call} ->

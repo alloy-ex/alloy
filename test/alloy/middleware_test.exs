@@ -162,6 +162,25 @@ defmodule Alloy.MiddlewareTest do
 
       assert result == {:halted, "limit"}
     end
+
+    test "raises ArgumentError when middleware returns {:halt, non_binary} such as {:halt, state}" do
+      defmodule HaltStateMiddleware do
+        @behaviour Alloy.Middleware
+        def call(_hook, state), do: {:halt, state}
+      end
+
+      state = build_state(middleware: [HaltStateMiddleware])
+
+      assert_raise ArgumentError, ~r/unsupported value/, fn ->
+        Middleware.run(:after_completion, state)
+      end
+
+      tool_call = %{id: "tc_1", name: "read", input: %{"path" => "mix.exs"}}
+
+      assert_raise ArgumentError, ~r/unsupported value/, fn ->
+        Middleware.run_before_tool_call(state, tool_call)
+      end
+    end
   end
 
   describe "run/2 with {:block, reason} at non-tool-call hook" do

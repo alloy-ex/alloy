@@ -36,6 +36,11 @@ decoded into `Alloy.Result.output`:
    `generationConfig`) so sibling caller `extra_body` keys (e.g.
    `output_config.effort`, `text.verbosity`, `generationConfig.temperature`) are
    preserved while explicit caller overrides for the schema key still win.
+   On Gemini, conflicting `generation_config` / `extra_body["generationConfig"]`
+   keys (`responseJsonSchema`, legacy `responseSchema`, snake_case equivalents,
+   or non-JSON `responseMimeType`) are rejected locally with non-retryable
+   `%Alloy.Provider.Error{kind: :invalid_request}` rather than silently
+   overwriting caller config or sending mixed-case keys over the wire.
    `Codex` already uses `--output-schema` for its outer loop envelope, so it
    injects explicit JSON Schema instructions into its prompt and includes
    non-nil `:output_schema` in its session scope fingerprint (omitting it when
@@ -45,9 +50,11 @@ decoded into `Alloy.Result.output`:
    the schema. Compaction summary requests never carry `:output_schema` by
    construction: `Config.from_opts/1` rejects `:output_schema` in
    `provider_config`, and only `Turn.build_provider_config/1` injects
-   `config.output_schema` on main completion turns (while `Compactor` strips
-   raw `extra_body` schema keys and the Compactor test acts as a structural
-   regression guard).
+   `config.output_schema` on main completion turns (while `Compactor` drops raw
+   `extra_body` `output_config`, `text`, and `response_format` containers —
+   including sibling keys such as `output_config.effort` and `text.verbosity` —
+   plus Gemini `generationConfig` schema/thinking fields on summary requests,
+   and the Compactor test acts as a structural regression guard).
 4. **Decoding, validation tiers, and terminal failure:** In `Turn.finish/1`
    (before `:after_completion`, skipped when `:stop_after_tool` finishes a run),
    Alloy concatenates the final assistant message's text blocks with `""` (not

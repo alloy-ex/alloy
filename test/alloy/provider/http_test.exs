@@ -986,7 +986,11 @@ defmodule Alloy.Provider.HTTPTest do
 
       assert OwnedWorker.format_exit_reason(%RuntimeError{message: "secret"}) == "RuntimeError"
       assert OwnedWorker.format_exit_reason({:noproc, []}) == ":noproc"
-      assert OwnedWorker.format_exit_reason({{:badmatch, "secret"}, []}) == "unexpected exit"
+      assert OwnedWorker.format_exit_reason({{:badmatch, "secret"}, []}) == "unexpected tuple"
+
+      assert OwnedWorker.format_exit_reason(
+               {:timeout, {GenServer, :call, [self(), {:secret, "sk-123"}, 100]}}
+             ) == ":timeout"
     end
   end
 

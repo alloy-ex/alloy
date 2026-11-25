@@ -56,46 +56,6 @@ defmodule Alloy.Tool.Validation do
   # newer dialects such as Draft 2020-12 or when `:ex_json_schema` is absent).
   @spec prepare_output_schema!(map(), String.t()) :: {:ok, term()} | :fallback
   def prepare_output_schema!(schema, name) when is_map(schema) do
-    resolve_output_schema(schema, name)
-  end
-
-  @doc false
-  # Returns true when a cached resolution term matches the current runtime
-  # environment and struct shape (preventing forged caches or missing optional
-  # dependency crashes).
-  @spec valid_resolved_output?(term()) :: boolean()
-  def valid_resolved_output?(:fallback), do: true
-
-  def valid_resolved_output?({:ok, root}) do
-    Code.ensure_loaded?(Validator) and is_map(root) and Map.get(root, :__struct__) == Root
-  end
-
-  def valid_resolved_output?(_other), do: false
-
-  @doc false
-  # Validates decoded structured output against an already-resolved schema.
-  @spec validate_resolved_output(term(), term()) :: :ok | {:error, String.t()}
-  def validate_resolved_output(resolved, decoded) do
-    case Validator.validate(resolved, decoded) do
-      :ok ->
-        :ok
-
-      {:error, errors} ->
-        {:error, "Structured output failed schema validation: #{format_output_errors(errors)}"}
-    end
-  rescue
-    error ->
-      if error.__struct__ in [
-           ExJsonSchema.Schema.InvalidReferenceError,
-           ExJsonSchema.Schema.InvalidSchemaError
-         ] do
-        {:error, "Invalid output_schema: #{Exception.message(error)}"}
-      else
-        reraise error, __STACKTRACE__
-      end
-  end
-
-  defp resolve_output_schema(schema, name) do
     local_refs!(schema, :output)
 
     if Code.ensure_loaded?(Schema) do
@@ -125,7 +85,44 @@ defmodule Alloy.Tool.Validation do
     end
   end
 
-  defp format_output_errors(errors) do
+  @doc false
+  # Returns true when a cached resolution term matches the current runtime
+  # environment and struct shape (preventing forged caches or missing optional
+  # dependency crashes).
+  @spec valid_resolved_output?(term()) :: boolean()
+  def valid_resolved_output?(:fallback), do: true
+
+  def valid_resolved_output?({:ok, root}) do
+    Code.ensure_loaded?(Validator) and is_map(root) and Map.get(root, :__struct__) == Root
+  end
+
+  def valid_resolved_output?(_other), do: false
+
+  @doc false
+  # Validates decoded structured output against an already-resolved schema.
+  @spec validate_resolved_output(term(), term()) :: :ok | {:error, String.t()}
+  def validate_resolved_output(resolved, decoded) do
+    case Validator.validate(resolved, decoded) do
+      :ok ->
+        :ok
+
+      {:error, errors} ->
+        {:error,
+         "Structured output failed schema validation: #{format_validation_errors(errors)}"}
+    end
+  rescue
+    error ->
+      if error.__struct__ in [
+           ExJsonSchema.Schema.InvalidReferenceError,
+           ExJsonSchema.Schema.InvalidSchemaError
+         ] do
+        {:error, "Invalid output_schema: #{Exception.message(error)}"}
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  defp format_validation_errors(errors) do
     total = length(errors)
 
     summary =
@@ -170,8 +167,7 @@ defmodule Alloy.Tool.Validation do
         :ok
 
       {:error, errors} ->
-        details = Enum.map_join(errors, "; ", fn {error, path} -> "#{path}: #{error}" end)
-        {:error, "Invalid input for #{name}: #{details}", nil}
+        {:error, "Invalid input for #{name}: #{format_validation_errors(errors)}", nil}
     end
   end
 

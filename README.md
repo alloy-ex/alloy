@@ -522,7 +522,11 @@ logging, or custom metrics:
 
 Each turn's stop fires when that turn ends. A turn the loop continues past
 reports `status: :running`; the run's outcome is on `[:alloy, :run, :stop]`.
-See [OpenTelemetry tracing recipe](docs/recipes/opentelemetry.md) for a
+`[:alloy, :run, :exception]` and `[:alloy, :turn, :exception]` strip function
+arguments from `:stacktrace` while carrying the raw `:reason` (matching
+`:telemetry.span/3`), so telemetry handlers exporting to external backends
+should record only the exception module or crash kind. See
+[OpenTelemetry tracing recipe](docs/recipes/opentelemetry.md) for a
 copy-pasteable GenAI OTel bridge.
 
 ### Structured output with `:output_schema` or `until_tool`

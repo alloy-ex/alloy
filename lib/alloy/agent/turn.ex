@@ -34,9 +34,10 @@ defmodule Alloy.Agent.Turn do
   Each turn is reported as `[:alloy, :turn, :start]` and `[:alloy, :turn, :stop]`,
   or `[:alloy, :turn, :exception]` when the turn raises, using the same
   measurements and `telemetry_span_context` metadata shape as `:telemetry.span/3`
-  with sanitized stacktraces. A turn's stop event fires when that turn ends; its
-  `:status` is `:running` when the loop goes on to another turn and the final
-  status otherwise.
+  with argument-stripped stacktraces (`:reason` still carries the raw exception
+  or exit term, so handlers exporting externally should sanitize it). A turn's
+  stop event fires when that turn ends; its `:status` is `:running` when the
+  loop goes on to another turn and the final status otherwise.
 
   ## Options
 
@@ -585,10 +586,10 @@ defmodule Alloy.Agent.Turn do
          %State{config: %{output_schema: spec}, messages: messages} = state
        ) do
     last_assistant =
-      messages
-      |> Enum.reverse()
-      |> Enum.take_while(&(&1.role == :assistant))
-      |> List.first()
+      case List.last(messages) do
+        %Message{role: :assistant} = msg -> msg
+        _ -> nil
+      end
 
     if refusal_message?(last_assistant) do
       message = "The model refused to produce structured output"

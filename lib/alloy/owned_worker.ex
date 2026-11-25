@@ -63,19 +63,7 @@ defmodule Alloy.OwnedWorker do
   def shutdown_reason?(_), do: false
 
   @spec format_exit_reason(term()) :: String.t()
-  def format_exit_reason(reason) when is_atom(reason), do: inspect(reason)
-  def format_exit_reason(%mod{}), do: inspect(mod)
-
-  def format_exit_reason({:shutdown, tag}) when is_atom(tag),
-    do: "{:shutdown, #{inspect(tag)}}"
-
-  def format_exit_reason({:shutdown, _other}), do: "{:shutdown, ...}"
-
-  # Drop the second tuple element (stacktrace/payload) so arbitrary terms or
-  # secrets captured in crash reasons never leak into error messages.
-  def format_exit_reason({%mod{}, _stacktrace}), do: inspect(mod)
-  def format_exit_reason({tag, _stacktrace}) when is_atom(tag), do: inspect(tag)
-  def format_exit_reason(_other), do: "unexpected exit"
+  def format_exit_reason(reason), do: Sanitize.exit_summary(reason, :redact)
 
   defp run_worker(owner, done_ref, fun) do
     result = fun.()

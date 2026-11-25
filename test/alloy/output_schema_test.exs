@@ -215,6 +215,20 @@ defmodule Alloy.OutputSchemaTest do
                OutputSchema.decode_and_validate(nil, OutputSchema.normalize!(@answer_schema))
 
       assert missing_msg =~ "missing assistant text"
+
+      assert {:error, %{kind: :missing_text}} =
+               OutputSchema.decode_and_validate(
+                 "  \n\t ",
+                 OutputSchema.normalize!(@answer_schema)
+               )
+
+      assert_raise FunctionClauseError, fn ->
+        OutputSchema.decode_and_validate(~s({"a":1}), Function.identity(nil))
+      end
+
+      assert_raise ArgumentError, ~r/non-empty JSON Schema map/, fn ->
+        OutputSchema.decode_and_validate(nil, Function.identity(%{}))
+      end
     end
 
     test "rejects remote $ref with output_schema wording even without :ex_json_schema" do
@@ -1576,6 +1590,56 @@ defmodule Alloy.OutputSchemaTest do
                Alloy.run("turn 2",
                  messages: prior_messages,
                  provider: {Alloy.Provider.Test, agent_pid: pid},
+                 output_schema: @answer_schema
+               )
+    end
+
+    test "classifies whitespace-only assistant text as :missing_text and decodes only the final assistant message" do
+      {:ok, ws_pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [
+               %Message{
+                 role: :assistant,
+                 content: [
+                   %{type: "thinking", thinking: "pondering..."},
+                   %{type: "text", text: " \n\t "}
+                 ]
+               }
+             ],
+             usage: %{input_tokens: 2, output_tokens: 1}
+           }}
+        ])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                metadata: %{run: %{output_error: %{kind: :missing_text, decoded: nil}}}
+              }} =
+               Alloy.run("go",
+                 provider: {Alloy.Provider.Test, agent_pid: ws_pid},
+                 output_schema: @answer_schema
+               )
+
+      {:ok, multi_pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [
+               Message.assistant(~s({"answer":"first","confidence":0.1})),
+               Message.assistant(~s({"answer":"second","confidence":0.9}))
+             ],
+             usage: %{input_tokens: 2, output_tokens: 2}
+           }}
+        ])
+
+      assert {:ok, %Result{output: %{"answer" => "second", "confidence" => 0.9}}} =
+               Alloy.run("go",
+                 provider: {Alloy.Provider.Test, agent_pid: multi_pid},
                  output_schema: @answer_schema
                )
     end

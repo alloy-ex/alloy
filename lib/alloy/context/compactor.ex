@@ -978,7 +978,7 @@ defmodule Alloy.Context.Compactor do
       stacktrace = Sanitize.stacktrace(__STACKTRACE__)
 
       Logger.warning(
-        "on_compaction callback error (#{kind}): #{Sanitize.inspect_bounded(payload)}\n" <>
+        "on_compaction callback error (#{kind}): #{Sanitize.exit_summary(payload)}\n" <>
           "Stacktrace: #{Exception.format_stacktrace(stacktrace)}"
       )
 

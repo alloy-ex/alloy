@@ -62,10 +62,13 @@ defmodule Alloy.Internal.Sanitize do
   `:badarg` (`"argument error"`), and atom key names on `KeyError` are kept;
   all other exceptions report only their module.
   """
-  @spec exception_summary(Exception.t(), pos_integer()) :: String.t()
+  @spec exception_summary(Exception.t(), pos_integer() | :redact) :: String.t()
   def exception_summary(exception, max_bytes \\ 500)
 
-  def exception_summary(%RuntimeError{message: msg}, max_bytes) when is_binary(msg) do
+  def exception_summary(%mod{}, :redact), do: inspect(mod)
+
+  def exception_summary(%RuntimeError{message: msg}, max_bytes)
+      when is_binary(msg) and is_integer(max_bytes) and max_bytes > 0 do
     cap_bytes(msg, max_bytes)
   end
 
@@ -107,7 +110,7 @@ defmodule Alloy.Internal.Sanitize do
   numbers, `{:shutdown, atom}`), and replaces arbitrary compound terms with
   type labels so secrets never leak.
   """
-  @spec exit_summary(term(), pos_integer()) :: String.t()
+  @spec exit_summary(term(), pos_integer() | :redact) :: String.t()
   def exit_summary(reason, max_bytes \\ 500)
 
   def exit_summary({inner, {mod, fun, args}}, max_bytes)
@@ -132,6 +135,9 @@ defmodule Alloy.Internal.Sanitize do
       stack == [] and is_exception(inner) ->
         exception_summary(inner, max_bytes)
 
+      stack == [] and is_atom(inner) ->
+        inspect(inner)
+
       true ->
         "unexpected tuple"
     end
@@ -141,11 +147,11 @@ defmodule Alloy.Internal.Sanitize do
     "nocatch: #{exit_summary(thrown, max_bytes)}"
   end
 
-  def exit_summary({:shutdown, tag}, _max_bytes) when is_atom(tag) do
-    "{:shutdown, #{inspect(tag)}}"
+  def exit_summary({tag, detail}, _max_bytes) when is_atom(tag) and is_atom(detail) do
+    "{#{inspect(tag)}, #{inspect(detail)}}"
   end
 
-  def exit_summary({:shutdown, _other}, _max_bytes), do: "{:shutdown, ...}"
+  def exit_summary({tag, _other}, _max_bytes) when is_atom(tag), do: "{#{inspect(tag)}, ...}"
 
   def exit_summary(exception, max_bytes) when is_exception(exception) do
     exception_summary(exception, max_bytes)

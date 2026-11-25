@@ -110,11 +110,16 @@ defmodule Alloy.Internal.SanitizeTest do
       assert Sanitize.exit_summary({:nocatch, :direct}) == "nocatch: :direct"
       assert Sanitize.exit_summary({:shutdown, :closed}) == "{:shutdown, :closed}"
       assert Sanitize.exit_summary({:shutdown, secret}) == "{:shutdown, ...}"
+      assert Sanitize.exit_summary({:error, :enoent}) == "{:error, :enoent}"
+      assert Sanitize.exit_summary({:timeout, :db}) == "{:timeout, :db}"
+      assert Sanitize.exit_summary({:noproc, []}) == ":noproc"
+      assert Sanitize.exit_summary(%RuntimeError{message: "sk-redact"}, :redact) == "RuntimeError"
       assert Sanitize.exit_summary(%MatchError{term: secret}) == "MatchError"
       assert Sanitize.exit_summary(42) == "42"
       assert Sanitize.exit_summary(URI.parse("https://example.com")) == "unexpected URI"
       assert Sanitize.exit_summary(secret) == "unexpected map"
-      assert Sanitize.exit_summary({:secret, "sk-123"}) == "unexpected tuple"
+      assert Sanitize.exit_summary({:custom_crash, "sk-123"}) == "{:custom_crash, ...}"
+      assert Sanitize.exit_summary({1, "sk-123"}) == "unexpected tuple"
       assert Sanitize.exit_summary(["sk-123"]) == "unexpected list"
       assert Sanitize.exit_summary("sk-123") == "unexpected binary"
       assert Sanitize.exit_summary(self()) == "unexpected term"
@@ -128,7 +133,7 @@ defmodule Alloy.Internal.SanitizeTest do
       assert Sanitize.crash_summary(:throw, :stop_now, []) == "throw: :stop_now"
       assert Sanitize.crash_summary(:throw, secret, []) == "throw: unexpected map"
       assert Sanitize.crash_summary(:exit, :gone, []) == "exit: :gone"
-      assert Sanitize.crash_summary(:exit, {:secret, secret}, []) == "exit: unexpected tuple"
+      assert Sanitize.crash_summary(:exit, {:secret, secret}, []) == "exit: {:secret, ...}"
     end
   end
 end

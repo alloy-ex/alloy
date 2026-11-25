@@ -117,9 +117,12 @@ Alloy translates `:output_schema` into each provider's native structured-output
 field (`output_config.format`, `text.format`, `response_format`,
 `generationConfig.responseJsonSchema`, or Codex prompt instructions) — preserving
 sibling `extra_body` keys such as Anthropic `output_config.effort`, OpenAI
-`text.verbosity`, and Gemini `generationConfig.temperature` — strips it
-automatically during compaction summaries, decodes the final JSON into
-`result.output` before `:after_completion`, and validates it:
+`text.verbosity`, and Gemini `generationConfig.temperature` on main completion
+turns — omits `:output_schema` (and drops raw `extra_body` `output_config`,
+`text`, `response_format`, and Gemini schema/thinking fields, including sibling
+keys such as `output_config.effort` and `text.verbosity`) during compaction
+summaries, decodes the final JSON into `result.output` before
+`:after_completion`, and validates it:
 
 - **Validation levels:** Full Draft 4/6/7 validation runs when optional
   `:ex_json_schema` is installed. Without `:ex_json_schema` (or when `$schema`
@@ -161,6 +164,7 @@ automatically during compaction summaries, decodes the final JSON into
   `:extra_body` (`output_config.format`, `text.format`, `response_format`,
   `generationConfig.responseJsonSchema`) replaces what is sent on the wire
   only — Alloy still validates the decoded reply against the top-level
-  `:output_schema`. When `:after_completion` middleware returns `{:halt, state}`,
-  `result.status` is `:halted` and `result.output` is `nil` (the validated value
-  was available inside `:after_completion` on `state.run_metadata.output`).
+  `:output_schema`. When `:after_completion` middleware returns `{:halt, reason}`
+  (or `{:halt, reason, state}`), `result.status` is `:halted` and `result.output`
+  is `nil` (the validated value was available inside `:after_completion` on
+  `state.run_metadata.output`).

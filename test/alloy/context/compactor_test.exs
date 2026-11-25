@@ -1210,6 +1210,32 @@ defmodule Alloy.Context.CompactorTest do
 
       assert key_log =~ "on_compaction callback crashed (KeyError)"
       refute key_log =~ "sk-secret-compactor-key"
+
+      silent_server =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      on_exit(fn -> send(silent_server, :stop) end)
+
+      for {label, callback_fn} <- [
+            {"throw", fn _middle, s -> throw({:abort, s}) end},
+            {"exit", fn _middle, s -> exit({:failed, s}) end},
+            {"call_timeout",
+             fn middle, s -> GenServer.call(silent_server, {:archive, middle, s}, 10) end}
+          ] do
+        catch_state = %{state | config: %{state.config | on_compaction: callback_fn}}
+
+        catch_log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            {:compacted, _} = Compactor.maybe_compact(catch_state)
+          end)
+
+        assert catch_log =~ "on_compaction callback error", "expected warning for #{label}"
+        refute catch_log =~ "sk-secret-compactor-key", "leaked api_key for #{label}"
+      end
     end
 
     test "logs stacktrace when on_compaction throws" do

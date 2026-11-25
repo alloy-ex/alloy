@@ -497,7 +497,7 @@ defmodule Alloy.Tool.Core.BashTest do
       cases = [
         {fn _, _ -> Map.fetch!(creds, :missing_key) end, "KeyError (key :missing_key not found)"},
         {fn _, _ -> {:ok, _} = Function.identity({:error, creds}) end, "MatchError"},
-        {fn _, _ -> exit({:failed, creds}) end, "exit: unexpected tuple"},
+        {fn _, _ -> exit({:failed, creds}) end, "exit: {:failed, ...}"},
         {fn _, _ -> throw(creds) end, "throw: unexpected map"}
       ]
 
