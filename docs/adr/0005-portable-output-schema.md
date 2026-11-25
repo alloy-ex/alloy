@@ -27,9 +27,11 @@ decoded into `Alloy.Result.output`:
    `Alloy.Agent.Config.from_opts/1` (and rejected inside provider config tuples
    so `Turn` always owns decoding and `State.prepare(state, output_schema: nil)`
    clears it cleanly). The normalized struct caches its preflighted schema
-   resolution so repeated `State.prepare/2` calls, provider wire translations,
-   and final response validation do not re-normalize or re-resolve per request
-   (while `Codex` embeds the normalized schema into its prompt).
+   resolution so repeated `State.prepare/2` calls with a normalized
+   `%Alloy.OutputSchema{}`, provider wire translations, and final response
+   validation do not re-normalize or re-resolve per request (passing a raw map
+   to `State.prepare/2` re-normalizes it, and `Codex` embeds the normalized
+   schema into its prompt).
 2. **Provider wire translation & `extra_body` preservation:** Each built-in
    HTTP provider translates `:output_schema` into its native wire field.
    Anthropic (`output_config`), OpenAI/xAI (`text`), and Gemini

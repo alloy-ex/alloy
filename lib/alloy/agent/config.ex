@@ -477,10 +477,17 @@ defmodule Alloy.Agent.Config do
   end
 
   defp format_invalid_provider({mod, _config}),
-    do: "{#{Sanitize.inspect_bounded(mod)}, ...}"
+    do: "{#{format_invalid_provider(mod)}, ...}"
 
-  defp format_invalid_provider(other),
-    do: Sanitize.inspect_bounded(other)
+  defp format_invalid_provider(other)
+       when is_atom(other) or is_number(other) or is_binary(other),
+       do: Sanitize.inspect_bounded(other)
+
+  defp format_invalid_provider(%mod{}), do: "%#{inspect(mod)}{...}"
+  defp format_invalid_provider(other) when is_map(other), do: "a map"
+  defp format_invalid_provider(other) when is_list(other), do: "a list"
+  defp format_invalid_provider(other) when is_tuple(other), do: "a tuple"
+  defp format_invalid_provider(_other), do: "an unsupported value"
 
   defp normalize_provider_config(config) when is_map(config), do: config
   defp normalize_provider_config(config) when is_list(config), do: Map.new(config)

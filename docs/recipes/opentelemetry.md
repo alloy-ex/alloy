@@ -3,7 +3,7 @@
 Alloy emits structured `:telemetry` spans and events without pulling
 OpenTelemetry into its core dependencies. You can bridge them to OpenTelemetry
 (following the OpenTelemetry GenAI semantic conventions) in your application
-startup with ~85 lines of Elixir.
+startup with ~115 lines of Elixir.
 
 When `:timeout_ms` is finite, Alloy's supervised HTTP/SSE and custom bash
 workers automatically propagate your process's OpenTelemetry context
@@ -85,7 +85,7 @@ defmodule MyApp.AlloyOtel do
 
   def handle_event([:alloy, :turn, :start], _measurements, meta, _cfg) do
     OpentelemetryTelemetry.start_telemetry_span(@tracer_id, "alloy.turn", meta, %{
-      attributes: %{"alloy.turn" => meta[:turn]}
+      attributes: %{"alloy.turn" => meta[:turn] || 0}
     })
   end
 
@@ -106,8 +106,8 @@ defmodule MyApp.AlloyOtel do
     Tracer.add_event("gen_ai.provider.request", %{
       "gen_ai.provider.name" => provider_name(meta[:provider]),
       "gen_ai.request.model" => to_string(meta[:model] || ""),
-      "alloy.streaming" => meta[:streaming],
-      "alloy.attempt" => meta[:attempt],
+      "alloy.streaming" => meta[:streaming] == true,
+      "alloy.attempt" => meta[:attempt] || 0,
       "alloy.result" => to_string(meta[:result]),
       "alloy.duration_ms" => duration_ms
     })
@@ -120,7 +120,7 @@ defmodule MyApp.AlloyOtel do
     Tracer.add_event("gen_ai.tool.execute", %{
       "gen_ai.tool.name" => to_string(meta[:tool_name] || ""),
       "gen_ai.tool.call.id" => to_string(meta[:tool_id] || ""),
-      "alloy.turn" => meta[:turn],
+      "alloy.turn" => meta[:turn] || 0,
       "alloy.duration_ms" => duration_ms,
       "alloy.tool.is_error" => not is_nil(meta[:error])
     })
@@ -128,9 +128,9 @@ defmodule MyApp.AlloyOtel do
 
   def handle_event([:alloy, :compaction, :done], measurements, meta, _cfg) do
     Tracer.add_event("alloy.compaction.done", %{
-      "alloy.turn" => meta[:turn],
-      "alloy.messages_before" => measurements[:messages_before],
-      "alloy.messages_after" => measurements[:messages_after]
+      "alloy.turn" => meta[:turn] || 0,
+      "alloy.messages_before" => measurements[:messages_before] || 0,
+      "alloy.messages_after" => measurements[:messages_after] || 0
     })
   end
 
@@ -142,7 +142,7 @@ defmodule MyApp.AlloyOtel do
 
   defp provider_name(Alloy.Provider.Anthropic), do: "anthropic"
   defp provider_name(Alloy.Provider.OpenAI), do: "openai"
-  defp provider_name(Alloy.Provider.XAI), do: "xai"
+  defp provider_name(Alloy.Provider.XAI), do: "x_ai"
   defp provider_name(Alloy.Provider.Gemini), do: "gcp.gemini"
   defp provider_name(Alloy.Provider.OpenAICompat), do: "openai_compat"
   defp provider_name(Alloy.Provider.Codex), do: "codex"

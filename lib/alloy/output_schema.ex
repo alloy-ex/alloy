@@ -32,7 +32,7 @@ defmodule Alloy.OutputSchema do
     startup. Full Draft 4/6/7 validation runs when optional `:ex_json_schema` is
     loaded (bounded to 10 errors / 1,000 bytes; Draft 7
     `contentMediaType: "application/json"` requires
-    `:decode_json` for `contentMediaType: "application/json"`); without
+    `config :ex_json_schema, decode_json: &Jason.decode/1`); without
     `:ex_json_schema` or for newer dialects (Draft 2019-09 / 2020-12), Alloy
     falls back to top-level JSON `"type"` and `"required"` checks only (logging
     a `Logger.warning` when `:ex_json_schema` is loaded and encounters an

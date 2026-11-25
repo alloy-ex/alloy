@@ -210,6 +210,20 @@ defmodule Alloy.Agent.ConfigTest do
         end
 
       refute Exception.message(err3) =~ secret
+
+      for bad_shape <- [
+            [api_key: secret],
+            %{module: Alloy.Provider.Test, api_key: secret},
+            {Alloy.Provider.Test, [api_key: secret], :extra},
+            URI.parse("https://user:#{secret}@example.com")
+          ] do
+        err =
+          assert_raise ArgumentError, ~r/provider must be a module/, fn ->
+            Config.from_opts(provider: bad_shape)
+          end
+
+        refute Exception.message(err) =~ secret
+      end
     end
   end
 
