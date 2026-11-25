@@ -642,7 +642,7 @@ defmodule Alloy.Provider.Gemini do
         {:ok, wrapper}
 
       {:ok, _non_map} ->
-        {:error, %Error{kind: :protocol_error, message: "Malformed JSON in Gemini SSE chunk"}}
+        {:error, %Error{kind: :protocol_error, message: "Malformed payload in Gemini SSE chunk"}}
 
       {:error, reason} ->
         {:error,
@@ -821,12 +821,7 @@ defmodule Alloy.Provider.Gemini do
 
   defp validate_gemini_generation_config(body, generation_config)
        when is_map(generation_config) do
-    invalid_mime =
-      [
-        Map.get(generation_config, "responseMimeType"),
-        Map.get(generation_config, "response_mime_type")
-      ]
-      |> Enum.find(&(&1 not in [nil, "application/json"]))
+    mime = Map.get(generation_config, "responseMimeType")
 
     cond do
       Map.has_key?(generation_config, "responseSchema") or
@@ -838,12 +833,21 @@ defmodule Alloy.Provider.Gemini do
              "cannot combine :output_schema with legacy generationConfig[\"responseSchema\"] on Gemini"
          }}
 
-      not is_nil(invalid_mime) ->
+      Map.has_key?(generation_config, "response_json_schema") or
+          Map.has_key?(generation_config, "response_mime_type") ->
         {:error,
          %Error{
            kind: :invalid_request,
            message:
-             "cannot combine :output_schema with non-JSON generationConfig[\"responseMimeType\"] (#{inspect(invalid_mime)}) on Gemini"
+             "cannot combine :output_schema with snake_case generationConfig keys (use camelCase responseMimeType/responseJsonSchema or omit them) on Gemini"
+         }}
+
+      mime not in [nil, "application/json"] ->
+        {:error,
+         %Error{
+           kind: :invalid_request,
+           message:
+             "cannot combine :output_schema with non-JSON generationConfig[\"responseMimeType\"] (#{inspect(mime)}) on Gemini"
          }}
 
       true ->

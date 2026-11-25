@@ -53,8 +53,13 @@ cancellation, and deadlines stop requests immediately.
 ## 4. Custom providers & `Alloy.Provider.decode_body/1`
 
 - When `:timeout_ms` is finite, Alloy passes internal `:alloy_request_deadline`
-  in `provider_config`. Custom providers using strict validators
-  (`Keyword.validate!/2`, `NimbleOptions`) should ignore unknown `:alloy_*` keys.
+  in `provider_config`. When the caller sets `:output_schema`, Alloy also
+  injects `:output_schema` (an `Alloy.OutputSchema.t()` struct; omitted when
+  unset). Custom providers using strict validators (`Keyword.validate!/2`,
+  `NimbleOptions`) should tolerate unknown `:alloy_*` keys and `:output_schema`,
+  and custom providers that want to support `:output_schema` must translate
+  `config.output_schema.schema` into their wire format (otherwise the run fails
+  terminally at JSON decode unless the model happened to emit conforming JSON).
 - `Alloy.Provider.decode_body/1` now rejects non-object JSON (`null`, arrays,
   scalars) with `{:error, %Alloy.Provider.Error{kind: :protocol_error}}` and
   invalid JSON with `{:error, %Alloy.Provider.Error{kind: :malformed_reply}}`
@@ -138,7 +143,13 @@ automatically during compaction summaries, decodes the final JSON into
   (`gemini-3-flash`), use `until_tool` / `stop_after_tool`, or drive a separate
   follow-up no-tools `Alloy.run/2` turn with `:output_schema`. On Gemini,
   combining `:output_schema` with legacy `generation_config` /
-  `extra_body["generationConfig"]` `responseSchema` (`response_schema`) or a
-  non-JSON `responseMimeType` (`response_mime_type`) returns a non-retryable
+  `extra_body["generationConfig"]` `responseSchema` (`response_schema`),
+  snake_case `response_json_schema` / `response_mime_type`, or a non-JSON
+  `responseMimeType` returns a non-retryable
   `{:error, %Alloy.Provider.Error{kind: :invalid_request}}`, so the run ends
-  with `{:error, result}` unless a fallback provider succeeds.
+  with `{:error, result}` unless a fallback provider succeeds. Note that
+  explicitly overriding a provider's wire schema key via `:extra_body`
+  (`output_config.format`, `text.format`, `response_format`,
+  `generationConfig.responseJsonSchema`) replaces what is sent on the wire
+  only — Alloy still validates the decoded reply against the top-level
+  `:output_schema`.

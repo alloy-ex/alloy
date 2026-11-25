@@ -446,12 +446,26 @@ defmodule Alloy.OutputSchemaTest do
                  %{
                    api_key: "k",
                    model: "gemini-3-flash",
-                   generation_config: %{response_mime_type: "text/plain"},
+                   generation_config: %{response_mime_type: "application/json"},
                    output_schema: @answer_schema
                  }
                )
 
-      assert msg6 =~ ~s(non-JSON generationConfig["responseMimeType"])
+      assert msg6 =~ "snake_case generationConfig keys"
+
+      assert {:error, %Error{kind: :invalid_request, message: msg7}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3-flash",
+                   extra_body: %{generationConfig: %{response_json_schema: %{type: "object"}}},
+                   output_schema: @answer_schema
+                 }
+               )
+
+      assert msg7 =~ "snake_case generationConfig keys"
     end
 
     test "atom-keyed nested extra_body merges without duplicate JSON keys and lets caller win" do
@@ -803,6 +817,79 @@ defmodule Alloy.OutputSchemaTest do
                )
 
       assert msg =~ ~s(non-JSON generationConfig["responseMimeType"])
+    end
+
+    test "custom providers receive %OutputSchema{} when set and omit :output_schema when nil" do
+      defmodule CustomSchemaProvider do
+        @behaviour Alloy.Provider
+
+        @impl true
+        def complete(_messages, _tool_defs, config) do
+          send(config.test_pid, {:custom_config, config})
+
+          text =
+            if Map.has_key?(config, :output_schema),
+              do: ~s({"answer":"custom","confidence":1}),
+              else: "plain"
+
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [Message.assistant(text)],
+             usage: %{input_tokens: 1, output_tokens: 1}
+           }}
+        end
+      end
+
+      assert {:ok, %Result{output: %{"answer" => "custom", "confidence" => 1}}} =
+               Alloy.run("hi",
+                 provider: {CustomSchemaProvider, test_pid: self()},
+                 output_schema: @answer_schema
+               )
+
+      assert_received {:custom_config, config_with_schema}
+      assert %OutputSchema{name: "alloy_output", strict: true} = config_with_schema.output_schema
+
+      assert {:ok, %Result{text: "plain", output: nil}} =
+               Alloy.run("hi", provider: {CustomSchemaProvider, test_pid: self()})
+
+      assert_received {:custom_config, config_without_schema}
+      refute Map.has_key?(config_without_schema, :output_schema)
+    end
+
+    test "OpenAI refusal under :output_schema reports refusal instead of JSON parse failure" do
+      Req.Test.stub(:output_schema_openai_refusal, fn conn ->
+        Req.Test.json(conn, %{
+          "id" => "resp_refuse",
+          "status" => "completed",
+          "output" => [
+            %{
+              "type" => "message",
+              "role" => "assistant",
+              "content" => [
+                %{"type" => "refusal", "refusal" => "I cannot comply with that request."}
+              ]
+            }
+          ],
+          "usage" => %{"input_tokens" => 5, "output_tokens" => 7}
+        })
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                text: "I cannot comply with that request.",
+                error: "The model refused to produce structured output"
+              }} =
+               Alloy.run("disallowed",
+                 provider:
+                   {OpenAI,
+                    api_key: "k",
+                    model: "gpt-5.4",
+                    req_options: [plug: {Req.Test, :output_schema_openai_refusal}]},
+                 output_schema: @answer_schema
+               )
     end
 
     test "does not duplicate :output inside result.metadata.run and skips validation on stop_after_tool" do

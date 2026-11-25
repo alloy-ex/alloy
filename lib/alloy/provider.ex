@@ -56,10 +56,14 @@ defmodule Alloy.Provider do
   - `config` - Provider-specific configuration (API keys, model, etc.). When
     called from `Alloy.Agent.Turn`, Alloy may also inject `:system_prompt`,
     `:provider_state`, `:on_event` (when streaming), `:req_options` (with
-    `:receive_timeout`), and `:alloy_request_deadline` (monotonic ms deadline
-    that built-in providers enforce as a hard wall-clock bound). Custom
-    providers using strict config validation should tolerate or ignore these
-    runtime keys.
+    `:receive_timeout`), `:alloy_request_deadline` (monotonic ms deadline
+    that built-in providers enforce as a hard wall-clock bound), and
+    `:output_schema` (an `Alloy.OutputSchema.t()` struct, injected only when
+    the caller sets `:output_schema`). Custom providers using strict config
+    validation should tolerate or ignore these runtime keys, and custom
+    providers that want to support `:output_schema` should translate
+    `config.output_schema.schema` (otherwise Alloy's final JSON decode will
+    fail terminally unless the model already replied with conforming JSON).
 
   ## Returns
   - `{:ok, completion_response()}` on success

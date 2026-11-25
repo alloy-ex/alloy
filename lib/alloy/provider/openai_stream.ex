@@ -54,7 +54,7 @@ defmodule Alloy.Provider.OpenAIStream do
       finish_reason: nil,
       done?: false,
       stream_error: nil,
-      malformed_error: nil,
+      sticky_error: nil,
       usage: %{},
       on_chunk: on_chunk
     }
@@ -170,7 +170,7 @@ defmodule Alloy.Provider.OpenAIStream do
 
   # Once a malformed chunk is recorded, stop emitting chunks while still
   # allowing an in-band API error chunk to take precedence.
-  defp handle_event(%{malformed_error: %Error{}} = acc, %{data: data}) do
+  defp handle_event(%{sticky_error: %Error{}} = acc, %{data: data}) do
     case Jason.decode(data) do
       {:ok, %{"error" => error} = event} when is_map(error) or is_binary(error) ->
         %{acc | stream_error: Error.from_body(event)}
@@ -252,7 +252,7 @@ defmodule Alloy.Provider.OpenAIStream do
            ) do
       acc = accumulate_tool_calls(acc, Map.get(delta, "tool_calls", []))
 
-      if acc.malformed_error do
+      if acc.sticky_error do
         acc
       else
         acc =
@@ -452,19 +452,19 @@ defmodule Alloy.Provider.OpenAIStream do
   end
 
   defp record_malformed_error(acc, message) do
-    %{acc | malformed_error: %Error{kind: :malformed_reply, message: message}}
+    %{acc | sticky_error: %Error{kind: :malformed_reply, message: message}}
   end
 
-  defp record_protocol_error(%{malformed_error: %Error{}} = acc, _message), do: acc
+  defp record_protocol_error(%{sticky_error: %Error{}} = acc, _message), do: acc
 
   defp record_protocol_error(acc, message) do
-    %{acc | malformed_error: %Error{kind: :protocol_error, message: message}}
+    %{acc | sticky_error: %Error{kind: :protocol_error, message: message}}
   end
 
   # ── Response Building ────────────────────────────────────────────────
 
   defp build_response(%{stream_error: %Error{} = error}), do: {:error, error}
-  defp build_response(%{malformed_error: %Error{} = error}), do: {:error, error}
+  defp build_response(%{sticky_error: %Error{} = error}), do: {:error, error}
 
   # Neither a finish_reason nor [DONE]: the connection was cut mid-response,
   # so the partial output must not be passed off as a complete answer.

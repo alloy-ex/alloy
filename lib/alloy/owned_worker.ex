@@ -9,6 +9,8 @@ defmodule Alloy.OwnedWorker do
   # directly to the owner task bypasses owner cleanup, so a worker that sets
   # `:trap_exit` would not receive an explicit kill in that edge case.)
 
+  alias Alloy.Internal.Sanitize
+
   @worker_kill_timeout_ms 1_000
   @cancel_timeout_ms 1_500
 
@@ -75,9 +77,6 @@ defmodule Alloy.OwnedWorker do
   def format_exit_reason({tag, _stacktrace}) when is_atom(tag), do: inspect(tag)
   def format_exit_reason(_other), do: "unexpected exit"
 
-  @spec sanitize_stacktrace(Exception.stacktrace()) :: Exception.stacktrace()
-  defdelegate sanitize_stacktrace(stacktrace), to: Alloy.Internal.Sanitize, as: :stacktrace
-
   defp run_worker(owner, done_ref, fun) do
     result = fun.()
     send(owner, {done_ref, {:ok, result}})
@@ -86,7 +85,7 @@ defmodule Alloy.OwnedWorker do
       send(
         owner,
         {done_ref,
-         {:worker_exit, {:worker_crash, kind, reason, sanitize_stacktrace(__STACKTRACE__)}}}
+         {:worker_exit, {:worker_crash, kind, reason, Sanitize.stacktrace(__STACKTRACE__)}}}
       )
 
       terminate_after_crash(kind, reason)

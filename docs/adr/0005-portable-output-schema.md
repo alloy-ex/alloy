@@ -26,8 +26,9 @@ decoded into `Alloy.Result.output`:
 1. **Top-level ownership:** `:output_schema` is validated at startup in
    `Alloy.Agent.Config.from_opts/1` (and rejected inside provider config tuples
    so `Turn` always owns decoding and `State.prepare(state, output_schema: nil)`
-   clears it cleanly). Providers consume the already-validated struct through an
-   O(1) wire helper without re-encoding or re-resolving per request.
+   clears it cleanly). Built-in HTTP providers consume `spec.schema` through an
+   O(1) wire helper without re-normalizing or re-resolving per request (and
+   `Codex` embeds it into its prompt).
 2. **Provider wire translation & `extra_body` preservation:** Each built-in
    HTTP provider translates `:output_schema` into its native wire field and
    merges one level deep on the enclosing container (`output_config`, `text`,

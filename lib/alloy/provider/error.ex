@@ -206,18 +206,18 @@ defmodule Alloy.Provider.Error do
     {raw, stored} =
       case label(error["message"]) do
         nil -> encode_error_fallback(error)
-        msg -> {msg, cap_bytes(msg, 2_000)}
+        msg -> {msg, Sanitize.cap_bytes(msg, 2_000)}
       end
 
     {label(error["type"]) || label(error["status"]), label(error["code"]), raw, stored}
   end
 
   defp fields(%{"error" => error}) when is_binary(error),
-    do: {nil, nil, error, cap_bytes(error, 2_000)}
+    do: {nil, nil, error, Sanitize.cap_bytes(error, 2_000)}
 
   defp fields([first | _]), do: fields(first)
 
-  defp fields(body) when is_binary(body), do: {nil, nil, body, cap_bytes(body, 2_000)}
+  defp fields(body) when is_binary(body), do: {nil, nil, body, Sanitize.cap_bytes(body, 2_000)}
 
   defp fields(body) do
     {raw, stored} = encode_error_fallback(body)
@@ -233,10 +233,6 @@ defmodule Alloy.Provider.Error do
 
     {raw, Sanitize.cap_bytes(raw, 500)}
   end
-
-  @doc false
-  @spec cap_bytes(String.t(), pos_integer()) :: String.t()
-  defdelegate cap_bytes(str, max_bytes), to: Sanitize
 
   defp label(value) when is_binary(value) and value != "", do: value
   defp label(_value), do: nil
@@ -268,7 +264,7 @@ defmodule Alloy.Provider.Error do
   # Bound the overflow scan to 64 KiB so multi-MB error bodies cannot allocate
   # large lowercased copies while still catching long proxy-wrapped errors.
   defp overflow?(code, message) do
-    scanned = cap_bytes(message, 65_536)
+    scanned = Sanitize.cap_bytes(message, 65_536)
     text = String.downcase("#{code} #{scanned}")
     Enum.any?(@overflow_phrases, &String.contains?(text, &1))
   end

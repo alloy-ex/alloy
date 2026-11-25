@@ -134,7 +134,7 @@ defmodule Alloy.Provider.OpenAI do
       buffer: "",
       response: nil,
       stream_error: nil,
-      malformed_error: nil,
+      sticky_error: nil,
       on_chunk: on_chunk
     }
 
@@ -403,7 +403,7 @@ defmodule Alloy.Provider.OpenAI do
   # Once a malformed chunk is recorded, suppress text deltas while still
   # accepting explicit API errors ("error" / "response.failed") so they take
   # precedence over malformed sibling chunks.
-  defp handle_stream_event(%{malformed_error: %Error{}} = acc, %{event: event_name, data: data}) do
+  defp handle_stream_event(%{sticky_error: %Error{}} = acc, %{event: event_name, data: data}) do
     case Jason.decode(data) do
       {:ok, parsed} when is_map(parsed) ->
         event_type = event_name || Map.get(parsed, "type")
@@ -426,7 +426,7 @@ defmodule Alloy.Provider.OpenAI do
         {:ok, _non_map} ->
           %{
             acc
-            | malformed_error: %Error{
+            | sticky_error: %Error{
                 kind: :protocol_error,
                 message: "Malformed payload in OpenAI SSE event"
               }
@@ -435,7 +435,7 @@ defmodule Alloy.Provider.OpenAI do
         {:error, _} ->
           %{
             acc
-            | malformed_error: %Error{
+            | sticky_error: %Error{
                 kind: :malformed_reply,
                 message: "Malformed JSON in OpenAI SSE event"
               }
@@ -482,7 +482,7 @@ defmodule Alloy.Provider.OpenAI do
   defp process_stream_event(acc, _event_type, _payload), do: acc
 
   defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
-  defp build_stream_response(%{malformed_error: %Error{} = error}), do: {:error, error}
+  defp build_stream_response(%{sticky_error: %Error{} = error}), do: {:error, error}
 
   defp build_stream_response(%{response: response}) when is_map(response),
     do: parse_response(response)
@@ -685,10 +685,10 @@ defmodule Alloy.Provider.OpenAI do
         [%{type: "text", text: text} |> maybe_put_annotations(item["annotations"])]
 
       %{"type" => "refusal", "refusal" => text} when is_binary(text) and text != "" ->
-        [%{type: "text", text: text}]
+        [%{type: "text", text: text, refusal: true}]
 
       %{"type" => "refusal", "text" => text} when is_binary(text) and text != "" ->
-        [%{type: "text", text: text}]
+        [%{type: "text", text: text, refusal: true}]
 
       _ ->
         []

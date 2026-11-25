@@ -79,7 +79,7 @@ defmodule MyApp.AlloyOtel do
 
   def handle_event([:alloy, :run, :exception], _measurements, meta, _cfg) do
     OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, meta)
-    Tracer.set_status(:error, inspect(meta[:reason]))
+    Tracer.set_status(:error, bounded_reason(meta[:reason]))
     OpentelemetryTelemetry.end_telemetry_span(@tracer_id, meta)
   end
 
@@ -97,14 +97,14 @@ defmodule MyApp.AlloyOtel do
 
   def handle_event([:alloy, :turn, :exception], _measurements, meta, _cfg) do
     OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, meta)
-    Tracer.set_status(:error, inspect(meta[:reason]))
+    Tracer.set_status(:error, bounded_reason(meta[:reason]))
     OpentelemetryTelemetry.end_telemetry_span(@tracer_id, meta)
   end
 
   # Alloy emits [:alloy, :provider, :request] once per attempt with duration_ms.
   def handle_event([:alloy, :provider, :request], %{duration_ms: duration_ms}, meta, _cfg) do
     Tracer.add_event("gen_ai.provider.request", %{
-      "gen_ai.provider.name" => inspect(meta[:provider]),
+      "gen_ai.provider.name" => provider_name(meta[:provider]),
       "gen_ai.request.model" => to_string(meta[:model] || ""),
       "alloy.streaming" => meta[:streaming],
       "alloy.attempt" => meta[:attempt],
@@ -133,6 +133,18 @@ defmodule MyApp.AlloyOtel do
       "alloy.messages_after" => measurements[:messages_after]
     })
   end
+
+  defp bounded_reason(reason) do
+    inspect(reason, limit: 20, printable_limit: 500)
+  end
+
+  defp provider_name(Alloy.Provider.Anthropic), do: "anthropic"
+  defp provider_name(Alloy.Provider.OpenAI), do: "openai"
+  defp provider_name(Alloy.Provider.XAI), do: "xai"
+  defp provider_name(Alloy.Provider.Gemini), do: "gcp.gemini"
+  defp provider_name(Alloy.Provider.OpenAICompat), do: "openai_compat"
+  defp provider_name(Alloy.Provider.Codex), do: "codex"
+  defp provider_name(other), do: inspect(other)
 end
 ```
 
@@ -140,7 +152,8 @@ end
 
 - **Context propagation:** Alloy copies `:"$__current_otel_ctx"` into
   supervised HTTP/SSE and custom bash workers, so downstream Finch/HTTP spans
-  stay linked to your active `alloy.turn` span.
+  stay linked to your active `alloy.turn` span when your host also installs
+  Finch/Req OpenTelemetry instrumentation (for example `:opentelemetry_finch`).
 - **Usage attributes:** Attach `result.usage` (`input_tokens`, `output_tokens`,
   `cache_read_input_tokens`, `cache_creation_input_tokens`) at the `Alloy.run/2`
   call site or inside `:after_completion` middleware to record token totals on

@@ -168,7 +168,7 @@ defmodule Alloy.Provider.Anthropic do
     initial_acc = %{
       buffer: "",
       error: nil,
-      protocol_error: nil,
+      sticky_error: nil,
       tool_json_error: nil,
       message: %{},
       content_blocks: %{},
@@ -210,7 +210,7 @@ defmodule Alloy.Provider.Anthropic do
   # emitting chunks/events (so Retry can still retry if nothing was streamed
   # yet), except "error" (API error takes precedence) and "message_delta" (so
   # stop_reason: "refusal" still bypasses retries).
-  defp handle_sse_raw_event(%{protocol_error: %Error{}} = acc, %{event: event_type, data: data})
+  defp handle_sse_raw_event(%{sticky_error: %Error{}} = acc, %{event: event_type, data: data})
        when event_type in ["error", "message_delta"] do
     case Jason.decode(data) do
       {:ok, parsed} when is_map(parsed) -> handle_sse_event(acc, event_type, parsed)
@@ -218,7 +218,7 @@ defmodule Alloy.Provider.Anthropic do
     end
   end
 
-  defp handle_sse_raw_event(%{protocol_error: %Error{}} = acc, _event), do: acc
+  defp handle_sse_raw_event(%{sticky_error: %Error{}} = acc, _event), do: acc
 
   # Bridge from SSE module's raw events to Anthropic's typed event handler.
   # Known Anthropic SSE events carry a JSON object payload; undecodable or
@@ -501,14 +501,14 @@ defmodule Alloy.Provider.Anthropic do
 
   defp tool_use_block?(_block), do: false
 
-  defp record_protocol_error(%{protocol_error: %Error{}} = acc, _message), do: acc
+  defp record_protocol_error(%{sticky_error: %Error{}} = acc, _message), do: acc
 
   defp record_protocol_error(acc, message) do
-    %{acc | protocol_error: %Error{kind: :protocol_error, message: message}}
+    %{acc | sticky_error: %Error{kind: :protocol_error, message: message}}
   end
 
   defp record_malformed_error(acc, message) do
-    %{acc | protocol_error: %Error{kind: :malformed_reply, message: message}}
+    %{acc | sticky_error: %Error{kind: :malformed_reply, message: message}}
   end
 
   defp record_tool_json_error(%{tool_json_error: %Error{}} = acc, _message), do: acc
@@ -532,7 +532,7 @@ defmodule Alloy.Provider.Anthropic do
     assemble_stream_response(acc)
   end
 
-  defp build_stream_response(%{protocol_error: %Error{} = error}), do: {:error, error}
+  defp build_stream_response(%{sticky_error: %Error{} = error}), do: {:error, error}
 
   defp build_stream_response(%{
          message: %{"stop_reason" => stop_reason},

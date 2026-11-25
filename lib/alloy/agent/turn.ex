@@ -559,15 +559,29 @@ defmodule Alloy.Agent.Turn do
   defp decode_structured_output(%State{run_metadata: %{final_tool: _}} = state), do: {:ok, state}
 
   defp decode_structured_output(%State{config: %{output_schema: spec}} = state) do
-    case OutputSchema.decode_and_validate(last_assistant_raw_text(state), spec) do
-      {:ok, decoded} ->
-        {:ok, State.merge_run_metadata(state, %{output: decoded})}
+    if last_assistant_refusal?(state) do
+      {:error, "The model refused to produce structured output"}
+    else
+      case OutputSchema.decode_and_validate(last_assistant_raw_text(state), spec) do
+        {:ok, decoded} ->
+          {:ok, State.merge_run_metadata(state, %{output: decoded})}
 
-      {:error, reason} when state.stop_reason == :max_tokens ->
-        {:error, "Structured output was truncated at :max_tokens (#{reason})"}
+        {:error, reason} when state.stop_reason == :max_tokens ->
+          {:error, "Structured output was truncated at :max_tokens (#{reason})"}
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp last_assistant_refusal?(%State{messages: messages}) do
+    case messages |> Enum.reverse() |> Enum.find(&(&1.role == :assistant)) do
+      %Message{content: blocks} when is_list(blocks) ->
+        Enum.any?(blocks, &match?(%{refusal: true}, &1))
+
+      _other ->
+        false
     end
   end
 
