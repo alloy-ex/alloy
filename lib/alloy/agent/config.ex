@@ -180,14 +180,20 @@ defmodule Alloy.Agent.Config do
     {compaction, compaction_explicit} = resolve_compaction(opts[:compaction], max_tokens)
     tools = Keyword.get(opts, :tools, []) ++ memory_tools(Keyword.get(opts, :memory))
 
+    system_prompt = opts[:system_prompt]
+    tool_validation = Keyword.get(opts, :tool_validation, :required)
+    context = Keyword.get(opts, :context, %{})
+    on_compaction = opts[:on_compaction]
+    code_execution = Keyword.get(opts, :code_execution, false)
+
     %__MODULE__{
       provider: provider_mod,
       provider_config: provider_config,
       tools: tools,
       system_prompt:
-        require_opt!(
-          is_nil(opts[:system_prompt]) or is_binary(opts[:system_prompt]),
-          opts[:system_prompt],
+        require_opt_shape!(
+          is_nil(system_prompt) or is_binary(system_prompt),
+          system_prompt,
           "system_prompt must be a string or nil"
         ),
       max_turns: validate_pos_integer!(Keyword.get(opts, :max_turns, 25), :max_turns),
@@ -202,8 +208,8 @@ defmodule Alloy.Agent.Config do
       tool_concurrency: validate_tool_concurrency!(Keyword.get(opts, :tool_concurrency)),
       tool_validation:
         require_opt!(
-          Keyword.get(opts, :tool_validation, :required) in [:required, :schema],
-          Keyword.get(opts, :tool_validation, :required),
+          tool_validation in [:required, :schema],
+          tool_validation,
           "tool_validation must be :required or :schema"
         ),
       stop_after_tool:
@@ -221,16 +227,11 @@ defmodule Alloy.Agent.Config do
       compaction_explicit: compaction_explicit,
       working_directory:
         validate_non_empty_string!(Keyword.get(opts, :working_directory, "."), :working_directory),
-      context:
-        require_opt!(
-          is_map(Keyword.get(opts, :context, %{})),
-          Keyword.get(opts, :context, %{}),
-          "context must be a map"
-        ),
+      context: require_opt_shape!(is_map(context), context, "context must be a map"),
       on_compaction:
         require_opt!(
-          is_nil(opts[:on_compaction]) or is_function(opts[:on_compaction], 2),
-          opts[:on_compaction],
+          is_nil(on_compaction) or is_function(on_compaction, 2),
+          on_compaction,
           "on_compaction must be a 2-arity function or nil"
         ),
       fallback_providers:
@@ -239,8 +240,8 @@ defmodule Alloy.Agent.Config do
         |> validate_fallback_providers!(),
       code_execution:
         require_opt!(
-          is_boolean(Keyword.get(opts, :code_execution, false)),
-          Keyword.get(opts, :code_execution, false),
+          is_boolean(code_execution),
+          code_execution,
           "code_execution must be a boolean"
         ),
       model_metadata_overrides: model_metadata_overrides,
@@ -257,6 +258,11 @@ defmodule Alloy.Agent.Config do
 
   defp require_opt!(false, value, msg),
     do: raise(ArgumentError, "#{msg}, got: #{Sanitize.inspect_bounded(value)}")
+
+  defp require_opt_shape!(true, value, _msg), do: value
+
+  defp require_opt_shape!(false, value, msg),
+    do: raise(ArgumentError, "#{msg}, got: #{Sanitize.shape_summary(value)}")
 
   defp validate_timeout_ms!(:infinity), do: :infinity
 
@@ -312,7 +318,7 @@ defmodule Alloy.Agent.Config do
   end
 
   defp validate_fallback_providers!(value) do
-    require_opt!(is_list(value), value, "fallback_providers must be a list")
+    require_opt_shape!(is_list(value), value, "fallback_providers must be a list")
     |> Enum.map(&parse_fallback_provider/1)
   end
 

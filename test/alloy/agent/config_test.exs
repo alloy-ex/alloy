@@ -226,6 +226,34 @@ defmodule Alloy.Agent.ConfigTest do
 
         refute Exception.message(err) =~ secret
       end
+
+      for bad_fallbacks <- [
+            {Alloy.Provider.Test, api_key: secret},
+            %{module: Alloy.Provider.Test, api_key: secret}
+          ] do
+        err =
+          assert_raise ArgumentError, ~r/fallback_providers must be a list/, fn ->
+            Config.from_opts(provider: Alloy.Provider.Test, fallback_providers: bad_fallbacks)
+          end
+
+        refute Exception.message(err) =~ secret
+      end
+
+      ctx_err =
+        assert_raise ArgumentError, ~r/context must be a map/, fn ->
+          Config.from_opts(provider: Alloy.Provider.Test, context: [api_key: secret])
+        end
+
+      refute Exception.message(ctx_err) =~ secret
+      assert Exception.message(ctx_err) =~ "got: list"
+
+      prompt_err =
+        assert_raise ArgumentError, ~r/system_prompt must be a string or nil/, fn ->
+          Config.from_opts(provider: Alloy.Provider.Test, system_prompt: %{api_key: secret})
+        end
+
+      refute Exception.message(prompt_err) =~ secret
+      assert Exception.message(prompt_err) =~ "got: map"
     end
   end
 

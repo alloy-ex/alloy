@@ -409,7 +409,7 @@ defmodule Alloy.Tool.Validation do
     end)
   end
 
-  defp has_nested_id?(%{"$ref" => ref}) when is_binary(ref), do: false
+  defp has_nested_id?(%{"$ref" => ref}) when is_binary(ref) or is_struct(ref), do: false
   defp has_nested_id?(%{"$id" => id}) when is_binary(id), do: true
   defp has_nested_id?(%{"id" => id}) when is_binary(id), do: true
   defp has_nested_id?(_map), do: false

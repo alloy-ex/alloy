@@ -558,6 +558,9 @@ defmodule Alloy.Agent.Turn do
   defp maybe_put_output_schema(provider_config, %OutputSchema{} = spec),
     do: Map.put(provider_config, :output_schema, spec)
 
+  defp maybe_put_output_schema(provider_config, raw),
+    do: Map.put(provider_config, :output_schema, OutputSchema.normalize!(raw))
+
   defp extract_tool_calls(messages) do
     Enum.flat_map(messages, &Message.tool_calls/1)
   end

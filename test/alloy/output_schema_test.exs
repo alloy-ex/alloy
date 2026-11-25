@@ -1751,6 +1751,31 @@ defmodule Alloy.OutputSchemaTest do
                  provider: {Alloy.Provider.Test, agent_pid: prefill_pid},
                  output_schema: @answer_schema
                )
+
+      # A prior refusal assistant message followed by an empty final turn must
+      # classify as :missing_text rather than re-triggering stale :refusal.
+      prior_refusal_messages = [
+        Message.user("turn 1"),
+        %Message{role: :assistant, content: [%{type: "text", text: "nope", refusal: true}]}
+      ]
+
+      {:ok, refusal_prefill_pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{stop_reason: :end_turn, messages: [], usage: %{input_tokens: 1, output_tokens: 0}}}
+        ])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                metadata: %{run: %{output_error: %{kind: :missing_text, decoded: nil}}}
+              }} =
+               Alloy.run(nil,
+                 messages: prior_refusal_messages,
+                 provider: {Alloy.Provider.Test, agent_pid: refusal_prefill_pid},
+                 output_schema: @answer_schema
+               )
     end
 
     test "classifies whitespace-only assistant text as :missing_text and decodes only the final assistant message" do

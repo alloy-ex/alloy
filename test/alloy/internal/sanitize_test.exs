@@ -161,6 +161,16 @@ defmodule Alloy.Internal.SanitizeTest do
       assert Sanitize.shape_summary({:halt, %{api_key: "sk-secret"}}) == "{:halt, map}"
       assert Sanitize.shape_summary({:halt, "sk-secret", %{}}) == "{:halt, string, map}"
       assert Sanitize.shape_summary(self()) == "term"
+
+      # Depth-capped tuple recursion prevents O(2^d) blowup on shared tuple DAGs
+      nested_2 = {:a, {:b, {:c, "sk-secret"}}}
+      assert Sanitize.shape_summary(nested_2) == "{:a, {:b, tuple}}"
+
+      dag = Enum.reduce(1..30, :ok, fn _, acc -> {:tag, acc, acc} end)
+      assert Sanitize.shape_summary(dag) == "{:tag, {:tag, tuple, tuple}, {:tag, tuple, tuple}}"
+
+      # Oversized integers collapse to type label rather than allocating huge decimal strings
+      assert Sanitize.shape_summary(Bitwise.bsl(1, 10_000)) == "integer"
     end
   end
 end

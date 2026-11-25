@@ -872,22 +872,20 @@ defmodule Alloy.Provider.Anthropic do
     do: %{"type" => type, "name" => name}
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do
+    input_examples = Map.get(def_map, :input_examples)
+    allowed_callers = Map.get(def_map, :allowed_callers)
+
     %{
       "name" => name,
       "description" => desc,
       "input_schema" => Alloy.Provider.stringify_keys(schema)
     }
-    |> HTTP.maybe_put("strict", if(def_map[:strict] == true, do: true))
-    |> HTTP.maybe_put(
-      "input_examples",
-      if(is_list(def_map[:input_examples]), do: def_map[:input_examples])
-    )
-    |> HTTP.maybe_put("defer_loading", if(def_map[:defer_loading] == true, do: true))
+    |> HTTP.maybe_put("strict", if(Map.get(def_map, :strict) == true, do: true))
+    |> HTTP.maybe_put("input_examples", if(is_list(input_examples), do: input_examples))
+    |> HTTP.maybe_put("defer_loading", if(Map.get(def_map, :defer_loading) == true, do: true))
     |> HTTP.maybe_put(
       "allowed_callers",
-      if(is_list(def_map[:allowed_callers]),
-        do: Enum.map(def_map[:allowed_callers], &allowed_caller/1)
-      )
+      if(is_list(allowed_callers), do: Enum.map(allowed_callers, &allowed_caller/1))
     )
   end
 

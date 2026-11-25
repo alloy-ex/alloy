@@ -188,26 +188,39 @@ defmodule Alloy.Internal.Sanitize do
   def exit_summary(_other, _max_bytes), do: "unexpected term"
 
   @doc """
-  Returns a value-safe outer shape summary for error messages on untrusted or
-  potentially secret-bearing terms (provider tuples, middleware return values).
-  Only atoms and numbers are printed verbatim; strings and compound structures
-  are reduced to type labels while preserving atom tags on 2/3-tuples.
+  Returns a bounded, value-safe outer shape summary for error messages on
+  untrusted or potentially secret-bearing terms (provider tuples, config
+  options, middleware return values). Only atoms and bounded numbers are
+  printed verbatim; strings and compound structures are reduced to type labels
+  while preserving atom tags on 2/3-tuples up to a fixed depth cap.
   """
   @spec shape_summary(term()) :: String.t()
-  def shape_summary({tag, val}) when is_atom(tag),
-    do: "{#{inspect(tag)}, #{shape_summary(val)}}"
+  def shape_summary(term) do
+    term |> do_shape_summary(2) |> cap_bytes(@default_max_inspect_bytes)
+  end
 
-  def shape_summary({tag, val1, val2}) when is_atom(tag),
-    do: "{#{inspect(tag)}, #{shape_summary(val1)}, #{shape_summary(val2)}}"
+  defp do_shape_summary({tag, val}, depth) when is_atom(tag) and depth > 0,
+    do: "{#{inspect(tag)}, #{do_shape_summary(val, depth - 1)}}"
 
-  def shape_summary({first, _second}), do: "{#{shape_summary(first)}, ...}"
-  def shape_summary(v) when is_atom(v) or is_number(v), do: inspect(v)
-  def shape_summary(v) when is_binary(v), do: "string"
-  def shape_summary(%mod{}), do: "%#{inspect(mod)}{}"
-  def shape_summary(v) when is_map(v), do: "map"
-  def shape_summary(v) when is_list(v), do: "list"
-  def shape_summary(v) when is_tuple(v), do: "tuple"
-  def shape_summary(_other), do: "term"
+  defp do_shape_summary({tag, val1, val2}, depth) when is_atom(tag) and depth > 0,
+    do:
+      "{#{inspect(tag)}, #{do_shape_summary(val1, depth - 1)}, #{do_shape_summary(val2, depth - 1)}}"
+
+  defp do_shape_summary({first, _second}, depth) when depth > 0,
+    do: "{#{do_shape_summary(first, depth - 1)}, ...}"
+
+  defp do_shape_summary(v, _depth) when is_atom(v) or is_float(v), do: inspect(v)
+
+  defp do_shape_summary(v, _depth) when is_integer(v) and abs(v) <= 1_000_000_000_000_000,
+    do: inspect(v)
+
+  defp do_shape_summary(v, _depth) when is_integer(v), do: "integer"
+  defp do_shape_summary(v, _depth) when is_binary(v), do: "string"
+  defp do_shape_summary(%mod{}, _depth), do: "%#{inspect(mod)}{}"
+  defp do_shape_summary(v, _depth) when is_map(v), do: "map"
+  defp do_shape_summary(v, _depth) when is_list(v), do: "list"
+  defp do_shape_summary(v, _depth) when is_tuple(v), do: "tuple"
+  defp do_shape_summary(_other, _depth), do: "term"
 
   @doc """
   Replaces argument lists in stacktrace entries with their arity so secrets
