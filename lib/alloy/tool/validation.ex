@@ -99,8 +99,14 @@ defmodule Alloy.Tool.Validation do
       :error ->
         :ok
 
-      {:ok, dialect} when is_binary(dialect) and dialect != "" ->
-        :ok
+      {:ok, dialect} when is_binary(dialect) ->
+        if String.trim(dialect) != "" do
+          :ok
+        else
+          raise ArgumentError,
+                "Invalid output_schema #{inspect(name)}: \"$schema\" must be a non-empty string, " <>
+                  "got: #{Sanitize.inspect_bounded(dialect)}"
+        end
 
       {:ok, bad_dialect} ->
         raise ArgumentError,

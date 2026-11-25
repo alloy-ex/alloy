@@ -554,6 +554,9 @@ defmodule Alloy.Agent.Turn do
   defp maybe_put_output_schema(provider_config, nil),
     do: Map.delete(provider_config, :output_schema)
 
+  defp maybe_put_output_schema(provider_config, %OutputSchema{} = spec),
+    do: Map.put(provider_config, :output_schema, spec)
+
   defp maybe_put_output_schema(provider_config, spec),
     do: Map.put(provider_config, :output_schema, OutputSchema.normalize!(spec))
 
@@ -614,6 +617,10 @@ defmodule Alloy.Agent.Turn do
        ) do
     text = messages |> last_assistant_message() |> raw_assistant_text()
     handle_decoded_output(state, OutputSchema.decode_and_validate(text, spec))
+  end
+
+  defp handle_decoded_output(state, {:error, %{kind: :invalid_schema, message: message} = error}) do
+    {:error, State.merge_run_metadata(state, %{output_error: error}), message}
   end
 
   defp handle_decoded_output(%State{stop_reason: :max_tokens} = state, result) do

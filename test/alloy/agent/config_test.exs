@@ -1,7 +1,7 @@
 defmodule Alloy.Agent.ConfigTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Agent.Config
+  alias Alloy.Agent.{Config, State}
   alias Alloy.Context.Compactor
   alias Alloy.ModelMetadata
 
@@ -176,6 +176,40 @@ defmodule Alloy.Agent.ConfigTest do
     test "accepts code_execution: false explicitly" do
       config = Config.from_opts(provider: {Alloy.Provider.Test, []}, code_execution: false)
       assert config.code_execution == false
+    end
+
+    test "redacts provider config secrets in invalid provider and fallback_providers ArgumentError" do
+      secret = "sk-invalid-provider-secret"
+
+      err1 =
+        assert_raise ArgumentError, ~r/provider must be a module/, fn ->
+          Config.from_opts(provider: {nil, [api_key: secret]})
+        end
+
+      refute Exception.message(err1) =~ secret
+      assert Exception.message(err1) =~ "{nil, ...}"
+
+      err2 =
+        assert_raise ArgumentError, ~r/fallback provider must be a module/, fn ->
+          Config.from_opts(
+            provider: Alloy.Provider.Test,
+            fallback_providers: [{false, %{api_key: secret}}]
+          )
+        end
+
+      refute Exception.message(err2) =~ secret
+      assert Exception.message(err2) =~ "{false, ...}"
+
+      state =
+        Config.from_opts(provider: Alloy.Provider.Test)
+        |> State.init([])
+
+      err3 =
+        assert_raise ArgumentError, ~r/provider must be a module/, fn ->
+          State.prepare(state, provider: {"bad", api_key: secret})
+        end
+
+      refute Exception.message(err3) =~ secret
     end
   end
 

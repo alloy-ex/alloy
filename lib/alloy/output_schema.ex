@@ -32,9 +32,13 @@ defmodule Alloy.OutputSchema do
     startup. Full Draft 4/6/7 validation runs when optional `:ex_json_schema` is
     loaded (bounded to 10 errors / 1,000 bytes; Draft 7
     `contentMediaType: "application/json"` requires
-    `config :ex_json_schema, decode_json: &Jason.decode/1`); without
+    `:decode_json` for `contentMediaType: "application/json"`); without
     `:ex_json_schema` or for newer dialects (Draft 2019-09 / 2020-12), Alloy
-    falls back to top-level JSON `"type"` and `"required"` checks only.
+    falls back to top-level JSON `"type"` and `"required"` checks only (logging
+    a `Logger.warning` when `:ex_json_schema` is loaded and encounters an
+    unsupported `$schema` dialect — pre-normalize once with `normalize!/1` if
+    reusing a Draft 2019-09 / 2020-12 schema across runs to avoid per-run log
+    warnings).
   - **Decoding & terminal failures:** Runs before `:after_completion` and is
     skipped when `:stop_after_tool` completes a run. Final assistant text blocks
     are joined with `""` for JSON decoding (whereas `result.text` joins blocks

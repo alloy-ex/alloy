@@ -66,20 +66,37 @@ defmodule Alloy.Internal.Sanitize do
 
   def exception_summary(%mod{}, :redact), do: inspect(mod)
 
-  def exception_summary(%RuntimeError{message: msg}, max_bytes)
+  def exception_summary(exception, max_bytes) do
+    case exception_parts(exception, max_bytes) do
+      {mod, nil} -> mod
+      {"RuntimeError", msg} -> msg
+      {"ArgumentError", "argument error"} -> "argument error"
+      {mod, detail} -> "#{mod} (#{detail})"
+    end
+  end
+
+  @doc """
+  Returns `{module_name, safe_detail | nil}` for an exception so diagnostic
+  headers can include the module name once without prefix-stripping real
+  `RuntimeError` messages.
+  """
+  @spec exception_parts(Exception.t(), pos_integer()) :: {String.t(), String.t() | nil}
+  def exception_parts(exception, max_bytes \\ 500)
+
+  def exception_parts(%RuntimeError{message: msg}, max_bytes)
       when is_binary(msg) and is_integer(max_bytes) and max_bytes > 0 do
-    cap_bytes(msg, max_bytes)
+    {"RuntimeError", cap_bytes(msg, max_bytes)}
   end
 
-  def exception_summary(%ArgumentError{message: "argument error"}, _max_bytes) do
-    "argument error"
+  def exception_parts(%ArgumentError{message: "argument error"}, _max_bytes) do
+    {"ArgumentError", "argument error"}
   end
 
-  def exception_summary(%KeyError{key: key}, _max_bytes) when is_atom(key) do
-    "KeyError (key #{inspect(key)} not found)"
+  def exception_parts(%KeyError{key: key}, _max_bytes) when is_atom(key) do
+    {"KeyError", "key #{inspect(key)} not found"}
   end
 
-  def exception_summary(%mod{}, _max_bytes), do: inspect(mod)
+  def exception_parts(%mod{}, _max_bytes), do: {inspect(mod), nil}
 
   @doc """
   Returns a bounded, value-safe summary for a caught `:error`, `:exit`, or

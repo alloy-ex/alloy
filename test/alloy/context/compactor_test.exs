@@ -1238,6 +1238,37 @@ defmodule Alloy.Context.CompactorTest do
       end
     end
 
+    test "strips thinking and schema keys from keyword-list Gemini generation_config on summary requests" do
+      messages = [
+        Message.user("original"),
+        Message.assistant(String.duplicate("x", 1200)),
+        Message.user("middle"),
+        Message.assistant("recent"),
+        Message.user("latest")
+      ]
+
+      state =
+        build_state(messages,
+          max_tokens: 250,
+          compaction: [reserve_tokens: 20, keep_recent_tokens: 20],
+          provider: ProbeProvider,
+          provider_config: %{
+            generation_config: [
+              temperature: 0.2,
+              thinkingConfig: %{thinkingLevel: "HIGH"},
+              responseJsonSchema: %{type: "object"},
+              responseMimeType: "application/json"
+            ],
+            summary_response: {:ok, summary_text("Clean")},
+            test_pid: self()
+          }
+        )
+
+      {:compacted, _compacted} = Compactor.maybe_compact(state)
+      assert_received {:summary_request, _msgs, _tools, summary_config}
+      assert summary_config[:generation_config] == [temperature: 0.2]
+    end
+
     test "logs stacktrace when on_compaction throws" do
       callback = fn _middle, _state ->
         throw(:kaboom)

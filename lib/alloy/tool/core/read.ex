@@ -21,6 +21,8 @@ defmodule Alloy.Tool.Core.Read do
 
   @behaviour Alloy.Tool
 
+  alias Alloy.Internal.Sanitize
+
   @default_limit 2000
   @binary_sniff_bytes 8_192
   @max_result_chars 50_000
@@ -72,7 +74,7 @@ defmodule Alloy.Tool.Core.Read do
   defp positive_integer(value, name, _default),
     do:
       {:error,
-       "#{name} must be an integer >= 1 (lines are numbered from 1), got: #{inspect(value)}"}
+       "#{name} must be an integer >= 1 (lines are numbered from 1), got: #{Sanitize.inspect_bounded(value)}"}
 
   defp check_text_file(path) do
     if File.regular?(path),

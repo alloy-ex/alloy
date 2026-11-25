@@ -238,8 +238,8 @@ defmodule Alloy.Provider.Codex do
       nil ->
         base
 
-      %OutputSchema{} = spec ->
-        Map.put(base, :output_schema, {spec.name, spec.schema, spec.strict})
+      %OutputSchema{schema: schema} ->
+        Map.put(base, :output_schema, schema)
     end
   end
 

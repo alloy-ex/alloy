@@ -71,7 +71,10 @@ decoded into `Alloy.Result.output`:
      1,000 bytes).
    - When `:ex_json_schema` is absent or the schema declares a newer dialect
      (Draft 2019-09 / 2020-12), Alloy falls back to **top-level `type` and
-     `required` checks only**.
+     `required` checks only** (logging a `Logger.warning` when `:ex_json_schema`
+     is loaded and encounters an unsupported `$schema` dialect; pre-normalizing
+     once via `OutputSchema.normalize!/1` avoids repeating the warning across
+     runs).
    - Invalid JSON, `:max_tokens`-truncated JSON, refusals, missing text, or
      schema violations fail the run terminally (`{:error, result}` with
      `status: :error`, `output: nil`, human-readable `result.error`, and

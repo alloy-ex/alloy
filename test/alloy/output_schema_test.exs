@@ -124,7 +124,7 @@ defmodule Alloy.OutputSchemaTest do
         OutputSchema.normalize!(%{schema: %{}})
       end
 
-      for bad_dialect <- [nil, "", 123] do
+      for bad_dialect <- [nil, "", "   ", 123] do
         assert_raise ArgumentError, ~r/"\$schema" must be a non-empty string/, fn ->
           OutputSchema.normalize!(%{"$schema" => bad_dialect, "type" => "object"})
         end
@@ -174,48 +174,56 @@ defmodule Alloy.OutputSchemaTest do
         |> OutputSchema.normalize!()
       end
 
-      assert {:ok, [1, 2]} =
-               OutputSchema.decode_and_validate("[1,2]", draft_2020.(%{"type" => "array"}))
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, [1, 2]} =
+                   OutputSchema.decode_and_validate("[1,2]", draft_2020.(%{"type" => "array"}))
 
-      assert {:ok, "hi"} =
-               OutputSchema.decode_and_validate(~s("hi"), draft_2020.(%{"type" => "string"}))
+          assert {:ok, "hi"} =
+                   OutputSchema.decode_and_validate(~s("hi"), draft_2020.(%{"type" => "string"}))
 
-      assert {:ok, 7} =
-               OutputSchema.decode_and_validate("7", draft_2020.(%{"type" => "integer"}))
+          assert {:ok, 7} =
+                   OutputSchema.decode_and_validate("7", draft_2020.(%{"type" => "integer"}))
 
-      assert {:ok, 1.0} =
-               OutputSchema.decode_and_validate("1.0", draft_2020.(%{"type" => "integer"}))
+          assert {:ok, 1.0} =
+                   OutputSchema.decode_and_validate("1.0", draft_2020.(%{"type" => "integer"}))
 
-      assert {:error, _} =
-               OutputSchema.decode_and_validate("1.5", draft_2020.(%{"type" => "integer"}))
+          assert {:error, _} =
+                   OutputSchema.decode_and_validate("1.5", draft_2020.(%{"type" => "integer"}))
 
-      assert {:ok, 1.5} =
-               OutputSchema.decode_and_validate("1.5", draft_2020.(%{"type" => "number"}))
+          assert {:ok, 1.5} =
+                   OutputSchema.decode_and_validate("1.5", draft_2020.(%{"type" => "number"}))
 
-      assert {:ok, true} =
-               OutputSchema.decode_and_validate("true", draft_2020.(%{"type" => "boolean"}))
+          assert {:ok, true} =
+                   OutputSchema.decode_and_validate("true", draft_2020.(%{"type" => "boolean"}))
 
-      assert {:ok, nil} =
-               OutputSchema.decode_and_validate("null", draft_2020.(%{"type" => "null"}))
+          assert {:ok, nil} =
+                   OutputSchema.decode_and_validate("null", draft_2020.(%{"type" => "null"}))
 
-      assert {:ok, "ok"} =
-               OutputSchema.decode_and_validate(
-                 ~s("ok"),
-                 draft_2020.(%{"type" => ["string", "null"]})
-               )
+          assert {:ok, "ok"} =
+                   OutputSchema.decode_and_validate(
+                     ~s("ok"),
+                     draft_2020.(%{"type" => ["string", "null"]})
+                   )
 
-      assert {:error, %{kind: :schema_mismatch, message: msg}} =
-               OutputSchema.decode_and_validate(
-                 "123",
-                 draft_2020.(%{"type" => ["string", "null"]})
-               )
+          assert {:error, %{kind: :schema_mismatch, message: msg}} =
+                   OutputSchema.decode_and_validate(
+                     "123",
+                     draft_2020.(%{"type" => ["string", "null"]})
+                   )
 
-      assert msg =~ "did not match any expected JSON type"
+          assert msg =~ "did not match any expected JSON type"
 
-      assert {:error, %{kind: :schema_mismatch, message: type_msg}} =
-               OutputSchema.decode_and_validate("123", draft_2020.(%{"type" => "string"}))
+          assert {:error, %{kind: :schema_mismatch, message: type_msg}} =
+                   OutputSchema.decode_and_validate("123", draft_2020.(%{"type" => "string"}))
 
-      assert type_msg =~ "expected JSON type"
+          assert type_msg =~ "expected JSON type"
+        end)
+
+      if Code.ensure_loaded?(ExJsonSchema.Schema) do
+        assert log =~ "unsupported $schema dialect"
+        assert log =~ "draft/2020-12"
+      end
 
       assert {:error, %{kind: :missing_text, message: missing_msg}} =
                OutputSchema.decode_and_validate(nil, OutputSchema.normalize!(@answer_schema))
@@ -344,6 +352,29 @@ defmodule Alloy.OutputSchemaTest do
                Validation.check(%{"payload" => "{}"}, "ingest", schemas)
 
       assert tool_msg =~ "decode_json"
+
+      # Under :max_tokens, :invalid_schema takes precedence over :truncated so repair
+      # loops do not waste retries raising max_tokens on an unfixable schema error.
+      {:ok, pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :max_tokens,
+             messages: [Message.assistant(~s({"payload":"{}"}))],
+             usage: %{input_tokens: 2, output_tokens: 2}
+           }}
+        ])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                metadata: %{run: %{output_error: %{kind: :invalid_schema, decoded: nil}}}
+              }} =
+               Alloy.run("go",
+                 provider: {Alloy.Provider.Test, agent_pid: pid},
+                 output_schema: media_schema
+               )
     end
   end
 
@@ -705,6 +736,22 @@ defmodule Alloy.OutputSchemaTest do
                )
 
       assert msg8 =~ ~s(generation_config["responseJsonSchema"])
+
+      for bad_extra_gen <- [nil, "bad", [temperature: 0.2]] do
+        assert {:error, %Error{kind: :invalid_request, message: extra_msg}} =
+                 Gemini.complete(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_key: "k",
+                     model: "gemini-3.8-flash",
+                     extra_body: %{"generationConfig" => bad_extra_gen},
+                     output_schema: spec
+                   }
+                 )
+
+        assert extra_msg =~ ~s(Invalid extra_body["generationConfig"])
+      end
     end
 
     test "atom-keyed nested extra_body merges without duplicate JSON keys and lets caller win" do
@@ -1880,6 +1927,97 @@ defmodule Alloy.OutputSchemaTest do
       assert_received {:run_span, [:alloy, :run, :start], %{telemetry_span_context: ctx_start}}
       assert_received {:run_span, [:alloy, :run, :stop], %{telemetry_span_context: ctx_stop}}
       assert is_reference(ctx_start) and ctx_start == ctx_stop
+
+      # Streaming array-of-parts refusal delta produces :refusal as well.
+      Req.Test.stub(:compat_stream_part_refusal, fn conn ->
+        sse =
+          "data: " <>
+            Jason.encode!(%{
+              "choices" => [
+                %{
+                  "delta" => %{
+                    "content" => [%{"type" => "refusal", "refusal" => "Stream policy refused"}]
+                  },
+                  "finish_reason" => nil
+                }
+              ]
+            }) <>
+            "\n\ndata: " <>
+            Jason.encode!(%{"choices" => [%{"delta" => %{}, "finish_reason" => "stop"}]}) <>
+            "\n\ndata: [DONE]\n\n"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                text: "Stream policy refused",
+                metadata: %{run: %{output_error: %{kind: :refusal, decoded: nil}}}
+              }} =
+               Alloy.stream("nope", fn _ -> :ok end,
+                 provider:
+                   {OpenAICompat,
+                    api_key: "k",
+                    model: "m",
+                    api_url: "https://example.test/v1",
+                    req_options: [plug: {Req.Test, :compat_stream_part_refusal}]},
+                 output_schema: @answer_schema
+               )
+
+      # Non-string refusal payloads in message.refusal, delta.refusal, and refusal parts
+      # fail fast with non-retryable :protocol_error.
+      Req.Test.stub(:compat_bad_msg_refusal, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{"message" => %{"role" => "assistant", "refusal" => 123}, "finish_reason" => "stop"}
+          ]
+        })
+      end)
+
+      assert {:error, %Error{kind: :protocol_error} = e1} =
+               OpenAICompat.complete([Message.user("hi")], [], %{
+                 api_key: "k",
+                 model: "m",
+                 api_url: "https://example.test/v1",
+                 req_options: [plug: {Req.Test, :compat_bad_msg_refusal}]
+               })
+
+      refute Error.retryable?(e1)
+
+      for {stub_name, delta} <- [
+            {:compat_bad_delta_refusal, %{"refusal" => %{"bad" => true}}},
+            {:compat_bad_part_refusal, %{"content" => [%{"type" => "refusal", "refusal" => 123}]}}
+          ] do
+        Req.Test.stub(stub_name, fn conn ->
+          sse =
+            "data: " <>
+              Jason.encode!(%{"choices" => [%{"delta" => delta, "finish_reason" => "stop"}]}) <>
+              "\n\ndata: [DONE]\n\n"
+
+          conn
+          |> Plug.Conn.put_resp_content_type("text/event-stream")
+          |> Plug.Conn.send_resp(200, sse)
+        end)
+
+        assert {:error, %Error{kind: :protocol_error} = err} =
+                 OpenAICompat.stream(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_key: "k",
+                     model: "m",
+                     api_url: "https://example.test/v1",
+                     req_options: [plug: {Req.Test, stub_name}]
+                   },
+                   fn _ -> :ok end
+                 )
+
+        refute Error.retryable?(err)
+      end
     end
 
     test "does not duplicate :output inside result.metadata.run and skips validation on stop_after_tool" do

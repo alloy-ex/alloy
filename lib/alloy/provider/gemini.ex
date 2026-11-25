@@ -93,7 +93,7 @@ defmodule Alloy.Provider.Gemini do
           optional(:system_prompt) => String.t(),
           optional(:api_url) => String.t(),
           optional(:api_version) => String.t(),
-          optional(:generation_config) => map(),
+          optional(:generation_config) => map() | keyword() | nil,
           optional(:tool_config) => map(),
           optional(:safety_settings) => [map()],
           optional(:extra_headers) => [{String.t(), String.t()}],
@@ -857,7 +857,7 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp validate_gemini_generation_config(body, generation_config)
-       when is_map(generation_config) do
+       when is_map(generation_config) and not is_struct(generation_config) do
     mime = Map.get(generation_config, "responseMimeType")
 
     cond do
@@ -892,5 +892,12 @@ defmodule Alloy.Provider.Gemini do
     end
   end
 
-  defp validate_gemini_generation_config(body, _other), do: {:ok, body}
+  defp validate_gemini_generation_config(_body, other) do
+    {:error,
+     %Error{
+       kind: :invalid_request,
+       message:
+         "Invalid extra_body[\"generationConfig\"] on Gemini: expected a map, got #{Sanitize.inspect_bounded(other)}"
+     }}
+  end
 end

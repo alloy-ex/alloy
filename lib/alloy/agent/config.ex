@@ -7,6 +7,7 @@ defmodule Alloy.Agent.Config do
   """
 
   alias Alloy.Context.Compactor
+  alias Alloy.Internal.Sanitize
   alias Alloy.ModelMetadata
   alias Alloy.OutputSchema
 
@@ -456,7 +457,7 @@ defmodule Alloy.Agent.Config do
 
   defp parse_provider(other) do
     raise ArgumentError,
-          "provider must be a module or {module, config} tuple, got: #{inspect(other)}"
+          "provider must be a module or {module, config} tuple, got: #{format_invalid_provider(other)}"
   end
 
   defp parse_fallback_provider({module, provider_config})
@@ -472,8 +473,14 @@ defmodule Alloy.Agent.Config do
 
   defp parse_fallback_provider(other) do
     raise ArgumentError,
-          "fallback provider must be a module or {module, config} tuple, got: #{inspect(other)}"
+          "fallback provider must be a module or {module, config} tuple, got: #{format_invalid_provider(other)}"
   end
+
+  defp format_invalid_provider({mod, _config}),
+    do: "{#{Sanitize.inspect_bounded(mod)}, ...}"
+
+  defp format_invalid_provider(other),
+    do: Sanitize.inspect_bounded(other)
 
   defp normalize_provider_config(config) when is_map(config), do: config
   defp normalize_provider_config(config) when is_list(config), do: Map.new(config)

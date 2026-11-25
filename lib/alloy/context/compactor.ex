@@ -733,7 +733,7 @@ defmodule Alloy.Context.Compactor do
 
   defp sanitize_extra_body_key(config, key) do
     case Map.get(config, key) do
-      extra when is_map(extra) ->
+      extra when is_map(extra) and not is_struct(extra) ->
         cleaned =
           extra
           |> Map.drop(@summary_stripped_extra_body_keys)
@@ -751,9 +751,19 @@ defmodule Alloy.Context.Compactor do
 
   defp sanitize_generation_config_key(map, key) do
     case Map.get(map, key) do
-      gen_cfg when is_map(gen_cfg) ->
+      gen_cfg when is_map(gen_cfg) and not is_struct(gen_cfg) ->
         cleaned = Map.drop(gen_cfg, @summary_stripped_generation_config_keys)
         if cleaned == %{}, do: Map.delete(map, key), else: Map.put(map, key, cleaned)
+
+      gen_cfg when is_list(gen_cfg) ->
+        if Keyword.keyword?(gen_cfg) do
+          cleaned =
+            Enum.reject(gen_cfg, fn {k, _v} -> k in @summary_stripped_generation_config_keys end)
+
+          if cleaned == [], do: Map.delete(map, key), else: Map.put(map, key, cleaned)
+        else
+          map
+        end
 
       _other ->
         map
@@ -966,14 +976,14 @@ defmodule Alloy.Context.Compactor do
   rescue
     e ->
       stacktrace = Sanitize.stacktrace(__STACKTRACE__)
-      mod_name = inspect(e.__struct__)
-      summary = Sanitize.exception_summary(e, 500)
-      detail = if summary == mod_name, do: "", else: ": #{summary}"
 
-      Logger.warning(
-        "on_compaction callback crashed (#{mod_name})#{detail}\n" <>
-          "Stacktrace: #{Exception.format_stacktrace(stacktrace)}"
-      )
+      header =
+        case Sanitize.exception_parts(e, 500) do
+          {mod_name, nil} -> "on_compaction callback crashed (#{mod_name})"
+          {mod_name, detail} -> "on_compaction callback crashed (#{mod_name}): #{detail}"
+        end
+
+      Logger.warning("#{header}\nStacktrace: #{Exception.format_stacktrace(stacktrace)}")
 
       :ok
   catch

@@ -95,6 +95,11 @@ cancellation, and deadlines stop requests immediately.
   blocks, `result.tool_calls[].error`, `[:alloy, :tool, :stop]`, and logs so
   captured `context` or credential maps cannot leak. Return `{:error, message}`
   or `raise "..."` for errors the model or telemetry should see.
+- **Strict middleware halt/block/edit validation:** `{:halt, reason}`,
+  `{:halt, reason, state}`, and `{:block, reason}` now require `reason` to be a
+  string (`String.t()`), and `{:edit, modified_call}` requires a plain map;
+  passing any other value (such as `{:halt, state}` or `{:block, state}`) raises
+  `ArgumentError`.
 
 ## 6. Portable structured outputs (`:output_schema`)
 
