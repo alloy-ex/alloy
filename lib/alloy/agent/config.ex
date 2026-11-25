@@ -79,9 +79,10 @@ defmodule Alloy.Agent.Config do
         }
 
   @type output_schema :: %{
-          name: String.t(),
-          schema: map(),
-          strict: boolean()
+          required(:name) => String.t(),
+          required(:schema) => map(),
+          required(:strict) => boolean(),
+          optional(:__struct__) => module()
         }
 
   @type t :: %__MODULE__{
@@ -372,6 +373,12 @@ defmodule Alloy.Agent.Config do
   end
 
   defp reject_removed!(provider_config, provider) do
+    if Map.has_key?(provider_config, :output_schema) or
+         Map.has_key?(provider_config, "output_schema") do
+      raise ArgumentError,
+            "pass :output_schema as a top-level Alloy.run/2 option, not inside provider config"
+    end
+
     case Map.get(@removed_provider_options, provider) do
       {key, message} when is_map_key(provider_config, key) -> raise ArgumentError, message
       _none -> provider_config

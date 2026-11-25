@@ -211,7 +211,11 @@ defmodule Alloy.Provider.Gemini do
         settings -> Map.put(body, "safetySettings", Provider.stringify_keys(settings))
       end
 
-    Map.merge(body, HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})))
+    OutputSchema.merge_extra_body(
+      body,
+      HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
+      "generationConfig"
+    )
   end
 
   defp build_contents(messages) do
@@ -792,13 +796,11 @@ defmodule Alloy.Provider.Gemini do
   defp maybe_put_new(map, key, value), do: Map.put_new(map, key, value)
 
   defp maybe_put_output_schema(generation_config, config) do
-    case Map.get(config, :output_schema) do
+    case OutputSchema.wire(Map.get(config, :output_schema)) do
       nil ->
         generation_config
 
-      spec ->
-        %{schema: schema} = OutputSchema.normalize!(spec)
-
+      %{schema: schema} ->
         generation_config
         |> maybe_put_new("responseMimeType", "application/json")
         |> maybe_put_new("responseJsonSchema", schema)

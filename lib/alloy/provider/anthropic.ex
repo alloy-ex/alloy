@@ -634,17 +634,20 @@ defmodule Alloy.Provider.Anthropic do
       |> maybe_put_output_schema(config)
 
     reject_extended_thinking!(config)
-    Map.merge(body, HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})))
+
+    OutputSchema.merge_extra_body(
+      body,
+      HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
+      "output_config"
+    )
   end
 
   defp maybe_put_output_schema(body, config) do
-    case Map.get(config, :output_schema) do
+    case OutputSchema.wire(Map.get(config, :output_schema)) do
       nil ->
         body
 
-      spec ->
-        %{schema: schema} = OutputSchema.normalize!(spec)
-
+      %{schema: schema} ->
         Map.put(body, "output_config", %{
           "format" => %{"type" => "json_schema", "schema" => schema}
         })

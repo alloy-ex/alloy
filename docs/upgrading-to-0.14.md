@@ -110,8 +110,29 @@ result.output
 
 Alloy translates `:output_schema` into each provider's native structured-output
 field (`output_config.format`, `text.format`, `response_format`,
-`generationConfig.responseJsonSchema`, or Codex prompt instructions), strips it
+`generationConfig.responseJsonSchema`, or Codex prompt instructions) — preserving
+sibling `extra_body` keys such as Anthropic `output_config.effort`, OpenAI
+`text.verbosity`, and Gemini `generationConfig.temperature` — strips it
 automatically during compaction summaries, decodes the final JSON into
-`result.output`, and validates it (with full Draft 4/6/7 validation when
-optional `:ex_json_schema` is installed, or basic JSON type/required validation
-otherwise).
+`result.output` before `:after_completion`, and validates it:
+
+- **Validation levels:** Full Draft 4/6/7 validation runs when optional
+  `:ex_json_schema` is installed. Without `:ex_json_schema` (or when `$schema`
+  uses an unsupported dialect such as Draft 2019-09 or Draft 2020-12), Alloy
+  falls back to **top-level JSON `type` and `required` checks only** (nested
+  properties, enums, and formats are not validated locally).
+- **Failure semantics:** Invalid JSON, `:max_tokens`-truncated JSON (reported
+  explicitly as truncated), or schema violations fail the run terminally
+  (`{:error, result}` with `status: :error`, `output: nil`, and the raw reply
+  preserved in `result.text`; no automatic repair turn). When
+  `:stop_after_tool` finishes a run, `:output_schema` decoding is skipped and
+  `result.output` is `nil`.
+- **Strict mode & provider portability:** Pass `:output_schema` as a top-level
+  `Alloy.run/2` / `Alloy.stream/3` option (passing it inside provider config
+  raises `ArgumentError`). `:strict` defaults to `true`, which on OpenAI/xAI
+  requires every property in `"required"` and `"additionalProperties" => false`
+  on every object (pass `%{schema: schema, strict: false}` to opt out). Because
+  `:output_schema` is sent on every completion turn, Gemini models prior to
+  Gemini 3 and some OpenAICompat servers reject combining `tools` with native
+  JSON Schema output; use Gemini 3+ (`gemini-3-flash`), attach `:output_schema`
+  on the final turn with `Alloy.Agent.State.prepare/2`, or use `until_tool`.

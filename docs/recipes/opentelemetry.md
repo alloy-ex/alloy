@@ -3,7 +3,7 @@
 Alloy emits structured `:telemetry` spans and events without pulling
 OpenTelemetry into its core dependencies. You can bridge them to OpenTelemetry
 (following the OpenTelemetry GenAI semantic conventions) in your application
-startup with ~80 lines of Elixir.
+startup with ~85 lines of Elixir.
 
 When `:timeout_ms` is finite, Alloy's supervised HTTP/SSE and custom bash
 workers automatically propagate your process's OpenTelemetry context
@@ -16,11 +16,16 @@ active Alloy span.
 defp deps do
   [
     {:alloy, "~> 0.14"},
+    {:opentelemetry, "~> 1.5"},
     {:opentelemetry_api, "~> 1.4"},
+    {:opentelemetry_exporter, "~> 1.8"},
     {:opentelemetry_telemetry, "~> 1.1"}
   ]
 end
 ```
+
+(`opentelemetry_api` alone is a no-op; include `:opentelemetry` and an exporter
+such as `:opentelemetry_exporter` so spans are recorded and exported.)
 
 ## Telemetry Bridge Module
 
@@ -33,6 +38,7 @@ defmodule MyApp.AlloyOtel do
   require OpenTelemetry.Tracer, as: Tracer
 
   @handler_id "myapp-alloy-otel"
+  @tracer_id __MODULE__
 
   @events [
     [:alloy, :run, :start],
@@ -51,14 +57,16 @@ defmodule MyApp.AlloyOtel do
   end
 
   def handle_event([:alloy, :run, :start], _measurements, meta, _cfg) do
-    OpentelemetryTelemetry.start_telemetry_span(@handler_id, "alloy.run", meta, %{
-      "gen_ai.operation.name" => "invoke_agent",
-      "gen_ai.request.model" => to_string(meta[:model] || "")
+    OpentelemetryTelemetry.start_telemetry_span(@tracer_id, "alloy.run", meta, %{
+      attributes: %{
+        "gen_ai.operation.name" => "invoke_agent",
+        "gen_ai.request.model" => to_string(meta[:model] || "")
+      }
     })
   end
 
   def handle_event([:alloy, :run, :stop], %{duration_ms: duration_ms}, meta, _cfg) do
-    OpentelemetryTelemetry.set_current_telemetry_span(@handler_id, meta)
+    OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, meta)
 
     Tracer.set_attributes(%{
       "alloy.status" => to_string(meta[:status]),
@@ -66,31 +74,31 @@ defmodule MyApp.AlloyOtel do
       "alloy.duration_ms" => duration_ms
     })
 
-    OpentelemetryTelemetry.end_telemetry_span(@handler_id, meta)
+    OpentelemetryTelemetry.end_telemetry_span(@tracer_id, meta)
   end
 
   def handle_event([:alloy, :run, :exception], _measurements, meta, _cfg) do
-    OpentelemetryTelemetry.set_current_telemetry_span(@handler_id, meta)
+    OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, meta)
     Tracer.set_status(:error, inspect(meta[:reason]))
-    OpentelemetryTelemetry.end_telemetry_span(@handler_id, meta)
+    OpentelemetryTelemetry.end_telemetry_span(@tracer_id, meta)
   end
 
   def handle_event([:alloy, :turn, :start], _measurements, meta, _cfg) do
-    OpentelemetryTelemetry.start_telemetry_span(@handler_id, "alloy.turn", meta, %{
-      "alloy.turn" => meta[:turn]
+    OpentelemetryTelemetry.start_telemetry_span(@tracer_id, "alloy.turn", meta, %{
+      attributes: %{"alloy.turn" => meta[:turn]}
     })
   end
 
   def handle_event([:alloy, :turn, :stop], _measurements, meta, _cfg) do
-    OpentelemetryTelemetry.set_current_telemetry_span(@handler_id, meta)
+    OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, meta)
     Tracer.set_attribute("alloy.status", to_string(meta[:status]))
-    OpentelemetryTelemetry.end_telemetry_span(@handler_id, meta)
+    OpentelemetryTelemetry.end_telemetry_span(@tracer_id, meta)
   end
 
   def handle_event([:alloy, :turn, :exception], _measurements, meta, _cfg) do
-    OpentelemetryTelemetry.set_current_telemetry_span(@handler_id, meta)
+    OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, meta)
     Tracer.set_status(:error, inspect(meta[:reason]))
-    OpentelemetryTelemetry.end_telemetry_span(@handler_id, meta)
+    OpentelemetryTelemetry.end_telemetry_span(@tracer_id, meta)
   end
 
   # Alloy emits [:alloy, :provider, :request] once per attempt with duration_ms.

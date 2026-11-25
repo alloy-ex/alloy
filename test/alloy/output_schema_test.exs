@@ -12,19 +12,19 @@ defmodule Alloy.OutputSchemaTest do
       answer: %{type: "string"},
       confidence: %{type: "number"}
     },
-    required: ["answer"],
+    required: ["answer", "confidence"],
     additionalProperties: false
   }
 
-  describe "normalize!/1" do
+  describe "normalize!/1 and wire/1" do
     test "returns nil for nil and normalizes plain JSON Schema maps" do
       assert OutputSchema.normalize!(nil) == nil
 
       spec = OutputSchema.normalize!(@answer_schema)
-      assert spec.name == "alloy_output"
-      assert spec.strict == true
+      assert %OutputSchema{name: "alloy_output", strict: true} = spec
       assert spec.schema["type"] == "object"
-      assert spec.schema["required"] == ["answer"]
+      assert spec.schema["required"] == ["answer", "confidence"]
+      assert OutputSchema.wire(spec) == spec
     end
 
     test "normalizes wrapper maps with custom name and strict flag" do
@@ -34,7 +34,7 @@ defmodule Alloy.OutputSchemaTest do
       assert spec.schema["type"] == "object"
     end
 
-    test "rejects invalid shapes, names, strict values, structs, and duplicate keys" do
+    test "rejects invalid shapes, names, strict values, structs, duplicate keys, and provider-level output_schema" do
       assert_raise ArgumentError, ~r/non-empty JSON Schema map/, fn ->
         OutputSchema.normalize!(%{})
       end
@@ -66,9 +66,16 @@ defmodule Alloy.OutputSchemaTest do
       assert_raise ArgumentError, ~r/:name must be a string/, fn ->
         OutputSchema.normalize!(%{name: 123, schema: @answer_schema})
       end
+
+      assert_raise ArgumentError, ~r/top-level Alloy\.run\/2 option/, fn ->
+        Config.from_opts(
+          provider:
+            {Anthropic, api_key: "k", model: "claude-sonnet-5-5", output_schema: @answer_schema}
+        )
+      end
     end
 
-    test "basic fallback validation covers JSON types, union types, and missing assistant text" do
+    test "basic fallback validation covers JSON types, Draft 6+ whole floats, union types, and missing text" do
       draft_2020 = fn extra ->
         Map.merge(%{"$schema" => "https://json-schema.org/draft/2020-12/schema"}, extra)
         |> OutputSchema.normalize!()
@@ -82,6 +89,12 @@ defmodule Alloy.OutputSchemaTest do
 
       assert {:ok, 7} =
                OutputSchema.decode_and_validate("7", draft_2020.(%{"type" => "integer"}))
+
+      assert {:ok, 1.0} =
+               OutputSchema.decode_and_validate("1.0", draft_2020.(%{"type" => "integer"}))
+
+      assert {:error, _} =
+               OutputSchema.decode_and_validate("1.5", draft_2020.(%{"type" => "integer"}))
 
       assert {:ok, 1.5} =
                OutputSchema.decode_and_validate("1.5", draft_2020.(%{"type" => "number"}))
@@ -118,33 +131,33 @@ defmodule Alloy.OutputSchemaTest do
     end
 
     @tag :ex_json_schema
-    test "rejects remote $ref at startup and allows Draft 2020-12 passthrough" do
-      assert_raise ArgumentError, ~r/local/i, fn ->
+    test "rejects remote $ref with output_schema wording and bounds large validation error lists" do
+      err =
+        assert_raise ArgumentError, fn ->
+          OutputSchema.normalize!(%{
+            type: "object",
+            properties: %{x: %{"$ref" => "https://example.com/schema.json"}}
+          })
+        end
+
+      assert Exception.message(err) =~ "output_schema"
+      refute Exception.message(err) =~ "tool schema"
+
+      array_spec =
         OutputSchema.normalize!(%{
-          type: "object",
-          properties: %{x: %{"$ref" => "https://example.com/schema.json"}}
+          type: "array",
+          items: %{type: "integer"}
         })
-      end
 
-      draft_2020 = %{
-        "$schema" => "https://json-schema.org/draft/2020-12/schema",
-        "type" => "object",
-        "required" => ["answer"],
-        "properties" => %{"answer" => %{"type" => "string"}}
-      }
-
-      spec = OutputSchema.normalize!(draft_2020)
-
-      assert {:ok, %{"answer" => "ok"}} =
-               OutputSchema.decode_and_validate(~s({"answer":"ok"}), spec)
-
-      assert {:error, msg} = OutputSchema.decode_and_validate(~s({}), spec)
-      assert msg =~ "missing required keys: answer"
+      bad_items = Jason.encode!(List.duplicate("not-an-int", 25))
+      assert {:error, msg} = OutputSchema.decode_and_validate(bad_items, array_spec)
+      assert msg =~ "(+15 more)"
+      assert byte_size(msg) <= 1_100
     end
   end
 
   describe "provider wire-format translation" do
-    test "Anthropic emits output_config.format and lets extra_body override" do
+    test "Anthropic emits output_config.format and preserves sibling extra_body effort" do
       test_pid = self()
 
       Req.Test.stub(:output_schema_anthropic, fn conn ->
@@ -155,19 +168,24 @@ defmodule Alloy.OutputSchemaTest do
           "id" => "msg_1",
           "type" => "message",
           "role" => "assistant",
-          "content" => [%{"type" => "text", "text" => ~s({"answer":"42"})}],
+          "content" => [%{"type" => "text", "text" => ~s({"answer":"42","confidence":0.9})}],
           "stop_reason" => "end_turn",
           "usage" => %{"input_tokens" => 5, "output_tokens" => 4}
         })
       end)
 
       assert {:ok,
-              %Result{status: :completed, text: ~s({"answer":"42"}), output: %{"answer" => "42"}}} =
+              %Result{
+                status: :completed,
+                text: ~s({"answer":"42","confidence":0.9}),
+                output: %{"answer" => "42", "confidence" => 0.9}
+              }} =
                Alloy.run("answer",
                  provider:
                    {Anthropic,
                     api_key: "k",
                     model: "claude-sonnet-5-5",
+                    extra_body: %{"output_config" => %{"effort" => "high"}},
                     req_options: [plug: {Req.Test, :output_schema_anthropic}]},
                  output_schema: @answer_schema
                )
@@ -175,14 +193,36 @@ defmodule Alloy.OutputSchemaTest do
       assert_received {:anthropic_body, body}
 
       assert %{
+               "effort" => "high",
                "format" => %{
                  "type" => "json_schema",
-                 "schema" => %{"type" => "object", "required" => ["answer"]}
+                 "schema" => %{"type" => "object", "required" => ["answer", "confidence"]}
                }
              } = body["output_config"]
+
+      # Explicit caller format inside extra_body.output_config still wins.
+      assert {:ok, _} =
+               Alloy.run("answer",
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    extra_body: %{
+                      "output_config" => %{
+                        "effort" => "low",
+                        "format" => %{"type" => "json_schema", "schema" => %{"type" => "object"}}
+                      }
+                    },
+                    req_options: [plug: {Req.Test, :output_schema_anthropic}]},
+                 output_schema: @answer_schema
+               )
+
+      assert_received {:anthropic_body, override_body}
+      assert override_body["output_config"]["effort"] == "low"
+      assert override_body["output_config"]["format"]["schema"] == %{"type" => "object"}
     end
 
-    test "OpenAI and XAI emit text.format json_schema" do
+    test "OpenAI and XAI emit text.format json_schema and preserve sibling extra_body text keys" do
       test_pid = self()
 
       for {label, mod} <- [{:output_schema_openai, OpenAI}, {:output_schema_xai, XAI}] do
@@ -197,23 +237,30 @@ defmodule Alloy.OutputSchemaTest do
               %{
                 "type" => "message",
                 "role" => "assistant",
-                "content" => [%{"type" => "output_text", "text" => ~s({"answer":"ok"})}]
+                "content" => [
+                  %{"type" => "output_text", "text" => ~s({"answer":"ok","confidence":1})}
+                ]
               }
             ],
             "usage" => %{"input_tokens" => 5, "output_tokens" => 4}
           })
         end)
 
-        assert {:ok, %Result{output: %{"answer" => "ok"}}} =
+        assert {:ok, %Result{output: %{"answer" => "ok", "confidence" => 1}}} =
                  Alloy.run("answer",
                    provider:
-                     {mod, api_key: "k", model: "gpt-5.4", req_options: [plug: {Req.Test, label}]},
+                     {mod,
+                      api_key: "k",
+                      model: "gpt-5.4",
+                      extra_body: %{"text" => %{"verbosity" => "low"}},
+                      req_options: [plug: {Req.Test, label}]},
                    output_schema: %{name: "ans", schema: @answer_schema, strict: true}
                  )
 
         assert_received {^label, body}
 
         assert %{
+                 "verbosity" => "low",
                  "format" => %{
                    "type" => "json_schema",
                    "name" => "ans",
@@ -235,14 +282,17 @@ defmodule Alloy.OutputSchemaTest do
           "choices" => [
             %{
               "finish_reason" => "stop",
-              "message" => %{"role" => "assistant", "content" => ~s({"answer":"hi"})}
+              "message" => %{
+                "role" => "assistant",
+                "content" => ~s({"answer":"hi","confidence":0.5})
+              }
             }
           ],
           "usage" => %{"prompt_tokens" => 3, "completion_tokens" => 2}
         })
       end)
 
-      assert {:ok, %Result{output: %{"answer" => "hi"}}} =
+      assert {:ok, %Result{output: %{"answer" => "hi", "confidence" => 0.5}}} =
                Alloy.run("answer",
                  provider:
                    {OpenAICompat,
@@ -264,7 +314,7 @@ defmodule Alloy.OutputSchemaTest do
              } = body["response_format"]
     end
 
-    test "Gemini emits generationConfig responseMimeType and responseJsonSchema" do
+    test "Gemini emits generationConfig responseMimeType/responseJsonSchema and preserves extra_body generationConfig" do
       test_pid = self()
 
       Req.Test.stub(:output_schema_gemini, fn conn ->
@@ -274,7 +324,9 @@ defmodule Alloy.OutputSchemaTest do
         Req.Test.json(conn, %{
           "candidates" => [
             %{
-              "content" => %{"parts" => [%{"text" => ~s({"answer":"gem"})}]},
+              "content" => %{
+                "parts" => [%{"text" => ~s({"answer":"gem","confidence":0.8})}]
+              },
               "finishReason" => "STOP"
             }
           ],
@@ -282,17 +334,19 @@ defmodule Alloy.OutputSchemaTest do
         })
       end)
 
-      assert {:ok, %Result{output: %{"answer" => "gem"}}} =
+      assert {:ok, %Result{output: %{"answer" => "gem", "confidence" => 0.8}}} =
                Alloy.run("answer",
                  provider:
                    {Gemini,
                     api_key: "k",
                     model: "gemini-3-flash",
+                    extra_body: %{"generationConfig" => %{"temperature" => 0.2}},
                     req_options: [plug: {Req.Test, :output_schema_gemini}]},
                  output_schema: @answer_schema
                )
 
       assert_received {:gemini_body, body}
+      assert body["generationConfig"]["temperature"] == 0.2
       assert body["generationConfig"]["responseMimeType"] == "application/json"
       assert body["generationConfig"]["responseJsonSchema"]["type"] == "object"
     end
@@ -309,7 +363,7 @@ defmodule Alloy.OutputSchemaTest do
         reply =
           Jason.encode!(%{
             stop_reason: "end_turn",
-            text: ~s({"answer":"codex"}),
+            text: ~s({"answer":"codex","confidence":1}),
             tool_calls: []
           })
 
@@ -317,7 +371,7 @@ defmodule Alloy.OutputSchemaTest do
         {"", 0}
       end
 
-      assert {:ok, %Result{output: %{"answer" => "codex"}}} =
+      assert {:ok, %Result{output: %{"answer" => "codex", "confidence" => 1}}} =
                Alloy.run("answer",
                  provider: {Codex, model: "gpt-5.4", command_runner: runner},
                  output_schema: @answer_schema
@@ -330,26 +384,45 @@ defmodule Alloy.OutputSchemaTest do
   end
 
   describe "loop, middleware, and compactor integration" do
-    test "returns error when final text is invalid JSON or fails schema validation" do
+    test "returns error when final text is invalid JSON or truncated at :max_tokens" do
       {:ok, pid} =
         Alloy.Provider.Test.start_link([
           Alloy.Testing.text_response("not json at all")
         ])
 
-      assert {:error, %Result{status: :error, output: nil, error: msg}} =
+      assert {:error, %Result{status: :error, output: nil, text: "not json at all", error: msg}} =
                Alloy.run("hi",
                  provider: {Alloy.Provider.Test, agent_pid: pid},
                  output_schema: @answer_schema
                )
 
       assert msg =~ "Structured output is not valid JSON"
+
+      {:ok, trunc_pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :max_tokens,
+             messages: [Message.assistant(~s({"answer":"cut off))],
+             usage: %{input_tokens: 5, output_tokens: 5}
+           }}
+        ])
+
+      assert {:error,
+              %Result{status: :error, output: nil, stop_reason: :max_tokens, error: trunc_msg}} =
+               Alloy.run("hi",
+                 provider: {Alloy.Provider.Test, agent_pid: trunc_pid},
+                 output_schema: @answer_schema
+               )
+
+      assert trunc_msg =~ "truncated at :max_tokens"
     end
 
     @tag :ex_json_schema
     test "returns schema validation error when JSON violates schema constraints" do
       {:ok, pid} =
         Alloy.Provider.Test.start_link([
-          Alloy.Testing.text_response(~s({"answer":123}))
+          Alloy.Testing.text_response(~s({"answer":123,"confidence":0.5}))
         ])
 
       assert {:error, %Result{status: :error, output: nil, error: msg}} =
@@ -394,10 +467,10 @@ defmodule Alloy.OutputSchemaTest do
 
       {:ok, pid2} =
         Alloy.Provider.Test.start_link([
-          Alloy.Testing.text_response(~s({"answer":"clean"}))
+          Alloy.Testing.text_response(~s({"answer":"clean","confidence":1}))
         ])
 
-      assert {:ok, %Result{output: %{"answer" => "clean"}, metadata: meta}} =
+      assert {:ok, %Result{output: %{"answer" => "clean", "confidence" => 1}, metadata: meta}} =
                Alloy.run("go",
                  provider: {Alloy.Provider.Test, agent_pid: pid2},
                  output_schema: @answer_schema
@@ -429,7 +502,6 @@ defmodule Alloy.OutputSchemaTest do
             {Anthropic,
              api_key: "k",
              model: "claude-sonnet-5-5",
-             output_schema: @answer_schema,
              req_options: [plug: {Req.Test, :output_schema_compactor}]},
           output_schema: @answer_schema,
           max_tokens: 1_000,

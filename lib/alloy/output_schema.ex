@@ -11,22 +11,27 @@ defmodule Alloy.OutputSchema do
   @name_pattern ~r/^[a-zA-Z0-9_-]{1,64}$/
   @wrapper_keys [:name, :schema, :strict, "name", "schema", "strict"]
 
-  @type t :: %{
+  @enforce_keys [:name, :schema, :strict]
+  defstruct [:name, :schema, :strict]
+
+  @type t :: %__MODULE__{
           name: String.t(),
           schema: map(),
           strict: boolean()
         }
 
   @doc """
-  Normalizes `:output_schema` into `%{name, schema, strict}` or `nil`.
+  Normalizes `:output_schema` into `%Alloy.OutputSchema{}` or `nil`.
 
-  Accepts either a plain JSON Schema map (defaulting `name: "alloy_output"` and
-  `strict: true`) or a wrapper map `%{schema: map, name: ..., strict: ...}`.
-  Raises `ArgumentError` on invalid shapes, non-JSON-encodable schemas, or
-  invalid local `$ref`s / schemas when `:ex_json_schema` is loaded.
+  Accepts either an already-normalized struct, a plain JSON Schema map
+  (defaulting `name: "alloy_output"` and `strict: true`), or a wrapper map
+  `%{schema: map, name: ..., strict: ...}`. Raises `ArgumentError` on invalid
+  shapes, non-JSON-encodable schemas, or invalid local `$ref`s / schemas when
+  `:ex_json_schema` is loaded.
   """
   @spec normalize!(term()) :: t() | nil
   def normalize!(nil), do: nil
+  def normalize!(%__MODULE__{} = spec), do: spec
 
   def normalize!(%_{} = struct) do
     raise ArgumentError,
@@ -37,7 +42,7 @@ defmodule Alloy.OutputSchema do
     if wrapper_map?(spec) do
       normalize_wrapper!(spec)
     else
-      %{
+      %__MODULE__{
         name: @default_name,
         schema: normalize_schema!(spec, @default_name),
         strict: true
@@ -51,13 +56,45 @@ defmodule Alloy.OutputSchema do
   end
 
   @doc """
+  Fast-path accessor for providers: returns an already-normalized struct without
+  re-running JSON encoding or schema resolution, normalizing raw maps only when
+  a provider module is called directly outside `Alloy.run/2`.
+  """
+  @spec wire(term()) :: t() | nil
+  def wire(nil), do: nil
+  def wire(%__MODULE__{} = spec), do: spec
+  def wire(raw), do: normalize!(raw)
+
+  @doc """
+  Merges `extra_body` into `body`, shallow-merging the nested map at
+  `nested_key` when both sides contain a map so sibling caller fields (such as
+  Anthropic `output_config.effort`, OpenAI `text.verbosity`, or Gemini
+  `generationConfig.temperature`) are preserved alongside `:output_schema`
+  while explicit caller overrides for the same nested key still win.
+  """
+  @spec merge_extra_body(map(), map(), String.t()) :: map()
+  def merge_extra_body(body, extra_body, nested_key)
+      when is_map(body) and is_map(extra_body) and is_binary(nested_key) do
+    case {Map.get(body, nested_key), Map.get(extra_body, nested_key)} do
+      {base_nested, extra_nested} when is_map(base_nested) and is_map(extra_nested) ->
+        body
+        |> Map.merge(extra_body)
+        |> Map.put(nested_key, Map.merge(base_nested, extra_nested))
+
+      _other ->
+        Map.merge(body, extra_body)
+    end
+  end
+
+  @doc """
   Decodes final assistant text as JSON and validates it against `spec`.
 
   Uses full Draft 4/6/7 validation via optional `:ex_json_schema` when loaded
   and the schema dialect is supported; falls back to top-level JSON `"type"`
   and `"required"` checks otherwise.
   """
-  @spec decode_and_validate(String.t() | nil, t()) :: {:ok, term()} | {:error, String.t()}
+  @spec decode_and_validate(String.t() | nil, map()) ::
+          {:ok, term()} | {:error, String.t()}
   def decode_and_validate(text, %{name: name, schema: schema}) when is_binary(text) do
     case Jason.decode(text) do
       {:ok, decoded} ->
@@ -90,7 +127,7 @@ defmodule Alloy.OutputSchema do
     validate_strict!(strict)
 
     if is_map(raw_schema) and not is_struct(raw_schema) and map_size(raw_schema) > 0 do
-      %{
+      %__MODULE__{
         name: name,
         schema: normalize_schema!(raw_schema, name),
         strict: strict
@@ -179,6 +216,7 @@ defmodule Alloy.OutputSchema do
   defp check_type(val, "array") when is_list(val), do: :ok
   defp check_type(val, "string") when is_binary(val), do: :ok
   defp check_type(val, "integer") when is_integer(val), do: :ok
+  defp check_type(val, "integer") when is_float(val) and trunc(val) == val, do: :ok
   defp check_type(val, "number") when is_number(val), do: :ok
   defp check_type(val, "boolean") when is_boolean(val), do: :ok
   defp check_type(nil, "null"), do: :ok

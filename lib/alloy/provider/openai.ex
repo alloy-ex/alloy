@@ -192,18 +192,21 @@ defmodule Alloy.Provider.OpenAI do
 
     body = maybe_put_output_schema(body, config)
 
-    # Merge extra_body LAST so caller can override any field (#18)
-    Map.merge(body, HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})))
+    # Merge extra_body LAST so caller can override any field (#18), preserving
+    # sibling keys inside "text" (e.g. verbosity alongside format).
+    OutputSchema.merge_extra_body(
+      body,
+      HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
+      "text"
+    )
   end
 
   defp maybe_put_output_schema(body, config) do
-    case Map.get(config, :output_schema) do
+    case OutputSchema.wire(Map.get(config, :output_schema)) do
       nil ->
         body
 
-      spec ->
-        %{name: name, schema: schema, strict: strict} = OutputSchema.normalize!(spec)
-
+      %{name: name, schema: schema, strict: strict} ->
         Map.put(body, "text", %{
           "format" => %{
             "type" => "json_schema",

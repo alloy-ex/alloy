@@ -111,7 +111,16 @@ Known limits:
   only mode on current models, has no such rule. Anthropic streaming also
   expects each block's `content_block_start` event before text, thinking, or
   signature deltas for that index (standard Anthropic endpoints always emit
-  it; non-compliant gateways omitting it return `:malformed_reply`).
+  it; non-compliant gateways omitting it return `:protocol_error`).
+- **Portable `:output_schema` with tools:** Alloy sends `:output_schema` on
+  every completion turn. Gemini models prior to Gemini 3 and some
+  OpenAI-compatible servers reject requests that combine tool declarations with
+  native JSON Schema output (`responseJsonSchema` / `response_format`). On
+  those endpoints, use Gemini 3+ (`gemini-3-flash`), attach `:output_schema` on
+  the final turn with `Alloy.Agent.State.prepare/2`, or use `until_tool` /
+  `stop_after_tool`. OpenAI and xAI strict mode (`strict: true`, the default)
+  requires every property in `"required"` and `"additionalProperties" => false`
+  on every object; pass `%{schema: schema, strict: false}` to opt out.
 - **`OpenAICompat`** reaches each vendor at its own `:api_url`, so
   switching vendors is a change of origin: earlier `reasoning_content` is
   sent as plain text in the assistant message, and Gemini signatures from

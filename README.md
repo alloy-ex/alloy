@@ -548,6 +548,24 @@ result.output
 #=> %{"answer" => "Paris", "confidence" => 0.99}
 ```
 
+A few details to keep in mind:
+- Invalid JSON, truncated `:max_tokens` output, or non-conforming JSON fails
+  the run terminally (`{:error, result}` with `status: :error`, `output: nil`,
+  and the raw reply preserved in `result.text`; Alloy does not run an
+  automatic repair turn). When `:stop_after_tool` finishes the run,
+  `result.output` stays `nil`.
+- Full Draft 4/6/7 validation runs when optional `:ex_json_schema` is loaded;
+  without it (or for unsupported dialects like Draft 2019-09/2020-12), Alloy
+  falls back to **top-level `type` and `required` checks only**.
+- `:strict` defaults to `true` (OpenAI/xAI strict mode requires every property
+  in `"required"` and `"additionalProperties" => false` on every object; pass
+  `%{schema: schema, strict: false}` to opt out).
+- `:output_schema` is sent on every completion turn. Gemini models before
+  Gemini 3 and some OpenAICompat servers reject combining `tools` with JSON
+  Schema output — use Gemini 3+ (`gemini-3-flash`), attach `:output_schema` on
+  the final turn via `Alloy.Agent.State.prepare/2`, or use `until_tool` /
+  `stop_after_tool`.
+
 Or force the model to call a specific tool before the loop completes using
 `until_tool` (optionally paired with `stop_after_tool`):
 

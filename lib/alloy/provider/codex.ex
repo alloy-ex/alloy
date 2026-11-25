@@ -230,7 +230,7 @@ defmodule Alloy.Provider.Codex do
       overrides: Map.get(config, :config_overrides, []),
       executable: CodexRunner.codex_bin(config),
       generation: Map.get(config, :session_generation),
-      output_schema: OutputSchema.normalize!(Map.get(config, :output_schema)),
+      output_schema: OutputSchema.wire(Map.get(config, :output_schema)),
       tools: tools
     }
   end
@@ -618,7 +618,7 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp build_prompt(messages, tool_defs, config) do
-    output_schema = OutputSchema.normalize!(Map.get(config, :output_schema))
+    output_schema = OutputSchema.wire(Map.get(config, :output_schema))
 
     payload = %{
       system_prompt: Map.get(config, :system_prompt),

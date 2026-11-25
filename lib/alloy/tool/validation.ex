@@ -1,6 +1,7 @@
 defmodule Alloy.Tool.Validation do
   @moduledoc false
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.Tool.Registry
   alias ExJsonSchema.Schema
   alias ExJsonSchema.Schema.{Ref, Root}
@@ -11,6 +12,8 @@ defmodule Alloy.Tool.Validation do
 
   @literal_keywords ~w(const enum default examples)
   @schema_map_keywords ~w(properties patternProperties definitions $defs dependencies)
+  @max_output_validation_errors 10
+  @max_output_validation_bytes 1_000
 
   @spec prepare(map(), :required | :schema, map()) :: {map(), map()}
   def prepare(_tools, :required, _cache), do: {%{}, %{}}
@@ -54,12 +57,16 @@ defmodule Alloy.Tool.Validation do
   @spec preflight_output_schema!(map(), String.t()) :: :ok
   def preflight_output_schema!(schema, name) when is_map(schema) do
     if Code.ensure_loaded?(Schema) do
-      local_refs!(schema)
-
       try do
+        local_refs!(schema)
         _resolved = schema |> Schema.resolve() |> normalize_literal_property_schemas!()
         :ok
       rescue
+        error in ArgumentError ->
+          reraise ArgumentError,
+                  relabel_output_schema_error(Exception.message(error)),
+                  __STACKTRACE__
+
         error ->
           cond do
             error.__struct__ == ExJsonSchema.Schema.UnsupportedSchemaVersionError ->
@@ -89,9 +96,8 @@ defmodule Alloy.Tool.Validation do
   @spec validate_output(map(), term(), String.t()) :: :ok | {:error, String.t()} | :fallback
   def validate_output(schema, decoded, _name) when is_map(schema) do
     if Code.ensure_loaded?(Schema) do
-      local_refs!(schema)
-
       try do
+        local_refs!(schema)
         resolved = schema |> Schema.resolve() |> normalize_literal_property_schemas!()
 
         case Validator.validate(resolved, decoded) do
@@ -99,10 +105,15 @@ defmodule Alloy.Tool.Validation do
             :ok
 
           {:error, errors} ->
-            details = Enum.map_join(errors, "; ", fn {error, path} -> "#{path}: #{error}" end)
-            {:error, "Structured output failed schema validation: #{details}"}
+            {:error,
+             "Structured output failed schema validation: #{format_output_errors(errors)}"}
         end
       rescue
+        error in ArgumentError ->
+          reraise ArgumentError,
+                  relabel_output_schema_error(Exception.message(error)),
+                  __STACKTRACE__
+
         error ->
           if error.__struct__ == ExJsonSchema.Schema.UnsupportedSchemaVersionError do
             :fallback
@@ -113,6 +124,30 @@ defmodule Alloy.Tool.Validation do
     else
       :fallback
     end
+  end
+
+  defp format_output_errors(errors) do
+    total = length(errors)
+
+    summary =
+      errors
+      |> Enum.take(@max_output_validation_errors)
+      |> Enum.map_join("; ", fn {error, path} -> "#{path}: #{error}" end)
+
+    summary =
+      if total > @max_output_validation_errors do
+        "#{summary} (+#{total - @max_output_validation_errors} more)"
+      else
+        summary
+      end
+
+    Sanitize.cap_bytes(summary, @max_output_validation_bytes)
+  end
+
+  defp relabel_output_schema_error(message) do
+    message
+    |> String.replace("tool schemas", "output_schema")
+    |> String.replace("tool schema", "output_schema")
   end
 
   @spec check(map(), String.t(), map()) :: :ok | {:error, String.t(), nil}

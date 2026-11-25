@@ -470,7 +470,8 @@ defmodule Alloy.Agent.Turn do
 
   defp maybe_enable_code_execution(provider_config, false), do: provider_config
 
-  defp maybe_put_output_schema(provider_config, nil), do: provider_config
+  defp maybe_put_output_schema(provider_config, nil),
+    do: Map.delete(provider_config, :output_schema)
 
   defp maybe_put_output_schema(provider_config, spec),
     do: Map.put(provider_config, :output_schema, spec)
@@ -496,12 +497,15 @@ defmodule Alloy.Agent.Turn do
 
       {:continue, State.append_messages(state, [reminder])}
     else
-      with {:ok, state} <- decode_structured_output(state),
-           {:continue, state} <- run_middleware(:after_completion, state) do
-        {:halt, %{state | status: :completed}}
-      else
-        {:error, reason} -> {:halt, fail(state, reason)}
-        {:halt, state} -> {:halt, state}
+      case decode_structured_output(state) do
+        {:ok, state} ->
+          case run_middleware(:after_completion, state) do
+            {:continue, state} -> {:halt, %{state | status: :completed}}
+            {:halt, state} -> {:halt, state}
+          end
+
+        {:error, reason} ->
+          {:halt, fail(state, reason)}
       end
     end
   end
@@ -512,8 +516,14 @@ defmodule Alloy.Agent.Turn do
 
   defp decode_structured_output(%State{config: %{output_schema: spec}} = state) do
     case OutputSchema.decode_and_validate(State.last_assistant_text(state), spec) do
-      {:ok, decoded} -> {:ok, State.merge_run_metadata(state, %{output: decoded})}
-      {:error, reason} -> {:error, reason}
+      {:ok, decoded} ->
+        {:ok, State.merge_run_metadata(state, %{output: decoded})}
+
+      {:error, reason} when state.stop_reason == :max_tokens ->
+        {:error, "Structured output was truncated at :max_tokens (#{reason})"}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

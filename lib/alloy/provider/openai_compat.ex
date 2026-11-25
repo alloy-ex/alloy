@@ -175,13 +175,11 @@ defmodule Alloy.Provider.OpenAICompat do
   end
 
   defp maybe_put_output_schema(body, config) do
-    case Map.get(config, :output_schema) do
+    case OutputSchema.wire(Map.get(config, :output_schema)) do
       nil ->
         body
 
-      spec ->
-        %{name: name, schema: schema, strict: strict} = OutputSchema.normalize!(spec)
-
+      %{name: name, schema: schema, strict: strict} ->
         Map.put(body, "response_format", %{
           "type" => "json_schema",
           "json_schema" => %{
