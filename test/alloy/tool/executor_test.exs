@@ -3,6 +3,7 @@ defmodule Alloy.Tool.ExecutorTest do
 
   alias Alloy.Agent.{Config, State}
   alias Alloy.Message
+  alias Alloy.Provider.Test, as: TestProvider
   alias Alloy.Tool.Executor
 
   # --- Test Tool Modules ---
@@ -1053,6 +1054,259 @@ defmodule Alloy.Tool.ExecutorTest do
 
       ids = Enum.map(blocks, & &1.tool_use_id)
       assert ids == ["c1", "c2", "c3"]
+    end
+  end
+
+  describe "execute_all — absolute run deadline" do
+    test "sequential batches skip unstarted calls after run deadline without emitting tool_start" do
+      test_pid = self()
+
+      first_seq =
+        Alloy.Tool.inline(
+          name: "first_seq",
+          description: "blocks until killed by run deadline",
+          concurrent?: false,
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :first_started)
+
+            receive do
+              :never -> {:ok, "done"}
+            end
+          end
+        )
+
+      second_seq =
+        Alloy.Tool.inline(
+          name: "second_seq",
+          description: "must not execute after deadline",
+          concurrent?: false,
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :second_executed)
+            {:ok, "ran"}
+          end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "c1", name: "first_seq", input: %{}},
+            %{id: "c2", name: "second_seq", input: %{}}
+          ]),
+          TestProvider.text_response("should not reach turn 2")
+        ])
+
+      assert {:error, result} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [first_seq, second_seq],
+                 timeout_ms: 150,
+                 tool_timeout: 10_000,
+                 on_event: fn ev -> send(test_pid, {:run_event, ev}) end
+               )
+
+      assert_received :first_started
+      refute_received :second_executed
+      assert result.status == :error
+      assert [first_call] = result.tool_calls
+      assert first_call.name == "first_seq"
+      assert first_call.error =~ "run deadline"
+
+      tool_starts =
+        Stream.repeatedly(fn ->
+          receive do
+            {:run_event, %{event: :tool_start, payload: %{name: name}}} -> name
+          after
+            0 -> :done
+          end
+        end)
+        |> Enum.take_while(&(&1 != :done))
+
+      assert tool_starts == ["first_seq"]
+      assert :ok == Alloy.Transcript.validate(result.messages)
+
+      tool_result_msg = List.last(result.messages)
+
+      assert Enum.any?(
+               tool_result_msg.content,
+               &(&1.tool_use_id == "c2" and &1.content =~ "Not executed:")
+             )
+    end
+
+    test "tool_concurrency: 1 skips expired calls without emitting tool_start" do
+      test_pid = self()
+
+      first_q_block =
+        Alloy.Tool.inline(
+          name: "first_q_block",
+          description: "blocks until run deadline",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            receive do
+              :never -> {:ok, "done"}
+            end
+          end
+        )
+
+      second_q_skip =
+        Alloy.Tool.inline(
+          name: "second_q_skip",
+          description: "must not run or emit tool_start after expiry",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :c1_second_ran)
+            {:ok, "ran"}
+          end
+        )
+
+      {:ok, c1_pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "s1", name: "first_q_block", input: %{}},
+            %{id: "s2", name: "second_q_skip", input: %{}}
+          ])
+        ])
+
+      assert {:error, c1_result} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: c1_pid},
+                 tools: [first_q_block, second_q_skip],
+                 tool_concurrency: 1,
+                 timeout_ms: 250,
+                 tool_timeout: 10_000,
+                 on_event: fn ev -> send(test_pid, {:c1_event, ev}) end
+               )
+
+      refute_received :c1_second_ran
+      assert [%{name: "first_q_block"}] = c1_result.tool_calls
+
+      c1_starts =
+        Stream.repeatedly(fn ->
+          receive do
+            {:c1_event, %{event: :tool_start, payload: %{name: name}}} -> name
+          after
+            0 -> :done
+          end
+        end)
+        |> Enum.take_while(&(&1 != :done))
+
+      assert c1_starts == ["first_q_block"]
+    end
+
+    test "queued concurrent tools inside a parallel batch are killed at the absolute run deadline" do
+      test_pid = self()
+
+      t1_delayed =
+        Alloy.Tool.inline(
+          name: "t1_delayed",
+          description: "finishes 500ms into an 800ms budget to dequeue t3 late",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            Process.sleep(500)
+            send(test_pid, :t1_done)
+            {:ok, "t1 done"}
+          end
+        )
+
+      t2_hold =
+        Alloy.Tool.inline(
+          name: "t2_hold",
+          description: "holds slot 2 until deadline",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            receive do
+              :never -> {:ok, "done"}
+            end
+          end
+        )
+
+      t3_queued =
+        Alloy.Tool.inline(
+          name: "t3_queued",
+          description: "dequeued at ~500ms and killed at 800ms before 1_000ms side effect",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :t3_started)
+            Process.sleep(500)
+            send(test_pid, :t3_side_effect)
+            {:ok, "ran"}
+          end
+        )
+
+      {:ok, q_pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "q1", name: "t1_delayed", input: %{}},
+            %{id: "q2", name: "t2_hold", input: %{}},
+            %{id: "q3", name: "t3_queued", input: %{}}
+          ])
+        ])
+
+      q_started = System.monotonic_time(:millisecond)
+
+      assert {:error, q_result} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: q_pid},
+                 tools: [t1_delayed, t2_hold, t3_queued],
+                 tool_concurrency: 2,
+                 timeout_ms: 800,
+                 tool_timeout: 10_000
+               )
+
+      assert System.monotonic_time(:millisecond) - q_started < 3_000
+      assert_received :t1_done
+      assert_received :t3_started
+      refute_receive :t3_side_effect, 400
+      assert q_result.status == :error
+
+      assert Enum.any?(
+               q_result.tool_calls,
+               &(&1.name == "t3_queued" and &1.error =~ "run deadline")
+             )
+    end
+
+    test "blocked tool calls in an already-expired batch preserve middleware block reason" do
+      state = build_state([SuccessTool], middleware: [BlockingMiddleware])
+      call = %{type: "tool_use", id: "b1", name: "success", input: %{}}
+      past = System.monotonic_time(:millisecond) - 10
+
+      assert {:ok, %Message{content: [%{tool_use_id: "b1", content: content, is_error: true}]},
+              []} =
+               Executor.execute_all([call], state.tool_fns, state, run_deadline: past)
+
+      assert content == "Blocked: not allowed"
+    end
+
+    test "explicit nil or false tool inputs are rejected rather than coerced to an empty map" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "optional_tool",
+          description: "Optional args",
+          input_schema: %{type: "object", properties: %{a: %{type: "string"}}},
+          execute: fn input, _ctx ->
+            send(test_pid, {:ran, input})
+            {:ok, "ran"}
+          end
+        )
+
+      state = build_state([tool])
+      on_event = fn event -> send(test_pid, {:event, event}) end
+
+      for bad_input <- [nil, false, [1, 2], "str"] do
+        call = %{type: "tool_use", id: "bad", name: "optional_tool", input: bad_input}
+
+        assert {:ok, %Message{content: [%{is_error: true, content: content}]}, [meta]} =
+                 Executor.execute_all([call], state.tool_fns, state, on_event: on_event)
+
+        assert content =~ "must be a JSON object"
+        assert meta.input == bad_input
+        assert_received {:event, {:tool_start, %{id: "bad", input: ^bad_input}}}
+        assert_received {:event, {:tool_end, %{id: "bad", input: ^bad_input}}}
+        refute_received {:ran, _}
+      end
     end
   end
 end

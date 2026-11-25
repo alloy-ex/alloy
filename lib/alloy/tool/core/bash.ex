@@ -28,7 +28,9 @@ defmodule Alloy.Tool.Core.Bash do
     still applies on top of it.
   - `:bash_executor` - an `t:executor/0` that runs the command instead of
     the local shell, for a container, VM or remote runner. The options
-    above, except the timeout, do not apply to it.
+    above, except the timeout, do not apply to it. Custom executors run inside
+    a supervised worker that is brutally killed on timeout or cancellation
+    (avoid setting `:trap_exit` unless your executor handles termination).
   - `:working_directory` - where the command runs (set by the agent).
 
   ## Security
@@ -67,7 +69,8 @@ defmodule Alloy.Tool.Core.Bash do
 
   @behaviour Alloy.Tool
 
-  alias Alloy.OSProcess
+  alias Alloy.{OSProcess, OwnedWorker}
+  alias Alloy.Provider.Error
 
   @typedoc """
   A custom command executor. Receives the shell command string and the working
@@ -115,15 +118,31 @@ defmodule Alloy.Tool.Core.Bash do
   @impl true
   def execute(input, context) do
     command = input["command"]
-    max_timeout = Map.get(context, :bash_max_timeout, @max_timeout)
-    timeout = normalize_timeout(input["timeout"], max_timeout)
-    working_dir = Map.get(context, :working_directory)
 
-    case Map.get(context, :bash_executor) do
-      nil -> run_host(command, working_dir, timeout, context)
-      executor -> run_custom_executor(executor, command, working_dir, timeout)
+    with :ok <- validate_command(command) do
+      max_timeout = Map.get(context, :bash_max_timeout, @max_timeout)
+      timeout = normalize_timeout(input["timeout"], max_timeout)
+      working_dir = Map.get(context, :working_directory)
+
+      case Map.get(context, :bash_executor) do
+        nil -> run_host(command, working_dir, timeout, context)
+        executor -> run_custom_executor(executor, command, working_dir, timeout)
+      end
     end
   end
+
+  defp validate_command(command) when is_binary(command) do
+    if String.contains?(command, <<0>>) do
+      {:error, "command must not contain NUL bytes."}
+    else
+      :ok
+    end
+  end
+
+  defp validate_command(command),
+    do:
+      {:error,
+       "command must be a string, got: #{inspect(command, limit: 20, printable_limit: 500)}"}
 
   defp run_host(command, working_dir, timeout, context) do
     with {:ok, bash} <- find_bash(),
@@ -156,7 +175,8 @@ defmodule Alloy.Tool.Core.Bash do
           {:error, with_output(output, timeout_message(timeout))}
 
         {:exit, reason} ->
-          {:error, "Executor crashed: #{inspect(reason)}"}
+          OSProcess.signal_group(os_pid, "KILL")
+          {:error, "Executor crashed: #{OwnedWorker.format_exit_reason(reason)}"}
 
         # The runner missed its own deadline and was killed before it could
         # stop the shell, so stop it here.
@@ -216,20 +236,33 @@ defmodule Alloy.Tool.Core.Bash do
   end
 
   defp run_port(bash, opts, timeout, caller) do
+    # Trapping exits lets a supervisor shutdown stop the shell process group too.
+    Process.flag(:trap_exit, true)
     caller_ref = Process.monitor(caller)
-    port = Port.open({:spawn_executable, bash}, opts)
 
-    run = %{
-      port: port,
-      os_pid: OSProcess.os_pid(port),
-      caller_ref: caller_ref,
-      deadline: System.monotonic_time(:millisecond) + timeout
-    }
+    receive do
+      {:DOWN, ^caller_ref, :process, _pid, _reason} ->
+        :caller_down
 
-    send(caller, {:bash_os_pid, self(), run.os_pid})
-    result = collect(run, new_output())
-    Process.demonitor(caller_ref, [:flush])
-    result
+      {:EXIT, from, reason} when is_pid(from) ->
+        Process.demonitor(caller_ref, [:flush])
+        exit(reason)
+    after
+      0 ->
+        port = Port.open({:spawn_executable, bash}, opts)
+
+        run = %{
+          port: port,
+          os_pid: OSProcess.os_pid(port),
+          caller_ref: caller_ref,
+          deadline: System.monotonic_time(:millisecond) + timeout
+        }
+
+        send(caller, {:bash_os_pid, self(), run.os_pid})
+        result = collect(run, new_output())
+        Process.demonitor(caller_ref, [:flush])
+        result
+    end
   end
 
   # Flushes the runner's start message in every outcome; the pid is only
@@ -262,6 +295,11 @@ defmodule Alloy.Tool.Core.Bash do
       {:DOWN, ^caller_ref, :process, _pid, _reason} ->
         OSProcess.signal_group(run.os_pid, "KILL")
         :caller_down
+
+      {:EXIT, from, reason} when is_pid(from) ->
+        OSProcess.signal_group(run.os_pid, "KILL")
+        Process.demonitor(caller_ref, [:flush])
+        exit(reason)
     after
       remaining -> time_out(run, output)
     end
@@ -272,26 +310,52 @@ defmodule Alloy.Tool.Core.Bash do
     {:timeout, render(output)}
   end
 
+  # Runs the custom executor inside a linked worker owned by a supervised task
+  # that monitors the caller before starting the worker and propagates Logger
+  # metadata and OpenTelemetry context.
   defp run_custom_executor(executor, command, working_dir, timeout) do
-    task =
-      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-        executor.(command, working_dir)
-      end)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    owner = OwnedWorker.start(deadline, fn -> executor.(command, working_dir) end)
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {output, exit_code}} ->
+    case Task.yield(owner, timeout + 1_000) do
+      {:ok, {:ok, {output, exit_code}}} when is_binary(output) and is_integer(exit_code) ->
         {:ok, "#{new_output() |> append(output) |> render()}\nexit code: #{exit_code}"}
 
+      {:ok, {:ok, other}} ->
+        {:error,
+         "Custom bash executor returned invalid result: #{inspect(other, limit: 20, printable_limit: 500)}"}
+
+      {:ok, {:worker_exit, {:worker_crash, kind, reason, stacktrace}}} ->
+        {:error, "Executor crashed: #{format_worker_crash(kind, reason, stacktrace)}"}
+
+      {:ok, {:worker_exit, reason}} ->
+        {:error, "Executor crashed: #{OwnedWorker.format_exit_reason(reason)}"}
+
       {:exit, reason} ->
-        {:error, "Executor crashed: #{inspect(reason)}"}
+        {:error, "Executor crashed: #{OwnedWorker.format_exit_reason(reason)}"}
+
+      {:ok, :timeout} ->
+        {:error, timeout_message(timeout)}
 
       nil ->
-        {:error, "Command timed out after #{timeout}ms."}
+        OwnedWorker.cancel(owner)
+        {:error, timeout_message(timeout)}
     end
   end
 
   defp maybe_add_cd(opts, nil), do: opts
   defp maybe_add_cd(opts, dir), do: [{:cd, dir} | opts]
+
+  defp format_worker_crash(:error, reason, stacktrace) do
+    :error
+    |> Exception.format_banner(reason, stacktrace)
+    |> Error.cap_bytes(500)
+  end
+
+  defp format_worker_crash(kind, reason, _stacktrace) do
+    "#{kind}: #{inspect(reason, limit: 20, printable_limit: 500)}"
+    |> Error.cap_bytes(500)
+  end
 
   defp normalize_timeout(timeout, max) when is_integer(timeout) and timeout > 0,
     do: min(timeout, max)

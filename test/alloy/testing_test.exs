@@ -3,6 +3,18 @@ defmodule Alloy.TestingTest do
 
   use Alloy.Testing
 
+  alias Alloy.Message
+
+  defmodule SentinelProvider do
+    @behaviour Alloy.Provider
+
+    @impl true
+    def complete(_m, _t, config) do
+      send(config.owner, :sentinel_called)
+      {:ok, %{stop_reason: :end_turn, messages: [Message.assistant("sentinel")], usage: %{}}}
+    end
+  end
+
   describe "run_with_responses/2" do
     test "runs agent with scripted text response" do
       result =
@@ -66,6 +78,79 @@ defmodule Alloy.TestingTest do
                %Alloy.Tool.Inline{} -> true
                module when is_atom(module) -> module in app_modules
              end)
+    end
+
+    test "routes through Config.from_opts/1, enforces scripted provider, and rejects unknown options" do
+      test_pid = self()
+
+      state =
+        run_with_responses(
+          "hi",
+          [
+            tool_response("echo", %{text: "hi"}),
+            text_response("ignored")
+          ],
+          stop_after_tool: "echo"
+        )
+
+      assert state.status == :completed
+      assert state.turn == 1
+      assert state.config.middleware == []
+
+      scripted =
+        run_with_responses(
+          "hi",
+          [text_response("from scripted")],
+          provider: {SentinelProvider, owner: test_pid}
+        )
+
+      assert scripted.status == :completed
+      assert Message.text(List.last(scripted.messages)) == "from scripted"
+      refute_received :sentinel_called
+
+      links_before = Process.info(self(), :links)
+
+      assert_raise ArgumentError, ~r/unknown options/, fn ->
+        run_with_responses("hi", [], bogus_opt: true)
+      end
+
+      assert Process.info(self(), :links) == links_before
+
+      assert_raise ArgumentError, fn ->
+        run_with_responses("hi", [], tools: [123])
+      end
+
+      assert Process.info(self(), :links) == links_before
+
+      _ = run_with_responses("hi", [text_response("tidy")])
+      assert Process.info(self(), :links) == links_before
+    end
+
+    test "clears fallback_providers so scripted errors or exhausted queues never invoke live fallbacks" do
+      test_pid = self()
+
+      errored =
+        run_with_responses(
+          "hi",
+          [error_response(%Alloy.Provider.Error{kind: :overloaded, message: "busy"})],
+          max_retries: 0,
+          fallback_providers: [{SentinelProvider, owner: test_pid}]
+        )
+
+      assert errored.status == :error
+      assert errored.error =~ "busy"
+      refute_received :sentinel_called
+
+      exhausted =
+        run_with_responses(
+          "hi",
+          [],
+          max_retries: 0,
+          fallback_providers: [{SentinelProvider, owner: test_pid}]
+        )
+
+      assert exhausted.status == :error
+      refute_received :sentinel_called
     end
   end
 

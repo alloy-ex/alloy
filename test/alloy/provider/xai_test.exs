@@ -126,6 +126,30 @@ defmodule Alloy.Provider.XAITest do
       assert_received {:request_host, host}
       assert host == "custom.xai.endpoint"
     end
+
+    test "forwards extra_headers, trims trailing api_url slash, and Provider.decode_body returns :malformed_reply" do
+      test_pid = self()
+
+      Req.Test.stub(:xai_extra_headers, fn conn ->
+        send(test_pid, {:headers, conn.request_path, conn.req_headers})
+        Req.Test.json(conn, %{"output_text" => "ok", "usage" => %{}})
+      end)
+
+      assert {:ok, _} =
+               XAI.complete([Message.user("hi")], [], %{
+                 api_key: "k",
+                 api_url: "http://localhost/",
+                 model: "grok-4.7",
+                 extra_headers: [{"x-custom", "yes"}],
+                 req_options: [plug: {Req.Test, :xai_extra_headers}]
+               })
+
+      assert_received {:headers, "/v1/responses", headers}
+      assert {"x-custom", "yes"} in headers
+
+      assert {:error, %Alloy.Provider.Error{kind: :malformed_reply}} =
+               Alloy.Provider.decode_body("{not-json")
+    end
   end
 
   describe "stream/4" do

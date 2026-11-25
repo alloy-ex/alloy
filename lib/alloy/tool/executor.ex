@@ -10,8 +10,13 @@ defmodule Alloy.Tool.Executor do
 
   `:tool_concurrency` limits parallel calls (defaults to the scheduler count).
   `:tool_validation` defaults to required-key checks; `:schema` enables optional
-  JSON Schema validation. Each outcome passes through `:after_tool_call`
-  middleware before transcript and event publication.
+  JSON Schema validation. Each dispatched call outcome passes through
+  `:after_tool_call` middleware before transcript and event publication. If the
+  run's `:timeout_ms` deadline expires before a batch starts, unstarted calls
+  (including middleware-blocked calls in that batch) still receive matching
+  error `tool_result` blocks in the transcript (preserving any `:before_tool_call`
+  block reason) without emitting `:tool_start`/`:tool_end`, running
+  `:after_tool_call`, or appearing in `result.tool_calls`.
 
   Each call runs in an unlinked task under `Alloy.TaskSupervisor`, bounded
   by the agent's `:tool_timeout`. A tool that raises, exits, throws or
@@ -40,16 +45,24 @@ defmodule Alloy.Tool.Executor do
   @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t(), keyword()) ::
           {:ok, Message.t(), [map()]} | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
-    {schemas, _cache} =
-      Validation.prepare(tool_fns, state.config.tool_validation, state.tool_schema_cache)
+    inline_tools = Map.new(tool_fns, fn {name, tool} -> {name, Registry.to_inline(tool)} end)
+
+    schemas =
+      Keyword.get_lazy(opts, :tool_schemas, fn ->
+        {prepared, _cache} =
+          Validation.prepare(inline_tools, state.config.tool_validation, state.tool_schema_cache)
+
+        prepared
+      end)
 
     run = %{
       state: state,
       schemas: schemas,
       concurrency: state.config.tool_concurrency || System.schedulers_online(),
-      tool_fns: tool_fns,
+      tool_fns: inline_tools,
       context: build_context(state),
       timeout: state.config.tool_timeout,
+      run_deadline: Keyword.get(opts, :run_deadline),
       on_event: Keyword.get(opts, :on_event, fn _ -> :ok end),
       seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
       corr_id: Keyword.get(opts, :event_correlation_id, random_id()),
@@ -59,19 +72,23 @@ defmodule Alloy.Tool.Executor do
     with {:ok, tagged} <- tag_tool_calls(state, tool_calls) do
       {results, meta} =
         tagged
-        |> batches(tool_fns)
+        |> batches(inline_tools, state.config.tool_concurrency == 1)
         |> Enum.flat_map(&run_batch(&1, run))
         |> Enum.unzip()
 
-      {:ok, Message.tool_results(results), meta}
+      {:ok, Message.tool_results(results), Enum.reject(meta, &is_nil/1)}
     end
   end
 
   # Calls run in the order the model made them, so a sequential call sees
   # the effects of every call before it ([read f, edit f] reads first).
-  # Consecutive concurrency-safe calls share a parallel batch; each
-  # sequential call is a batch of its own.
-  defp batches(tagged, tool_fns) do
+  # Consecutive concurrency-safe calls share a parallel batch unless
+  # tool_concurrency: 1 is explicitly requested; sequential calls (and all
+  # calls under explicit tool_concurrency: 1) run as their own single-call
+  # batch so unstarted calls after deadline expiry never emit tool_start.
+  defp batches(tagged, _tool_fns, true = _explicit_serial?), do: Enum.map(tagged, &[&1])
+
+  defp batches(tagged, tool_fns, false = _explicit_serial?) do
     tagged
     |> Enum.chunk_by(&concurrent?(&1, tool_fns))
     |> Enum.flat_map(fn [first | _] = batch ->
@@ -81,7 +98,7 @@ defmodule Alloy.Tool.Executor do
 
   defp concurrent?({:execute, call}, tool_fns) do
     case Map.fetch(tool_fns, call[:name]) do
-      {:ok, tool} -> Registry.to_inline(tool).concurrent? != false
+      {:ok, %Inline{concurrent?: concurrent?}} -> concurrent? != false
       :error -> true
     end
   end
@@ -93,13 +110,30 @@ defmodule Alloy.Tool.Executor do
   # instead of taking down the agent process that called the executor. If
   # that process is killed (a cancelled turn), the tasks are killed too.
   #
-  # tool_start is emitted here, before the task exists, and tool_end after
-  # it finishes, so the pair matches even when the task is killed on
-  # timeout. Parallelism uses the configured cap, defaulting to schedulers_online;
-  # a queued call's duration includes its wait.
+  # tool_start is emitted here, before the tasks in a batch exist, and tool_end
+  # after each finishes, so on_event always runs in the caller process and every
+  # tool_start pairs with a tool_end even on timeout. Sequential calls (and all
+  # calls when tool_concurrency: 1) are singleton batches, so expired calls emit
+  # no events and are omitted from tool_calls. Inside an already-dispatched
+  # parallel batch (tool_concurrency > 1), a queued call dequeued after expiry
+  # skips tool execution and emits its matching error tool_end. Parallelism uses
+  # the configured cap, defaulting to schedulers_online; a queued call's duration
+  # includes its wait.
   defp run_batch(batch, run) do
-    started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
-    watcher = watch_caller(self(), length(started))
+    case batch_timeout(run) do
+      :expired ->
+        Enum.map(batch, &unexecuted_result(&1, run))
+
+      {timeout_ms, deadline_capped?} ->
+        started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
+        execute_batch_tasks(started, batch, run, timeout_ms, deadline_capped?)
+    end
+  end
+
+  defp execute_batch_tasks(started, batch, run, timeout_ms, deadline_capped?) do
+    deadline_hit_ref = :atomics.new(1, signed: false)
+    expected_workers = Enum.count(started, &match?({:execute, _}, &1.tag))
+    watcher = watch_caller(self(), expected_workers, run.run_deadline, deadline_hit_ref)
 
     try do
       results =
@@ -107,7 +141,7 @@ defmodule Alloy.Tool.Executor do
         |> Task.Supervisor.async_stream_nolink(
           started,
           &{&1, invoke_watched(&1.tag, run, watcher)},
-          timeout: run.timeout,
+          timeout: timeout_ms,
           on_timeout: :kill_task,
           max_concurrency: min(length(batch), run.concurrency),
           ordered: false,
@@ -118,7 +152,13 @@ defmodule Alloy.Tool.Executor do
             finish(started, outcome, run)
 
           {:exit, {started, reason}} ->
-            finish(started, exit_outcome(started.call, reason, run), run)
+            deadline_hit? = :atomics.get(deadline_hit_ref, 1) == 1
+
+            finish(
+              started,
+              exit_outcome(started.call, reason, run, deadline_capped?, deadline_hit?),
+              run
+            )
         end)
 
       results
@@ -129,26 +169,94 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
+  defp unexecuted_result({:blocked, call, reason}, _run) do
+    {Message.tool_result_block(call[:id], "Blocked: #{reason}", true), nil}
+  end
+
+  defp unexecuted_result({:execute, call}, run) do
+    {Message.tool_result_block(call[:id], deadline_skipped_message(run), true), nil}
+  end
+
+  defp batch_timeout(%{run_deadline: nil, timeout: timeout}), do: {timeout, false}
+
+  defp batch_timeout(%{run_deadline: deadline, timeout: timeout}) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      :expired
+    else
+      {min(timeout, remaining), remaining < timeout}
+    end
+  end
+
+  defp deadline_expired?(nil), do: false
+  defp deadline_expired?(deadline), do: System.monotonic_time(:millisecond) >= deadline
+
+  defp deadline_wait_ms(nil), do: :infinity
+
+  defp deadline_wait_ms(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
+  end
+
+  defp deadline_skipped_message(run) do
+    case run.state.config.timeout_ms do
+      timeout_ms when is_integer(timeout_ms) ->
+        "Not executed: Agent run timed out after #{timeout_ms}ms"
+
+      _infinity ->
+        "Not executed: Agent run deadline was reached"
+    end
+  end
+
+  defp deadline_skipped_outcome(run) do
+    {:error, deadline_skipped_message(run), nil}
+  end
+
   # The tasks are unlinked, so a cancelled turn — killed outright, with no
   # chance to clean up — would leave its tools running. This supervised
-  # watcher kills them when the caller dies. Each task registers itself as
-  # it starts; after the caller dies the watcher still waits briefly for
-  # tasks that started but had not registered yet.
-  defp watch_caller(caller, expected) do
+  # watcher kills them when the caller dies OR when the run's absolute deadline
+  # arrives (bounding tasks dequeued shortly before expiry under tool_concurrency).
+  # Each task registers itself as it starts; after the caller dies the watcher
+  # still waits briefly for tasks that started but had not registered yet.
+  defp watch_caller(caller, expected, deadline, deadline_hit_ref) do
     {:ok, watcher} =
       Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
         ref = Process.monitor(caller)
-        watch(ref, [], expected)
+        watch(ref, [], expected, deadline, deadline_hit_ref)
       end)
 
     watcher
   end
 
-  defp watch(ref, pids, expected) do
+  defp watch(ref, pids, expected, deadline, deadline_hit_ref) do
     receive do
-      {:watch, pid} -> watch(ref, [pid | pids], expected)
-      :done -> Process.demonitor(ref, [:flush])
-      {:DOWN, ^ref, :process, _pid, _reason} -> kill_watched(pids, expected - length(pids))
+      {:watch, pid} ->
+        watch(ref, [pid | pids], expected, deadline, deadline_hit_ref)
+
+      :done ->
+        Process.demonitor(ref, [:flush])
+
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        kill_watched(pids, expected - length(pids))
+    after
+      deadline_wait_ms(deadline) ->
+        :atomics.put(deadline_hit_ref, 1, 1)
+        Enum.each(pids, &Process.exit(&1, :kill))
+        watch_expired(ref)
+    end
+  end
+
+  defp watch_expired(ref) do
+    receive do
+      {:watch, pid} ->
+        Process.exit(pid, :kill)
+        watch_expired(ref)
+
+      :done ->
+        Process.demonitor(ref, [:flush])
+
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        :ok
     end
   end
 
@@ -167,9 +275,22 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
+  defp invoke_watched({:blocked, _call, reason}, _run, _watcher) do
+    {:error, "Blocked: #{reason}", nil}
+  end
+
   defp invoke_watched(tag, run, watcher) do
-    send(watcher, {:watch, self()})
-    invoke(tag, run)
+    if deadline_expired?(run.run_deadline) do
+      deadline_skipped_outcome(run)
+    else
+      send(watcher, {:watch, self()})
+
+      if deadline_expired?(run.run_deadline) do
+        deadline_skipped_outcome(run)
+      else
+        invoke(tag, run)
+      end
+    end
   end
 
   defp tag_tool_calls(state, calls) do
@@ -198,7 +319,7 @@ defmodule Alloy.Tool.Executor do
        %{
          id: call[:id],
          name: call[:name],
-         input: call[:input] || %{},
+         input: Map.get(call, :input, %{}),
          event_seq: seq,
          correlation_id: run.corr_id
        }}
@@ -222,11 +343,9 @@ defmodule Alloy.Tool.Executor do
 
   # Runs inside the task. Returns {:ok, text, structured_data | nil} or
   # {:error, model_visible_message, diagnostic_message}.
-  defp invoke({:blocked, _call, reason}, _run), do: {:error, "Blocked: #{reason}", nil}
-
   defp invoke({:execute, call}, run) do
     with {:ok, tool} <- fetch_tool(run.tool_fns, call[:name]),
-         input = call[:input] || %{},
+         input = Map.get(call, :input, %{}),
          :ok <- check_input(input, tool),
          :ok <- Validation.check(input, call[:name], run.schemas) do
       execute_tool(tool, input, call, run.context)
@@ -235,7 +354,7 @@ defmodule Alloy.Tool.Executor do
 
   defp fetch_tool(tool_fns, name) do
     case Map.fetch(tool_fns, name) do
-      {:ok, tool} -> {:ok, Registry.to_inline(tool)}
+      {:ok, %Inline{} = tool} -> {:ok, tool}
       :error -> {:error, "Unknown tool: #{name}", nil}
     end
   end
@@ -258,7 +377,9 @@ defmodule Alloy.Tool.Executor do
   end
 
   defp check_input(input, %Inline{name: name}) do
-    {:error, "Input for #{name} must be a JSON object, got: #{inspect(input)}", nil}
+    {:error,
+     "Input for #{name} must be a JSON object, got: #{inspect(input, limit: 20, printable_limit: 500)}",
+     nil}
   end
 
   defp required_keys(schema) do
@@ -286,16 +407,38 @@ defmodule Alloy.Tool.Executor do
        Exception.format(:error, e, stacktrace)}
   end
 
-  defp exit_outcome(call, :timeout, run) do
-    {:error,
-     "Tool #{call[:name]} timed out after #{run.timeout}ms. " <>
-       "Try a smaller input or raise :tool_timeout.", nil}
+  defp exit_outcome(call, :killed, run, _deadline_capped?, true = _deadline_hit?) do
+    run_deadline_timeout_outcome(call, run)
   end
 
-  defp exit_outcome(call, reason, _run) do
+  defp exit_outcome(call, :timeout, run, true = _deadline_capped?, _deadline_hit?) do
+    run_deadline_timeout_outcome(call, run)
+  end
+
+  defp exit_outcome(call, :timeout, run, false = _deadline_capped?, deadline_hit?) do
+    if deadline_hit? or deadline_expired?(run.run_deadline) do
+      run_deadline_timeout_outcome(call, run)
+    else
+      {:error,
+       "Tool #{call[:name]} timed out after #{run.timeout}ms. " <>
+         "Try a smaller input or raise :tool_timeout.", nil}
+    end
+  end
+
+  defp exit_outcome(call, reason, _run, _deadline_capped?, _deadline_hit?) do
     {:error,
      "Tool #{call[:name]} crashed during execution: #{inspect(exit_reason(reason))}. " <>
        "Check the input and try again.", nil}
+  end
+
+  defp run_deadline_timeout_outcome(call, run) do
+    detail =
+      case run.state.config.timeout_ms do
+        timeout_ms when is_integer(timeout_ms) -> " (#{timeout_ms}ms)"
+        _infinity -> ""
+      end
+
+    {:error, "Tool #{call[:name]} timed out because the run deadline#{detail} was reached.", nil}
   end
 
   # The model sees the reason without the stacktrace a throw carries.
@@ -328,7 +471,7 @@ defmodule Alloy.Tool.Executor do
     meta = %{
       id: call[:id],
       name: call[:name],
-      input: call[:input] || %{},
+      input: Map.get(call, :input, %{}),
       duration_ms: max(System.monotonic_time(:millisecond) - started.started_at, 0),
       error: result_error(error, original, result)
     }
@@ -355,7 +498,7 @@ defmodule Alloy.Tool.Executor do
 
   defp bounded_result(content, _original, call, run) do
     case Map.fetch(run.tool_fns, call[:name]) do
-      {:ok, tool} -> maybe_truncate(valid_text(content), Registry.to_inline(tool))
+      {:ok, %Inline{} = tool} -> maybe_truncate(valid_text(content), tool)
       :error -> valid_text(content)
     end
   end

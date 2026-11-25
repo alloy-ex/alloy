@@ -72,6 +72,7 @@ defmodule Alloy.Memory do
 
   @tool_name "memory"
   @tool_type "memory_20250818"
+  @max_result_chars 50_000
 
   @tool_description """
   Persistent memory that outlives this conversation, stored as files \
@@ -181,6 +182,7 @@ defmodule Alloy.Memory do
       input_schema: @tool_schema,
       execute: fn input, _context -> Router.dispatch(binding, input) end,
       concurrent?: false,
+      max_result_chars: @max_result_chars,
       native_types: %{anthropic: @tool_type}
     )
   end

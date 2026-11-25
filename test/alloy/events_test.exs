@@ -1,6 +1,8 @@
 defmodule Alloy.EventsTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Alloy.Agent.{Config, State}
   alias Alloy.Events
 
@@ -192,6 +194,56 @@ defmodule Alloy.EventsTest do
       refute Map.has_key?(envelope.payload, :event_seq)
       refute Map.has_key?(envelope.payload, :correlation_id)
       assert envelope.payload.name == "read"
+    end
+
+    test "rescues raising on_event callbacks (logging once per run) and still fires telemetry" do
+      ref = make_ref()
+      handler = "events-rescue-#{inspect(ref)}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler,
+        [:alloy, :event],
+        fn _ev, _m, meta, _ -> send(test_pid, {:telemetry_event, meta.event}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      opts =
+        Events.normalize_opts(
+          build_state(),
+          on_event: fn _ -> raise "ui exploded" end,
+          event_correlation_id: "c1"
+        )
+
+      log =
+        capture_log(fn ->
+          assert :ok = Events.emit(opts, 1, {:tool_start, %{name: "read"}})
+          assert :ok = Events.emit(opts, 1, {:tool_end, %{name: "read"}})
+        end)
+
+      assert length(Regex.scan(~r/on_event callback failed/, log)) == 1
+      assert_received {:telemetry_event, :tool_start}
+      assert_received {:telemetry_event, :tool_end}
+    end
+
+    test "strips callback arguments from FunctionClauseError logs on on_event failure" do
+      opts =
+        Events.normalize_opts(
+          build_state(),
+          on_event: fn %{event: :never_matches} -> :ok end,
+          event_correlation_id: "c-secret"
+        )
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   Events.emit(opts, 1, {:tool_end, %{output: "SECRET_EVENT_PAYLOAD_TOKEN"}})
+        end)
+
+      assert log =~ "on_event callback failed"
+      refute log =~ "SECRET_EVENT_PAYLOAD_TOKEN"
     end
   end
 end

@@ -24,6 +24,9 @@ defmodule Alloy.Provider.Gemini do
   - `:tool_config` - Raw Gemini `toolConfig`
   - `:safety_settings` - Raw Gemini `safetySettings`
   - `:extra_headers` - Additional headers as `[{name, value}]`
+  - `:extra_body` - Additional top-level request body fields, shallow-merged last
+    (a key in `:extra_body` replaces any provider-built key of the same name,
+    such as `"generationConfig"`)
   - `:req_options` - Additional options passed to Req
 
   ## Thinking
@@ -59,6 +62,7 @@ defmodule Alloy.Provider.Gemini do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
+  alias Alloy.Provider
   alias Alloy.Provider.{Error, HTTP}
 
   @placeholder_thought_signature "skip_thought_signature_validator"
@@ -91,6 +95,7 @@ defmodule Alloy.Provider.Gemini do
           optional(:tool_config) => map(),
           optional(:safety_settings) => [map()],
           optional(:extra_headers) => [{String.t(), String.t()}],
+          optional(:extra_body) => map(),
           optional(:req_options) => keyword()
         }
 
@@ -105,7 +110,8 @@ defmodule Alloy.Provider.Gemini do
              request_url(config, "generateContent"),
              build_headers(config),
              body,
-             Map.get(config, :req_options, [])
+             Map.get(config, :req_options, []),
+             deadline: Map.get(config, :alloy_request_deadline)
            ) do
       parse_response(resp_body)
     end
@@ -124,6 +130,7 @@ defmodule Alloy.Provider.Gemini do
       content_blocks: [],
       response: %{},
       candidate: %{},
+      stream_error: nil,
       on_chunk: on_chunk
     }
 
@@ -134,18 +141,19 @@ defmodule Alloy.Provider.Gemini do
              body,
              initial_acc,
              &handle_sse_event/2,
-             [params: [alt: "sse"]] ++ Map.get(config, :req_options, [])
+             [params: [alt: "sse"]] ++ Map.get(config, :req_options, []),
+             deadline: Map.get(config, :alloy_request_deadline)
            ) do
       build_stream_response(acc)
     end
   end
 
   defp request_url(config, method) do
-    api_url = Map.get(config, :api_url, @default_api_url) |> String.trim_trailing("/")
+    api_url = Map.get(config, :api_url, @default_api_url)
     api_version = Map.get(config, :api_version, @default_api_version)
     model = normalize_model(Map.fetch!(config, :model))
 
-    "#{api_url}/#{api_version}/models/#{model}:#{method}"
+    HTTP.join_url(api_url, "/#{api_version}/models/#{model}:#{method}")
   end
 
   defp normalize_model("models/" <> model), do: model
@@ -195,10 +203,13 @@ defmodule Alloy.Provider.Gemini do
         tool_config -> Map.put(body, "toolConfig", Alloy.Provider.stringify_keys(tool_config))
       end
 
-    case Map.get(config, :safety_settings) do
-      nil -> body
-      settings -> Map.put(body, "safetySettings", Alloy.Provider.stringify_keys(settings))
-    end
+    body =
+      case Map.get(config, :safety_settings) do
+        nil -> body
+        settings -> Map.put(body, "safetySettings", Provider.stringify_keys(settings))
+      end
+
+    Map.merge(body, HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})))
   end
 
   defp build_contents(messages) do
@@ -334,37 +345,47 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp parse_response(body) when is_binary(body) do
-    case Alloy.Provider.decode_body(body) do
+    case Provider.decode_body(body) do
       {:ok, decoded} -> parse_response(decoded)
-      {:error, message} -> {:error, %Error{kind: :unknown, message: message}}
+      {:error, _} = err -> err
     end
   end
 
-  defp parse_response(%{"candidates" => [candidate | _]} = resp) do
-    candidate
-    |> get_in(["content", "parts"])
-    |> List.wrap()
-    |> Enum.map(&parse_content_part/1)
-    |> respond(candidate, resp)
+  # Prioritize explicit in-band API errors before candidate parsing so a real
+  # error payload is never masked by missing or malformed sibling candidates.
+  defp parse_response(%{"error" => error}) when is_map(error) or is_binary(error),
+    do: {:error, in_band_error(error)}
+
+  defp parse_response(%{"candidates" => [candidate | _]} = resp) when is_map(candidate) do
+    with {:ok, blocks} <- extract_candidate_blocks(candidate) do
+      respond(blocks, candidate, resp)
+    end
+  end
+
+  defp parse_response(%{"candidates" => [_non_map | _]}) do
+    {:error, %Error{kind: :malformed_reply, message: "Malformed candidate in Gemini response"}}
+  end
+
+  defp parse_response(%{"candidates" => candidates})
+       when candidates != nil and not is_list(candidates) do
+    {:error, %Error{kind: :malformed_reply, message: "Malformed candidates in Gemini response"}}
   end
 
   defp parse_response(%{"promptFeedback" => %{"blockReason" => _}} = resp),
     do: prompt_blocked(resp)
 
-  defp parse_response(%{"error" => error}), do: {:error, in_band_error(error)}
-
   defp parse_response(other) do
     {:error,
-     %Error{kind: :unknown, message: "Unexpected Gemini response payload: #{inspect(other)}"}}
+     %Error{
+       kind: :unknown,
+       message:
+         "Unexpected Gemini response payload: #{inspect(other, limit: 20, printable_limit: 500)}"
+     }}
   end
 
   # Errors can also arrive in a 200 body: as an SSE chunk mid-stream, or
-  # from a proxy. Google's error object carries the HTTP status it stands
-  # for in "code"; without one the error is classified by its "status"
-  # label alone and keeps no HTTP status.
-  defp in_band_error(%{"code" => status} = error) when is_integer(status) and status >= 400,
-    do: Error.from_response(status, [], %{"error" => error})
-
+  # from a proxy. Error.from_body/1 reads Google's numeric HTTP status in
+  # "code" (400..599) as well as its "status" label.
   defp in_band_error(error), do: Error.from_body(%{"error" => error})
 
   defp respond(_blocks, %{"finishReason" => reason} = candidate, _resp)
@@ -409,38 +430,116 @@ defmodule Alloy.Provider.Gemini do
     }
   end
 
-  defp parse_content_part(%{"text" => text, "thought" => true} = part) do
-    %{type: "thinking", thinking: text}
-    |> maybe_put(:signature, part["thoughtSignature"])
-  end
+  defp extract_candidate_blocks(candidate) do
+    case Map.fetch(candidate, "content") do
+      :error ->
+        {:ok, []}
 
-  defp parse_content_part(%{"text" => text} = part) do
-    %{type: "text", text: text}
-    |> maybe_put(:signature, part["thoughtSignature"])
-  end
+      {:ok, nil} ->
+        {:ok, []}
 
-  defp parse_content_part(%{"functionCall" => call} = part) do
-    id = call["id"] || generated_tool_call_id(call["name"])
+      {:ok, content} when is_map(content) ->
+        extract_content_parts(content)
 
-    %{type: "tool_use", id: id, name: call["name"], input: call["args"] || %{}}
-    |> maybe_put(:signature, part["thoughtSignature"])
-  end
-
-  defp parse_content_part(%{"inlineData" => %{"mimeType" => mime_type, "data" => data}}) do
-    case String.split(mime_type, "/", parts: 2) do
-      ["image", _] -> %{type: "image", mime_type: mime_type, data: data}
-      ["audio", _] -> %{type: "audio", mime_type: mime_type, data: data}
-      ["video", _] -> %{type: "video", mime_type: mime_type, data: data}
-      _ -> %{type: "binary", mime_type: mime_type, data: data}
+      {:ok, _invalid} ->
+        {:error, %Error{kind: :malformed_reply, message: "Malformed content in Gemini candidate"}}
     end
   end
 
-  defp parse_content_part(%{"fileData" => %{"mimeType" => mime_type, "fileUri" => uri}}) do
-    %{type: "document", mime_type: mime_type, uri: uri}
+  defp extract_content_parts(content) do
+    case Map.fetch(content, "parts") do
+      :error ->
+        {:ok, []}
+
+      {:ok, nil} ->
+        {:ok, []}
+
+      {:ok, parts} when is_list(parts) ->
+        parse_content_parts(parts)
+
+      {:ok, _invalid} ->
+        {:error,
+         %Error{kind: :malformed_reply, message: "Malformed parts in Gemini candidate content"}}
+    end
   end
 
-  defp parse_content_part(part) do
-    %{type: "unknown"} |> Map.merge(part)
+  defp parse_content_parts(parts) do
+    result =
+      Enum.reduce_while(parts, {:ok, []}, fn part, {:ok, acc} ->
+        case parse_content_part(part) do
+          {:ok, block} -> {:cont, {:ok, [block | acc]}}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+
+    case result do
+      {:ok, blocks} -> {:ok, Enum.reverse(blocks)}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp parse_content_part(%{"text" => text, "thought" => true} = part) when is_binary(text) do
+    {:ok, %{type: "thinking", thinking: text} |> maybe_put(:signature, part["thoughtSignature"])}
+  end
+
+  defp parse_content_part(%{"text" => text} = part) when is_binary(text) do
+    {:ok, %{type: "text", text: text} |> maybe_put(:signature, part["thoughtSignature"])}
+  end
+
+  defp parse_content_part(%{"functionCall" => %{"name" => name} = call} = part)
+       when is_binary(name) and name != "" do
+    id =
+      case call["id"] do
+        id when is_binary(id) and id != "" -> id
+        _ -> generated_tool_call_id(name)
+      end
+
+    case Map.get(call, "args") do
+      nil ->
+        {:ok,
+         %{type: "tool_use", id: id, name: name, input: %{}}
+         |> maybe_put(:signature, part["thoughtSignature"])}
+
+      args when is_map(args) ->
+        {:ok,
+         %{type: "tool_use", id: id, name: name, input: args}
+         |> maybe_put(:signature, part["thoughtSignature"])}
+
+      _invalid ->
+        {:error,
+         %Error{kind: :malformed_reply, message: "Malformed functionCall args in Gemini response"}}
+    end
+  end
+
+  defp parse_content_part(%{"functionCall" => _invalid}) do
+    {:error, %Error{kind: :malformed_reply, message: "Malformed functionCall in Gemini response"}}
+  end
+
+  defp parse_content_part(%{"inlineData" => %{"mimeType" => mime_type, "data" => data}})
+       when is_binary(mime_type) and is_binary(data) do
+    block =
+      case String.split(mime_type, "/", parts: 2) do
+        ["image", _] -> %{type: "image", mime_type: mime_type, data: data}
+        ["audio", _] -> %{type: "audio", mime_type: mime_type, data: data}
+        ["video", _] -> %{type: "video", mime_type: mime_type, data: data}
+        _ -> %{type: "binary", mime_type: mime_type, data: data}
+      end
+
+    {:ok, block}
+  end
+
+  defp parse_content_part(%{"fileData" => %{"mimeType" => mime_type, "fileUri" => uri}})
+       when is_binary(mime_type) and is_binary(uri) do
+    {:ok, %{type: "document", mime_type: mime_type, uri: uri}}
+  end
+
+  defp parse_content_part(part) when is_map(part) do
+    {:ok, %{type: "unknown"} |> Map.merge(part)}
+  end
+
+  defp parse_content_part(_invalid) do
+    {:error,
+     %Error{kind: :malformed_reply, message: "Malformed part in Gemini candidate content"}}
   end
 
   defp build_response_metadata(resp, candidate) do
@@ -473,42 +572,131 @@ defmodule Alloy.Provider.Gemini do
   # of built-in tools such as URL context or code execution, fed back to the
   # model) is reported apart from the prompt but billed as input. Thinking
   # tokens are billed as output, yet candidatesTokenCount leaves them out.
-  defp parse_usage(usage) do
-    cached = Map.get(usage, "cachedContentTokenCount", 0)
+  defp parse_usage(usage) when is_map(usage) do
+    cached = non_neg_int(usage["cachedContentTokenCount"])
 
     %{
       input_tokens:
-        max(Map.get(usage, "promptTokenCount", 0) - cached, 0) +
-          Map.get(usage, "toolUsePromptTokenCount", 0),
+        max(non_neg_int(usage["promptTokenCount"]) - cached, 0) +
+          non_neg_int(usage["toolUsePromptTokenCount"]),
       output_tokens:
-        Map.get(usage, "candidatesTokenCount", 0) + Map.get(usage, "thoughtsTokenCount", 0),
+        non_neg_int(usage["candidatesTokenCount"]) + non_neg_int(usage["thoughtsTokenCount"]),
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: cached
     }
   end
 
+  defp parse_usage(_usage) do
+    %{
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0
+    }
+  end
+
+  defp non_neg_int(n) when is_integer(n) and n >= 0, do: n
+  defp non_neg_int(_), do: 0
+
   defp handle_sse_event(acc, %{data: "[DONE]"}), do: acc
 
-  defp handle_sse_event(acc, %{data: data}) do
-    case Alloy.Provider.decode_body(data) do
-      {:ok, decoded} -> handle_stream_chunk(acc, decoded)
-      {:error, _} -> acc
+  defp handle_sse_event(%{response: %{"error" => error}} = acc, _event)
+       when is_map(error) or is_binary(error),
+       do: acc
+
+  # Once a malformed chunk is recorded, stop emitting text deltas so Retry can
+  # still recover if nothing was streamed yet, while still capturing an
+  # in-band API error chunk so it takes precedence over malformed siblings.
+  defp handle_sse_event(%{stream_error: %Error{}} = acc, %{data: data}) do
+    case decode_sse_chunk(data) do
+      {:ok, %{"error" => error} = decoded} when is_map(error) or is_binary(error) ->
+        merge_response_fields(acc, decoded)
+
+      _ ->
+        acc
     end
   end
 
-  defp handle_stream_chunk(acc, %{"candidates" => [candidate | _]} = chunk) do
-    blocks =
-      candidate
-      |> get_in(["content", "parts"])
-      |> List.wrap()
-      |> Enum.map(&parse_content_part/1)
+  defp handle_sse_event(acc, %{data: data}) do
+    if String.trim(data) == "" do
+      acc
+    else
+      case decode_sse_chunk(data) do
+        {:ok, decoded} -> handle_stream_chunk(acc, decoded)
+        {:error, %Error{} = error} -> %{acc | stream_error: error}
+      end
+    end
+  end
 
-    Enum.each(blocks, &emit_text_delta(&1, acc.on_chunk))
+  defp decode_sse_chunk(data) do
+    case Jason.decode(data) do
+      {:ok, decoded} when is_map(decoded) ->
+        {:ok, decoded}
 
+      {:ok, [%{"error" => error} = wrapper | _]} when is_map(error) or is_binary(error) ->
+        {:ok, wrapper}
+
+      {:ok, _non_map} ->
+        {:error, %Error{kind: :malformed_reply, message: "Malformed JSON in Gemini SSE chunk"}}
+
+      {:error, reason} ->
+        {:error,
+         %Error{
+           kind: :malformed_reply,
+           message: "Malformed JSON in Gemini SSE chunk: #{Exception.message(reason)}"
+         }}
+    end
+  end
+
+  defp handle_stream_chunk(acc, %{"error" => error} = chunk)
+       when is_map(error) or is_binary(error) do
+    merge_response_fields(acc, chunk)
+  end
+
+  defp handle_stream_chunk(acc, %{"candidates" => [candidate | _]} = chunk)
+       when is_map(candidate) do
+    case extract_candidate_blocks(candidate) do
+      {:ok, blocks} ->
+        Enum.each(blocks, &emit_text_delta(&1, acc.on_chunk))
+
+        candidate_updates =
+          candidate
+          |> Map.delete("content")
+          |> Map.reject(fn {_key, value} -> is_nil(value) end)
+
+        %{
+          merge_response_fields(acc, chunk)
+          | content_blocks: Enum.reduce(blocks, acc.content_blocks, &merge_stream_block/2),
+            candidate: Map.merge(acc.candidate, candidate_updates)
+        }
+
+      {:error, %Error{} = error} ->
+        %{acc | stream_error: error}
+    end
+  end
+
+  defp handle_stream_chunk(acc, %{"candidates" => [_non_map | _]}) do
     %{
-      merge_response_fields(acc, chunk)
-      | content_blocks: Enum.reduce(blocks, acc.content_blocks, &merge_stream_block/2),
-        candidate: Map.merge(acc.candidate, Map.delete(candidate, "content"))
+      acc
+      | stream_error: %Error{
+          kind: :malformed_reply,
+          message: "Malformed candidate in Gemini SSE chunk"
+        }
+    }
+  end
+
+  defp handle_stream_chunk(acc, %{"candidates" => candidates} = chunk)
+       when is_nil(candidates) or candidates == [] do
+    merge_response_fields(acc, chunk)
+  end
+
+  defp handle_stream_chunk(acc, %{"candidates" => _non_list}) do
+    %{
+      acc
+      | stream_error: %Error{
+          kind: :malformed_reply,
+          message: "Malformed candidates in Gemini SSE chunk"
+        }
     }
   end
 
@@ -521,8 +709,23 @@ defmodule Alloy.Provider.Gemini do
 
     response =
       Map.merge(acc.response, fields, fn
-        "usageMetadata", previous, latest -> Map.merge(previous, latest)
-        _key, _previous, latest -> latest
+        "usageMetadata", previous, latest when is_map(previous) and is_map(latest) ->
+          Map.merge(previous, Map.reject(latest, fn {_k, v} -> is_nil(v) end))
+
+        "usageMetadata", _previous, latest when is_map(latest) ->
+          Map.reject(latest, fn {_k, v} -> is_nil(v) end)
+
+        "usageMetadata", previous, _latest when is_map(previous) ->
+          previous
+
+        "usageMetadata", _previous, _latest ->
+          %{}
+
+        "error", previous, nil when is_map(previous) or is_binary(previous) ->
+          previous
+
+        _key, _previous, latest ->
+          latest
       end)
 
     %{acc | response: response}
@@ -554,7 +757,13 @@ defmodule Alloy.Provider.Gemini do
 
   defp merge_stream_block(block, blocks), do: [block | blocks]
 
-  defp build_stream_response(%{response: %{"error" => error}}), do: {:error, in_band_error(error)}
+  # Prioritize explicit in-band API errors over malformed-chunk errors so a
+  # real quota/safety error is never masked by a garbled sibling chunk.
+  defp build_stream_response(%{response: %{"error" => error}})
+       when is_map(error) or is_binary(error),
+       do: {:error, in_band_error(error)}
+
+  defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
 
   defp build_stream_response(%{
          content_blocks: [],
@@ -562,17 +771,17 @@ defmodule Alloy.Provider.Gemini do
        }),
        do: prompt_blocked(resp)
 
-  # A finished stream always ends with a finishReason; without one the
-  # connection was cut and the output is incomplete.
-  defp build_stream_response(%{candidate: candidate})
-       when not is_map_key(candidate, "finishReason"),
-       do: {:error, %Error{kind: :network, message: "Gemini stream ended before a finishReason"}}
+  # A finished stream always ends with a non-empty finishReason; without one
+  # the connection was cut and the output is incomplete.
+  defp build_stream_response(%{candidate: %{"finishReason" => reason}} = acc)
+       when is_binary(reason) and reason != "",
+       do: acc.content_blocks |> Enum.reverse() |> respond(acc.candidate, acc.response)
 
-  defp build_stream_response(acc),
-    do: acc.content_blocks |> Enum.reverse() |> respond(acc.candidate, acc.response)
+  defp build_stream_response(_acc),
+    do: {:error, %Error{kind: :network, message: "Gemini stream ended before a finishReason"}}
 
   defp generated_tool_call_id(name) do
-    "gemini_call_#{name || "tool"}_#{System.unique_integer([:positive])}"
+    "gemini_call_#{name}_#{System.unique_integer([:positive])}"
   end
 
   defp maybe_put(map, _key, nil), do: map

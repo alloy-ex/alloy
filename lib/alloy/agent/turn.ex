@@ -17,7 +17,10 @@ defmodule Alloy.Agent.Turn do
   require Logger
 
   # Buffer subtracted from timeout_ms when computing the retry deadline.
-  # Ensures the retry loop finishes before the caller-side timeout fires.
+  # Stops retries 5s before timeout_ms and caps non-streaming receive_timeout
+  # (once timeout_ms > 8_000, with a 3s floor for shorter runs) to leave
+  # cleanup headroom. Streaming requests, tool execution, and turn boundaries
+  # are bounded by the absolute run_deadline (started + timeout_ms).
   # Note: timeout_ms values <= this constant effectively disable retries.
   @deadline_headroom_ms 5_000
 
@@ -45,12 +48,21 @@ defmodule Alloy.Agent.Turn do
   def run_loop(%State{} = state, opts \\ []) do
     opts = Events.normalize_opts(state, opts)
 
-    # Compute a hard deadline ONCE for the entire loop, leaving headroom
-    # so the retry logic never overshoots the caller-side timeout.
-    deadline =
-      System.monotonic_time(:millisecond) + state.config.timeout_ms - @deadline_headroom_ms
+    # Compute deadlines ONCE for the entire loop (or nil when timeout_ms: :infinity):
+    # - `deadline` leaves headroom so retries never overshoot the caller timeout
+    # - `run_deadline` is the absolute wall-clock bound for requests, tools, and turns
+    {deadline, hard_deadline} =
+      case state.config.timeout_ms do
+        :infinity ->
+          {nil, nil}
 
-    state = %{state | deadline: deadline}
+        timeout_ms when is_integer(timeout_ms) ->
+          now = System.monotonic_time(:millisecond)
+          hard = now + timeout_ms
+          {hard - @deadline_headroom_ms, hard}
+      end
+
+    state = %{state | deadline: deadline, run_deadline: hard_deadline}
     run_span(state.config.provider_config[:model], fn -> loop(state, opts) end)
   end
 
@@ -88,15 +100,19 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  defp loop(%State{turn: turn, config: config} = state, _opts)
-       when turn >= config.max_turns do
-    %{state | status: :max_turns}
-  end
+  defp loop(%State{turn: turn, config: config} = state, opts) do
+    cond do
+      turn > 0 and deadline_expired?(state) ->
+        fail(state, timeout_error(state))
 
-  defp loop(%State{} = state, opts) do
-    case run_turn(state, opts) do
-      {:continue, state} -> loop(state, opts)
-      {:halt, state} -> state
+      turn >= config.max_turns ->
+        %{state | status: :max_turns}
+
+      true ->
+        case run_turn(state, opts) do
+          {:continue, state} -> loop(state, opts)
+          {:halt, state} -> state
+        end
     end
   end
 
@@ -116,7 +132,23 @@ defmodule Alloy.Agent.Turn do
   defp step_status({:halt, %State{status: status}}), do: status
 
   defp complete(%State{} = state, opts, overflow_retried?) do
-    with {:continue, state} <- run_middleware(:before_completion, state) do
+    # On turn 0, preflight tool validation (optional dependency + local-ref/schema
+    # check) before :before_completion so compaction cannot spend a summary request
+    # on a misconfigured tool set. On later turns, validate once after
+    # :before_completion so middleware that swaps tools does not thrash the cache.
+    {pre_key, schemas, state} =
+      if state.turn == 0 and not overflow_retried? do
+        {prepared, updated} = prepare_tool_schemas(state)
+        {tool_schema_key(updated), prepared, updated}
+      else
+        {nil, nil, state}
+      end
+
+    with {:continue, state} <- run_middleware(:before_completion, state),
+         :ok <- check_deadline(state) do
+      {schemas, state} = refresh_tool_schemas(state, pre_key, schemas)
+      post_key = tool_schema_key(state)
+
       case request(state, opts) do
         {:ok, %{stop_reason: :refusal} = response} ->
           {:halt, refuse(state, response)}
@@ -125,7 +157,7 @@ defmodule Alloy.Agent.Turn do
           state
           |> State.append_messages(new_msgs)
           |> account_response(response)
-          |> continue_after(stop_reason, new_msgs, opts)
+          |> continue_after(stop_reason, new_msgs, {post_key, schemas}, opts)
 
         {:error, reason} ->
           handle_provider_error(reason, state, opts, overflow_retried?)
@@ -138,10 +170,7 @@ defmodule Alloy.Agent.Turn do
     provider_config = build_provider_config(state)
     provider_event_turn = state.turn + 1
 
-    streaming? =
-      Keyword.get(opts, :streaming, false) &&
-        (Code.ensure_loaded(provider) == {:module, provider} &&
-           function_exported?(provider, :stream, 4))
+    streaming? = Keyword.get(opts, :streaming, false) && Retry.supports_streaming?(provider)
 
     on_chunk = Keyword.get(opts, :on_chunk, fn _chunk -> :ok end)
 
@@ -150,9 +179,13 @@ defmodule Alloy.Agent.Turn do
     end
 
     provider_config =
-      if streaming?,
-        do: Map.put(provider_config, :on_event, on_event),
-        else: provider_config
+      provider_config
+      |> then(fn cfg ->
+        if is_integer(state.run_deadline),
+          do: Map.put(cfg, :alloy_request_deadline, state.run_deadline),
+          else: cfg
+      end)
+      |> then(fn cfg -> if streaming?, do: Map.put(cfg, :on_event, on_event), else: cfg end)
 
     Retry.call_with_retry(state, provider, provider_config, streaming?, on_chunk, state.deadline)
   end
@@ -165,27 +198,34 @@ defmodule Alloy.Agent.Turn do
     |> State.put_provider_response_metadata(Map.get(response, :response_metadata))
   end
 
-  defp continue_after(state, :tool_use, new_msgs, opts) do
+  defp continue_after(state, :tool_use, new_msgs, prepared_schemas, opts) do
     case extract_tool_calls(new_msgs) do
       # Only server-executed tools ran: there is nothing for the client to
       # answer, and an empty tool-results message is rejected by every API.
       [] -> finish(state)
-      calls -> handle_tool_use(state, calls, opts)
+      calls -> handle_tool_use(state, calls, prepared_schemas, opts)
     end
   end
 
-  defp continue_after(state, :end_turn, _new_msgs, _opts), do: finish(state)
+  defp continue_after(state, :end_turn, _new_msgs, _prepared_schemas, _opts), do: finish(state)
 
-  defp continue_after(state, :pause_turn, _new_msgs, _opts), do: {:continue, state}
+  defp continue_after(state, :pause_turn, _new_msgs, _prepared_schemas, _opts),
+    do: {:continue, state}
 
-  defp continue_after(state, :max_tokens, new_msgs, _opts) do
+  defp continue_after(state, :max_tokens, new_msgs, _prepared_schemas, _opts) do
     case extract_tool_calls(new_msgs) do
-      [] -> finish(state)
-      calls -> {:halt, abandon_truncated_tool_calls(state, calls)}
+      [] ->
+        finish(state)
+
+      calls ->
+        reason =
+          "Output hit the max_tokens limit while writing a tool call; raise the provider's :max_tokens"
+
+        {:halt, abandon_tool_calls(state, calls, reason)}
     end
   end
 
-  defp continue_after(state, stop_reason, _new_msgs, _opts) do
+  defp continue_after(state, stop_reason, _new_msgs, _prepared_schemas, _opts) do
     {:halt, fail(state, "Provider returned an unsupported stop_reason: #{inspect(stop_reason)}")}
   end
 
@@ -204,18 +244,17 @@ defmodule Alloy.Agent.Turn do
     |> fail(reason)
   end
 
-  # A tool call cut off by max_tokens has incomplete arguments, so it must not
-  # run. Answer each call with an error so the transcript stays valid for a
-  # follow-up request, then fail the run.
-  defp abandon_truncated_tool_calls(state, calls) do
-    reason = "Output hit the max_tokens limit while writing a tool call; raise :max_tokens"
+  # Answers every unanswered tool call with an error so the transcript stays
+  # valid for a follow-up request, then fails the run.
+  defp abandon_tool_calls(state, calls, failure) do
+    reason = if is_struct(failure, Error), do: Exception.message(failure), else: failure
 
     results =
       Enum.map(calls, &Message.tool_result_block(&1.id, "Not executed: #{reason}", true))
 
     state
     |> State.append_messages(Message.tool_results(results))
-    |> fail(reason)
+    |> fail(failure)
   end
 
   # Result.error stays a string for compatibility; the structured error is
@@ -273,8 +312,14 @@ defmodule Alloy.Agent.Turn do
       {:continue, shrunk} ->
         Logger.info("[Turn] Prompt too long — history shrunk by middleware, retrying")
         overflow_event(state, true)
-        {next, state} = complete(shrunk, opts, true)
-        {next, State.merge_run_metadata(state, %{prompt_too_long_recovery: true})}
+
+        case complete(shrunk, opts, true) do
+          {:halt, %State{status: status} = failed} when status in [:error, :halted] ->
+            {:halt, failed}
+
+          {next, recovered} ->
+            {next, State.merge_run_metadata(recovered, %{prompt_too_long_recovery: true})}
+        end
     end
   end
 
@@ -291,17 +336,23 @@ defmodule Alloy.Agent.Turn do
 
   defp put_provider_error(state, _reason), do: state
 
-  defp handle_tool_use(%State{} = state, tool_calls, opts) do
-    case run_middleware(:after_tool_request, state) do
-      {:continue, state} -> execute_tools(state, tool_calls, opts)
-      {:halt, state} -> {:halt, answer_tool_calls(state, tool_calls, [])}
+  defp handle_tool_use(%State{} = state, tool_calls, prepared_schemas, opts) do
+    if deadline_expired?(state) do
+      {:halt, abandon_tool_calls(state, tool_calls, timeout_error(state))}
+    else
+      case run_middleware(:after_tool_request, state) do
+        {:continue, state} -> execute_tools(state, tool_calls, prepared_schemas, opts)
+        {:halt, state} -> {:halt, answer_tool_calls(state, tool_calls, [])}
+      end
     end
   end
 
-  defp execute_tools(%State{} = state, tool_calls, opts) do
-    state = prepare_tool_schemas(state)
+  defp execute_tools(%State{} = state, tool_calls, {prev_key, prev_schemas}, opts) do
+    # Refresh against the effective tool set only if :after_tool_request
+    # middleware changed tools or validation mode.
+    {schemas, state} = refresh_tool_schemas(state, prev_key, prev_schemas)
 
-    case run_executor(tool_calls, state, opts) do
+    case run_executor(tool_calls, state, schemas, opts) do
       {:halted, reason} ->
         {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, [])}
 
@@ -314,11 +365,22 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
+  defp tool_schema_key(%State{tool_fns: tool_fns, config: %{tool_validation: mode}}),
+    do: {tool_fns, mode}
+
+  defp refresh_tool_schemas(state, prev_key, prev_schemas) do
+    if tool_schema_key(state) == prev_key do
+      {prev_schemas, state}
+    else
+      prepare_tool_schemas(state)
+    end
+  end
+
   defp prepare_tool_schemas(state) do
-    {_schemas, cache} =
+    {schemas, cache} =
       Validation.prepare(state.tool_fns, state.config.tool_validation, state.tool_schema_cache)
 
-    %{state | tool_schema_cache: cache}
+    {schemas, %{state | tool_schema_cache: cache}}
   end
 
   defp maybe_finish_after_tool({:halt, _state} = halted, _calls), do: halted
@@ -341,21 +403,33 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
+  # Search trailing user messages since this round's assistant tool call so an
+  # :after_tool_execution hook that appends a user note doesn't hide the result,
+  # while stopping at the assistant message prevents matching an earlier round
+  # that reused the same tool_use_id.
   defp final_tool_block(state, id) do
-    case List.last(state.messages) do
-      %Message{role: :user, content: blocks} when is_list(blocks) ->
+    state.messages
+    |> Enum.reverse()
+    |> Enum.take_while(&(&1.role == :user))
+    |> Enum.find_value(fn
+      %Message{content: blocks} when is_list(blocks) ->
         Enum.find(blocks, &(&1[:type] == "tool_result" and &1[:tool_use_id] == id))
 
       _message ->
         nil
-    end
+    end)
   end
 
-  defp run_executor(calls, state, opts) do
+  defp run_executor(calls, state, schemas, opts) do
     executor_opts =
       opts
       |> Keyword.take([:event_seq_ref, :event_correlation_id])
-      |> Keyword.merge(on_event: &Events.emit(opts, state.turn, &1), event_turn: state.turn)
+      |> Keyword.merge(
+        on_event: &Events.emit(opts, state.turn, &1),
+        event_turn: state.turn,
+        tool_schemas: schemas,
+        run_deadline: state.run_deadline
+      )
 
     case Executor.execute_all(calls, state.tool_fns, state, executor_opts) do
       {:ok, %Message{content: blocks}, tool_call_meta} -> {:ok, blocks, tool_call_meta}
@@ -403,6 +477,10 @@ defmodule Alloy.Agent.Turn do
   defp prompt_too_long?(reason) when is_binary(reason), do: Error.overflow_text?(reason)
   defp prompt_too_long?(_reason), do: false
 
+  # Once a final answer or stop_after_tool outcome has already completed, do not
+  # discard it on timeout (which would push callers to retry completed side
+  # effects). When until_tool requires another turn, returning {:continue, state}
+  # enters loop/2's turn > 0 deadline check before starting it.
   defp finish(state) do
     if until_tool_pending?(state) do
       reminder =
@@ -416,6 +494,25 @@ defmodule Alloy.Agent.Turn do
         {:halt, %{state | status: :completed}}
       end
     end
+  end
+
+  defp check_deadline(state) do
+    if deadline_expired?(state),
+      do: {:halt, fail(state, timeout_error(state))},
+      else: :ok
+  end
+
+  defp deadline_expired?(%State{run_deadline: deadline}) when is_integer(deadline) do
+    System.monotonic_time(:millisecond) >= deadline
+  end
+
+  defp deadline_expired?(_state), do: false
+
+  defp timeout_error(state) do
+    %Error{
+      kind: :timeout,
+      message: "Agent run timed out after #{state.config.timeout_ms}ms"
+    }
   end
 
   defp until_tool_pending?(%State{config: %{until_tool: nil}}), do: false

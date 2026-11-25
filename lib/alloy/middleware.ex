@@ -102,6 +102,12 @@ defmodule Alloy.Middleware do
                 "#{inspect(middleware)} returned {:block, #{inspect(reason)}} " <>
                   "from hook #{inspect(hook)}, but {:block, reason} is only valid for " <>
                   "the :before_tool_call hook. Use {:halt, reason} to stop the agent loop."
+
+        other ->
+          raise ArgumentError,
+                "#{inspect(middleware)} returned unsupported value #{inspect(other)} " <>
+                  "from hook #{inspect(hook)}. Expected %Alloy.Agent.State{}, {:halt, reason}, " <>
+                  "or {:halt, reason, state}."
       end
     end)
   end
@@ -143,6 +149,12 @@ defmodule Alloy.Middleware do
 
           %State{} ->
             {:cont, {:edit, current}}
+
+          other ->
+            raise ArgumentError,
+                  "#{inspect(middleware)} returned unsupported value #{inspect(other)} " <>
+                    "from :before_tool_call. Expected %Alloy.Agent.State{}, {:edit, call}, " <>
+                    "{:block, reason}, or {:halt, reason}."
         end
       end)
 
@@ -164,8 +176,16 @@ defmodule Alloy.Middleware do
       scoped = tool_state(state, call, current)
 
       case middleware.call(:after_tool_call, scoped) do
-        %State{} -> current
-        {:result, replacement} -> validate_result!(current, replacement)
+        %State{} ->
+          current
+
+        {:result, replacement} ->
+          validate_result!(current, replacement)
+
+        other ->
+          raise ArgumentError,
+                "#{inspect(middleware)} returned unsupported value #{inspect(other)} " <>
+                  "from :after_tool_call. Expected %Alloy.Agent.State{} or {:result, result}."
       end
     end)
   end

@@ -177,6 +177,11 @@ defmodule Alloy.Provider.SSETest do
       assert event.data == data
       assert microseconds < 1_000_000
     end
+
+    test "strips at most one leading space and keeps the last event line per SSE spec" do
+      chunk = "event: first\nevent:  second\ndata:  two spaces\n\n"
+      assert {[%{event: " second", data: " two spaces"}], ""} = SSE.process_chunk("", chunk)
+    end
   end
 
   defp parse_in_chunks(stream, size) do

@@ -39,24 +39,27 @@ defmodule Alloy.Tool.Core.Write do
 
   @impl true
   def execute(input, context) do
-    case Alloy.Tool.resolve_path(input["file_path"], context) do
-      {:error, reason} ->
-        {:error, reason}
+    with {:ok, content} <- validate_content(input["content"]),
+         {:ok, path} <- Alloy.Tool.resolve_path(input["file_path"], context),
+         :ok <- make_parent_dir(path) do
+      case File.write(path, content) do
+        :ok -> {:ok, "Successfully wrote to #{path}"}
+        {:error, reason} -> {:error, "Failed to write to #{path}: #{inspect(reason)}"}
+      end
+    end
+  end
 
-      {:ok, path} ->
-        case path |> Path.dirname() |> File.mkdir_p() do
-          :ok ->
-            case File.write(path, input["content"]) do
-              :ok ->
-                {:ok, "Successfully wrote to #{path}"}
+  defp validate_content(content) when is_binary(content), do: {:ok, content}
 
-              {:error, reason} ->
-                {:error, "Failed to write to #{path}: #{inspect(reason)}"}
-            end
+  defp validate_content(content),
+    do:
+      {:error,
+       "content must be a string, got: #{inspect(content, limit: 20, printable_limit: 500)}"}
 
-          {:error, reason} ->
-            {:error, "Cannot create directory: #{inspect(reason)}"}
-        end
+  defp make_parent_dir(path) do
+    case path |> Path.dirname() |> File.mkdir_p() do
+      :ok -> :ok
+      {:error, reason} -> {:error, "Cannot create directory: #{inspect(reason)}"}
     end
   end
 end

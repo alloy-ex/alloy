@@ -22,6 +22,9 @@ defmodule Alloy.Tool.Core.Edit do
 
   @behaviour Alloy.Tool
 
+  @binary_sniff_bytes 8_192
+  @max_file_bytes 10 * 1024 * 1024
+
   @impl true
   def name, do: "edit"
 
@@ -50,9 +53,8 @@ defmodule Alloy.Tool.Core.Edit do
 
   @impl true
   def execute(input, context) do
-    replace_all = input["replace_all"] || false
-
-    with {:ok, old_string, new_string} <- strings(input["old_string"], input["new_string"]),
+    with {:ok, replace_all} <- parse_replace_all(input["replace_all"]),
+         {:ok, old_string, new_string} <- strings(input["old_string"], input["new_string"]),
          {:ok, path} <- Alloy.Tool.resolve_path(input["file_path"], context),
          {:ok, raw} <- read_file(path) do
       # The model works from `read` output and writes LF without a BOM, so
@@ -65,6 +67,14 @@ defmodule Alloy.Tool.Core.Edit do
       end
     end
   end
+
+  defp parse_replace_all(nil), do: {:ok, false}
+  defp parse_replace_all(value) when is_boolean(value), do: {:ok, value}
+
+  defp parse_replace_all(value),
+    do:
+      {:error,
+       "replace_all must be a boolean, got: #{inspect(value, limit: 20, printable_limit: 500)}"}
 
   defp strings(old_string, new_string) when is_binary(old_string) and is_binary(new_string) do
     case {to_lf(old_string), to_lf(new_string)} do
@@ -84,9 +94,50 @@ defmodule Alloy.Tool.Core.Edit do
     do: {:error, "old_string and new_string must be strings."}
 
   defp read_file(path) do
-    case File.read(path) do
-      {:ok, content} -> {:ok, content}
-      {:error, reason} -> {:error, "Cannot read #{path}: #{reason}"}
+    with :ok <- check_file_bounds(path),
+         {:ok, content} <- read_bounded(path) do
+      head = binary_part(content, 0, min(byte_size(content), @binary_sniff_bytes))
+
+      if String.contains?(head, <<0>>) do
+        {:error, "#{path} is a binary file; edit only supports text files."}
+      else
+        {:ok, content}
+      end
+    end
+  end
+
+  defp check_file_bounds(path) do
+    case File.stat(path) do
+      {:ok, %File.Stat{type: :regular, size: size}} when size <= @max_file_bytes ->
+        :ok
+
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        {:error, "Cannot edit #{path}: file is #{size} bytes (max #{@max_file_bytes} bytes)."}
+
+      {:ok, _other} ->
+        {:error, "Cannot read #{path}: not a regular file"}
+
+      {:error, reason} ->
+        {:error, "Cannot read #{path}: #{reason}"}
+    end
+  end
+
+  defp read_bounded(path) do
+    case File.open(path, [:read, :binary], &IO.binread(&1, @max_file_bytes + 1)) do
+      {:ok, :eof} ->
+        {:ok, ""}
+
+      {:ok, {:error, reason}} ->
+        {:error, "Cannot read #{path}: #{reason}"}
+
+      {:ok, content} when is_binary(content) and byte_size(content) > @max_file_bytes ->
+        {:error, "Cannot edit #{path}: file exceeds #{@max_file_bytes} bytes."}
+
+      {:ok, content} when is_binary(content) ->
+        {:ok, content}
+
+      {:error, reason} ->
+        {:error, "Cannot read #{path}: #{reason}"}
     end
   end
 

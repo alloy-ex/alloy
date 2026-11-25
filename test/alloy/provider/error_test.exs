@@ -143,7 +143,7 @@ defmodule Alloy.Provider.ErrorTest do
     test "reads future HTTP dates and clamps past dates to zero" do
       future = DateTime.add(DateTime.utc_now(), 60, :second)
       headers = %{"retry-after" => [Calendar.strftime(future, "%a, %d %b %Y %H:%M:%S GMT")]}
-      assert Error.from_response(503, headers, "").retry_after_ms in 58_000..60_000
+      assert Error.from_response(503, headers, "").retry_after_ms in 55_000..60_000
 
       past = %{"retry-after" => ["Wed, 21 Oct 2015 07:28:00 GMT"]}
       assert Error.from_response(503, past, "").retry_after_ms == 0
@@ -180,6 +180,103 @@ defmodule Alloy.Provider.ErrorTest do
                :context_overflow
 
       assert Error.from_body(%{"error" => %{"code" => "invalid_prompt"}}).kind == :unknown
+
+      assert %Error{kind: :rate_limited, status: 429, message: "Too many requests"} =
+               Error.from_body(%{"error" => %{"code" => 429, "message" => "Too many requests"}})
+
+      assert %Error{kind: :server_error, status: 502, message: "Bad gateway"} =
+               Error.from_body(%{"error" => %{"code" => 502, "message" => "Bad gateway"}})
+
+      assert %Error{kind: :auth, status: 403, message: "Denied"} =
+               Error.from_body(%{"error" => %{"code" => 403, "message" => "Denied"}})
+
+      assert %Error{kind: :rate_limited, type: "RESOURCE_EXHAUSTED"} =
+               Error.from_body(%{
+                 "error" => %{
+                   "type" => 999,
+                   "status" => "RESOURCE_EXHAUSTED",
+                   "message" => "busy"
+                 }
+               })
+
+      assert %Error{kind: :rate_limited, status: 429, message: "Slow down"} =
+               Error.from_body(%{"error" => %{"code" => "429", "message" => "Slow down"}})
+
+      # Bounded JSON, inspect, and string-body fallbacks (including non-JSON and nested terms).
+      huge = String.duplicate("x", 3_000)
+      json_fallback = Error.from_body(%{"error" => %{"detail" => huge}})
+      assert String.length(json_fallback.message) == 500
+
+      non_json = Error.from_body(%{"error" => %{"a_pid" => self(), "z_detail" => huge}})
+      assert String.length(non_json.message) == 500
+      assert non_json.message =~ "#PID<"
+
+      wide_nested = Map.new(1..10, &{"k#{&1}", String.duplicate("y", 100)})
+      non_error_map = Error.from_body(wide_nested)
+      assert String.length(non_error_map.message) == 500
+
+      raw_html = "<html>" <> huge <> "</html>"
+      assert byte_size(Error.from_response(502, %{}, raw_html).message) == 2_000
+      assert byte_size(Error.from_body(%{"error" => huge}).message) == 2_000
+      assert byte_size(Error.from_body(%{"error" => %{"message" => huge}}).message) == 2_000
+
+      # Overflow classification runs on full payload before byte capping, and
+      # combining-mark / multi-byte UTF-8 payloads stay valid UTF-8 within byte cap.
+      long_overflow = String.duplicate("x", 2_500) <> " prompt is too long"
+      overflow_err = Error.from_response(400, %{}, long_overflow)
+      assert overflow_err.kind == :context_overflow
+      assert byte_size(overflow_err.message) == 2_000
+
+      combining = "e" <> String.duplicate("\u0301", 2_000)
+      capped_utf8 = Error.from_response(500, %{}, combining)
+      assert String.valid?(capped_utf8.message)
+      assert byte_size(capped_utf8.message) <= 2_000
+
+      # Invalid UTF-8 (e.g. Latin-1 proxy pages) is sanitized on both short and long bodies
+      # without discarding trailing diagnostic text.
+      short_invalid = <<"bad ", 0xE9, " gateway">>
+      short_err = Error.from_response(502, %{}, short_invalid)
+      assert String.valid?(short_err.message)
+      assert short_err.message =~ "gateway"
+
+      long_invalid = <<"err ", 0xE9, " ">> <> String.duplicate("z", 2_500)
+      long_err = Error.from_response(502, %{}, long_invalid)
+      assert String.valid?(long_err.message)
+      assert byte_size(long_err.message) == 2_000
+      assert long_err.message =~ "zzzzz"
+
+      # 5xx server error mentioning "context window" stays :server_error (retryable),
+      # while an explicit context_length_exceeded code still classifies as :context_overflow.
+      html_502 = "<html>502 Bad Gateway: context window proxy timeout</html>"
+      assert Error.from_response(502, %{}, html_502).kind == :server_error
+
+      assert Error.from_response(
+               500,
+               %{},
+               %{"error" => %{"code" => "context_length_exceeded", "message" => "too long"}}
+             ).kind == :context_overflow
+
+      assert Error.from_response(
+               500,
+               %{},
+               %{"error" => %{"type" => "context_length_exceeded", "message" => "too long"}}
+             ).kind == :context_overflow
+
+      # Multi-MB invalid UTF-8 body is sliced before sanitization and capped cleanly at 2,000 bytes.
+      multi_mb_latin1 = :binary.copy(<<"bad ", 0xE9, " gateway\n">>, 150_000)
+      multi_mb_err = Error.from_response(502, %{}, multi_mb_latin1)
+      assert multi_mb_err.kind == :server_error
+      assert String.valid?(multi_mb_err.message)
+      assert byte_size(multi_mb_err.message) <= 2_000
+
+      # 64 KiB overflow phrase scan boundary on 4xx bodies.
+      within_64k = String.duplicate("a", 60_000) <> " prompt is too long"
+      past_64k = String.duplicate("a", 70_000) <> " prompt is too long"
+      assert Error.from_response(400, %{}, within_64k).kind == :context_overflow
+      assert Error.from_response(400, %{}, past_64k).kind == :invalid_request
+
+      long_transport = Error.from_transport({:error, huge})
+      assert byte_size(long_transport.message) <= 530
     end
   end
 

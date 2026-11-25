@@ -57,6 +57,7 @@ defmodule Alloy.ModelMetadataTest do
       )
 
       assert windows(models) == expect(models, 1_048_576)
+      assert ModelMetadata.context_window("models/gemini-3.8-flash") == 1_048_576
     end
 
     test "Grok 4.3 and the 4.20 family, including xAI's date-stamped ids and aliases" do

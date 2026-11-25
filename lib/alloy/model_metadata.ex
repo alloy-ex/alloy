@@ -53,7 +53,7 @@ defmodule Alloy.ModelMetadata do
      272_000},
     # Input token limit on each https://ai.google.dev/gemini-api/docs/models
     # page, checked 2026-10-09. 2.5 is limited to existing users but served.
-    {~r/^gemini-(2\.5-(pro|flash|flash-lite)|3-flash-preview|3\.1-pro-preview(-customtools)?|3\.[15]-flash-lite|3\.[5-8]-flash|flash-latest)$/,
+    {~r/^(?:models\/)?gemini-(2\.5-(pro|flash|flash-lite)|3-flash-preview|3\.1-pro-preview(-customtools)?|3\.[15]-flash-lite|3\.[5-8]-flash|flash-latest)$/,
      1_048_576},
     # https://docs.x.ai/developers/pricing and the per-model pages, checked
     # 2026-10-09. The slugs retired in

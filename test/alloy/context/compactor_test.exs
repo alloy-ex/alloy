@@ -3,8 +3,41 @@ defmodule Alloy.Context.CompactorTest do
 
   alias Alloy.Agent.{Config, State}
   alias Alloy.Context.Compactor
+  alias Alloy.Context.Compactor.Estimator
   alias Alloy.Message
+  alias Alloy.Provider.{Anthropic, Error, OpenAI}
   alias Alloy.Provider.Test, as: TestProvider
+
+  defmodule InspectSummaryConfigProvider do
+    @behaviour Alloy.Provider
+
+    @impl true
+    def complete(_messages, _tools, config) do
+      send(config.owner, {:summary_config, config})
+      {:ok, %{stop_reason: :end_turn, messages: [Message.assistant("summary")], usage: %{}}}
+    end
+  end
+
+  defmodule FailingPrimarySummaryProvider do
+    @behaviour Alloy.Provider
+
+    @impl true
+    def complete(_messages, _tools, _config) do
+      {:error, %Error{kind: :server_error, status: 500, message: "primary down"}}
+    end
+  end
+
+  defmodule CountAfterCompaction do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:after_compaction, state) do
+      send(state.config.context.owner, :after_compaction_fired)
+      state
+    end
+
+    def call(_hook, state), do: state
+  end
 
   defmodule ProbeProvider do
     @behaviour Alloy.Provider
@@ -1312,6 +1345,294 @@ defmodule Alloy.Context.CompactorTest do
 
       compacted = Compactor.compact_messages(messages, keep_recent: 10)
       assert compacted == messages
+    end
+
+    test "drops empty content messages and shrinks dense single-round tool results on force_compact" do
+      thinking_only =
+        Message.assistant_blocks([%{type: "thinking", thinking: "secret", signature: "sig"}])
+
+      messages = [Message.user("u1"), thinking_only, Message.assistant("ok"), Message.user("u2")]
+      compacted = Compactor.compact_messages(messages, keep_recent: 2)
+      refute Enum.any?(compacted, &(&1.content == []))
+
+      big_result = String.duplicate("x", 10_000)
+
+      dense_msgs = [
+        Message.user("inspect"),
+        Message.assistant_blocks([
+          %{type: "thinking", thinking: "plan", signature: "sig"},
+          %{type: "tool_use", id: "t1", name: "read", input: %{}}
+        ]),
+        Message.tool_results([Message.tool_result_block("t1", big_result)])
+      ]
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{},
+        max_tokens: 200_000,
+        compaction: %{
+          reserve_tokens: 1_000,
+          keep_recent_tokens: 20_000,
+          fallback: :truncate,
+          clear_tool_results: true,
+          keep_recent_tool_results: 3
+        }
+      }
+
+      forced = Compactor.force_compact(State.init(config, dense_msgs))
+
+      [_, %Message{content: assistant_blocks}, %Message{content: [%{content: shrunk}]}] =
+        forced.messages
+
+      refute Enum.any?(assistant_blocks, &(&1[:type] == "thinking"))
+      assert byte_size(shrunk) < byte_size(big_result)
+      assert shrunk =~ "tool result truncated"
+    end
+
+    test "sanitizes primary and fallback summary configs and wire bodies while preserving privacy keys" do
+      test_pid = self()
+
+      config = %Config{
+        provider: InspectSummaryConfigProvider,
+        provider_config: %{
+          "persist_session" => true,
+          owner: test_pid,
+          generation_config: %{
+            responseSchema: %{type: "object"},
+            responseMimeType: "application/json",
+            temperature: 0.2
+          },
+          extra_body: %{
+            "thinking" => %{"type" => "adaptive"},
+            "text" => %{"format" => %{"type" => "json_schema"}},
+            "generationConfig" => %{"responseSchema" => %{}, "topP" => 0.9},
+            "store" => false
+          }
+        },
+        middleware: [Compactor, CountAfterCompaction],
+        context: %{owner: test_pid},
+        max_tokens: 100,
+        compaction: %{
+          reserve_tokens: 10,
+          keep_recent_tokens: 5,
+          fallback: :truncate,
+          clear_tool_results: false,
+          keep_recent_tool_results: 3
+        }
+      }
+
+      noop_state = State.init(config, [Message.user(String.duplicate("a", 1_000))])
+      Compactor.call(:before_completion, noop_state)
+      refute_received :after_compaction_fired
+
+      long_msgs = [
+        Message.user("start"),
+        Message.assistant(String.duplicate("a", 500)),
+        Message.user(String.duplicate("b", 500)),
+        Message.assistant("recent")
+      ]
+
+      Compactor.call(:before_completion, State.init(config, long_msgs))
+      assert_received {:summary_config, summary_config}
+
+      assert summary_config.extra_body == %{
+               "store" => false,
+               "generationConfig" => %{"topP" => 0.9}
+             }
+
+      assert summary_config.generation_config == %{temperature: 0.2}
+      refute Map.has_key?(summary_config, "persist_session")
+      assert_received :after_compaction_fired
+
+      fallback_config = %Config{
+        provider: FailingPrimarySummaryProvider,
+        provider_config: %{},
+        fallback_providers: [
+          {InspectSummaryConfigProvider,
+           %{
+             owner: test_pid,
+             persist_session: true,
+             provider_state: %{thread_id: "t1"},
+             tool_config: %{functionCallingConfig: %{mode: "ANY"}},
+             generation_config: %{responseSchema: %{type: "object"}, temperature: 0.1},
+             extra_body: %{
+               "tools" => [%{"type" => "function"}],
+               "tool_choice" => "required",
+               "text" => %{"format" => %{"type" => "json_schema"}},
+               "store" => false
+             }
+           }}
+        ],
+        max_retries: 0,
+        max_tokens: 100,
+        compaction: %{
+          reserve_tokens: 10,
+          keep_recent_tokens: 5,
+          fallback: :truncate,
+          clear_tool_results: false,
+          keep_recent_tool_results: 3
+        }
+      }
+
+      {:compacted, _} = Compactor.maybe_compact(State.init(fallback_config, long_msgs))
+      assert_received {:summary_config, fb_summary_config}
+      refute Map.has_key?(fb_summary_config, :persist_session)
+      refute Map.has_key?(fb_summary_config, :provider_state)
+      refute Map.has_key?(fb_summary_config, :tool_config)
+      assert fb_summary_config.generation_config == %{temperature: 0.1}
+      assert fb_summary_config.extra_body == %{"store" => false}
+
+      Req.Test.stub(:compactor_openai_wire, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:openai_wire_body, Jason.decode!(raw)})
+        Req.Test.json(conn, %{"output_text" => "openai summary", "usage" => %{}})
+      end)
+
+      openai_cfg = %Config{
+        provider: OpenAI,
+        provider_config: %{
+          api_key: "k",
+          model: "gpt-5.4",
+          store: false,
+          tool_choice: %{type: "function", name: "submit"},
+          web_search: true,
+          x_search: true,
+          built_in_tools: [%{type: "file_search"}],
+          extra_body: %{"text" => %{"format" => %{"type" => "json_schema"}}},
+          req_options: [plug: {Req.Test, :compactor_openai_wire}]
+        },
+        max_tokens: 100,
+        compaction: %{
+          reserve_tokens: 10,
+          keep_recent_tokens: 5,
+          fallback: :truncate,
+          clear_tool_results: false,
+          keep_recent_tool_results: 3
+        }
+      }
+
+      {:compacted, _} = Compactor.maybe_compact(State.init(openai_cfg, long_msgs))
+      assert_received {:openai_wire_body, openai_body}
+      assert openai_body["store"] == false
+      refute Map.has_key?(openai_body, "tool_choice")
+      refute Map.has_key?(openai_body, "tools")
+      refute Map.has_key?(openai_body, "text")
+
+      Req.Test.stub(:compactor_anthropic_wire, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:anthropic_wire_body, Jason.decode!(raw)})
+
+        Req.Test.json(conn, %{
+          "type" => "message",
+          "role" => "assistant",
+          "content" => [%{"type" => "text", "text" => "anthropic summary"}],
+          "stop_reason" => "end_turn",
+          "usage" => %{"input_tokens" => 10, "output_tokens" => 5}
+        })
+      end)
+
+      anthropic_cfg = %Config{
+        provider: Anthropic,
+        provider_config: %{
+          api_key: "k",
+          model: "claude-sonnet-5-5",
+          code_execution: true,
+          server_tools: [%{"type" => "web_search_20250305", "name" => "web_search"}],
+          extra_body: %{"thinking" => %{"type" => "adaptive"}},
+          req_options: [plug: {Req.Test, :compactor_anthropic_wire}]
+        },
+        max_tokens: 100,
+        compaction: %{
+          reserve_tokens: 10,
+          keep_recent_tokens: 5,
+          fallback: :truncate,
+          clear_tool_results: false,
+          keep_recent_tool_results: 3
+        }
+      }
+
+      {:compacted, _} = Compactor.maybe_compact(State.init(anthropic_cfg, long_msgs))
+      assert_received {:anthropic_wire_body, anthropic_body}
+      refute Map.has_key?(anthropic_body, "tools")
+      refute Map.has_key?(anthropic_body, "thinking")
+    end
+
+    test "multimodal tool_result lists (atom and wire-format string keys) reuse fixed media token budgets" do
+      large_base64 = String.duplicate("A", 100_000)
+
+      atom_msg =
+        Message.tool_results([
+          %{
+            type: "tool_result",
+            tool_use_id: "c1",
+            content: [
+              %{type: "text", text: "abcd"},
+              %{type: "image", mime_type: "image/png", data: large_base64},
+              %{type: "input_image", image_url: "data:image/png;base64," <> large_base64}
+            ]
+          }
+        ])
+
+      wire_msg =
+        Message.tool_results([
+          %{
+            "type" => "tool_result",
+            "tool_use_id" => "c2",
+            "content" => [
+              %{"type" => "text", "text" => "abcd"},
+              %{
+                "type" => "image",
+                "source" => %{
+                  "type" => "base64",
+                  "media_type" => "image/png",
+                  "data" => large_base64
+                }
+              },
+              %{"type" => "input_image", "image_url" => "data:image/png;base64," <> large_base64}
+            ]
+          }
+        ])
+
+      # 1 ("abcd") + 1000 (image) + 1000 (input_image) = 2001
+      assert Estimator.estimate_message_tokens(atom_msg) == 2_001
+      assert Estimator.estimate_message_tokens(wire_msg) == 2_001
+    end
+
+    test "opts[:deadline] clamps to state.run_deadline instead of extending past it" do
+      now = System.monotonic_time(:millisecond)
+      run_deadline = now + 25_000
+      looser_opt = now + 90_000
+      tighter_opt = now + 10_000
+
+      messages = [
+        Message.user("original"),
+        Message.assistant(String.duplicate("x", 1200)),
+        Message.user("middle"),
+        Message.assistant("recent"),
+        Message.user("latest")
+      ]
+
+      base_state =
+        build_state(messages,
+          max_tokens: 250,
+          compaction: [reserve_tokens: 20, keep_recent_tokens: 20],
+          provider: ProbeProvider,
+          provider_config: %{summary_response: {:ok, summary_text("Clamped")}, test_pid: self()}
+        )
+
+      state_with_run_deadline = %{base_state | run_deadline: run_deadline, deadline: run_deadline}
+
+      assert {:compacted, _} =
+               Compactor.maybe_compact(state_with_run_deadline, deadline: looser_opt)
+
+      assert_received {:summary_request, _msgs, _tools, cfg_looser}
+      assert cfg_looser[:alloy_request_deadline] == run_deadline
+
+      assert {:compacted, _} =
+               Compactor.maybe_compact(state_with_run_deadline, deadline: tighter_opt)
+
+      assert_received {:summary_request, _msgs, _tools, cfg_tighter}
+      assert cfg_tighter[:alloy_request_deadline] == tighter_opt
     end
   end
 end

@@ -2,7 +2,7 @@ defmodule Alloy.Provider.OpenAIStreamTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Message
-  alias Alloy.Provider.{Error, OpenAIStream}
+  alias Alloy.Provider.{Error, OpenAICompat, OpenAIStream}
 
   # ── Helper: build SSE chunks ─────────────────────────────────────────
 
@@ -362,7 +362,7 @@ defmodule Alloy.Provider.OpenAIStreamTest do
       assert tool.input == %{}
     end
 
-    test "returns ok when tool call has malformed JSON arguments (network truncation)" do
+    test "returns :malformed_reply error when tool call has malformed JSON arguments (network truncation)" do
       chunks = [
         sse_chunk(tool_call_start(0, "call_bad", "read")),
         sse_chunk(tool_call_args(0, "{\"file_path\": \"mix")),
@@ -373,8 +373,241 @@ defmodule Alloy.Provider.OpenAIStreamTest do
 
       {_collected, result} = collect_stream(chunks, test_name: :tool_malformed_args)
 
-      # Should return an error tuple, NOT raise an exception
-      assert {:error, _reason} = result
+      # Should return a typed malformed_reply error, NOT raise an exception
+      assert {:error, %Error{kind: :malformed_reply}} = result
+    end
+
+    test "rejects raw non-string argument deltas, non-object decoded arguments, and malformed SSE JSON without executing tools" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "delete_item",
+          description: "Deletes an optional target",
+          input_schema: %{type: "object", properties: %{target: %{type: "string"}}},
+          execute: fn input, _ctx ->
+            send(test_pid, {:tool_executed, input})
+            {:ok, "deleted"}
+          end
+        )
+
+      modes =
+        if Code.ensure_loaded?(ExJsonSchema.Schema), do: [:required, :schema], else: [:required]
+
+      raw_arg_delta = fn raw_value ->
+        sse_chunk(%{
+          "id" => "chatcmpl-bad",
+          "object" => "chat.completion.chunk",
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [%{"index" => 0, "function" => %{"arguments" => raw_value}}]
+              },
+              "finish_reason" => nil
+            }
+          ]
+        })
+      end
+
+      extra_content_delta = fn extra, args ->
+        sse_chunk(%{
+          "id" => "chatcmpl-bad",
+          "object" => "chat.completion.chunk",
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{
+                    "index" => 0,
+                    "extra_content" => extra,
+                    "function" => %{"arguments" => args}
+                  }
+                ]
+              },
+              "finish_reason" => nil
+            }
+          ]
+        })
+      end
+
+      nil_choice_delta =
+        sse_chunk(%{
+          "id" => "chatcmpl-bad",
+          "object" => "chat.completion.chunk",
+          "choices" => [%{"index" => 0, "delta" => nil, "finish_reason" => nil}]
+        })
+
+      cases = [
+        {:stream_raw_nil_arg, [raw_arg_delta.(nil)], "Invalid tool call arguments delta"},
+        {:stream_raw_false_arg, [raw_arg_delta.(false)], "Invalid tool call arguments delta"},
+        {:stream_raw_list_arg, [raw_arg_delta.([])], "Invalid tool call arguments delta"},
+        {:stream_bad_extra_content, [extra_content_delta.(false, "false")],
+         "Invalid extra_content"},
+        {:stream_bad_google_extra, [extra_content_delta.(%{"google" => false}, "{}")],
+         "Invalid extra_content.google"},
+        {:stream_nil_choice_delta, [nil_choice_delta], "Invalid choice delta"},
+        {:stream_encoded_null_arg, [sse_chunk(tool_call_args(0, "null"))],
+         "must be a JSON object"},
+        {:stream_encoded_false_arg, [sse_chunk(tool_call_args(0, "false"))],
+         "must be a JSON object"},
+        {:stream_encoded_array_arg, [sse_chunk(tool_call_args(0, "[]"))],
+         "must be a JSON object"},
+        {:stream_bad_sse_json, ["data: {broken\n\n"], "Malformed JSON"}
+      ]
+
+      for validation <- modes, {stub_name, bad_chunks, expected_msg} <- cases do
+        body =
+          ([sse_chunk(tool_call_start(0, "call_1", "delete_item"))] ++
+             bad_chunks ++
+             [sse_chunk(finish_chunk("tool_calls")), sse_done()])
+          |> Enum.join()
+
+        Req.Test.stub(stub_name, fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("text/event-stream")
+          |> Plug.Conn.send_resp(200, body)
+        end)
+
+        assert {:error, %Error{kind: :malformed_reply, message: provider_msg}} =
+                 OpenAICompat.stream(
+                   [Message.user("delete it")],
+                   [],
+                   %{
+                     api_url: "http://localhost",
+                     model: "m",
+                     req_options: [plug: {Req.Test, stub_name}]
+                   },
+                   fn _ -> :ok end
+                 )
+
+        assert provider_msg =~ expected_msg
+
+        assert {:error, %{status: :error, error: error_msg}} =
+                 Alloy.stream("delete it", fn _ -> :ok end,
+                   provider:
+                     {OpenAICompat,
+                      api_url: "http://localhost",
+                      model: "m",
+                      req_options: [plug: {Req.Test, stub_name}]},
+                   tools: [tool],
+                   tool_validation: validation,
+                   max_retries: 0
+                 )
+
+        assert error_msg =~ expected_msg
+        refute_received {:tool_executed, _}
+      end
+
+      # Streamed tool call missing id or function name is also rejected with :malformed_reply.
+      missing_meta_chunks = [
+        sse_chunk(%{
+          "id" => "chatcmpl-bad",
+          "object" => "chat.completion.chunk",
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [%{"index" => 0, "function" => %{"arguments" => "{}"}}]
+              },
+              "finish_reason" => nil
+            }
+          ]
+        }),
+        sse_chunk(finish_chunk("tool_calls")),
+        sse_done()
+      ]
+
+      {_collected, missing_result} =
+        collect_stream(missing_meta_chunks, test_name: :tool_missing_id_or_name)
+
+      assert {:error, %Error{kind: :malformed_reply, message: msg}} = missing_result
+      assert msg =~ "missing id or function name"
+    end
+
+    test "supports omitted tool call index (Gemini OpenAI-compat) while rejecting non-integer index" do
+      no_index_chunks = [
+        sse_chunk(%{
+          "id" => "chatcmpl-gem",
+          "object" => "chat.completion.chunk",
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{
+                    "id" => "call_gem_1",
+                    "function" => %{"name" => "read", "arguments" => "{\"path\":"}
+                  }
+                ]
+              },
+              "finish_reason" => nil
+            }
+          ]
+        }),
+        sse_chunk(%{
+          "id" => "chatcmpl-gem",
+          "object" => "chat.completion.chunk",
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [%{"function" => %{"arguments" => "\"mix.exs\"}"}}]
+              },
+              "finish_reason" => nil
+            }
+          ]
+        }),
+        sse_chunk(finish_chunk("tool_calls")),
+        sse_done()
+      ]
+
+      {_collected, {:ok, response}} =
+        collect_stream(no_index_chunks, test_name: :tool_omitted_index)
+
+      assert [
+               %Message{
+                 content: [
+                   %{
+                     type: "tool_use",
+                     id: "call_gem_1",
+                     name: "read",
+                     input: %{"path" => "mix.exs"}
+                   }
+                 ]
+               }
+             ] =
+               response.messages
+
+      bad_index_chunks = [
+        sse_chunk(%{
+          "id" => "chatcmpl-bad-idx",
+          "object" => "chat.completion.chunk",
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{
+                    "index" => "zero",
+                    "id" => "c1",
+                    "function" => %{"name" => "read", "arguments" => "{}"}
+                  }
+                ]
+              },
+              "finish_reason" => nil
+            }
+          ]
+        }),
+        sse_chunk(finish_chunk("tool_calls")),
+        sse_done()
+      ]
+
+      {_collected, {:error, %Error{kind: :malformed_reply, message: bad_idx_msg}}} =
+        collect_stream(bad_index_chunks, test_name: :tool_bad_index)
+
+      assert bad_idx_msg =~ "Invalid tool call index"
     end
 
     test "cached prompt tokens are reported apart from uncached input" do
@@ -427,6 +660,386 @@ defmodule Alloy.Provider.OpenAIStreamTest do
       assert {:ok, response} = result
       assert response.usage.input_tokens == 20
       assert response.usage.output_tokens == 10
+    end
+
+    test "captures usage attached to a non-empty choices chunk" do
+      payload = %{
+        "choices" => [%{"index" => 0, "delta" => %{"content" => "hi"}, "finish_reason" => "stop"}],
+        "usage" => %{"prompt_tokens" => 42, "completion_tokens" => 7}
+      }
+
+      Req.Test.stub(:openai_stream_inline_usage, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, "data: #{Jason.encode!(payload)}\n\ndata: [DONE]\n\n")
+      end)
+
+      assert {:ok, response} =
+               OpenAIStream.stream(
+                 "http://localhost/v1/chat/completions",
+                 [],
+                 %{"model" => "m", "messages" => []},
+                 fn _ -> :ok end,
+                 plug: {Req.Test, :openai_stream_inline_usage}
+               )
+
+      assert response.usage.input_tokens == 42
+      assert response.usage.output_tokens == 7
+    end
+
+    test "reuses slot for repeated tool call id without index, supports parallel id-keyed calls, and tolerates malformed usage" do
+      chunks = [
+        sse_chunk(%{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{
+                    "id" => "call_a",
+                    "function" => %{"name" => "read", "arguments" => "{\"path\":"}
+                  }
+                ]
+              }
+            }
+          ]
+        }),
+        sse_chunk(%{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{
+                    "id" => "call_b",
+                    "function" => %{"name" => "write", "arguments" => "{\"ok\":true}"}
+                  }
+                ]
+              }
+            }
+          ]
+        }),
+        sse_chunk(%{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{"id" => "call_a", "function" => %{"arguments" => "\"mix.exs\"}"}}
+                ]
+              }
+            }
+          ]
+        }),
+        sse_chunk(%{
+          "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => "tool_calls"}],
+          "usage" => %{
+            "prompt_tokens" => "bad",
+            "completion_tokens" => 5,
+            "prompt_tokens_details" => "not-a-map"
+          }
+        }),
+        sse_done()
+      ]
+
+      {_collected, result} = collect_stream(chunks, test_name: :repeated_id_no_index)
+
+      assert {:ok, %{stop_reason: :tool_use, messages: [%Message{content: blocks}], usage: usage}} =
+               result
+
+      assert [
+               %{type: "tool_use", id: "call_a", name: "read", input: %{"path" => "mix.exs"}},
+               %{type: "tool_use", id: "call_b", name: "write", input: %{"ok" => true}}
+             ] = blocks
+
+      assert usage.input_tokens == 0
+      assert usage.output_tokens == 5
+    end
+
+    test "handles sparse explicit indices mixed with omitted indices and routes id-less continuations to the most recently touched call" do
+      # Explicit index 1 followed by an omitted-index call B must not overwrite index 1,
+      # and an id-less fragment after a repeated-id touch on call_a must extend call_a.
+      chunks = [
+        sse_chunk(%{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{
+                    "index" => 1,
+                    "id" => "call_a",
+                    "function" => %{"name" => "read", "arguments" => "{\"path\":"}
+                  }
+                ]
+              }
+            }
+          ]
+        }),
+        sse_chunk(%{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{
+                    "id" => "call_b",
+                    "function" => %{"name" => "write", "arguments" => "{\"ok\":true}"}
+                  }
+                ]
+              }
+            }
+          ]
+        }),
+        sse_chunk(%{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{"id" => "call_a", "function" => %{"arguments" => "\"mix"}}
+                ]
+              }
+            }
+          ]
+        }),
+        sse_chunk(%{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{"function" => %{"arguments" => ".exs\"}"}}
+                ]
+              }
+            }
+          ]
+        }),
+        # Choice without delta carrying finish_reason must still preserve :tool_use.
+        sse_chunk(%{"choices" => [%{"index" => 0, "finish_reason" => "tool_calls"}]}),
+        sse_done()
+      ]
+
+      {_collected, result} = collect_stream(chunks, test_name: :sparse_and_interleaved_indices)
+
+      assert {:ok, %{stop_reason: :tool_use, messages: [%Message{content: blocks}]}} = result
+
+      assert [
+               %{type: "tool_use", id: "call_a", name: "read", input: %{"path" => "mix.exs"}},
+               %{type: "tool_use", id: "call_b", name: "write", input: %{"ok" => true}}
+             ] = blocks
+    end
+
+    test "rejects non-map choices, non-list choices, and non-string delta content/reasoning_content" do
+      for {name, bad_chunk} <- [
+            {:bad_choice_item, %{"choices" => ["bad"]}},
+            {:bad_choices_field, %{"choices" => "bad"}},
+            {:bad_delta_content,
+             %{"choices" => [%{"delta" => %{"content" => %{"text" => "lost"}}}]}},
+            {:bad_delta_content_part, %{"choices" => [%{"delta" => %{"content" => [123]}}]}},
+            {:bad_delta_text_part,
+             %{"choices" => [%{"delta" => %{"content" => [%{"type" => "text", "text" => 123}]}}]}},
+            {:bad_delta_thinking_part,
+             %{
+               "choices" => [
+                 %{"delta" => %{"content" => [%{"type" => "thinking", "thinking" => [123]}]}}
+               ]
+             }},
+            {:bad_delta_thinking_scalar,
+             %{
+               "choices" => [
+                 %{"delta" => %{"content" => [%{"type" => "thinking", "thinking" => 123}]}}
+               ]
+             }},
+            {:bad_delta_reasoning, %{"choices" => [%{"delta" => %{"reasoning_content" => 123}}]}}
+          ] do
+        chunks = [sse_chunk(bad_chunk), sse_chunk(finish_chunk("stop")), sse_done()]
+        {_collected, result} = collect_stream(chunks, test_name: name)
+        assert {:error, %Error{kind: :malformed_reply}} = result
+      end
+    end
+
+    test "maps finish_reason stop with tool calls to :tool_use while preserving length/content_filter, and supports array-of-parts delta content with unknown parts" do
+      tool_stop_chunks = [
+        sse_chunk(tool_call_start(0, "call_1", "ping")),
+        sse_chunk(tool_call_args(0, "{}")),
+        sse_chunk(finish_chunk("stop")),
+        sse_done()
+      ]
+
+      {_, tool_result} = collect_stream(tool_stop_chunks, test_name: :stop_with_tool_calls)
+
+      assert {:ok,
+              %{stop_reason: :tool_use, messages: [%Message{content: [%{type: "tool_use"}]}]}} =
+               tool_result
+
+      length_chunks = [
+        sse_chunk(tool_call_start(0, "call_1", "ping")),
+        sse_chunk(tool_call_args(0, ~s({"path": "/tm))),
+        sse_chunk(finish_chunk("length")),
+        sse_done()
+      ]
+
+      {_, length_res} = collect_stream(length_chunks, test_name: :tool_length)
+
+      assert {:ok,
+              %{
+                stop_reason: :max_tokens,
+                messages: [
+                  %Message{
+                    content: [%{type: "tool_use", id: "call_1", name: "ping", input: %{}}]
+                  }
+                ]
+              }} = length_res
+
+      missing_meta_length_chunks = [
+        sse_chunk(%{
+          "choices" => [
+            %{"index" => 0, "delta" => %{"tool_calls" => [%{"index" => 0, "function" => %{}}]}}
+          ]
+        }),
+        sse_chunk(finish_chunk("length")),
+        sse_done()
+      ]
+
+      {_, placeholder_res} =
+        collect_stream(missing_meta_length_chunks, test_name: :tool_length_placeholder)
+
+      assert {:ok,
+              %{
+                stop_reason: :max_tokens,
+                messages: [
+                  %Message{
+                    content: [
+                      %{type: "tool_use", id: "truncated_0_" <> _, name: "truncated", input: %{}}
+                    ]
+                  }
+                ]
+              }} = placeholder_res
+
+      filter_chunks = [
+        sse_chunk(tool_call_start(0, "call_1", "ping")),
+        sse_chunk(tool_call_args(0, ~s({"path": "/tm))),
+        sse_chunk(finish_chunk("content_filter")),
+        sse_done()
+      ]
+
+      {_, filter_res} = collect_stream(filter_chunks, test_name: :tool_content_filter)
+
+      assert {:ok, %{stop_reason: :refusal, messages: [%Message{content: []}]}} = filter_res
+
+      # End-to-end Alloy.stream/3 check: truncated streamed tool call under
+      # finish_reason: "length" fails with max_tokens without retrying or executing the tool.
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "ping",
+          description: "Ping",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, _ctx ->
+            send(test_pid, :stream_tool_should_not_run)
+            {:ok, "pong"}
+          end
+        )
+
+      Req.Test.stub(:stream_truncated_length_e2e, fn conn ->
+        send(test_pid, :stream_length_request_hit)
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, Enum.join(length_chunks))
+      end)
+
+      assert {:error, %{status: :error, error: err_msg}} =
+               Alloy.stream("ping it", fn _ -> :ok end,
+                 provider:
+                   {Alloy.Provider.OpenAICompat,
+                    api_url: "http://localhost",
+                    model: "m",
+                    req_options: [plug: {Req.Test, :stream_truncated_length_e2e}]},
+                 tools: [tool],
+                 max_retries: 2,
+                 retry_backoff_ms: 0
+               )
+
+      assert err_msg =~ "max_tokens"
+      assert_received :stream_length_request_hit
+      refute_received :stream_length_request_hit
+      refute_received :stream_tool_should_not_run
+
+      parts_chunks = [
+        sse_chunk(%{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "content" => [
+                  %{
+                    "type" => "thinking",
+                    "thinking" => [
+                      %{"type" => "text", "text" => "plan "},
+                      %{"type" => "reference", "reference_ids" => [1]}
+                    ]
+                  },
+                  %{"type" => "reference", "reference_ids" => [2]},
+                  %{"type" => "text", "text" => "hello"}
+                ]
+              }
+            }
+          ]
+        }),
+        sse_chunk(finish_chunk("stop")),
+        sse_done()
+      ]
+
+      {collected, parts_result} = collect_stream(parts_chunks, test_name: :array_delta_content)
+      assert collected == ["hello"]
+
+      assert {:ok,
+              %{
+                stop_reason: :end_turn,
+                messages: [
+                  %Message{
+                    content: [
+                      %{type: "thinking", thinking: "plan ", source: "content_part"},
+                      %{type: "text", text: "hello"}
+                    ]
+                  }
+                ]
+              }} = parts_result
+    end
+
+    test "malformed tool-call JSON error does not leak raw argument buffer into error message" do
+      chunks = [
+        sse_chunk(%{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "tool_calls" => [
+                  %{
+                    "index" => 0,
+                    "id" => "call_bad",
+                    "type" => "function",
+                    "function" => %{
+                      "name" => "lookup",
+                      "arguments" => "{broken SECRET_TOOL_ARG_BUFFER"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }),
+        sse_chunk(finish_chunk("tool_calls")),
+        sse_done()
+      ]
+
+      {_collected, result} = collect_stream(chunks, test_name: :malformed_tool_arg_no_leak)
+      assert {:error, %Error{kind: :malformed_reply, message: msg}} = result
+      assert msg =~ "Invalid tool call JSON for lookup"
+      refute msg =~ "SECRET_TOOL_ARG_BUFFER"
     end
   end
 
@@ -494,7 +1107,8 @@ defmodule Alloy.Provider.OpenAIStreamTest do
       chunks = [sse_chunk(text_delta("Hel")), sse_chunk(error_chunk), sse_done()]
       {_, result} = collect_stream(chunks, test_name: :openrouter_error)
 
-      assert {:error, %Error{message: "Provider disconnected"}} = result
+      assert {:error, %Error{kind: :server_error, status: 502, message: "Provider disconnected"}} =
+               result
     end
 
     test "a stream that ends without finish_reason or [DONE] is an error" do

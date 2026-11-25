@@ -105,5 +105,11 @@ defmodule Alloy.Tool.Core.WriteTest do
       assert {:error, msg} = result
       assert msg =~ "Cannot create directory"
     end
+
+    test "rejects non-string content", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "a.txt")
+      assert {:error, msg} = Write.execute(%{"file_path" => file, "content" => 123}, %{})
+      assert msg =~ "string"
+    end
   end
 end

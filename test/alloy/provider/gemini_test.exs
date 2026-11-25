@@ -666,7 +666,128 @@ defmodule Alloy.Provider.GeminiTest do
     test "a body that is not JSON is a provider error" do
       config = config_with_response(%{status: 200, body: "<html>proxy error</html>"})
 
-      assert {:error, %Error{kind: :unknown}} = Gemini.complete([Message.user("Hi")], [], config)
+      assert {:error, %Error{kind: :malformed_reply}} =
+               Gemini.complete([Message.user("Hi")], [], config)
+    end
+
+    test "rejects cut-off stream with null finishReason and supports extra_body" do
+      chunk = %{
+        "candidates" => [
+          %{"content" => %{"parts" => [%{"text" => "half"}]}, "finishReason" => nil}
+        ]
+      }
+
+      Req.Test.stub(:gemini_null_finish, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        body = Jason.decode!(raw)
+        assert body["cachedContent"] == "cachedContents/123"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, "data: #{Jason.encode!(chunk)}\n\n")
+      end)
+
+      config = %{
+        api_key: "k",
+        model: "models/gemini-3.8-flash",
+        extra_body: %{cachedContent: "cachedContents/123"},
+        req_options: [plug: {Req.Test, :gemini_null_finish}]
+      }
+
+      assert {:error, %Error{kind: :network}} =
+               Gemini.stream([Message.user("hi")], [], config, fn _ -> :ok end)
+    end
+
+    test "classifies undecodable SSE chunk as :malformed_reply while prioritizing in-band API errors" do
+      bad_then_good =
+        "data: {not-valid-json\n\n" <>
+          "data: #{Jason.encode!(%{"candidates" => [%{"content" => %{"parts" => [%{"text" => "ok"}]}, "finishReason" => "STOP"}]})}\n\n"
+
+      Req.Test.stub(:gemini_malformed_chunk, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, bad_then_good)
+      end)
+
+      config = %{
+        api_key: "k",
+        model: "models/gemini-3.8-flash",
+        req_options: [plug: {Req.Test, :gemini_malformed_chunk}]
+      }
+
+      assert {:error, %Error{kind: :malformed_reply}} =
+               Gemini.stream([Message.user("hi")], [], config, fn _ -> :ok end)
+
+      bad_and_api_error =
+        "data: {not-valid-json\n\n" <>
+          "data: #{Jason.encode!(%{"error" => %{"code" => 429, "status" => "RESOURCE_EXHAUSTED", "message" => "quota"}})}\n\n"
+
+      Req.Test.stub(:gemini_inband_over_malformed, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, bad_and_api_error)
+      end)
+
+      assert {:error, %Error{kind: :rate_limited, status: 429}} =
+               Gemini.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{config | req_options: [plug: {Req.Test, :gemini_inband_over_malformed}]},
+                 fn _ -> :ok end
+               )
+
+      # Non-map JSON (data: null) also yields to a later in-band API error.
+      null_then_api_error =
+        "data: null\n\n" <>
+          "data: #{Jason.encode!(%{"error" => %{"code" => 429, "status" => "RESOURCE_EXHAUSTED", "message" => "quota"}})}\n\n"
+
+      Req.Test.stub(:gemini_null_then_api_error, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, null_then_api_error)
+      end)
+
+      assert {:error, %Error{kind: :rate_limited, status: 429}} =
+               Gemini.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{config | req_options: [plug: {Req.Test, :gemini_null_then_api_error}]},
+                 fn _ -> :ok end
+               )
+
+      # Malformed first chunk suppresses stale text deltas so Retry can recover on attempt 2.
+      test_pid = self()
+      attempts = :atomics.new(1, signed: false)
+
+      good_stream =
+        "data: #{Jason.encode!(%{"candidates" => [%{"content" => %{"parts" => [%{"text" => "recovered"}]}, "finishReason" => "STOP"}]})}\n\n"
+
+      Req.Test.stub(:gemini_retry_after_malformed, fn conn ->
+        attempt = :atomics.add_get(attempts, 1, 1)
+        body = if attempt == 1, do: bad_then_good, else: good_stream
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, body)
+      end)
+
+      assert {:ok, result} =
+               Alloy.stream(
+                 "hi",
+                 fn chunk -> send(test_pid, {:chunk, chunk}) end,
+                 provider:
+                   {Gemini,
+                    api_key: "k",
+                    model: "models/gemini-3.8-flash",
+                    req_options: [plug: {Req.Test, :gemini_retry_after_malformed}]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0
+               )
+
+      assert :atomics.get(attempts, 1) == 2
+      assert result.text == "recovered"
+      assert_received {:chunk, "recovered"}
+      refute_received {:chunk, "ok"}
     end
   end
 
@@ -712,6 +833,172 @@ defmodule Alloy.Provider.GeminiTest do
       assert_received {:request_body, body}
       [_user, model, _again] = Jason.decode!(body)["contents"]
       assert model["parts"] == [%{"text" => "Hello"}]
+    end
+  end
+
+  describe "malformed candidate, error, and usage hardening" do
+    test "stream records sticky :malformed_reply on malformed content/parts/candidates and suppresses later text" do
+      for {label, bad_chunk} <- [
+            {"false content", %{"candidates" => [%{"content" => false}]}},
+            {"non-list parts", %{"candidates" => [%{"content" => %{"parts" => "bad"}}]}},
+            {"non-map part", %{"candidates" => [%{"content" => %{"parts" => ["bad"]}}]}},
+            {"non-map candidate", %{"candidates" => ["bad"]}},
+            {"non-list candidates", %{"candidates" => "bad"}},
+            {"bad functionCall args",
+             %{
+               "candidates" => [
+                 %{
+                   "content" => %{
+                     "parts" => [%{"functionCall" => %{"name" => "f", "args" => "x"}}]
+                   }
+                 }
+               ]
+             }}
+          ] do
+        test_pid = self()
+
+        chunks = [
+          sse_chunk(%{"candidates" => [%{"content" => %{"parts" => [%{"text" => "prefix"}]}}]}),
+          sse_chunk(bad_chunk),
+          sse_chunk(%{
+            "candidates" => [
+              %{"content" => %{"parts" => [%{"text" => "suppressed"}]}, "finishReason" => "STOP"}
+            ]
+          })
+        ]
+
+        config = config_with_sse_stream(chunks)
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 Gemini.stream([Message.user("Hi")], [], config, fn text ->
+                   send(test_pid, {:chunk, label, text})
+                   :ok
+                 end)
+
+        assert_received {:chunk, ^label, "prefix"}
+        refute_received {:chunk, ^label, "suppressed"}
+      end
+    end
+
+    test "complete/3 returns :malformed_reply on malformed candidate, content, parts, or functionCall" do
+      for payload <- [
+            %{"candidates" => ["bad"]},
+            %{"candidates" => "bad"},
+            %{"candidates" => [%{"content" => false, "finishReason" => "STOP"}]},
+            %{"candidates" => [%{"content" => %{"parts" => "bad"}, "finishReason" => "STOP"}]},
+            %{"candidates" => [%{"content" => %{"parts" => ["bad"]}, "finishReason" => "STOP"}]},
+            %{
+              "candidates" => [
+                %{
+                  "content" => %{
+                    "parts" => [%{"functionCall" => %{"name" => "f", "args" => 123}}]
+                  },
+                  "finishReason" => "STOP"
+                }
+              ]
+            }
+          ] do
+        assert {:error, %Error{kind: :malformed_reply}} = complete_with(payload)
+      end
+    end
+
+    test "ignores error: null and preserves list-wrapped in-band API error classification" do
+      assert {:ok, %{stop_reason: :end_turn}} =
+               stream_with([
+                 %{
+                   "error" => nil,
+                   "candidates" => [
+                     %{"content" => %{"parts" => [%{"text" => "ok"}]}, "finishReason" => "STOP"}
+                   ],
+                   "usageMetadata" => %{"promptTokenCount" => "bad", "candidatesTokenCount" => 3}
+                 }
+               ])
+
+      list_error =
+        "data: " <>
+          Jason.encode!([
+            %{
+              "error" => %{
+                "code" => 429,
+                "status" => "RESOURCE_EXHAUSTED",
+                "message" => "Quota exceeded"
+              }
+            }
+          ]) <> "\n\n"
+
+      config =
+        config_with_sse_stream([
+          sse_chunk(%{"candidates" => [%{"content" => false}]}),
+          list_error
+        ])
+
+      assert {:error, %Error{kind: :rate_limited, message: "Quota exceeded"}} =
+               Gemini.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+    end
+
+    test "malformed SSE JSON error does not leak raw chunk payload into error message" do
+      config = config_with_sse_stream(["data: {not json SECRET_GEMINI_CHUNK_PAYLOAD\n\n"])
+
+      assert {:error, %Error{kind: :malformed_reply, message: msg}} =
+               Gemini.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert msg =~ "Malformed JSON in Gemini SSE chunk"
+      refute msg =~ "SECRET_GEMINI_CHUNK_PAYLOAD"
+    end
+
+    test "tolerates non-map usageMetadata and non-integer counts in complete/3 and stream/4" do
+      assert {:ok, %{usage: %{input_tokens: 0, output_tokens: 0}}} =
+               complete_with(%{
+                 "candidates" => [
+                   %{"content" => %{"parts" => [%{"text" => "ok"}]}, "finishReason" => "STOP"}
+                 ],
+                 "usageMetadata" => "not-a-map"
+               })
+
+      assert {:ok, %{usage: %{input_tokens: 10, output_tokens: 0}}} =
+               stream_with([
+                 %{
+                   "candidates" => [%{"content" => %{"parts" => [%{"text" => "ok"}]}}],
+                   "usageMetadata" => "not-a-map"
+                 },
+                 %{
+                   "candidates" => [%{"finishReason" => "STOP"}],
+                   "usageMetadata" => %{
+                     "promptTokenCount" => 10,
+                     "candidatesTokenCount" => "bad"
+                   }
+                 },
+                 %{
+                   "usageMetadata" => %{"promptTokenCount" => nil}
+                 }
+               ])
+    end
+
+    test "complete/3 prioritizes explicit API errors over malformed or present candidates" do
+      assert {:error, %Error{kind: :auth, status: 403, type: "PERMISSION_DENIED"}} =
+               complete_with(%{
+                 "candidates" => false,
+                 "error" => %{
+                   "code" => 403,
+                   "status" => "PERMISSION_DENIED",
+                   "message" => "denied"
+                 }
+               })
+
+      assert {:error, %Error{kind: :rate_limited, status: 429}} =
+               complete_with(%{
+                 "candidates" => [
+                   %{
+                     "content" => %{"parts" => [%{"text" => "partial"}]},
+                     "finishReason" => "STOP"
+                   }
+                 ],
+                 "error" => %{
+                   "code" => 429,
+                   "status" => "RESOURCE_EXHAUSTED",
+                   "message" => "Quota exceeded"
+                 }
+               })
     end
   end
 

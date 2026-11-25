@@ -19,10 +19,16 @@ defmodule Alloy.Provider.Error do
   ## Kinds
 
     * retried: `:rate_limited`, `:overloaded`, `:server_error`, `:timeout`,
-      `:network`, `:malformed_reply`
+      `:network`, `:malformed_reply` (note: `:malformed_reply` covers both
+      transient garbled JSON/SSE and structurally invalid replies, so retries
+      only run before any stream output is emitted and are bounded by
+      `:max_retries`)
     * not retried: `:context_overflow` (the loop compacts once instead),
       `:quota` (billing or spend limit), `:auth`, `:invalid_request`,
-      `:session_uncertain` (a persisted CLI turn may have been recorded), `:unknown`
+      `:session_uncertain` (a persisted CLI turn may have been recorded),
+      `:shutdown` (interrupted by supervisor shutdown; skips retries and
+      fallbacks — on a resumed Codex session, also rotate `:session_generation`),
+      `:unknown`
   """
 
   @type kind ::
@@ -37,6 +43,7 @@ defmodule Alloy.Provider.Error do
           | :quota
           | :auth
           | :invalid_request
+          | :shutdown
           | :unknown
 
   @type t :: %__MODULE__{
@@ -115,14 +122,14 @@ defmodule Alloy.Provider.Error do
   """
   @spec from_response(pos_integer(), map() | [{String.t(), String.t()}], term()) :: t()
   def from_response(status, headers, body) do
-    {type, code, message} = body |> decode() |> fields()
+    {type, code, raw_message, stored_message} = body |> decode() |> fields()
 
     %__MODULE__{
-      kind: classify(status, type, code, message),
+      kind: classify(status, type, code, raw_message),
       status: status,
       type: type,
       code: code,
-      message: message,
+      message: stored_message,
       retry_after_ms: retry_after_ms(headers)
     }
   end
@@ -130,19 +137,39 @@ defmodule Alloy.Provider.Error do
   @doc """
   Builds an error reported inside a successful HTTP response: a failed
   response object or an error event in an SSE stream. Accepts the body
-  shapes `from_response/3` reads and classifies by code and type alone.
+  shapes `from_response/3` reads and classifies by code, type, and numeric
+  HTTP status codes (`400..599`) carried in `error.code`.
   """
   @spec from_body(term()) :: t()
   def from_body(body) do
-    {type, code, message} = body |> decode() |> fields()
+    decoded = decode(body)
+    {type, code, raw_message, stored_message} = fields(decoded)
+    status = numeric_status(decoded)
 
     %__MODULE__{
-      kind: classify(nil, type, code, message),
+      kind: classify(status, type, code, raw_message),
+      status: status,
       type: type,
       code: code,
-      message: message
+      message: stored_message
     }
   end
+
+  # Assumes numeric error.code values in 400..599 represent HTTP statuses
+  # (as used by Gemini and OpenRouter in-band 200 error payloads).
+  defp numeric_status(%{"error" => %{"code" => status}})
+       when is_integer(status) and status >= 400 and status <= 599,
+       do: status
+
+  defp numeric_status(%{"error" => %{"code" => status}}) when is_binary(status) do
+    case Integer.parse(status) do
+      {n, ""} when n >= 400 and n <= 599 -> n
+      _ -> nil
+    end
+  end
+
+  defp numeric_status([first | _]), do: numeric_status(first)
+  defp numeric_status(_), do: nil
 
   @doc """
   Builds an error from a transport failure (connection refused, closed,
@@ -150,9 +177,11 @@ defmodule Alloy.Provider.Error do
   """
   @spec from_transport(term()) :: t()
   def from_transport(reason) do
+    detail = reason |> inspect(limit: 20, printable_limit: 500) |> cap_bytes(500)
+
     %__MODULE__{
       kind: transport_kind(reason),
-      message: "HTTP request failed: #{inspect(reason)}"
+      message: "HTTP request failed: #{detail}"
     }
   end
 
@@ -168,17 +197,70 @@ defmodule Alloy.Provider.Error do
   defp decode(body), do: body
 
   defp fields(%{"error" => %{} = error}) do
-    {
-      label(error["type"] || error["status"]),
-      label(error["code"]),
-      label(error["message"]) || Jason.encode!(error)
-    }
+    {raw, stored} =
+      case label(error["message"]) do
+        nil -> encode_error_fallback(error)
+        msg -> {msg, cap_bytes(msg, 2_000)}
+      end
+
+    {label(error["type"]) || label(error["status"]), label(error["code"]), raw, stored}
   end
 
-  defp fields(%{"error" => error}) when is_binary(error), do: {nil, nil, error}
+  defp fields(%{"error" => error}) when is_binary(error),
+    do: {nil, nil, error, cap_bytes(error, 2_000)}
+
   defp fields([first | _]), do: fields(first)
-  defp fields(body) when is_binary(body), do: {nil, nil, body}
-  defp fields(body), do: {nil, nil, inspect(body)}
+
+  defp fields(body) when is_binary(body), do: {nil, nil, body, cap_bytes(body, 2_000)}
+
+  defp fields(body) do
+    {raw, stored} = encode_error_fallback(body)
+    {nil, nil, raw, stored}
+  end
+
+  defp encode_error_fallback(term) do
+    raw =
+      case Jason.encode(term) do
+        {:ok, json} -> json
+        {:error, _} -> inspect(term, limit: 20, printable_limit: 500)
+      end
+
+    {raw, cap_bytes(raw, 500)}
+  end
+
+  # Slices before sanitizing invalid UTF-8 so multi-MB invalid binaries never
+  # allocate proportionally, then normalizes invalid bytes and caps by UTF-8
+  # byte size while preserving valid UTF-8.
+  @doc false
+  @spec cap_bytes(String.t(), pos_integer()) :: String.t()
+  def cap_bytes(str, max_bytes) do
+    slice =
+      if byte_size(str) <= max_bytes do
+        str
+      else
+        # Keep up to max_bytes + 3 bytes before sanitizing so a valid 4-byte
+        # UTF-8 codepoint starting just before max_bytes stays intact.
+        binary_part(str, 0, min(byte_size(str), max_bytes + 3))
+      end
+
+    valid = if String.valid?(slice), do: slice, else: String.replace_invalid(slice)
+
+    if byte_size(valid) <= max_bytes do
+      valid
+    else
+      valid
+      |> binary_part(0, max_bytes)
+      |> drop_incomplete_utf8_tail()
+    end
+  end
+
+  defp drop_incomplete_utf8_tail(bin) do
+    if String.valid?(bin) do
+      bin
+    else
+      bin |> binary_part(0, byte_size(bin) - 1) |> drop_incomplete_utf8_tail()
+    end
+  end
 
   defp label(value) when is_binary(value) and value != "", do: value
   defp label(_value), do: nil
@@ -187,7 +269,10 @@ defmodule Alloy.Provider.Error do
 
   defp classify(status, type, code, message) do
     cond do
-      status != 429 and overflow?(code, message) ->
+      status != 429 and (overflow_code?(code) or overflow_code?(type)) ->
+        :context_overflow
+
+      status != 429 and not server_status?(status) and overflow?(code, message) ->
         :context_overflow
 
       quota?(type) or quota?(code) ->
@@ -198,8 +283,17 @@ defmodule Alloy.Provider.Error do
     end
   end
 
+  defp overflow_code?("context_length_exceeded"), do: true
+  defp overflow_code?(_), do: false
+
+  defp server_status?(status) when is_integer(status) and status in 500..599, do: true
+  defp server_status?(_), do: false
+
+  # Bound the overflow scan to 64 KiB so multi-MB error bodies cannot allocate
+  # large lowercased copies while still catching long proxy-wrapped errors.
   defp overflow?(code, message) do
-    text = String.downcase("#{code} #{message}")
+    scanned = cap_bytes(message, 65_536)
+    text = String.downcase("#{code} #{scanned}")
     Enum.any?(@overflow_phrases, &String.contains?(text, &1))
   end
 
@@ -216,6 +310,7 @@ defmodule Alloy.Provider.Error do
   defp by_status(status) when status in 400..499, do: :invalid_request
   defp by_status(_status), do: :unknown
 
+  defp transport_kind(%Jason.DecodeError{}), do: :malformed_reply
   defp transport_kind(%{reason: reason}), do: transport_kind(reason)
   defp transport_kind(reason) when reason in [:timeout, :connect_timeout], do: :timeout
 

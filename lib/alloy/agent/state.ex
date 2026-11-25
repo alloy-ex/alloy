@@ -6,9 +6,19 @@ defmodule Alloy.Agent.State do
   current status. Passed through each iteration of the agent loop.
 
   `deadline` is the monotonic time in milliseconds (see
-  `System.monotonic_time/1`) by which the run's provider requests must
-  finish; `Alloy.Agent.Turn.run_loop/2` sets it. Middleware that makes its
-  own provider request, as compaction does, should finish by it.
+  `System.monotonic_time/1`) with 5 seconds of headroom before `timeout_ms`
+  (`run_deadline - 5_000`), or `nil` when `timeout_ms: :infinity`.
+  `Alloy.Agent.Turn.run_loop/2` sets it to govern provider retries and give
+  non-streaming calls cleanup headroom; `run_deadline` is the absolute
+  wall-clock cap (`started + timeout_ms`), or `nil` when `timeout_ms: :infinity`,
+  enforced across requests, streaming, tool execution, and turns. Middleware
+  inspecting `deadline` or `run_deadline` should guard with `is_integer/1`. Hosts
+  wrapping `Alloy.run/2` or `Alloy.stream/3` in `Task.await/2` should give
+  their outer await more time than `:timeout_ms` so Alloy can return its own
+  `:timeout` result cleanly. Middleware that makes its own provider request,
+  as compaction does, uses `deadline` for retry headroom and `run_deadline` as
+  the hard wall-clock ceiling (so when `timeout_ms <= 5_000`, summary requests
+  run once without retries or fallbacks).
   """
 
   alias Alloy.Agent.Config
@@ -34,6 +44,7 @@ defmodule Alloy.Agent.State do
           run_metadata: map(),
           started_at: integer() | nil,
           deadline: integer() | nil,
+          run_deadline: integer() | nil,
           agent_id: String.t()
         }
 
@@ -56,6 +67,8 @@ defmodule Alloy.Agent.State do
     run_metadata: %{},
     started_at: nil,
     deadline: nil,
+    # Internal absolute monotonic deadline for the whole run (without retry headroom).
+    run_deadline: nil,
     agent_id: ""
   ]
 
@@ -64,7 +77,7 @@ defmodule Alloy.Agent.State do
   """
   @spec init(Config.t(), [Message.t()]) :: t()
   def init(%Config{} = config, messages \\ []) do
-    {tool_defs, tool_fns} = Alloy.Tool.Registry.build(config.tools)
+    {tool_defs, tool_fns} = Registry.build(config.tools)
 
     agent_id =
       Map.get(config.context, :session_id) || generate_agent_id()

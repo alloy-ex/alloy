@@ -49,6 +49,10 @@ defmodule Alloy.Testing do
 
   Takes a user prompt and a list of scripted responses (built with
   `text_response/1`, `tool_response/2`, or `error_response/1`).
+  Always uses the scripted `Alloy.Provider.Test` and clears `:fallback_providers`
+  even if `:provider` or `:fallback_providers` are present in `opts` (for
+  example when reusing shared application options in tests), so no live
+  provider calls can happen.
 
   Returns the final `Alloy.Agent.State` struct.
 
@@ -63,21 +67,35 @@ defmodule Alloy.Testing do
   """
   @spec run_with_responses(String.t(), [term()], keyword()) :: State.t()
   def run_with_responses(prompt, responses, opts \\ []) do
+    defaults = [
+      tools: default_tools(),
+      max_turns: 10,
+      compaction: false
+    ]
+
+    # Validate options before starting TestProvider so invalid opts never leak a linked process.
+    config =
+      defaults
+      |> Keyword.merge(opts)
+      |> Keyword.put(:provider, {TestProvider, %{}})
+      |> Keyword.put(:fallback_providers, [])
+      |> Config.from_opts()
+
     {:ok, pid} = TestProvider.start_link(responses)
+    config = %{config | provider_config: %{agent_pid: pid}}
 
-    config = %Config{
-      provider: TestProvider,
-      provider_config: %{agent_pid: pid},
-      tools: Keyword.get(opts, :tools, default_tools()),
-      system_prompt: Keyword.get(opts, :system_prompt),
-      max_turns: Keyword.get(opts, :max_turns, 10),
-      middleware: Keyword.get(opts, :middleware, []),
-      working_directory: Keyword.get(opts, :working_directory, "."),
-      context: Keyword.get(opts, :context, %{})
-    }
+    try do
+      state = State.init(config, [Message.user(prompt)])
+      Turn.run_loop(state)
+    after
+      stop_test_provider(pid)
+    end
+  end
 
-    state = State.init(config, [Message.user(prompt)])
-    Turn.run_loop(state)
+  defp stop_test_provider(pid) do
+    Agent.stop(pid)
+  catch
+    :exit, _ -> :ok
   end
 
   @doc """

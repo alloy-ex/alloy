@@ -25,10 +25,12 @@ defmodule Alloy.Message do
   ### Reasoning and provider-specific blocks
 
   Assistant messages can also hold blocks only their own provider can read
-  back: `"thinking"` with a `:signature` (Anthropic, Gemini), `"redacted_thinking"`,
-  `"reasoning"` and `"output_item"` (OpenAI and xAI raw items), `"server_tool_use"`
-  and server tool results (Anthropic), and `:signature` or
-  `:thought_signature` on text and tool-call blocks (Gemini).
+  back: `"thinking"` with a `:signature` (Anthropic, Gemini) or
+  `source: "content_part"` (OpenAI-compatible array-of-parts thinking, which
+  is withheld from top-level `reasoning_content` echo on subsequent turns),
+  `"redacted_thinking"`, `"reasoning"` and `"output_item"` (OpenAI and xAI raw
+  items), `"server_tool_use"` and server tool results (Anthropic), and
+  `:signature` or `:thought_signature` on text and tool-call blocks (Gemini).
 
   ## Provenance
 
@@ -244,24 +246,34 @@ defmodule Alloy.Message do
     messages
   end
 
-  defp normalize(%__MODULE__{role: :assistant, origin: from} = message, ids, target)
+  # A same-origin (or unattributed) assistant message starts a new round with
+  # no foreign ID renames, so later tool results reusing the same raw ID keep
+  # their original pairing.
+  defp normalize(%__MODULE__{role: :assistant, origin: from} = message, _ids, target)
        when from in [nil, target],
-       do: {[message], ids}
+       do: {[message], %{}}
 
-  defp normalize(%__MODULE__{role: :assistant, content: text} = message, ids, _target)
+  defp normalize(%__MODULE__{role: :assistant, content: text} = message, _ids, _target)
        when is_binary(text),
-       do: {[message], ids}
+       do: {[message], %{}}
 
-  defp normalize(%__MODULE__{role: :assistant, content: blocks} = message, ids, _target) do
-    case Enum.flat_map_reduce(blocks, ids, &foreign_block/2) do
+  defp normalize(%__MODULE__{role: :assistant, content: blocks} = message, _ids, _target) do
+    case Enum.flat_map_reduce(blocks, %{}, &foreign_block/2) do
       {[], ids} -> {[], ids}
       {blocks, ids} -> {[%{message | content: blocks}], ids}
     end
   end
 
   defp normalize(%__MODULE__{role: :user, content: blocks} = message, ids, _target)
-       when is_list(blocks) and map_size(ids) > 0,
-       do: {[%{message | content: Enum.map(blocks, &rename_result(&1, ids))}], ids}
+       when is_list(blocks) and map_size(ids) > 0 do
+    if Enum.any?(blocks, &(is_map(&1) and &1[:type] == "tool_result")) do
+      {[%{message | content: Enum.map(blocks, &rename_result(&1, ids))}], ids}
+    else
+      {[message], %{}}
+    end
+  end
+
+  defp normalize(%__MODULE__{role: :user} = message, _ids, _target), do: {[message], %{}}
 
   defp normalize(message, ids, _target), do: {[message], ids}
 

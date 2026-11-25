@@ -18,6 +18,8 @@ defmodule Alloy.Provider do
     layer (for example, citations or server-side tool usage)
   """
 
+  alias Alloy.Provider.Error
+
   @typedoc """
   Why the model stopped. Map the wire value to the closest of:
 
@@ -51,7 +53,13 @@ defmodule Alloy.Provider do
   ## Parameters
   - `messages` - Conversation history as normalized `Alloy.Message` structs
   - `tool_defs` - Tool definitions (JSON Schema format)
-  - `config` - Provider-specific configuration (API keys, model, etc.)
+  - `config` - Provider-specific configuration (API keys, model, etc.). When
+    called from `Alloy.Agent.Turn`, Alloy may also inject `:system_prompt`,
+    `:provider_state`, `:on_event` (when streaming), `:req_options` (with
+    `:receive_timeout`), and `:alloy_request_deadline` (monotonic ms deadline
+    that built-in providers enforce as a hard wall-clock bound). Custom
+    providers using strict config validation should tolerate or ignore these
+    runtime keys.
 
   ## Returns
   - `{:ok, completion_response()}` on success
@@ -105,15 +113,21 @@ defmodule Alloy.Provider do
   @doc """
   Decode a JSON binary response body, passing through maps unchanged.
 
-  Returns `{:ok, decoded_map}` or `{:error, reason}`.
+  Returns `{:ok, decoded_map}` or `{:error, %Alloy.Provider.Error{kind: :malformed_reply}}`.
   """
-  @spec decode_body(binary() | map()) :: {:ok, map()} | {:error, String.t()}
+  @spec decode_body(binary() | map()) :: {:ok, map()} | {:error, Error.t()}
   def decode_body(body) when is_map(body), do: {:ok, body}
 
   def decode_body(body) when is_binary(body) do
     case Jason.decode(body) do
-      {:ok, decoded} -> {:ok, decoded}
-      {:error, _} -> {:error, "Failed to decode response JSON"}
+      {:ok, decoded} when is_map(decoded) ->
+        {:ok, decoded}
+
+      {:ok, _non_map} ->
+        {:error, %Error{kind: :malformed_reply, message: "Expected JSON object response body"}}
+
+      {:error, _} ->
+        {:error, %Error{kind: :malformed_reply, message: "Failed to decode response JSON"}}
     end
   end
 end

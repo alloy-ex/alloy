@@ -706,8 +706,10 @@ defmodule Alloy.Provider.OpenAITest do
             )
         })
 
-      assert {:error, reason} = OpenAI.complete([Message.user("Hi")], [], config)
-      assert reason =~ "Invalid JSON"
+      assert {:error, %Alloy.Provider.Error{kind: :malformed_reply} = reason} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "Invalid JSON"
     end
   end
 
@@ -1121,6 +1123,130 @@ defmodule Alloy.Provider.OpenAITest do
       decoded = Jason.decode!(body)
       assert decoded["stream"] == true
       assert is_list(decoded["input"])
+    end
+
+    test "rejects non-object tool arguments and non-map SSE payloads with :malformed_reply" do
+      for bad_args <- ["null", "false", "[]"] do
+        body = [function_call_item("call_1", "read", bad_args)] |> response_payload()
+        config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAI.complete([Message.user("Hi")], [], config)
+      end
+
+      for bad_sse <- ["data: null\n\n", "data: 123\n\n", "data: {broken\n\n"] do
+        config =
+          config_with_sse_stream([
+            bad_sse,
+            sse_response_completed([assistant_text_item("ok")]),
+            "data: [DONE]\n\n"
+          ])
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+      end
+
+      # In-band API error after a malformed chunk takes precedence, and text deltas are suppressed.
+      test_pid = self()
+
+      config =
+        config_with_sse_stream([
+          "data: {broken\n\n",
+          sse_response_output_text_delta("stale text"),
+          sse_response_event("error", %{
+            "type" => "error",
+            "code" => "rate_limit_exceeded",
+            "message" => "Slow down"
+          })
+        ])
+
+      assert {:error, %Error{kind: :rate_limited, code: "rate_limit_exceeded"}} =
+               OpenAI.stream([Message.user("Hi")], [], config, fn chunk ->
+                 send(test_pid, {:chunk, chunk})
+               end)
+
+      refute_received {:chunk, _}
+    end
+
+    test "rejects function_call items missing non-empty id or name with :malformed_reply" do
+      for bad_item <- [
+            %{"type" => "function_call", "name" => "read", "arguments" => "{}"},
+            %{"type" => "function_call", "call_id" => "", "name" => "read", "arguments" => "{}"},
+            %{"type" => "function_call", "call_id" => "call_1", "arguments" => "{}"},
+            %{"type" => "function_call", "call_id" => "call_1", "name" => "", "arguments" => "{}"}
+          ] do
+        body = response_payload([bad_item])
+        config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAI.complete([Message.user("Hi")], [], config)
+      end
+    end
+
+    test "incomplete max_output_tokens truncations abandon cleanly without retrying, and content_filter drops partial calls" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "read",
+          description: "read",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :openai_truncated_tool_ran)
+            {:ok, "nope"}
+          end
+        )
+
+      incomplete_body = %{
+        "id" => "resp_trunc",
+        "object" => "response",
+        "status" => "incomplete",
+        "incomplete_details" => %{"reason" => "max_output_tokens"},
+        "output" => [
+          %{"type" => "function_call", "arguments" => "{\"file_path\":\"cut_off"}
+        ],
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 5}
+      }
+
+      Req.Test.stub(:openai_incomplete_truncated_tool, fn conn ->
+        send(test_pid, :openai_incomplete_hit)
+        Req.Test.json(conn, incomplete_body)
+      end)
+
+      assert {:error, result} =
+               Alloy.run("read it",
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-test",
+                    model: "gpt-5.4",
+                    req_options: [plug: {Req.Test, :openai_incomplete_truncated_tool}]},
+                 tools: [tool],
+                 max_retries: 2,
+                 retry_backoff_ms: 0
+               )
+
+      assert result.status == :error
+      assert result.error =~ "max_tokens"
+      assert_received :openai_incomplete_hit
+      refute_received :openai_incomplete_hit
+      refute_received :openai_truncated_tool_ran
+      assert :ok == Alloy.Transcript.validate(result.messages)
+
+      refusal_body = %{
+        "id" => "resp_refusal",
+        "object" => "response",
+        "status" => "incomplete",
+        "incomplete_details" => %{"reason" => "content_filter"},
+        "output" => [
+          %{"type" => "function_call", "arguments" => "{broken"}
+        ],
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 0}
+      }
+
+      config = config_with_response(%{status: 200, body: Jason.encode!(refusal_body)})
+
+      assert {:ok, %{stop_reason: :refusal, messages: [%Message{content: []}]}} =
+               OpenAI.complete([Message.user("Hi")], [], config)
     end
   end
 

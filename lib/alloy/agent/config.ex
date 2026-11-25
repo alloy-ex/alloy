@@ -85,8 +85,8 @@ defmodule Alloy.Agent.Config do
           max_tokens: pos_integer(),
           max_tokens_explicit?: boolean(),
           max_retries: non_neg_integer(),
-          retry_backoff_ms: pos_integer(),
-          timeout_ms: pos_integer(),
+          retry_backoff_ms: non_neg_integer(),
+          timeout_ms: pos_integer() | :infinity,
           tool_timeout: pos_integer(),
           tool_concurrency: pos_integer() | nil,
           tool_validation: :required | :schema,
@@ -178,33 +178,123 @@ defmodule Alloy.Agent.Config do
       provider: provider_mod,
       provider_config: provider_config,
       tools: tools,
-      system_prompt: Keyword.get(opts, :system_prompt),
-      max_turns: Keyword.get(opts, :max_turns, 25),
+      system_prompt: validate_optional_string!(Keyword.get(opts, :system_prompt), :system_prompt),
+      max_turns: validate_pos_integer!(Keyword.get(opts, :max_turns, 25), :max_turns),
       max_tokens: max_tokens,
       max_tokens_explicit?: max_tokens_explicit?,
-      max_retries: Keyword.get(opts, :max_retries, 3),
-      retry_backoff_ms: Keyword.get(opts, :retry_backoff_ms, 1_000),
-      timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
-      tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
+      max_retries: validate_non_neg_integer!(Keyword.get(opts, :max_retries, 3), :max_retries),
+      retry_backoff_ms:
+        validate_non_neg_integer!(Keyword.get(opts, :retry_backoff_ms, 1_000), :retry_backoff_ms),
+      timeout_ms: validate_timeout_ms!(Keyword.get(opts, :timeout_ms, 120_000)),
+      tool_timeout:
+        validate_pos_integer!(Keyword.get(opts, :tool_timeout, 120_000), :tool_timeout),
       tool_concurrency: validate_tool_concurrency!(Keyword.get(opts, :tool_concurrency)),
       tool_validation: validate_tool_validation!(Keyword.get(opts, :tool_validation, :required)),
       stop_after_tool: validate_stop_after_tool!(Keyword.get(opts, :stop_after_tool)),
-      middleware: resolve_middleware(Keyword.get(opts, :middleware, []), opts[:compaction]),
+      middleware:
+        resolve_middleware(
+          validate_middleware!(Keyword.get(opts, :middleware, [])),
+          opts[:compaction]
+        ),
       compaction: compaction,
       compaction_explicit: compaction_explicit,
-      working_directory: Keyword.get(opts, :working_directory, "."),
-      context: Keyword.get(opts, :context, %{}),
-      on_compaction: Keyword.get(opts, :on_compaction, nil),
+      working_directory:
+        validate_non_empty_string!(Keyword.get(opts, :working_directory, "."), :working_directory),
+      context: validate_context!(Keyword.get(opts, :context, %{})),
+      on_compaction: validate_on_compaction!(Keyword.get(opts, :on_compaction, nil)),
       fallback_providers:
         opts
         |> Keyword.get(:fallback_providers, [])
-        |> Enum.map(&parse_fallback_provider/1),
-      code_execution: Keyword.get(opts, :code_execution, false),
+        |> validate_fallback_providers!(),
+      code_execution:
+        validate_boolean!(Keyword.get(opts, :code_execution, false), :code_execution),
       model_metadata_overrides: model_metadata_overrides,
       model_catalog: model_catalog,
-      until_tool: Keyword.get(opts, :until_tool)
+      until_tool: validate_optional_non_empty_string!(Keyword.get(opts, :until_tool), :until_tool)
     }
   end
+
+  defp validate_timeout_ms!(:infinity), do: :infinity
+  defp validate_timeout_ms!(n) when is_integer(n) and n > 0, do: n
+
+  defp validate_timeout_ms!(value),
+    do:
+      raise(
+        ArgumentError,
+        "timeout_ms must be a positive integer or :infinity, got: #{inspect(value)}"
+      )
+
+  defp validate_pos_integer!(n, _field) when is_integer(n) and n > 0, do: n
+
+  defp validate_pos_integer!(value, field),
+    do: raise(ArgumentError, "#{field} must be a positive integer, got: #{inspect(value)}")
+
+  defp validate_non_neg_integer!(n, _field) when is_integer(n) and n >= 0, do: n
+
+  defp validate_non_neg_integer!(value, field),
+    do: raise(ArgumentError, "#{field} must be a non-negative integer, got: #{inspect(value)}")
+
+  defp validate_boolean!(value, _field) when is_boolean(value), do: value
+
+  defp validate_boolean!(value, field),
+    do: raise(ArgumentError, "#{field} must be a boolean, got: #{inspect(value)}")
+
+  defp validate_optional_string!(nil, _field), do: nil
+  defp validate_optional_string!(value, _field) when is_binary(value), do: value
+
+  defp validate_optional_string!(value, field),
+    do: raise(ArgumentError, "#{field} must be a string or nil, got: #{inspect(value)}")
+
+  defp validate_non_empty_string!(value, _field) when is_binary(value) and byte_size(value) > 0,
+    do: value
+
+  defp validate_non_empty_string!(value, field),
+    do: raise(ArgumentError, "#{field} must be a nonempty string, got: #{inspect(value)}")
+
+  defp validate_optional_non_empty_string!(nil, _field), do: nil
+
+  defp validate_optional_non_empty_string!(value, _field)
+       when is_binary(value) and byte_size(value) > 0,
+       do: value
+
+  defp validate_optional_non_empty_string!(value, field),
+    do: raise(ArgumentError, "#{field} must be a nonempty string or nil, got: #{inspect(value)}")
+
+  defp validate_context!(context) when is_map(context), do: context
+
+  defp validate_context!(value),
+    do: raise(ArgumentError, "context must be a map, got: #{inspect(value)}")
+
+  defp validate_on_compaction!(nil), do: nil
+  defp validate_on_compaction!(fun) when is_function(fun, 2), do: fun
+
+  defp validate_on_compaction!(value),
+    do:
+      raise(
+        ArgumentError,
+        "on_compaction must be a 2-arity function or nil, got: #{inspect(value)}"
+      )
+
+  defp validate_middleware!(middleware) when is_list(middleware) do
+    if Enum.all?(middleware, &valid_module_atom?/1) do
+      middleware
+    else
+      raise ArgumentError,
+            "middleware must be a list of module atoms, got: #{inspect(middleware)}"
+    end
+  end
+
+  defp validate_middleware!(value),
+    do: raise(ArgumentError, "middleware must be a list of module atoms, got: #{inspect(value)}")
+
+  defp validate_fallback_providers!(fallbacks) when is_list(fallbacks) do
+    Enum.map(fallbacks, &parse_fallback_provider/1)
+  end
+
+  defp validate_fallback_providers!(value),
+    do: raise(ArgumentError, "fallback_providers must be a list, got: #{inspect(value)}")
+
+  defp valid_module_atom?(mod), do: is_atom(mod) and not is_nil(mod) and not is_boolean(mod)
 
   defp validate_tool_concurrency!(nil), do: nil
   defp validate_tool_concurrency!(n) when is_integer(n) and n > 0, do: n
@@ -342,25 +432,39 @@ defmodule Alloy.Agent.Config do
   end
 
   defp parse_provider({module, config})
-       when is_atom(module) and (is_list(config) or is_map(config)) do
+       when is_atom(module) and not is_nil(module) and not is_boolean(module) and
+              (is_list(config) or is_map(config)) do
     {module, config}
   end
 
-  defp parse_provider(module) when is_atom(module) do
+  defp parse_provider(module)
+       when is_atom(module) and not is_nil(module) and not is_boolean(module) do
     {module, []}
   end
 
-  defp parse_fallback_provider({module, provider_config}) when is_atom(module) do
+  defp parse_provider(other) do
+    raise ArgumentError,
+          "provider must be a module or {module, config} tuple, got: #{inspect(other)}"
+  end
+
+  defp parse_fallback_provider({module, provider_config})
+       when is_atom(module) and not is_nil(module) and not is_boolean(module) and
+              (is_list(provider_config) or is_map(provider_config)) do
     {module, provider_config |> normalize_provider_config() |> reject_removed!(module)}
   end
 
-  defp parse_fallback_provider(module) when is_atom(module) do
+  defp parse_fallback_provider(module)
+       when is_atom(module) and not is_nil(module) and not is_boolean(module) do
     {module, %{}}
+  end
+
+  defp parse_fallback_provider(other) do
+    raise ArgumentError,
+          "fallback provider must be a module or {module, config} tuple, got: #{inspect(other)}"
   end
 
   defp normalize_provider_config(config) when is_map(config), do: config
   defp normalize_provider_config(config) when is_list(config), do: Map.new(config)
-  defp normalize_provider_config(nil), do: %{}
 
   defp normalize_model_metadata_overrides(overrides) when is_map(overrides), do: overrides
 
@@ -378,7 +482,7 @@ defmodule Alloy.Agent.Config do
          max_tokens_explicit?
        ) do
     if max_tokens_explicit? do
-      Keyword.fetch!(opts, :max_tokens)
+      opts |> Keyword.fetch!(:max_tokens) |> validate_pos_integer!(:max_tokens)
     else
       provider_config
       |> model_name()

@@ -2,10 +2,44 @@ defmodule Alloy.Agent.TurnTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Agent.{Config, State, Turn}
-  alias Alloy.Message
+  alias Alloy.{Message, Tool, Transcript}
+  alias Alloy.Provider.Error
   alias Alloy.Provider.Test, as: TestProvider
 
   alias Alloy.Test.EchoTool
+
+  defmodule GatedProvider do
+    @behaviour Alloy.Provider
+
+    @impl true
+    def complete(_m, _t, %{owner: owner, reply: reply}) do
+      send(owner, {:provider_started, self()})
+
+      receive do
+        :release_provider -> {:ok, reply}
+      end
+    end
+  end
+
+  defmodule ShrinkOnceMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:on_context_overflow, state),
+      do: %{state | messages: [List.last(state.messages)]}
+
+    def call(_hook, state), do: state
+  end
+
+  defmodule SummarySpyProvider do
+    @behaviour Alloy.Provider
+
+    @impl true
+    def complete(_m, _t, config) do
+      send(config.owner, :provider_called)
+      {:ok, %{stop_reason: :end_turn, messages: [Message.assistant("summary")], usage: %{}}}
+    end
+  end
 
   describe "run_loop/1 with simple text response" do
     test "completes in one turn" do
@@ -398,7 +432,7 @@ defmodule Alloy.Agent.TurnTest do
       state = Alloy.Testing.run_with_responses("hi", responses, tools: [tool])
 
       assert state.status == :error
-      assert state.error =~ "max_tokens"
+      assert state.error =~ "raise the provider's :max_tokens"
       refute_received :tool_ran
 
       assert %Message{role: :user, content: [%{type: "tool_result", tool_use_id: "toolu_1"} = r]} =
@@ -2954,6 +2988,270 @@ defmodule Alloy.Agent.TurnTest do
       {:loop_telemetry, event, metadata} -> [{event, metadata} | collect_loop_telemetry()]
     after
       0 -> []
+    end
+  end
+
+  describe "hard run deadlines, termination precedence, and preflight" do
+    test "deadline failure on the final allowed turn returns timeout error instead of max_turns" do
+      blocking_tool =
+        Tool.inline(
+          name: "blocker",
+          description: "blocks until killed by run deadline",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            receive do
+              :never -> {:ok, "done"}
+            end
+          end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "c1", name: "blocker", input: %{}}])
+        ])
+
+      assert {:error, result} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [blocking_tool],
+                 max_turns: 1,
+                 timeout_ms: 250,
+                 tool_timeout: 10_000
+               )
+
+      assert result.status == :error
+      assert result.error =~ "timed out"
+      assert %Error{kind: :timeout} = result.metadata.run.provider_error
+      assert result.turns == 1
+    end
+
+    test "stops between turns once timeout_ms hard deadline expires" do
+      slow_tool =
+        Tool.inline(
+          name: "slow",
+          description: "slow",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            Process.sleep(500)
+            {:ok, "done"}
+          end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "c1", name: "slow", input: %{}}]),
+          TestProvider.text_response("should not reach turn 2")
+        ])
+
+      assert {:error, result} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [slow_tool],
+                 timeout_ms: 200
+               )
+
+      assert result.status == :error
+      assert result.error =~ "timed out"
+      assert result.turns == 1
+    end
+
+    test "delayed provider reply past timeout_ms skips tool execution while preserving finished end_turn answers" do
+      test_pid = self()
+
+      side_effect =
+        Tool.inline(
+          name: "side_effect",
+          description: "must not run",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :tool_executed)
+            {:ok, "ran"}
+          end
+        )
+
+      tool_reply = %{
+        stop_reason: :tool_use,
+        messages: [
+          Message.assistant_blocks([
+            %{type: "tool_use", id: "c1", name: "side_effect", input: %{}}
+          ])
+        ],
+        usage: %{}
+      }
+
+      task =
+        Task.async(fn ->
+          Alloy.run("go",
+            provider: {GatedProvider, %{owner: test_pid, reply: tool_reply}},
+            tools: [side_effect],
+            timeout_ms: 200
+          )
+        end)
+
+      assert_receive {:provider_started, provider_pid}, 1_000
+      Process.sleep(450)
+      send(provider_pid, :release_provider)
+
+      assert {:error, tool_result} = Task.await(task, 5_000)
+      assert tool_result.status == :error
+      assert tool_result.error =~ "timed out"
+      refute_received :tool_executed
+      assert :ok == Transcript.validate(tool_result.messages)
+
+      end_reply = %{stop_reason: :end_turn, messages: [Message.assistant("finished")], usage: %{}}
+
+      end_task =
+        Task.async(fn ->
+          Alloy.run("go",
+            provider: {GatedProvider, %{owner: test_pid, reply: end_reply}},
+            timeout_ms: 200
+          )
+        end)
+
+      assert_receive {:provider_started, end_provider_pid}, 1_000
+      Process.sleep(450)
+      send(end_provider_pid, :release_provider)
+
+      assert {:ok, end_result} = Task.await(end_task, 5_000)
+      assert end_result.status == :completed
+      assert end_result.text == "finished"
+    end
+
+    test "failed overflow retry does not set prompt_too_long_recovery: true" do
+      {:ok, pid} =
+        TestProvider.start_link([
+          {:error, %Error{kind: :context_overflow, message: "too long"}},
+          {:error, %Error{kind: :context_overflow, message: "still too long"}}
+        ])
+
+      assert {:error, result} =
+               Alloy.run("hi",
+                 provider: {TestProvider, agent_pid: pid},
+                 messages: [Message.user("old"), Message.assistant("old")],
+                 compaction: false,
+                 middleware: [ShrinkOnceMiddleware]
+               )
+
+      refute Map.has_key?(result.metadata.run, :prompt_too_long_recovery)
+    end
+
+    @tag :ex_json_schema
+    test "tool_validation: :schema preflights remote $ref before compaction makes any summary request" do
+      test_pid = self()
+
+      remote_ref_tool =
+        Tool.inline(
+          name: "bad_schema",
+          description: "has remote $ref",
+          input_schema: %{
+            type: "object",
+            properties: %{
+              payload: %{"$ref" => "https://example.com/schema.json"}
+            }
+          },
+          execute: fn _, _ -> {:ok, "never"} end
+        )
+
+      over_budget = [
+        Message.user("start"),
+        Message.assistant(String.duplicate("a", 500)),
+        Message.user(String.duplicate("b", 500)),
+        Message.assistant("recent")
+      ]
+
+      assert_raise ArgumentError, ~r/remote|local/i, fn ->
+        Alloy.run("next",
+          provider: {SummarySpyProvider, owner: test_pid},
+          tools: [remote_ref_tool],
+          tool_validation: :schema,
+          messages: over_budget,
+          max_tokens: 100,
+          compaction: %{
+            reserve_tokens: 10,
+            keep_recent_tokens: 5,
+            fallback: :truncate,
+            clear_tool_results: false,
+            keep_recent_tool_results: 3
+          }
+        )
+      end
+
+      refute_received :provider_called
+    end
+
+    test "timeout_ms: :infinity disables run deadline, preserves retries, and still enforces tool_timeout" do
+      test_pid = self()
+
+      defmodule UnboundedInspectProvider do
+        @behaviour Alloy.Provider
+
+        @impl true
+        def complete(_messages, _tools, config) do
+          send(config.owner, {:unbounded_config, config})
+          Agent.get_and_update(config.agent_pid, fn [next | rest] -> {next, rest} end)
+        end
+      end
+
+      slow_tool =
+        Tool.inline(
+          name: "slow_tool",
+          description: "sleeps past tool_timeout",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            Process.sleep(500)
+            {:ok, "too late"}
+          end
+        )
+
+      {:ok, agent_pid} =
+        Agent.start_link(fn ->
+          [
+            {:error, %Error{kind: :server_error, status: 500, message: "transient"}},
+            TestProvider.tool_use_response([%{id: "c1", name: "slow_tool", input: %{}}]),
+            TestProvider.text_response("done after tool timeout")
+          ]
+        end)
+
+      assert {:ok, result} =
+               Alloy.run("go",
+                 provider: {UnboundedInspectProvider, %{owner: test_pid, agent_pid: agent_pid}},
+                 tools: [slow_tool],
+                 timeout_ms: :infinity,
+                 tool_timeout: 80,
+                 max_retries: 1,
+                 retry_backoff_ms: 0
+               )
+
+      assert result.status == :completed
+      assert result.text == "done after tool timeout"
+
+      for _ <- 1..3 do
+        assert_received {:unbounded_config, cfg}
+        refute Map.has_key?(cfg, :alloy_request_deadline)
+        assert Keyword.fetch!(cfg.req_options, :receive_timeout) == :infinity
+      end
+
+      # Caller-specified req_options[:receive_timeout] is preserved under timeout_ms: :infinity.
+      {:ok, explicit_pid} = Agent.start_link(fn -> [TestProvider.text_response("ok")] end)
+
+      assert {:ok, _} =
+               Alloy.run("go",
+                 provider:
+                   {UnboundedInspectProvider,
+                    %{
+                      owner: test_pid,
+                      agent_pid: explicit_pid,
+                      req_options: [receive_timeout: 30_000]
+                    }},
+                 timeout_ms: :infinity
+               )
+
+      assert_received {:unbounded_config, explicit_cfg}
+      assert Keyword.fetch!(explicit_cfg.req_options, :receive_timeout) == 30_000
+
+      tool_result_msg = Enum.find(result.messages, &(&1.role == :user and is_list(&1.content)))
+      assert [%{is_error: true, content: err_text}] = tool_result_msg.content
+      assert err_text =~ "timed out"
     end
   end
 

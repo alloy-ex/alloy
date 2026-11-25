@@ -51,7 +51,7 @@ defmodule Alloy.Transcript do
     %{
       state
       | messages: [message | state.messages],
-        pending: Enum.uniq(ids),
+        pending: ids |> Enum.filter(&valid_id?/1) |> Enum.uniq(),
         answered: MapSet.new(),
         errors: Enum.reverse(errors) ++ state.errors
     }

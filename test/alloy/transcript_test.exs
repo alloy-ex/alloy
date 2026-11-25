@@ -104,4 +104,12 @@ defmodule Alloy.TranscriptTest do
     assert :ok = Transcript.validate(messages)
     assert {:ok, ^messages} = Transcript.repair(messages)
   end
+
+  test "validate does not emit spurious :missing_result for invalid call IDs" do
+    messages = [
+      Message.assistant_blocks([%{type: "tool_use", id: "", name: "read", input: %{}}])
+    ]
+
+    assert {:error, [%{kind: :invalid_call, id: ""}]} = Transcript.validate(messages)
+  end
 end

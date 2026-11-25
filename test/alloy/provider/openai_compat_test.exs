@@ -582,5 +582,519 @@ defmodule Alloy.Provider.OpenAICompatTest do
       refute Map.has_key?(decoded, "response_format")
       refute Map.has_key?(decoded, "temperature")
     end
+
+    test "non-streaming accepts empty-string tool arguments, trims trailing api_url slash, and classifies malformed JSON" do
+      Req.Test.stub(:openai_compat_empty_args, fn conn ->
+        assert conn.request_path == "/v1/chat/completions"
+
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "tool_calls",
+              "message" => %{
+                "role" => "assistant",
+                "tool_calls" => [
+                  %{
+                    "id" => "c1",
+                    "type" => "function",
+                    "function" => %{"name" => "ping", "arguments" => ""}
+                  }
+                ]
+              }
+            }
+          ],
+          "usage" => %{}
+        })
+      end)
+
+      config = %{
+        api_url: "http://localhost/",
+        model: "m",
+        req_options: [plug: {Req.Test, :openai_compat_empty_args}]
+      }
+
+      assert {:ok,
+              %{messages: [%Message{content: [%{type: "tool_use", name: "ping", input: %{}}]}]}} =
+               OpenAICompat.complete([Message.user("hi")], [], config)
+
+      Req.Test.stub(:openai_compat_bad_args, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "tool_calls",
+              "message" => %{
+                "role" => "assistant",
+                "tool_calls" => [
+                  %{
+                    "id" => "c1",
+                    "type" => "function",
+                    "function" => %{"name" => "ping", "arguments" => "{bad"}
+                  }
+                ]
+              }
+            }
+          ]
+        })
+      end)
+
+      assert {:error, %Alloy.Provider.Error{kind: :malformed_reply}} =
+               OpenAICompat.complete([Message.user("hi")], [], %{
+                 config
+                 | req_options: [plug: {Req.Test, :openai_compat_bad_args}]
+               })
+    end
+
+    test "rejects null, false, and non-object tool arguments and never executes tools under required or schema validation" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "delete_item",
+          description: "Deletes an optional target",
+          input_schema: %{type: "object", properties: %{target: %{type: "string"}}},
+          execute: fn input, _ctx ->
+            send(test_pid, {:tool_executed, input})
+            {:ok, "deleted"}
+          end
+        )
+
+      modes =
+        if Code.ensure_loaded?(ExJsonSchema.Schema), do: [:required, :schema], else: [:required]
+
+      for validation <- modes,
+          {stub_name, raw_args} <- [
+            {:openai_compat_nil_args, nil},
+            {:openai_compat_null_json_args, "null"},
+            {:openai_compat_false_json_args, "false"},
+            {:openai_compat_array_json_args, "[]"}
+          ] do
+        Req.Test.stub(stub_name, fn conn ->
+          Req.Test.json(conn, %{
+            "choices" => [
+              %{
+                "finish_reason" => "tool_calls",
+                "message" => %{
+                  "role" => "assistant",
+                  "tool_calls" => [
+                    %{
+                      "id" => "c1",
+                      "type" => "function",
+                      "function" => %{"name" => "delete_item", "arguments" => raw_args}
+                    }
+                  ]
+                }
+              }
+            ],
+            "usage" => %{}
+          })
+        end)
+
+        assert {:error, %{status: :error}} =
+                 Alloy.run("delete it",
+                   provider:
+                     {OpenAICompat,
+                      api_url: "http://localhost",
+                      model: "m",
+                      req_options: [plug: {Req.Test, stub_name}]},
+                   tools: [tool],
+                   tool_validation: validation,
+                   max_retries: 0
+                 )
+
+        refute_received {:tool_executed, _}
+      end
+    end
+
+    test "rejects missing/empty tool call id, invalid name, non-map calls, and malformed extra_content without crashing or executing tools" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "delete_item",
+          description: "Deletes an optional target",
+          input_schema: %{type: "object", properties: %{target: %{type: "string"}}},
+          execute: fn input, _ctx ->
+            send(test_pid, {:tool_executed, input})
+            {:ok, "deleted"}
+          end
+        )
+
+      bad_tool_calls_cases = [
+        {:oc_missing_id,
+         [%{"type" => "function", "function" => %{"name" => "delete_item", "arguments" => "{}"}}]},
+        {:oc_nil_id,
+         [
+           %{
+             "id" => nil,
+             "type" => "function",
+             "function" => %{"name" => "delete_item", "arguments" => "{}"}
+           }
+         ]},
+        {:oc_empty_id,
+         [
+           %{
+             "id" => "",
+             "type" => "function",
+             "function" => %{"name" => "delete_item", "arguments" => "{}"}
+           }
+         ]},
+        {:oc_empty_name,
+         [
+           %{
+             "id" => "c1",
+             "type" => "function",
+             "function" => %{"name" => "", "arguments" => "{}"}
+           }
+         ]},
+        {:oc_non_map_tc, ["not-a-map"]},
+        {:oc_non_list_tool_calls, "not-a-list"},
+        {:oc_bad_extra_content,
+         [
+           %{
+             "id" => "c1",
+             "type" => "function",
+             "extra_content" => false,
+             "function" => %{"name" => "delete_item", "arguments" => "{}"}
+           }
+         ]},
+        {:oc_bad_google_extra,
+         [
+           %{
+             "id" => "c1",
+             "type" => "function",
+             "extra_content" => %{"google" => "bad"},
+             "function" => %{"name" => "delete_item", "arguments" => "{}"}
+           }
+         ]}
+      ]
+
+      for {stub_name, tool_calls} <- bad_tool_calls_cases do
+        Req.Test.stub(stub_name, fn conn ->
+          Req.Test.json(conn, %{
+            "choices" => [
+              %{
+                "finish_reason" => "tool_calls",
+                "message" => %{"role" => "assistant", "tool_calls" => tool_calls}
+              }
+            ],
+            "usage" => %{}
+          })
+        end)
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAICompat.complete([Message.user("delete it")], [], %{
+                   api_url: "http://localhost",
+                   model: "m",
+                   req_options: [plug: {Req.Test, stub_name}]
+                 })
+
+        assert {:error, %{status: :error}} =
+                 Alloy.run("delete it",
+                   provider:
+                     {OpenAICompat,
+                      api_url: "http://localhost",
+                      model: "m",
+                      req_options: [plug: {Req.Test, stub_name}]},
+                   tools: [tool],
+                   stop_after_tool: "delete_item",
+                   max_retries: 0
+                 )
+
+        refute_received {:tool_executed, _}
+      end
+    end
+
+    test "returns :malformed_reply for missing/null/non-map message or non-map choice and tolerates malformed usage" do
+      bad_payloads = [
+        {:oc_missing_msg, %{"choices" => [%{"finish_reason" => "stop"}]}},
+        {:oc_null_msg, %{"choices" => [%{"message" => nil, "finish_reason" => "stop"}]}},
+        {:oc_str_msg, %{"choices" => [%{"message" => "bad", "finish_reason" => "stop"}]}},
+        {:oc_bad_choice, %{"choices" => ["not-a-map"]}},
+        {:oc_bad_content,
+         %{
+           "choices" => [
+             %{"message" => %{"content" => %{"text" => "lost"}}, "finish_reason" => "stop"}
+           ]
+         }},
+        {:oc_bad_reasoning,
+         %{
+           "choices" => [
+             %{
+               "message" => %{"content" => "ok", "reasoning_content" => 123},
+               "finish_reason" => "stop"
+             }
+           ]
+         }}
+      ]
+
+      for {stub_name, payload} <- bad_payloads do
+        Req.Test.stub(stub_name, fn conn -> Req.Test.json(conn, payload) end)
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAICompat.complete([Message.user("Hi")], [], %{
+                   api_url: "http://localhost",
+                   model: "m",
+                   req_options: [plug: {Req.Test, stub_name}]
+                 })
+      end
+
+      Req.Test.stub(:oc_numeric_in_band_error, fn conn ->
+        Req.Test.json(conn, %{"error" => %{"code" => 429, "message" => "Rate limited"}})
+      end)
+
+      assert {:error, %Error{kind: :rate_limited, status: 429, message: "Rate limited"}} =
+               OpenAICompat.complete([Message.user("Hi")], [], %{
+                 api_url: "http://localhost",
+                 model: "m",
+                 req_options: [plug: {Req.Test, :oc_numeric_in_band_error}]
+               })
+
+      Req.Test.stub(:oc_bad_usage, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{"message" => %{"role" => "assistant", "content" => "ok"}, "finish_reason" => "stop"}
+          ],
+          "usage" => %{
+            "prompt_tokens" => "bad",
+            "completion_tokens" => -5,
+            "prompt_tokens_details" => "not-a-map"
+          }
+        })
+      end)
+
+      assert {:ok, %{usage: %{input_tokens: 0, output_tokens: 0}}} =
+               OpenAICompat.complete([Message.user("Hi")], [], %{
+                 api_url: "http://localhost",
+                 model: "m",
+                 req_options: [plug: {Req.Test, :oc_bad_usage}]
+               })
+    end
+
+    test "supports array-of-parts content (skipping unknown part types), omitted tool arguments, finish_reason stop with tool calls, and omits reasoning_content echo on turn 2" do
+      Req.Test.stub(:oc_array_and_stop_tools, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "stop",
+              "message" => %{
+                "role" => "assistant",
+                "content" => [
+                  %{
+                    "type" => "thinking",
+                    "thinking" => [
+                      %{"type" => "text", "text" => "step 1"},
+                      %{"type" => "reference", "reference_ids" => [1]}
+                    ]
+                  },
+                  %{"type" => "reference", "reference_ids" => [2]},
+                  %{"type" => "text", "text" => "calling ping"}
+                ],
+                "tool_calls" => [
+                  %{"id" => "c1", "type" => "function", "function" => %{"name" => "ping"}}
+                ]
+              }
+            }
+          ]
+        })
+      end)
+
+      assert {:ok,
+              %{
+                stop_reason: :tool_use,
+                messages: [
+                  %Message{
+                    content: [
+                      %{type: "thinking", thinking: "step 1", source: "content_part"},
+                      %{type: "text", text: "calling ping"},
+                      %{type: "tool_use", id: "c1", name: "ping", input: %{}}
+                    ]
+                  } = assistant_msg
+                ]
+              }} =
+               OpenAICompat.complete([Message.user("Hi")], [], %{
+                 api_url: "http://localhost",
+                 model: "m",
+                 req_options: [plug: {Req.Test, :oc_array_and_stop_tools}]
+               })
+
+      assert Message.thinking(assistant_msg) == "step 1"
+
+      # Multi-turn check: content-part-sourced thinking must not inject a
+      # DeepSeek-style "reasoning_content" key on the outgoing assistant message.
+      tool_result_msg = Message.tool_results([Message.tool_result_block("c1", "pong")])
+
+      assert {:ok, _} =
+               OpenAICompat.complete(
+                 [Message.user("Hi"), assistant_msg, tool_result_msg],
+                 [],
+                 config_that_captures_request()
+               )
+
+      assert_received {:request_body, body}
+      outgoing = Enum.find(Jason.decode!(body)["messages"], &(&1["role"] == "assistant"))
+      refute Map.has_key?(outgoing, "reasoning_content")
+    end
+
+    test "handles truncated tool-call arguments under length and content_filter without retrying" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "read",
+          description: "Read file",
+          input_schema: %{type: "object", properties: %{path: %{type: "string"}}},
+          execute: fn _input, _ctx ->
+            send(test_pid, :tool_should_not_run)
+            {:ok, "ok"}
+          end
+        )
+
+      Req.Test.stub(:oc_truncated_length, fn conn ->
+        send(test_pid, :length_request_hit)
+
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "length",
+              "message" => %{
+                "role" => "assistant",
+                "tool_calls" => [
+                  %{
+                    "id" => "c1",
+                    "type" => "function",
+                    "function" => %{"name" => "read", "arguments" => ~s({"path": "/tm)}
+                  }
+                ]
+              }
+            }
+          ]
+        })
+      end)
+
+      assert {:error, %{status: :error, error: err_msg}} =
+               Alloy.run("read file",
+                 provider:
+                   {OpenAICompat,
+                    api_url: "http://localhost",
+                    model: "m",
+                    req_options: [plug: {Req.Test, :oc_truncated_length}]},
+                 tools: [tool],
+                 max_retries: 2,
+                 retry_backoff_ms: 0
+               )
+
+      assert err_msg =~ "max_tokens"
+      assert_received :length_request_hit
+      refute_received :length_request_hit
+      refute_received :tool_should_not_run
+
+      Req.Test.stub(:oc_truncated_filter, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "content_filter",
+              "message" => %{
+                "role" => "assistant",
+                "tool_calls" => [
+                  %{
+                    "id" => "c1",
+                    "type" => "function",
+                    "function" => %{"name" => "read", "arguments" => ~s({"path": "/tm)}
+                  }
+                ]
+              }
+            }
+          ]
+        })
+      end)
+
+      assert {:ok, %{stop_reason: :refusal, messages: [%Message{content: []}]}} =
+               OpenAICompat.complete([Message.user("Hi")], [], %{
+                 api_url: "http://localhost",
+                 model: "m",
+                 req_options: [plug: {Req.Test, :oc_truncated_filter}]
+               })
+
+      Req.Test.stub(:oc_truncated_placeholder, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "length",
+              "message" => %{
+                "role" => "assistant",
+                "tool_calls" => [%{"function" => %{}}]
+              }
+            }
+          ]
+        })
+      end)
+
+      assert {:ok,
+              %{
+                stop_reason: :max_tokens,
+                messages: [
+                  %Message{
+                    content: [
+                      %{type: "tool_use", id: "truncated_0_" <> _, name: "truncated", input: %{}}
+                    ]
+                  }
+                ]
+              }} =
+               OpenAICompat.complete([Message.user("Hi")], [], %{
+                 api_url: "http://localhost",
+                 model: "m",
+                 req_options: [plug: {Req.Test, :oc_truncated_placeholder}]
+               })
+
+      # Under finish_reason: "length", structurally invalid tool_calls entries
+      # (non-map entry, non-map function, non-string name) still fail with :malformed_reply.
+      for {stub, bad_calls} <- [
+            {:oc_length_non_map_tc, ["not-a-map"]},
+            {:oc_length_bad_func, [%{"id" => "c1", "function" => "bad"}]},
+            {:oc_length_bad_name, [%{"id" => "c1", "function" => %{"name" => 123}}]}
+          ] do
+        Req.Test.stub(stub, fn conn ->
+          Req.Test.json(conn, %{
+            "choices" => [
+              %{
+                "finish_reason" => "length",
+                "message" => %{"role" => "assistant", "tool_calls" => bad_calls}
+              }
+            ]
+          })
+        end)
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAICompat.complete([Message.user("Hi")], [], %{
+                   api_url: "http://localhost",
+                   model: "m",
+                   req_options: [plug: {Req.Test, stub}]
+                 })
+      end
+
+      # Defensive format_message/1: tolerates non-map blocks, thinking blocks
+      # missing :thinking, and atom :content_part source without crashing.
+      weird_assistant = %Message{
+        role: :assistant,
+        content: [
+          "stray-binary",
+          %{type: "thinking"},
+          %{type: "thinking", thinking: "ignored", source: :content_part},
+          %{type: "text", text: "kept"}
+        ]
+      }
+
+      assert {:ok, _} =
+               OpenAICompat.complete(
+                 [Message.user("Hi"), weird_assistant],
+                 [],
+                 config_that_captures_request()
+               )
+
+      assert_received {:request_body, body}
+      outgoing = Enum.find(Jason.decode!(body)["messages"], &(&1["role"] == "assistant"))
+      assert outgoing["content"] == "kept"
+      refute Map.has_key?(outgoing, "reasoning_content")
+    end
   end
 end

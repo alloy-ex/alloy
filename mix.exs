@@ -56,7 +56,7 @@ defmodule Alloy.MixProject do
   def application do
     [
       mod: {Alloy.Application, []},
-      extra_applications: [:logger]
+      extra_applications: [:logger, :crypto]
     ]
   end
 
@@ -75,6 +75,8 @@ defmodule Alloy.MixProject do
       {:mint, "~> 1.11"},
       {:jason, "~> 1.2"},
       {:telemetry, "~> 1.0"},
+      # Validation uses 0.11.x Ref/Root/get_fragment internals for local-only $ref
+      # preflight (lib/alloy/tool/validation.ex); re-verify before bumping to 0.12+.
       {:ex_json_schema, "~> 0.11.5", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

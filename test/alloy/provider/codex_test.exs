@@ -3,7 +3,7 @@ defmodule Alloy.Provider.CodexTest do
 
   alias Alloy.Agent.{Config, State, Turn}
   alias Alloy.Message
-  alias Alloy.Provider.{Codex, Error, Retry}
+  alias Alloy.Provider.{Codex, CodexRunner, Error, Retry}
 
   describe "opt-in continuation" do
     test "the agent loop resumes after executing a tool" do
@@ -1117,6 +1117,231 @@ defmodule Alloy.Provider.CodexTest do
       pids = await_pids!(pids_path)
       assert eventually(fn -> Enum.all?(pids, &(not os_alive?(&1))) end)
     end
+
+    @tag :tmp_dir
+    test "rejects non-zero exit with last_message under persist_session: true", %{tmp_dir: dir} do
+      runner = fn _bin, args, _opts ->
+        idx = Enum.find_index(args, &(&1 == "--output-last-message"))
+
+        File.write!(
+          Enum.at(args, idx + 1),
+          ~s({"stop_reason":"end_turn","text":"partial","tool_calls":[]})
+        )
+
+        {"failed on disk", 1}
+      end
+
+      assert {:error, %Error{message: msg}} =
+               Codex.complete([Message.user("hi")], [], %{
+                 model: "gpt-5.4",
+                 workdir: dir,
+                 persist_session: true,
+                 command_runner: runner
+               })
+
+      assert msg =~ "status 1"
+    end
+
+    @tag :tmp_dir
+    test "timeout kills TERM-resistant descendants even when leader exits on SIGTERM", %{
+      tmp_dir: dir
+    } do
+      marker = Path.join(dir, "survivor_marker")
+      script = Path.join(dir, "fake_codex.sh")
+
+      File.write!(script, """
+      #!/bin/sh
+      (trap '' TERM; sleep 1; touch "#{marker}") &
+      trap 'exit 0' TERM
+      sleep 5
+      """)
+
+      File.chmod!(script, 0o755)
+
+      assert {:error, %Error{kind: :timeout}} =
+               Codex.complete([Message.user("hi")], [], %{
+                 model: "gpt-5.4",
+                 codex_bin: script,
+                 codex_home: dir,
+                 timeout_ms: 150
+               })
+
+      Process.sleep(1_300)
+      refute File.exists?(marker)
+    end
+
+    @tag :tmp_dir
+    test "rejects option-like codex_bin values", %{tmp_dir: dir} do
+      assert {:error, %Error{message: bad_bin_msg}} =
+               Codex.complete([Message.user("hi")], [], %{
+                 model: "gpt-5.4",
+                 codex_bin: "-bad-flag",
+                 codex_home: dir
+               })
+
+      assert bad_bin_msg =~ "could not run codex executable"
+    end
+
+    @tag :tmp_dir
+    test "temp directories use unpredictable random names, 0700 mode, and never delete pre-existing dirs on :eexist",
+         %{tmp_dir: dir} do
+      test_pid = self()
+
+      runner = fn _bin, args, _opts ->
+        idx = Enum.find_index(args, &(&1 == "--output-last-message"))
+        last_msg_path = Enum.at(args, idx + 1)
+        send(test_pid, {:codex_dir, Path.basename(Path.dirname(last_msg_path))})
+        File.write!(last_msg_path, ~s({"stop_reason":"end_turn","text":"ok","tool_calls":[]}))
+        {"", 0}
+      end
+
+      assert {:ok, _} =
+               Codex.complete([Message.user("hi")], [], %{
+                 model: "gpt-5.4",
+                 tmp_dir: dir,
+                 command_runner: runner
+               })
+
+      assert_received {:codex_dir, dir_name}
+      assert dir_name =~ ~r/^alloy-codex-[A-Za-z0-9_-]{16}$/
+
+      # Pre-existing directory survives an :eexist collision untouched.
+      existing = Path.join(dir, "preexisting")
+      sentinel = Path.join(existing, "keep.txt")
+      File.mkdir_p!(existing)
+      File.write!(sentinel, "important")
+
+      assert {:error, %Error{kind: :unknown, message: collision_msg}} =
+               CodexRunner.create_temp_dir(dir, "preexisting")
+
+      assert collision_msg =~ "eexist"
+      assert File.read!(sentinel) == "important"
+
+      # Fresh directory is created with 0700 permissions under the default umask.
+      assert {:ok, fresh} = CodexRunner.create_temp_dir(dir, "fresh-dir")
+      %File.Stat{mode: mode} = File.stat!(fresh)
+      assert Bitwise.band(mode, 0o777) == 0o700
+
+      # Atomic 0700 creation also holds under a permissive umask (000).
+      sh = System.find_executable("sh")
+      elixir = System.find_executable("elixir")
+      assert is_binary(sh), "sh executable is required for permissive-umask regression test"
+
+      assert is_binary(elixir),
+             "elixir executable is required for permissive-umask regression test"
+
+      ebin = Mix.Project.compile_path()
+
+      code =
+        ~S'{:ok, p} = Alloy.Provider.CodexRunner.create_temp_dir(hd(System.argv()), "umask-zero"); IO.puts("DIR:" <> p)'
+
+      {output, status} =
+        System.cmd(
+          sh,
+          [
+            "-c",
+            ~S(umask 000 && exec "$1" -pa "$2" -e "$3" -- "$4"),
+            "umask-test",
+            elixir,
+            ebin,
+            code,
+            dir
+          ]
+        )
+
+      assert status == 0, output
+
+      ["DIR:" <> created] =
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "DIR:"))
+
+      %File.Stat{mode: umask_mode} = File.stat!(created)
+      assert Bitwise.band(umask_mode, 0o777) == 0o700
+
+      # Fails closed without creating an insecure directory when atomic mkdir is unavailable.
+      assert {:error, %Error{kind: :unknown, message: no_mkdir_msg}} =
+               CodexRunner.create_temp_dir(dir, "no-mkdir", find_mkdir: fn -> nil end)
+
+      assert no_mkdir_msg =~ "atomic_mkdir_unavailable"
+      refute File.exists?(Path.join(dir, "no-mkdir"))
+
+      # Non-directory tmp_dir returns typed %Error{}.
+      blocker = Path.join(dir, "not_a_dir")
+      File.write!(blocker, "file")
+
+      assert {:error, %Error{kind: :unknown, message: tmp_msg}} =
+               Codex.complete([Message.user("hi")], [], %{
+                 model: "gpt-5.4",
+                 tmp_dir: blocker,
+                 command_runner: fn _, _, _ -> {"", 0} end
+               })
+
+      assert tmp_msg =~ "failed to prepare Codex temp directory"
+    end
+
+    @tag :tmp_dir
+    test "write_inputs wraps file write failures in typed Error", %{tmp_dir: dir} do
+      missing_parent = Path.join(dir, "missing")
+
+      paths = %{
+        schema_path: Path.join(missing_parent, "schema.json"),
+        prompt_path: Path.join(missing_parent, "prompt.txt")
+      }
+
+      assert {:error, %Error{kind: :unknown, message: msg}} =
+               CodexRunner.write_inputs(paths, "{}", "hi")
+
+      assert msg =~ "failed to write Codex input files"
+    end
+
+    @tag :tmp_dir
+    test "already-expired alloy_request_deadline returns timeout without launching codex", %{
+      tmp_dir: dir
+    } do
+      marker = Path.join(dir, "should_not_run")
+      script = script!(dir, "touch \"#{marker}\"\nexit 0\n")
+      past = System.monotonic_time(:millisecond) - 10
+
+      assert {:error, %Error{kind: :timeout}} =
+               Codex.complete([Message.user("hi")], [], %{
+                 model: "gpt-5.4",
+                 codex_bin: script,
+                 codex_home: dir,
+                 timeout_ms: 5_000,
+                 alloy_request_deadline: past
+               })
+
+      refute File.exists?(marker)
+
+      assert {:error, %Error{kind: :timeout}} =
+               Codex.complete([Message.user("hi")], [], %{
+                 model: "gpt-5.4",
+                 timeout_ms: 5_000,
+                 alloy_request_deadline: past,
+                 command_runner: fn _, _, _ ->
+                   flunk("command_runner must not run after expiry")
+                 end
+               })
+    end
+
+    @tag :tmp_dir
+    test "alloy_request_deadline bounds the real subprocess ahead of a larger timeout_ms", %{
+      tmp_dir: dir
+    } do
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, %Error{kind: :timeout}} =
+               Codex.complete([Message.user("hi")], [], %{
+                 model: "gpt-5.4",
+                 codex_bin: slow_codex!(dir),
+                 codex_home: dir,
+                 timeout_ms: 30_000,
+                 alloy_request_deadline: started + 150
+               })
+
+      assert System.monotonic_time(:millisecond) - started < 5_000
+    end
   end
 
   describe "stream/4" do
@@ -1299,6 +1524,173 @@ defmodule Alloy.Provider.CodexTest do
              ) == :cancel
 
       pids = await_pids!(pids_path)
+      assert eventually(fn -> Enum.all?(pids, &(not os_alive?(&1))) end)
+      assert File.ls!(runs) == []
+    end
+
+    @tag :tmp_dir
+    test "mid-stream reply_fn exception stops codex children and removes temporary files", %{
+      tmp_dir: dir
+    } do
+      pids_path = Path.join(dir, "pids")
+      runs = Path.join(dir, "runs")
+      File.mkdir_p!(runs)
+
+      script =
+        fake_codex!(dir, """
+        sleep 30 &
+        echo "$$ $!" > "#{pids_path}"
+        printf '%s\\n' '#{reply_event("boom")}'
+        wait
+        """)
+
+      config = %{
+        model: "test-model",
+        codex_bin: script,
+        codex_home: dir,
+        tmp_dir: runs,
+        alloy_on_chunk: fn _ -> :ok end
+      }
+
+      build_args = fn paths ->
+        ["exec", "--output-last-message", paths.last_message_path]
+      end
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, %Error{kind: :unknown, message: msg}} =
+                   CodexRunner.execute(
+                     "hi",
+                     dir,
+                     build_args,
+                     "{}",
+                     config,
+                     fn _text -> raise "reply parser boom" end
+                   )
+
+          assert msg == "codex exec failed: RuntimeError"
+        end)
+
+      refute log =~ "reply parser boom"
+      refute log =~ "CodexRunner"
+      pids = await_pids!(pids_path)
+      assert eventually(fn -> Enum.all?(pids, &(not os_alive?(&1))) end)
+      assert File.ls!(runs) == []
+    end
+
+    @tag :tmp_dir
+    test "supervisor shutdown returns :shutdown (fresh and resumed plans), kills the codex process group, and removes the temp dir",
+         %{tmp_dir: dir} do
+      {script, pids_path} = hanging_codex!(dir)
+      runs = Path.join(dir, "runs")
+      File.mkdir_p!(runs)
+
+      config = %{
+        model: "gpt-5.4",
+        codex_bin: script,
+        codex_home: dir,
+        tmp_dir: runs,
+        timeout_ms: 30_000
+      }
+
+      caller_task =
+        Task.async(fn ->
+          Codex.complete([Message.user("Hi")], [], config)
+        end)
+
+      pids = await_pids!(pids_path)
+      assert eventually(fn -> owners_started_by(caller_task.pid) != [] end)
+      [owner] = owners_started_by(caller_task.pid)
+      Process.exit(owner, :shutdown)
+
+      assert {:error, %Error{kind: :shutdown, message: "codex exec interrupted by shutdown"}} =
+               Task.await(caller_task, 5_000)
+
+      assert eventually(fn -> Enum.all?(pids, &(not os_alive?(&1))) end)
+      assert File.ls!(runs) == []
+
+      # Persisted resume plan interrupted by shutdown preserves kind: :shutdown
+      # (so Retry skips fallbacks) while noting :session_generation uncertainty.
+      resume_pids_path = Path.join(dir, "resume_pids")
+      marker_path = Path.join(dir, "turn1_done")
+
+      two_turn_script =
+        fake_codex!(dir, """
+        if [ ! -f "#{marker_path}" ]; then
+          touch "#{marker_path}"
+          printf '%s\\n' '{"type":"thread.started","thread_id":"thread_shutdown_1"}'
+        else
+          sleep 30 &
+          echo "$$ $!" > "#{resume_pids_path}.tmp" && mv "#{resume_pids_path}.tmp" "#{resume_pids_path}"
+          wait
+        fi
+        """)
+
+      resume_base = %{
+        model: "gpt-5.4",
+        codex_bin: two_turn_script,
+        codex_home: dir,
+        workdir: dir,
+        tmp_dir: runs,
+        persist_session: true,
+        timeout_ms: 30_000
+      }
+
+      turn1_msgs = [Message.user("turn 1")]
+      assert {:ok, turn1_res} = Codex.complete(turn1_msgs, [], resume_base)
+      assert turn1_res.provider_state["codex_session"]["id"] == "thread_shutdown_1"
+
+      resume_config = Map.put(resume_base, :provider_state, turn1_res.provider_state)
+
+      resume_task =
+        Task.async(fn ->
+          Codex.complete(
+            turn1_msgs ++ turn1_res.messages ++ [Message.user("turn 2")],
+            [],
+            resume_config
+          )
+        end)
+
+      resume_pids = await_pids!(resume_pids_path)
+      assert eventually(fn -> owners_started_by(resume_task.pid) != [] end)
+      [resume_owner] = owners_started_by(resume_task.pid)
+      Process.exit(resume_owner, :shutdown)
+
+      assert {:error, %Error{kind: :shutdown, message: resume_msg}} =
+               Task.await(resume_task, 5_000)
+
+      assert resume_msg =~ "session_generation"
+      assert eventually(fn -> Enum.all?(resume_pids, &(not os_alive?(&1))) end)
+      assert File.ls!(runs) == []
+    end
+
+    @tag :tmp_dir
+    test "external non-shutdown owner exit returns sanitized :unknown error and cleans up", %{
+      tmp_dir: dir
+    } do
+      runs = Path.join(dir, "runs")
+      File.mkdir_p!(runs)
+      {script, pids_path} = hanging_codex!(dir)
+
+      task =
+        Task.async(fn ->
+          Codex.complete([Message.user("hi")], [], %{
+            model: "gpt-5.4",
+            codex_bin: script,
+            codex_home: dir,
+            tmp_dir: runs,
+            timeout_ms: 30_000
+          })
+        end)
+
+      pids = await_pids!(pids_path)
+      assert eventually(fn -> owners_started_by(task.pid) != [] end)
+      [owner] = owners_started_by(task.pid)
+      Process.exit(owner, {:custom_crash, "secret-token"})
+
+      assert {:error, %Error{kind: :unknown, message: msg}} = Task.await(task, 5_000)
+      assert msg =~ ":custom_crash"
+      refute msg =~ "secret-token"
       assert eventually(fn -> Enum.all?(pids, &(not os_alive?(&1))) end)
       assert File.ls!(runs) == []
     end

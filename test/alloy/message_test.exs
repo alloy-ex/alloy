@@ -245,5 +245,27 @@ defmodule Alloy.MessageTest do
       assert ids == Enum.uniq(ids)
       assert [%Message{content: ^rewritten}] = Message.normalize_for([message], @anthropic, %{})
     end
+
+    test "later same-origin reused call ID keeps its raw ID paired with its tool result" do
+      provider = Alloy.Provider.OpenAICompat
+      config = %{api_key: "target"}
+      call = %{type: "tool_use", id: "functions.read:0", name: "read", input: %{}}
+
+      foreign = %{
+        Message.assistant_blocks([call])
+        | origin: Message.origin(provider, %{api_key: "other"})
+      }
+
+      local = %{Message.assistant_blocks([call]) | origin: Message.origin(provider, config)}
+      result = Message.tool_results([Message.tool_result_block(call.id, "ok")])
+
+      [norm_foreign, norm_foreign_res, norm_local, norm_local_res] =
+        Message.normalize_for([foreign, result, local, result], provider, config)
+
+      assert hd(norm_foreign.content).id == hd(norm_foreign_res.content).tool_use_id
+      assert hd(norm_foreign.content).id != call.id
+      assert hd(norm_local.content).id == call.id
+      assert hd(norm_local_res.content).tool_use_id == call.id
+    end
   end
 end

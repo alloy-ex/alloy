@@ -377,5 +377,29 @@ defmodule Alloy.Agent.ConfigTest do
         )
       end
     end
+
+    test "accepts timeout_ms: :infinity to disable the run-level deadline" do
+      config = Config.from_opts(provider: Alloy.Provider.Test, timeout_ms: :infinity)
+      assert config.timeout_ms == :infinity
+    end
+
+    test "rejects nil and invalid core option values" do
+      for bad_opts <- [
+            [provider: nil],
+            [provider: false],
+            [provider: Alloy.Provider.Test, max_turns: nil],
+            [provider: Alloy.Provider.Test, max_turns: 0],
+            [provider: Alloy.Provider.Test, max_tokens: nil],
+            [provider: Alloy.Provider.Test, max_retries: -1],
+            [provider: Alloy.Provider.Test, retry_backoff_ms: -1],
+            [provider: Alloy.Provider.Test, timeout_ms: 0],
+            [provider: Alloy.Provider.Test, timeout_ms: :bad],
+            [provider: Alloy.Provider.Test, tool_timeout: 0],
+            [provider: Alloy.Provider.Test, tool_timeout: :infinity],
+            [provider: Alloy.Provider.Test, fallback_providers: [nil]]
+          ] do
+        assert_raise ArgumentError, fn -> Config.from_opts(bad_opts) end
+      end
+    end
   end
 end

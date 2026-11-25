@@ -14,6 +14,8 @@ defmodule Alloy.Events do
 
   alias Alloy.Agent.State
 
+  require Logger
+
   @doc """
   Normalize runtime opts for event emission.
 
@@ -27,6 +29,7 @@ defmodule Alloy.Events do
     opts
     |> Keyword.put(:on_event, on_event)
     |> put_new_lazy(:event_seq_ref, fn -> :atomics.new(1, signed: false) end)
+    |> put_new_lazy(:event_error_logged_ref, fn -> :atomics.new(1, signed: false) end)
     |> put_new_lazy(:event_correlation_id, fn -> build_correlation_id(state) end)
   end
 
@@ -65,7 +68,7 @@ defmodule Alloy.Events do
     correlation_id = Keyword.get(opts, :event_correlation_id)
 
     envelope = build_event_envelope(raw_event, event_seq_ref, correlation_id, turn)
-    on_event.(envelope)
+    notify_on_event(on_event, envelope, Keyword.get(opts, :event_error_logged_ref))
 
     :telemetry.execute(
       [:alloy, :event],
@@ -78,6 +81,29 @@ defmodule Alloy.Events do
       }
     )
   end
+
+  # A raising UI/telemetry callback must not crash the loop after side-effecting
+  # tools have already run. Log at most once per run so a broken streaming UI
+  # callback cannot flood logs on every chunk. Throws and exits still propagate.
+  defp notify_on_event(on_event, envelope, logged_ref) do
+    on_event.(envelope)
+    :ok
+  rescue
+    exception ->
+      if should_log_error?(logged_ref) do
+        sanitized_trace = Alloy.OwnedWorker.sanitize_stacktrace(__STACKTRACE__)
+
+        Logger.warning(
+          "[Alloy] on_event callback failed; the run continues (further failures in this run suppressed).\n" <>
+            Exception.format(:error, exception, sanitized_trace)
+        )
+      end
+
+      :ok
+  end
+
+  defp should_log_error?(nil), do: true
+  defp should_log_error?(ref), do: :atomics.compare_exchange(ref, 1, 0, 1) == :ok
 
   defp build_event_envelope(%{v: 1} = envelope, _seq_ref, _correlation_id, _turn), do: envelope
 
