@@ -1,7 +1,7 @@
 defmodule Alloy.OutputSchemaTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Agent.{Config, State}
+  alias Alloy.Agent.{Config, State, Turn}
   alias Alloy.Context.Compactor
   alias Alloy.{Message, OutputSchema, Result}
   alias Alloy.Provider.{Anthropic, Codex, CodexSession, Error, Gemini, OpenAI, OpenAICompat, XAI}
@@ -148,6 +148,15 @@ defmodule Alloy.OutputSchemaTest do
           description: "belongs inside schema"
         })
       end
+
+      assert_raise ArgumentError, ~r/unsupported key/, fn ->
+        OutputSchema.normalize!(%{
+          type: "json_schema",
+          name: "ans",
+          schema: @answer_schema,
+          strict: true
+        })
+      end
     end
 
     test "basic fallback validation covers JSON types, Draft 6+ whole floats, union types, and missing text" do
@@ -230,6 +239,14 @@ defmodule Alloy.OutputSchemaTest do
         OutputSchema.normalize!(%{
           type: "object",
           properties: %{"$ref" => "https://example.com/container.json"}
+        })
+      end
+
+      # List values under schema-map containers (e.g. dependencies) are also checked.
+      assert_raise ArgumentError, ~r/output_schema.*local \$ref/, fn ->
+        OutputSchema.normalize!(%{
+          type: "object",
+          dependencies: %{a: [%{"$ref" => "https://attacker.example/schema.json"}]}
         })
       end
 
@@ -1379,6 +1396,62 @@ defmodule Alloy.OutputSchemaTest do
                )
 
       assert oai_err =~ "content_filter"
+    end
+
+    test "clears stale :output and :output_error across reused State runs" do
+      {:ok, pid} =
+        Alloy.Provider.Test.start_link([
+          Alloy.Testing.text_response(~s({"answer":"first","confidence":1})),
+          Alloy.Testing.text_response("plain second run"),
+          Alloy.Testing.text_response("not json"),
+          Alloy.Testing.text_response(~s({"answer":"recovered","confidence":0.9}))
+        ])
+
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, agent_pid: pid},
+          output_schema: @answer_schema
+        )
+
+      state1 =
+        State.init(config, [Message.user("run 1")])
+        |> Turn.run_loop()
+
+      result1 = Result.from_state(state1)
+      assert result1.output == %{"answer" => "first", "confidence" => 1}
+
+      # Clearing :output_schema on a reused State must not leak Run 1's output.
+      state2 =
+        state1
+        |> State.prepare(output_schema: nil)
+        |> State.append_messages([Message.user("run 2")])
+        |> Turn.run_loop()
+
+      result2 = Result.from_state(state2)
+      assert result2.status == :completed
+      assert result2.text == "plain second run"
+      assert result2.output == nil
+
+      # Failing with output_error on Run 3, then succeeding on Run 4 must not leak output_error.
+      state3 =
+        state2
+        |> State.prepare(output_schema: @answer_schema)
+        |> State.append_messages([Message.user("run 3")])
+        |> Turn.run_loop()
+
+      result3 = Result.from_state(state3)
+      assert result3.status == :error
+      assert result3.metadata.run.output_error.kind == :invalid_json
+
+      state4 =
+        state3
+        |> State.append_messages([Message.user("run 4")])
+        |> Turn.run_loop()
+
+      result4 = Result.from_state(state4)
+      assert result4.status == :completed
+      assert result4.output == %{"answer" => "recovered", "confidence" => 0.9}
+      refute Map.has_key?(Map.get(result4.metadata, :run, %{}), :output_error)
     end
 
     test "does not duplicate :output inside result.metadata.run and skips validation on stop_after_tool" do

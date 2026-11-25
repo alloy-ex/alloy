@@ -24,9 +24,10 @@ defmodule Alloy.Provider.Gemini do
   - `:tool_config` - Raw Gemini `toolConfig`
   - `:safety_settings` - Raw Gemini `safetySettings`
   - `:extra_headers` - Additional headers as `[{name, value}]`
-  - `:extra_body` - Additional top-level request body fields, shallow-merged last
-    (a key in `:extra_body` replaces any provider-built key of the same name,
-    such as `"generationConfig"`)
+  - `:extra_body` - Additional top-level request body fields, merged last with
+    stringified keys (`"generationConfig"` is merged one level deep so sibling
+    caller keys coexist with `:max_tokens` / `:output_schema` while explicit
+    caller keys win)
   - `:req_options` - Additional options passed to Req
 
   ## Thinking

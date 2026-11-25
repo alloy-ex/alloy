@@ -34,6 +34,7 @@ defmodule Alloy.Context.Compactor do
 
   alias Alloy.Agent.State
   alias Alloy.Context.Compactor.Estimator
+  alias Alloy.Internal.Sanitize
   alias Alloy.{Message, Middleware}
   alias Alloy.Provider.Retry
 
@@ -977,17 +978,21 @@ defmodule Alloy.Context.Compactor do
     callback.(middle, state)
   rescue
     e ->
+      stacktrace = Sanitize.stacktrace(__STACKTRACE__)
+
       Logger.warning(
         "on_compaction callback crashed: #{Exception.message(e)}\n" <>
-          "Stacktrace: #{Exception.format_stacktrace(__STACKTRACE__)}"
+          "Stacktrace: #{Exception.format_stacktrace(stacktrace)}"
       )
 
       :ok
   catch
     kind, payload ->
+      stacktrace = Sanitize.stacktrace(__STACKTRACE__)
+
       Logger.warning(
-        "on_compaction callback error (#{kind}): #{inspect(payload)}\n" <>
-          "Stacktrace: #{Exception.format_stacktrace(__STACKTRACE__)}"
+        "on_compaction callback error (#{kind}): #{Sanitize.inspect_bounded(payload)}\n" <>
+          "Stacktrace: #{Exception.format_stacktrace(stacktrace)}"
       )
 
       :ok

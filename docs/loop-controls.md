@@ -91,7 +91,8 @@ end
 def call(_hook, state), do: state
 ```
 
-`State.prepare/2` accepts `:tools`, `:messages`, `:system_prompt`, and `:provider`.
+`State.prepare/2` accepts `:tools`, `:messages`, `:system_prompt`, `:provider`,
+and `:output_schema`.
 Changes persist for later turns. Tool definitions and dispatch mappings change
 together. A provider tuple can update the model or its request settings; derived
 model limits are refreshed, while explicit context limits remain unchanged.

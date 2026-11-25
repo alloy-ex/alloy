@@ -147,9 +147,7 @@ defmodule Alloy.OutputSchema do
   # ── Normalization ────────────────────────────────────────────────────────
 
   defp wrapper_map?(map) do
-    has_schema? = Map.has_key?(map, :schema) or Map.has_key?(map, "schema")
-    has_type? = Map.has_key?(map, :type) or Map.has_key?(map, "type")
-    has_schema? and not has_type?
+    Map.has_key?(map, :schema) or Map.has_key?(map, "schema")
   end
 
   defp normalize_wrapper!(spec) do

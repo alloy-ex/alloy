@@ -108,6 +108,7 @@ defmodule Alloy.Provider.Codex do
 
   @behaviour Alloy.Provider
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.{Message, OutputSchema}
   alias Alloy.Provider.{CodexRunner, CodexSession, Error, HTTP}
 
@@ -473,7 +474,7 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp parse_payload(payload, _config, _command_result) do
-    {:error, "unexpected Codex response payload: #{inspect(payload)}"}
+    {:error, "unexpected Codex response payload: #{Sanitize.inspect_bounded(payload)}"}
   end
 
   defp parse_tool_blocks(text, tool_calls) do
@@ -520,14 +521,14 @@ defmodule Alloy.Provider.Codex do
     case Map.get(tool_call, "call_id") do
       value when is_binary(value) and value != "" -> {:ok, value}
       nil -> {:ok, "call_#{index}"}
-      other -> {:error, "invalid Codex tool call id: #{inspect(other)}"}
+      other -> {:error, "invalid Codex tool call id: #{Sanitize.inspect_bounded(other)}"}
     end
   end
 
   defp fetch_string(map, key) do
     case Map.get(map, key) do
       value when is_binary(value) and value != "" -> {:ok, value}
-      other -> {:error, "invalid Codex field #{inspect(key)}: #{inspect(other)}"}
+      other -> {:error, "invalid Codex field #{inspect(key)}: #{Sanitize.inspect_bounded(other)}"}
     end
   end
 

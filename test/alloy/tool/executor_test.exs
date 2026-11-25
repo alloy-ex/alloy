@@ -168,6 +168,64 @@ defmodule Alloy.Tool.ExecutorTest do
       assert log =~ "lib/alloy/tool/executor.ex"
     end
 
+    test "does not leak input or context secrets on FunctionClauseError in logs, tool_calls, or telemetry" do
+      clause_tool =
+        Alloy.Tool.inline(
+          name: "strict_clause",
+          description: "Matches only expected input",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn %{"expected" => val}, _ctx -> {:ok, val} end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          Alloy.Testing.tool_response("strict_clause", %{"token" => "input-secret-888"}),
+          Alloy.Testing.text_response("done")
+        ])
+
+      test_pid = self()
+      stop_handler_id = "tool-sanitize-telemetry-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        stop_handler_id,
+        [:alloy, :tool, :stop],
+        fn _event, _measurements, metadata, _config ->
+          if metadata.tool_name == "strict_clause" do
+            send(test_pid, {:tool_stop_sanitized, metadata})
+          end
+        end,
+        nil
+      )
+
+      try do
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:ok, result} =
+                     Alloy.run("call it",
+                       provider: {TestProvider, agent_pid: pid},
+                       tools: [clause_tool],
+                       context: %{api_secret: "ctx-secret-999"}
+                     )
+
+            assert [meta] = result.tool_calls
+            assert is_binary(meta.error)
+            refute meta.error =~ "ctx-secret-999"
+            refute meta.error =~ "input-secret-888"
+          end)
+
+        assert log =~ "Tool strict_clause crashed"
+        refute log =~ "ctx-secret-999"
+        refute log =~ "input-secret-888"
+
+        assert_received {:tool_stop_sanitized, stop_meta}
+        assert is_binary(stop_meta.error)
+        refute stop_meta.error =~ "ctx-secret-999"
+        refute stop_meta.error =~ "input-secret-888"
+      after
+        :telemetry.detach(stop_handler_id)
+      end
+    end
+
     test "exception telemetry keeps full stacktrace while model-visible result is short" do
       state = build_state([CrashingTool])
       tool_call = %{id: "call_crash", name: "crasher", type: "tool_use", input: %{}}

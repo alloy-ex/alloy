@@ -511,7 +511,7 @@ logging, or custom metrics:
 | `[:alloy, :run, :exception]` | `duration_ms` | `kind`, `reason`, `stacktrace`, `model` |
 | `[:alloy, :turn, :start]` | `system_time`, `monotonic_time` | `turn`, `telemetry_span_context` |
 | `[:alloy, :turn, :stop]` | `duration`, `monotonic_time` | `turn`, `status`, `telemetry_span_context` |
-| `[:alloy, :turn, :exception]` | `duration`, `monotonic_time` | `turn`, `kind`, `reason`, `stacktrace` |
+| `[:alloy, :turn, :exception]` | `duration`, `monotonic_time` | `turn`, `kind`, `reason`, `stacktrace`, `telemetry_span_context` |
 | `[:alloy, :provider, :request]` | `duration_ms` | `provider`, `model`, `streaming`, `attempt`, `result` |
 | `[:alloy, :compaction, :cleared]` | `results_cleared`, `bytes_cleared` | `turn` |
 | `[:alloy, :compaction, :done]` | `messages_before`, `messages_after` | `turn` |

@@ -1163,6 +1163,39 @@ defmodule Alloy.Context.CompactorTest do
       assert log =~ "Stacktrace"
     end
 
+    test "does not leak state.config secrets when on_compaction raises FunctionClauseError" do
+      callback = fn :never_matches, _state -> :ok end
+
+      messages = [
+        Message.user("original"),
+        Message.assistant(String.duplicate("x", 1200)),
+        Message.user("middle"),
+        Message.assistant("recent"),
+        Message.user("latest")
+      ]
+
+      state =
+        build_state(messages,
+          max_tokens: 250,
+          compaction: [reserve_tokens: 20, keep_recent_tokens: 20],
+          provider: ProbeProvider,
+          provider_config: %{
+            api_key: "sk-secret-compactor-key",
+            summary_response: {:ok, summary_text("Sanitized")},
+            test_pid: self()
+          },
+          on_compaction: callback
+        )
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {:compacted, _} = Compactor.maybe_compact(state)
+        end)
+
+      assert log =~ "on_compaction callback crashed"
+      refute log =~ "sk-secret-compactor-key"
+    end
+
     test "logs stacktrace when on_compaction throws" do
       callback = fn _middle, _state ->
         throw(:kaboom)

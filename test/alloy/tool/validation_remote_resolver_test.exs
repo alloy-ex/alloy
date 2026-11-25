@@ -1,6 +1,7 @@
 defmodule Alloy.Tool.ValidationRemoteResolverTest do
   use ExUnit.Case, async: false
 
+  alias Alloy.OutputSchema
   alias Alloy.Provider.Test, as: TestProvider
   alias Alloy.Tool
   alias Alloy.Tool.Validation
@@ -539,5 +540,57 @@ defmodule Alloy.Tool.ValidationRemoteResolverTest do
     assert Map.has_key?(root, :schema)
     assert Map.has_key?(root, :refs)
     assert Map.has_key?(root, :version)
+  end
+
+  test "rejects remote $ref inside list values under properties and dependencies even with custom $id" do
+    schema_with_list_ref = %{
+      "$id" => "http://json-schema.org/custom",
+      "type" => "object",
+      "properties" => %{
+        "a" => [%{"$ref" => "https://169.254.169.254/latest/meta-data/"}]
+      }
+    }
+
+    assert_raise ArgumentError, ~r/local \$ref/, fn ->
+      Validation.prepare(%{"submit" => schema_tool(schema_with_list_ref)}, :schema, %{})
+    end
+
+    assert_raise ArgumentError, ~r/local \$ref/, fn ->
+      OutputSchema.normalize!(schema_with_list_ref)
+    end
+
+    dep_list_ref = %{
+      "$id" => "http://json-schema.org/custom",
+      "type" => "object",
+      "dependencies" => %{
+        "a" => [%{"$ref" => "https://169.254.169.254/latest/meta-data/"}]
+      }
+    }
+
+    assert_raise ArgumentError, ~r/local \$ref/, fn ->
+      Validation.prepare(%{"submit" => schema_tool(dep_list_ref)}, :schema, %{})
+    end
+
+    assert_raise ArgumentError, ~r/local \$ref/, fn ->
+      OutputSchema.normalize!(dep_list_ref)
+    end
+
+    refute_received {:remote_resolver_called, _}
+  end
+
+  test "OutputSchema.decode_and_validate/2 rescues runtime InvalidReferenceError on #/default -> literal $ref" do
+    schema = %{
+      "type" => "object",
+      "default" => %{"$ref" => "https://example.invalid/x"},
+      "properties" => %{
+        "a" => %{"$ref" => "#/default"}
+      }
+    }
+
+    spec = OutputSchema.normalize!(schema)
+
+    assert {:error, msg} = OutputSchema.decode_and_validate(~s({"a":"x"}), spec)
+    assert msg =~ "Invalid output_schema"
+    refute_received {:remote_resolver_called, _}
   end
 end

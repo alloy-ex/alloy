@@ -64,7 +64,13 @@ defmodule Alloy.Agent.Turn do
           {hard - @deadline_headroom_ms, hard}
       end
 
-    state = %{state | deadline: deadline, run_deadline: hard_deadline}
+    state = %{
+      state
+      | deadline: deadline,
+        run_deadline: hard_deadline,
+        run_metadata: Map.drop(state.run_metadata, [:output, :output_error])
+    }
+
     run_span(state.config.provider_config[:model], fn -> loop(state, opts) end)
   end
 

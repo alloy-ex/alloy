@@ -397,7 +397,7 @@ defmodule Alloy.Tool.Executor do
     end
   rescue
     e ->
-      stacktrace = __STACKTRACE__
+      stacktrace = Sanitize.stacktrace(__STACKTRACE__)
 
       Logger.error(
         "Tool #{call[:name]} crashed: #{Exception.message(e)}\n#{Exception.format_stacktrace(stacktrace)}"
@@ -427,7 +427,7 @@ defmodule Alloy.Tool.Executor do
 
   defp exit_outcome(call, reason, _run, _deadline_capped?, _deadline_hit?) do
     {:error,
-     "Tool #{call[:name]} crashed during execution: #{inspect(exit_reason(reason))}. " <>
+     "Tool #{call[:name]} crashed during execution: #{Sanitize.inspect_bounded(exit_reason(reason))}. " <>
        "Check the input and try again.", nil}
   end
 
@@ -441,8 +441,9 @@ defmodule Alloy.Tool.Executor do
     {:error, "Tool #{call[:name]} timed out because the run deadline#{detail} was reached.", nil}
   end
 
-  # The model sees the reason without the stacktrace a throw carries.
-  defp exit_reason({reason, [{_mod, _fun, _arity, _location} | _]}), do: reason
+  # The model sees the reason without the stacktrace a throw or exit carries.
+  defp exit_reason({reason, [{_mod, _fun, _arity_or_args, _location} | _]}), do: reason
+  defp exit_reason({reason, [{_fun, _arity_or_args, _location} | _]}), do: reason
   defp exit_reason(reason), do: reason
 
   defp finish(started, outcome, run) do

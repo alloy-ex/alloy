@@ -83,6 +83,16 @@ defmodule Alloy.Tool.Validation do
       {:error, errors} ->
         {:error, "Structured output failed schema validation: #{format_output_errors(errors)}"}
     end
+  rescue
+    error ->
+      if error.__struct__ in [
+           ExJsonSchema.Schema.InvalidReferenceError,
+           ExJsonSchema.Schema.InvalidSchemaError
+         ] do
+        {:error, "Invalid output_schema: #{Exception.message(error)}"}
+      else
+        reraise error, __STACKTRACE__
+      end
   end
 
   defp resolve_output_schema(schema, name) do
@@ -222,9 +232,23 @@ defmodule Alloy.Tool.Validation do
           {"$ref", ref}, {i, r} when is_binary(ref) ->
             {i, [{ref, map_scope} | r]}
 
-          {prop, subschema}, {i, r} ->
+          {prop, subschema}, {i, r} when is_map(subschema) ->
             child_record_ids? = record_ids? and prop not in @literal_keywords
             collect_scopes_and_refs(subschema, map_scope, i, r, child_record_ids?)
+
+          {prop, subschemas}, {i, r} when is_list(subschemas) ->
+            child_record_ids? = record_ids? and prop not in @literal_keywords
+
+            Enum.reduce(subschemas, {i, r}, fn
+              item, {ii, rr} when is_map(item) ->
+                collect_scopes_and_refs(item, map_scope, ii, rr, child_record_ids?)
+
+              _non_map, inner ->
+                inner
+            end)
+
+          {_prop, _other}, inner ->
+            inner
         end)
 
       {"$ref", ref}, {ids, ref_acc} when is_binary(ref) ->
