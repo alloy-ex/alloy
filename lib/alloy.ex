@@ -57,6 +57,7 @@ defmodule Alloy do
   - `:tool_validation` - `:required` for object/required-key checks (default), or `:schema` for optional JSON Schema validation (accepts only local `#`-prefixed `$ref`s — rejecting external and absolute self-references — verified against `ex_json_schema` `0.11.x` so the remote schema resolver is never invoked; invalid tool schemas fail fast by raising `ArgumentError` / `InvalidSchemaError` / `Jason.EncodeError` during turn-0 preflight on all configured tools before `:before_completion` middleware runs, and whenever middleware changes tools)
   - `:tool_concurrency` - positive integer limiting parallel tool execution (default: scheduler count). Passing `tool_concurrency: 1` explicitly runs each tool call as its own singleton batch so `:tool_start` and `:tool_end` events alternate per call
   - `:stop_after_tool` - complete successfully after this tool succeeds; settle the whole round and return its output (default: `nil`)
+  - `:output_schema` - portable JSON Schema map (or `%{name: ..., schema: ..., strict: ...}`) for native structured outputs across all built-in providers; decodes and validates the final assistant response into `result.output` (default: `nil`)
   - `:working_directory` - base path for file tools (default: `"."`)
   - `:context` - arbitrary map passed to tools and middleware (default: `%{}`)
   - `:model_metadata_overrides` - overrides for model context windows used to derive `:max_tokens` when not set explicitly (default: `%{}`)

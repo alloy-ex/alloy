@@ -73,7 +73,7 @@ defmodule Alloy.Provider.OpenAI do
   @behaviour Alloy.Provider
 
   alias Alloy.Internal.Sanitize
-  alias Alloy.Message
+  alias Alloy.{Message, OutputSchema}
   alias Alloy.Provider.{Error, HTTP}
 
   @default_api_url "https://api.openai.com"
@@ -190,8 +190,29 @@ defmodule Alloy.Provider.OpenAI do
         defs -> Map.put(body, "tools", defs)
       end
 
+    body = maybe_put_output_schema(body, config)
+
     # Merge extra_body LAST so caller can override any field (#18)
     Map.merge(body, HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})))
+  end
+
+  defp maybe_put_output_schema(body, config) do
+    case Map.get(config, :output_schema) do
+      nil ->
+        body
+
+      spec ->
+        %{name: name, schema: schema, strict: strict} = OutputSchema.normalize!(spec)
+
+        Map.put(body, "text", %{
+          "format" => %{
+            "type" => "json_schema",
+            "name" => name,
+            "schema" => schema,
+            "strict" => strict
+          }
+        })
+    end
   end
 
   defp maybe_put_optional_request_field(body, _key, nil), do: body

@@ -73,7 +73,7 @@ defmodule Alloy.Provider.OpenAICompat do
   @behaviour Alloy.Provider
 
   alias Alloy.Internal.Sanitize
-  alias Alloy.Message
+  alias Alloy.{Message, OutputSchema}
   alias Alloy.Provider.{Error, HTTP, OpenAIStream}
 
   @default_chat_path "/v1/chat/completions"
@@ -166,10 +166,31 @@ defmodule Alloy.Provider.OpenAICompat do
         defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
       end
 
+    body = maybe_put_output_schema(body, config)
+
     # Merge extra_body LAST so caller can override any field. Keys are
     # stringified first: an atom key would sit beside the string key it
     # meant to replace and be encoded as a duplicate JSON key.
     Map.merge(body, HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})))
+  end
+
+  defp maybe_put_output_schema(body, config) do
+    case Map.get(config, :output_schema) do
+      nil ->
+        body
+
+      spec ->
+        %{name: name, schema: schema, strict: strict} = OutputSchema.normalize!(spec)
+
+        Map.put(body, "response_format", %{
+          "type" => "json_schema",
+          "json_schema" => %{
+            "name" => name,
+            "schema" => schema,
+            "strict" => strict
+          }
+        })
+    end
   end
 
   defp build_messages(messages, config) do

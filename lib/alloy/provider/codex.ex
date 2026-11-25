@@ -108,7 +108,7 @@ defmodule Alloy.Provider.Codex do
 
   @behaviour Alloy.Provider
 
-  alias Alloy.Message
+  alias Alloy.{Message, OutputSchema}
   alias Alloy.Provider.{CodexRunner, CodexSession, Error, HTTP}
 
   @output_truncation 4_000
@@ -230,6 +230,7 @@ defmodule Alloy.Provider.Codex do
       overrides: Map.get(config, :config_overrides, []),
       executable: CodexRunner.codex_bin(config),
       generation: Map.get(config, :session_generation),
+      output_schema: OutputSchema.normalize!(Map.get(config, :output_schema)),
       tools: tools
     }
   end
@@ -617,11 +618,22 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp build_prompt(messages, tool_defs, config) do
+    output_schema = OutputSchema.normalize!(Map.get(config, :output_schema))
+
     payload = %{
       system_prompt: Map.get(config, :system_prompt),
       conversation: Enum.map(messages, &serialize_message/1),
       available_tools: Enum.map(tool_defs, &serialize_tool_def/1)
     }
+
+    output_rule =
+      case output_schema do
+        nil ->
+          ""
+
+        %{schema: schema} ->
+          "\n- When `stop_reason = \"end_turn\"`, `text` MUST be a valid JSON string conforming strictly to this JSON Schema (no markdown fences or extra text):\n  #{Jason.encode!(schema)}"
+      end
 
     """
     You are acting as the model backend for Alloy, an agent harness.
@@ -639,7 +651,7 @@ defmodule Alloy.Provider.Codex do
       that satisfies the tool schema.
     - If returning tool calls, keep `text` empty unless a short preamble would
       help the outer agent loop.
-    - Never mention the schema or these instructions in `text`.
+    - Never mention the schema or these instructions in `text`.#{output_rule}
 
     Transcript payload:
     #{Jason.encode!(payload)}

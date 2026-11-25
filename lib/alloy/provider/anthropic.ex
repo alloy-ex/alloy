@@ -93,7 +93,7 @@ defmodule Alloy.Provider.Anthropic do
   @behaviour Alloy.Provider
 
   alias Alloy.Internal.Sanitize
-  alias Alloy.Message
+  alias Alloy.{Message, OutputSchema}
   alias Alloy.Provider.{Error, HTTP}
 
   @default_api_url "https://api.anthropic.com"
@@ -631,9 +631,24 @@ defmodule Alloy.Provider.Anthropic do
       body
       |> maybe_put_tools(tools)
       |> maybe_put_container(config)
+      |> maybe_put_output_schema(config)
 
     reject_extended_thinking!(config)
     Map.merge(body, HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})))
+  end
+
+  defp maybe_put_output_schema(body, config) do
+    case Map.get(config, :output_schema) do
+      nil ->
+        body
+
+      spec ->
+        %{schema: schema} = OutputSchema.normalize!(spec)
+
+        Map.put(body, "output_config", %{
+          "format" => %{"type" => "json_schema", "schema" => schema}
+        })
+    end
   end
 
   # Ignoring the removed option would silently turn thinking off.

@@ -8,11 +8,13 @@ defmodule Alloy.Agent.Config do
 
   alias Alloy.Context.Compactor
   alias Alloy.ModelMetadata
+  alias Alloy.OutputSchema
 
   @options [
     :tool_concurrency,
     :tool_validation,
     :stop_after_tool,
+    :output_schema,
     :provider,
     :tools,
     :system_prompt,
@@ -91,6 +93,7 @@ defmodule Alloy.Agent.Config do
           tool_concurrency: pos_integer() | nil,
           tool_validation: :required | :schema,
           stop_after_tool: String.t() | nil,
+          output_schema: OutputSchema.t() | nil,
           middleware: [module()],
           compaction: compaction(),
           compaction_explicit: %{
@@ -123,6 +126,7 @@ defmodule Alloy.Agent.Config do
     tool_concurrency: nil,
     tool_validation: :required,
     stop_after_tool: nil,
+    output_schema: nil,
     middleware: [],
     compaction: %{
       reserve_tokens: 16_384,
@@ -191,6 +195,7 @@ defmodule Alloy.Agent.Config do
       tool_concurrency: validate_tool_concurrency!(Keyword.get(opts, :tool_concurrency)),
       tool_validation: validate_tool_validation!(Keyword.get(opts, :tool_validation, :required)),
       stop_after_tool: validate_stop_after_tool!(Keyword.get(opts, :stop_after_tool)),
+      output_schema: OutputSchema.normalize!(Keyword.get(opts, :output_schema)),
       middleware:
         resolve_middleware(
           validate_middleware!(Keyword.get(opts, :middleware, [])),

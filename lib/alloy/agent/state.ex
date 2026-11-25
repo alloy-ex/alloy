@@ -22,7 +22,7 @@ defmodule Alloy.Agent.State do
   """
 
   alias Alloy.Agent.Config
-  alias Alloy.{Message, Usage}
+  alias Alloy.{Message, OutputSchema, Usage}
   alias Alloy.Tool.Registry
 
   @type status :: :idle | :running | :completed | :error | :max_turns | :halted
@@ -96,8 +96,9 @@ defmodule Alloy.Agent.State do
   @doc """
   Prepares request inputs from `:before_completion` middleware.
 
-  Accepts `:messages`, `:tools`, `:system_prompt`, and `:provider` (the same
-  provider tuple accepted by `Alloy.run/2`). Changes persist for later turns.
+  Accepts `:messages`, `:tools`, `:system_prompt`, `:provider` (the same
+  provider tuple accepted by `Alloy.run/2`), and `:output_schema`. Changes
+  persist for later turns.
   Tools and their wire definitions are rebuilt together. Provider changes
   re-derive model limits and discard previous opaque provider state; pass an
   explicit `provider_state` in the new provider config to restore it.
@@ -105,7 +106,7 @@ defmodule Alloy.Agent.State do
   """
   @spec prepare(t(), keyword()) :: t()
   def prepare(%__MODULE__{} = state, opts) when is_list(opts) do
-    opts = Keyword.validate!(opts, [:messages, :tools, :system_prompt, :provider])
+    opts = Keyword.validate!(opts, [:messages, :tools, :system_prompt, :provider, :output_schema])
     config = prepare_config(state.config, opts)
     {tool_defs, tool_fns} = Registry.build(config.tools)
     messages = Keyword.get(opts, :messages, state.messages)
@@ -142,7 +143,13 @@ defmodule Alloy.Agent.State do
     unless is_nil(prompt) or is_binary(prompt),
       do: raise(ArgumentError, "system_prompt must be a string or nil")
 
-    %{config | system_prompt: prompt}
+    output_schema =
+      case Keyword.fetch(opts, :output_schema) do
+        {:ok, spec} -> OutputSchema.normalize!(spec)
+        :error -> config.output_schema
+      end
+
+    %{config | system_prompt: prompt, output_schema: output_schema}
   end
 
   defp prepared_provider_state(state, config) do

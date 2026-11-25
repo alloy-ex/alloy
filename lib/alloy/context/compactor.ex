@@ -76,7 +76,9 @@ defmodule Alloy.Context.Compactor do
     :code_execution,
     "code_execution",
     :tool_config,
-    "tool_config"
+    "tool_config",
+    :output_schema,
+    "output_schema"
   ]
 
   # extra_body keys that alter thinking, tools, context editing, or output

@@ -62,7 +62,7 @@ defmodule Alloy.Provider.Gemini do
   @behaviour Alloy.Provider
 
   alias Alloy.Internal.Sanitize
-  alias Alloy.Message
+  alias Alloy.{Message, OutputSchema}
   alias Alloy.Provider
   alias Alloy.Provider.{Error, HTTP}
 
@@ -186,6 +186,7 @@ defmodule Alloy.Provider.Gemini do
       Map.get(config, :generation_config, %{})
       |> Alloy.Provider.stringify_keys()
       |> maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
+      |> maybe_put_output_schema(config)
 
     body = maybe_put(body, "generationConfig", generation_config)
 
@@ -789,4 +790,18 @@ defmodule Alloy.Provider.Gemini do
 
   defp maybe_put_new(map, _key, nil), do: map
   defp maybe_put_new(map, key, value), do: Map.put_new(map, key, value)
+
+  defp maybe_put_output_schema(generation_config, config) do
+    case Map.get(config, :output_schema) do
+      nil ->
+        generation_config
+
+      spec ->
+        %{schema: schema} = OutputSchema.normalize!(spec)
+
+        generation_config
+        |> maybe_put_new("responseMimeType", "application/json")
+        |> maybe_put_new("responseJsonSchema", schema)
+    end
+  end
 end

@@ -46,6 +46,75 @@ defmodule Alloy.Tool.Validation do
     {Map.new(cache, fn {name, {_source, resolved}} -> {name, resolved} end), cache}
   end
 
+  @doc false
+  # Preflights an `:output_schema` at config/prepare time when `:ex_json_schema`
+  # is available: always rejects external `$ref`s so the remote resolver is never
+  # invoked, and validates Draft 4/6/7 schemas eagerly (allowing newer dialects
+  # such as Draft 2020-12 to pass through to native provider enforcement).
+  @spec preflight_output_schema!(map(), String.t()) :: :ok
+  def preflight_output_schema!(schema, name) when is_map(schema) do
+    if Code.ensure_loaded?(Schema) do
+      local_refs!(schema)
+
+      try do
+        schema |> Schema.resolve() |> normalize_literal_property_schemas!()
+        :ok
+      rescue
+        error ->
+          cond do
+            error.__struct__ == ExJsonSchema.Schema.UnsupportedSchemaVersionError ->
+              :ok
+
+            error.__struct__ in [
+              ExJsonSchema.Schema.InvalidReferenceError,
+              ExJsonSchema.Schema.InvalidSchemaError
+            ] ->
+              reraise ArgumentError,
+                      "Invalid output_schema #{inspect(name)}: #{Exception.message(error)}",
+                      __STACKTRACE__
+
+            true ->
+              reraise error, __STACKTRACE__
+          end
+      end
+    else
+      :ok
+    end
+  end
+
+  @doc false
+  # Validates decoded structured output against `schema` using `:ex_json_schema`
+  # when available and supported, or returns `:fallback` for basic structural
+  # validation when the optional dep is absent or the dialect is unsupported.
+  @spec validate_output(map(), term(), String.t()) :: :ok | {:error, String.t()} | :fallback
+  def validate_output(schema, decoded, _name) when is_map(schema) do
+    if Code.ensure_loaded?(Schema) do
+      local_refs!(schema)
+
+      try do
+        resolved = schema |> Schema.resolve() |> normalize_literal_property_schemas!()
+
+        case Validator.validate(resolved, decoded) do
+          :ok ->
+            :ok
+
+          {:error, errors} ->
+            details = Enum.map_join(errors, "; ", fn {error, path} -> "#{path}: #{error}" end)
+            {:error, "Structured output failed schema validation: #{details}"}
+        end
+      rescue
+        error ->
+          if error.__struct__ == ExJsonSchema.Schema.UnsupportedSchemaVersionError do
+            :fallback
+          else
+            reraise error, __STACKTRACE__
+          end
+      end
+    else
+      :fallback
+    end
+  end
+
   @spec check(map(), String.t(), map()) :: :ok | {:error, String.t(), nil}
   def check(input, name, schemas) do
     case Map.fetch(schemas, name) do
