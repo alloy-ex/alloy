@@ -635,7 +635,7 @@ defmodule Alloy.Provider.Anthropic do
 
     reject_extended_thinking!(config)
 
-    OutputSchema.merge_extra_body(
+    HTTP.merge_extra_body(
       body,
       HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
       "output_config"

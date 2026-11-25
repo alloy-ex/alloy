@@ -194,7 +194,7 @@ defmodule Alloy.Provider.OpenAI do
 
     # Merge extra_body LAST so caller can override any field (#18), preserving
     # sibling keys inside "text" (e.g. verbosity alongside format).
-    OutputSchema.merge_extra_body(
+    HTTP.merge_extra_body(
       body,
       HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
       "text"

@@ -4,7 +4,7 @@ defmodule Alloy.OutputSchemaTest do
   alias Alloy.Agent.{Config, State}
   alias Alloy.Context.Compactor
   alias Alloy.{Message, OutputSchema, Result}
-  alias Alloy.Provider.{Anthropic, Codex, CodexSession, Gemini, OpenAI, OpenAICompat, XAI}
+  alias Alloy.Provider.{Anthropic, Codex, CodexSession, Error, Gemini, OpenAI, OpenAICompat, XAI}
 
   @answer_schema %{
     type: "object",
@@ -79,6 +79,15 @@ defmodule Alloy.OutputSchemaTest do
           name: "bad name!",
           schema: @answer_schema,
           strict: true
+        })
+      end
+
+      assert_raise ArgumentError, ~r/unsupported key/, fn ->
+        OutputSchema.normalize!(%{
+          name: "ans",
+          schema: @answer_schema,
+          strict: true,
+          description: "belongs inside schema"
         })
       end
     end
@@ -358,31 +367,181 @@ defmodule Alloy.OutputSchemaTest do
       assert body["generationConfig"]["responseMimeType"] == "application/json"
       assert body["generationConfig"]["responseJsonSchema"]["type"] == "object"
 
-      assert_raise ArgumentError, ~r/legacy generation_config\["responseSchema"\]/, fn ->
-        Gemini.complete(
-          [Message.user("hi")],
-          [],
-          %{
-            api_key: "k",
-            model: "gemini-3-flash",
-            generation_config: %{responseSchema: %{type: "OBJECT"}},
-            output_schema: @answer_schema
-          }
-        )
-      end
+      assert {:error, %Error{kind: :invalid_request, message: msg1}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3-flash",
+                   generation_config: %{responseSchema: %{type: "OBJECT"}},
+                   output_schema: @answer_schema
+                 }
+               )
 
-      assert_raise ArgumentError, ~r/non-JSON generation_config\["responseMimeType"\]/, fn ->
-        Gemini.complete(
-          [Message.user("hi")],
-          [],
-          %{
-            api_key: "k",
-            model: "gemini-3-flash",
-            generation_config: %{responseMimeType: "text/plain"},
-            output_schema: @answer_schema
-          }
-        )
-      end
+      assert msg1 =~ ~s(legacy generationConfig["responseSchema"])
+
+      assert {:error, %Error{kind: :invalid_request, message: msg2}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3-flash",
+                   generation_config: %{responseMimeType: "text/plain"},
+                   output_schema: @answer_schema
+                 }
+               )
+
+      assert msg2 =~ ~s(non-JSON generationConfig["responseMimeType"])
+
+      assert {:error, %Error{kind: :invalid_request, message: msg3}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3-flash",
+                   extra_body: %{
+                     "generationConfig" => %{"responseSchema" => %{"type" => "OBJECT"}}
+                   },
+                   output_schema: @answer_schema
+                 }
+               )
+
+      assert msg3 =~ ~s(legacy generationConfig["responseSchema"])
+
+      assert {:error, %Error{kind: :invalid_request, message: msg4}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3-flash",
+                   extra_body: %{generationConfig: %{responseMimeType: "text/plain"}},
+                   output_schema: @answer_schema
+                 }
+               )
+
+      assert msg4 =~ ~s(non-JSON generationConfig["responseMimeType"])
+    end
+
+    test "atom-keyed nested extra_body merges without duplicate JSON keys and lets caller win" do
+      test_pid = self()
+
+      Req.Test.stub(:atom_extra_anthropic, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:raw_anthropic, raw})
+
+        Req.Test.json(conn, %{
+          "id" => "msg_atom",
+          "type" => "message",
+          "role" => "assistant",
+          "content" => [%{"type" => "text", "text" => ~s({"answer":"ok","confidence":1})}],
+          "stop_reason" => "end_turn",
+          "usage" => %{"input_tokens" => 5, "output_tokens" => 4}
+        })
+      end)
+
+      assert {:ok, _} =
+               Alloy.run("answer",
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    extra_body: %{
+                      output_config: %{
+                        effort: "low",
+                        format: %{type: "json_schema", schema: %{type: "object"}}
+                      }
+                    },
+                    req_options: [plug: {Req.Test, :atom_extra_anthropic}]},
+                 output_schema: @answer_schema
+               )
+
+      assert_received {:raw_anthropic, raw_anthropic}
+      assert length(Regex.scan(~r/"format":/, raw_anthropic)) == 1
+      assert Jason.decode!(raw_anthropic)["output_config"]["effort"] == "low"
+
+      assert Jason.decode!(raw_anthropic)["output_config"]["format"]["schema"] == %{
+               "type" => "object"
+             }
+
+      Req.Test.stub(:atom_extra_openai, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:raw_openai, raw})
+
+        Req.Test.json(conn, %{
+          "id" => "resp_atom",
+          "status" => "completed",
+          "output" => [
+            %{
+              "type" => "message",
+              "role" => "assistant",
+              "content" => [
+                %{"type" => "output_text", "text" => ~s({"answer":"ok","confidence":1})}
+              ]
+            }
+          ],
+          "usage" => %{"input_tokens" => 5, "output_tokens" => 4}
+        })
+      end)
+
+      assert {:ok, _} =
+               Alloy.run("answer",
+                 provider:
+                   {OpenAI,
+                    api_key: "k",
+                    model: "gpt-5.4",
+                    extra_body: %{
+                      text: %{
+                        verbosity: "low",
+                        format: %{
+                          type: "json_schema",
+                          name: "caller_override",
+                          schema: %{type: "object"},
+                          strict: false
+                        }
+                      }
+                    },
+                    req_options: [plug: {Req.Test, :atom_extra_openai}]},
+                 output_schema: @answer_schema
+               )
+
+      assert_received {:raw_openai, raw_openai}
+      assert length(Regex.scan(~r/"format":/, raw_openai)) == 1
+      assert Jason.decode!(raw_openai)["text"]["verbosity"] == "low"
+      assert Jason.decode!(raw_openai)["text"]["format"]["name"] == "caller_override"
+
+      Req.Test.stub(:atom_extra_gemini, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:raw_gemini, raw})
+
+        Req.Test.json(conn, %{
+          "candidates" => [
+            %{
+              "content" => %{"parts" => [%{"text" => "plain text"}]},
+              "finishReason" => "STOP"
+            }
+          ],
+          "usageMetadata" => %{"promptTokenCount" => 3, "candidatesTokenCount" => 2}
+        })
+      end)
+
+      assert {:ok, _} =
+               Alloy.run("answer",
+                 provider:
+                   {Gemini,
+                    api_key: "k",
+                    model: "gemini-3-flash",
+                    max_tokens: 1024,
+                    extra_body: %{generationConfig: %{maxOutputTokens: 512}},
+                    req_options: [plug: {Req.Test, :atom_extra_gemini}]}
+               )
+
+      assert_received {:raw_gemini, raw_gemini}
+      assert length(Regex.scan(~r/"maxOutputTokens":/, raw_gemini)) == 1
+      assert Jason.decode!(raw_gemini)["generationConfig"]["maxOutputTokens"] == 512
     end
 
     test "Codex embeds output_schema rules into its prompt" do
@@ -468,13 +627,154 @@ defmodule Alloy.OutputSchemaTest do
       assert msg =~ "Structured output failed schema validation"
     end
 
-    test "State.prepare/2 can set or clear output_schema mid-run" do
-      config = Config.from_opts(provider: Alloy.Provider.Test)
-      state = State.init(config)
-      prepared = State.prepare(state, output_schema: @answer_schema)
-      assert prepared.config.output_schema.name == "alloy_output"
-      cleared = State.prepare(prepared, output_schema: nil)
-      assert cleared.config.output_schema == nil
+    test "before_completion middleware can set or clear output_schema mid-run" do
+      test_pid = self()
+
+      defmodule ToggleSchemaMiddleware do
+        @behaviour Alloy.Middleware
+
+        def call(:before_completion, state) do
+          schema = Map.get(state.config.context, :turn2_schema)
+
+          if state.turn == 1 do
+            State.prepare(state, output_schema: schema)
+          else
+            state
+          end
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      lookup_tool =
+        Alloy.Tool.inline(
+          name: "lookup",
+          description: "Lookup",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> {:ok, "42"} end
+        )
+
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      Req.Test.stub(:output_schema_midrun_set, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        turn = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+        send(test_pid, {:midrun_set, turn, Jason.decode!(raw)})
+
+        if turn == 1 do
+          Req.Test.json(conn, %{
+            "id" => "msg_1",
+            "type" => "message",
+            "role" => "assistant",
+            "content" => [
+              %{"type" => "tool_use", "id" => "tu_1", "name" => "lookup", "input" => %{}}
+            ],
+            "stop_reason" => "tool_use",
+            "usage" => %{"input_tokens" => 5, "output_tokens" => 4}
+          })
+        else
+          Req.Test.json(conn, %{
+            "id" => "msg_2",
+            "type" => "message",
+            "role" => "assistant",
+            "content" => [%{"type" => "text", "text" => ~s({"answer":"42","confidence":1})}],
+            "stop_reason" => "end_turn",
+            "usage" => %{"input_tokens" => 5, "output_tokens" => 4}
+          })
+        end
+      end)
+
+      assert {:ok, %Result{status: :completed, output: %{"answer" => "42", "confidence" => 1}}} =
+               Alloy.run("find and answer",
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    req_options: [plug: {Req.Test, :output_schema_midrun_set}]},
+                 tools: [lookup_tool],
+                 middleware: [ToggleSchemaMiddleware],
+                 context: %{turn2_schema: @answer_schema}
+               )
+
+      assert_received {:midrun_set, 1, body1}
+      assert_received {:midrun_set, 2, body2}
+      refute Map.has_key?(body1, "output_config")
+      assert body2["output_config"]["format"]["type"] == "json_schema"
+
+      {:ok, clear_counter} = Agent.start_link(fn -> 0 end)
+
+      Req.Test.stub(:output_schema_midrun_clear, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        turn = Agent.get_and_update(clear_counter, fn n -> {n + 1, n + 1} end)
+        send(test_pid, {:midrun_clear, turn, Jason.decode!(raw)})
+
+        if turn == 1 do
+          Req.Test.json(conn, %{
+            "id" => "msg_c1",
+            "type" => "message",
+            "role" => "assistant",
+            "content" => [
+              %{"type" => "tool_use", "id" => "tu_1", "name" => "lookup", "input" => %{}}
+            ],
+            "stop_reason" => "tool_use",
+            "usage" => %{"input_tokens" => 5, "output_tokens" => 4}
+          })
+        else
+          Req.Test.json(conn, %{
+            "id" => "msg_c2",
+            "type" => "message",
+            "role" => "assistant",
+            "content" => [%{"type" => "text", "text" => "plain text after clearing schema"}],
+            "stop_reason" => "end_turn",
+            "usage" => %{"input_tokens" => 5, "output_tokens" => 4}
+          })
+        end
+      end)
+
+      assert {:ok,
+              %Result{
+                status: :completed,
+                text: "plain text after clearing schema",
+                output: nil
+              }} =
+               Alloy.run("find and answer",
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    req_options: [plug: {Req.Test, :output_schema_midrun_clear}]},
+                 tools: [lookup_tool],
+                 middleware: [ToggleSchemaMiddleware],
+                 output_schema: @answer_schema,
+                 context: %{turn2_schema: nil}
+               )
+
+      assert_received {:midrun_clear, 1, clear_body1}
+      assert_received {:midrun_clear, 2, clear_body2}
+      assert clear_body1["output_config"]["format"]["type"] == "json_schema"
+      refute Map.has_key?(clear_body2, "output_config")
+    end
+
+    test "Gemini schema conflict on a fallback provider returns {:error, result} instead of raising" do
+      {:ok, primary_pid} =
+        Alloy.Provider.Test.start_link([
+          {:error, %Error{kind: :overloaded, status: 529, message: "primary overloaded"}}
+        ])
+
+      assert {:error, %Result{status: :error, output: nil, error: msg}} =
+               Alloy.run("answer",
+                 provider: {Alloy.Provider.Test, agent_pid: primary_pid},
+                 fallback_providers: [
+                   {Gemini,
+                    api_key: "k",
+                    model: "gemini-3-flash",
+                    generation_config: %{responseMimeType: "text/plain"}}
+                 ],
+                 max_retries: 0,
+                 output_schema: @answer_schema
+               )
+
+      assert msg =~ ~s(non-JSON generationConfig["responseMimeType"])
     end
 
     test "does not duplicate :output inside result.metadata.run and skips validation on stop_after_tool" do

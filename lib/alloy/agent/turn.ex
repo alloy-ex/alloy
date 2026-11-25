@@ -31,11 +31,12 @@ defmodule Alloy.Agent.Turn do
   Takes an initialized `State` with messages and returns the
   final state with status set to `:completed`, `:error`, or `:max_turns`.
 
-  Each turn is reported with `:telemetry.span/3` as `[:alloy, :turn, :start]`
-  and `[:alloy, :turn, :stop]`, or `[:alloy, :turn, :exception]` when the turn
-  raises. A turn's stop event fires when that turn ends; its `:status` is
-  `:running` when the loop goes on to another turn and the final status
-  otherwise.
+  Each turn is reported as `[:alloy, :turn, :start]` and `[:alloy, :turn, :stop]`,
+  or `[:alloy, :turn, :exception]` when the turn raises, using the same
+  measurements and `telemetry_span_context` metadata shape as `:telemetry.span/3`
+  with sanitized stacktraces. A turn's stop event fires when that turn ends; its
+  `:status` is `:running` when the loop goes on to another turn and the final
+  status otherwise.
 
   ## Options
 
@@ -127,11 +128,48 @@ defmodule Alloy.Agent.Turn do
   # with the final status set.
   defp run_turn(%State{} = state, opts) do
     turn = state.turn + 1
+    turn_span(turn, fn -> complete(state, opts, false) end)
+  end
 
-    :telemetry.span([:alloy, :turn], %{turn: turn}, fn ->
-      step = complete(state, opts, false)
-      {step, %{turn: turn, status: step_status(step)}}
-    end)
+  defp turn_span(turn, fun) do
+    start_mono = System.monotonic_time()
+    span_ctx = make_ref()
+
+    :telemetry.execute(
+      [:alloy, :turn, :start],
+      %{monotonic_time: start_mono, system_time: System.system_time()},
+      %{turn: turn, telemetry_span_context: span_ctx}
+    )
+
+    try do
+      step = fun.()
+      stop_mono = System.monotonic_time()
+
+      :telemetry.execute(
+        [:alloy, :turn, :stop],
+        %{duration: stop_mono - start_mono, monotonic_time: stop_mono},
+        %{turn: turn, status: step_status(step), telemetry_span_context: span_ctx}
+      )
+
+      step
+    catch
+      kind, reason ->
+        stop_mono = System.monotonic_time()
+
+        :telemetry.execute(
+          [:alloy, :turn, :exception],
+          %{duration: stop_mono - start_mono, monotonic_time: stop_mono},
+          %{
+            turn: turn,
+            kind: kind,
+            reason: reason,
+            stacktrace: Sanitize.stacktrace(__STACKTRACE__),
+            telemetry_span_context: span_ctx
+          }
+        )
+
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
   end
 
   defp step_status({:continue, %State{}}), do: :running

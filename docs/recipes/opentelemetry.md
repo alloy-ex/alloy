@@ -147,7 +147,7 @@ end
   the root span.
 - **Telemetry metadata hygiene:** Alloy's `:telemetry` metadata omits prompt
   bodies, tool arguments, and normal assistant text, and strips function
-  arguments from `[:alloy, :run, :exception]` stacktraces. Note that
-  `[:alloy, :tool, :stop]` carries `:error` (tool diagnostic text) and
-  `[:alloy, :run, :exception]` carries the exception `:reason`, so sanitize or
-  omit those attributes if your tools or exceptions can include sensitive data.
+  arguments from `[:alloy, :run, :exception]` and `[:alloy, :turn, :exception]`
+  stacktraces. Note that `[:alloy, :tool, :stop]` carries `:error` (tool
+  diagnostic text) and exception events carry `:reason`, so sanitize or omit
+  those attributes if your tools or exceptions can include sensitive data.

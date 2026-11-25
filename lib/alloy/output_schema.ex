@@ -69,21 +69,6 @@ defmodule Alloy.OutputSchema do
   def wire(%__MODULE__{} = spec), do: spec
   def wire(raw), do: normalize!(raw)
 
-  @doc false
-  @spec merge_extra_body(map(), map(), String.t()) :: map()
-  def merge_extra_body(body, extra_body, nested_key)
-      when is_map(body) and is_map(extra_body) and is_binary(nested_key) do
-    case {Map.get(body, nested_key), Map.get(extra_body, nested_key)} do
-      {base_nested, extra_nested} when is_map(base_nested) and is_map(extra_nested) ->
-        body
-        |> Map.merge(extra_body)
-        |> Map.put(nested_key, Map.merge(base_nested, extra_nested))
-
-      _other ->
-        Map.merge(body, extra_body)
-    end
-  end
-
   @doc """
   Decodes final assistant text as JSON and validates it against `spec`.
 
@@ -111,11 +96,19 @@ defmodule Alloy.OutputSchema do
   defp wrapper_map?(map) do
     has_schema? = Map.has_key?(map, :schema) or Map.has_key?(map, "schema")
     has_type? = Map.has_key?(map, :type) or Map.has_key?(map, "type")
-    only_wrapper_keys? = Enum.all?(Map.keys(map), &(&1 in @wrapper_keys))
-    has_schema? and not has_type? and only_wrapper_keys?
+    has_schema? and not has_type?
   end
 
   defp normalize_wrapper!(spec) do
+    unknown_keys = Enum.reject(Map.keys(spec), &(&1 in @wrapper_keys))
+
+    if unknown_keys != [] do
+      raise ArgumentError,
+            "output_schema wrapper map contains unsupported key(s): #{inspect(unknown_keys)}. " <>
+              "Allowed wrapper keys are :name, :schema, and :strict " <>
+              "(put schema metadata like \"description\" inside the :schema map)."
+    end
+
     name = fetch_unique_key!(spec, :name, "name", @default_name)
     strict = fetch_unique_key!(spec, :strict, "strict", true)
     raw_schema = fetch_unique_key!(spec, :schema, "schema", nil)

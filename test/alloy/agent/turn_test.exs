@@ -2548,10 +2548,28 @@ defmodule Alloy.Agent.TurnTest do
 
         assert [
                  {[:alloy, :run, :start], _},
-                 {[:alloy, :turn, :start], %{turn: 1}},
-                 {[:alloy, :turn, :exception], %{turn: 1, kind: :error}},
-                 {[:alloy, :run, :exception], %{kind: :error, reason: %RuntimeError{}}}
+                 {[:alloy, :turn, :start], %{turn: 1, telemetry_span_context: span_ctx}},
+                 {[:alloy, :turn, :exception],
+                  %{
+                    turn: 1,
+                    kind: :error,
+                    stacktrace: turn_stack,
+                    telemetry_span_context: span_ctx
+                  }},
+                 {[:alloy, :run, :exception],
+                  %{kind: :error, reason: %RuntimeError{}, stacktrace: run_stack}}
                ] = collect_loop_telemetry()
+
+        assert is_reference(span_ctx)
+        assert is_list(turn_stack) and turn_stack != []
+        assert is_list(run_stack) and run_stack != []
+
+        for stack <- [turn_stack, run_stack] do
+          assert Enum.all?(stack, fn
+                   {_mod, _fun, arity, _loc} when is_integer(arity) -> true
+                   _ -> false
+                 end)
+        end
       after
         :telemetry.detach(handler_id)
       end

@@ -517,7 +517,7 @@ logging, or custom metrics:
 | `[:alloy, :compaction, :done]` | `messages_before`, `messages_after` | `turn` |
 | `[:alloy, :tool, :start]` | `event_seq` | `correlation_id`, `turn`, `tool_id`, `tool_name` |
 | `[:alloy, :tool, :stop]` | `event_seq`, `duration_ms` | `correlation_id`, `turn`, `tool_id`, `tool_name`, `error`, `start_event_seq` |
-| `[:alloy, :turn, :prompt_too_long_recovery]` | — | `turn` |
+| `[:alloy, :turn, :prompt_too_long_recovery]` | — | `turn`, `retry` |
 | `[:alloy, :event]` | `seq` | `v`, `event`, `correlation_id`, `turn` |
 
 Each turn's stop fires when that turn ends. A turn the loop continues past

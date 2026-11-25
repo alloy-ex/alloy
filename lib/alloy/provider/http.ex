@@ -5,6 +5,7 @@ defmodule Alloy.Provider.HTTP do
   # turn deadline), and every failure turned into an Alloy.Provider.Error.
 
   alias Alloy.OwnedWorker
+  alias Alloy.Provider
   alias Alloy.Provider.{Error, SSE}
 
   @type headers :: [{String.t(), String.t()}]
@@ -88,6 +89,24 @@ defmodule Alloy.Provider.HTTP do
   end
 
   def stringify_extra_body(_), do: %{}
+
+  @doc false
+  @spec merge_extra_body(map(), map(), String.t()) :: map()
+  def merge_extra_body(body, extra_body, nested_key)
+      when is_map(body) and is_map(extra_body) and is_binary(nested_key) do
+    case {Map.get(body, nested_key), Map.get(extra_body, nested_key)} do
+      {base_nested, extra_nested}
+      when is_map(base_nested) and is_map(extra_nested) and not is_struct(extra_nested) ->
+        merged_nested = Map.merge(base_nested, Provider.stringify_keys(extra_nested))
+
+        body
+        |> Map.merge(extra_body)
+        |> Map.put(nested_key, merged_nested)
+
+      _other ->
+        Map.merge(body, extra_body)
+    end
+  end
 
   @doc false
   @spec join_url(String.t(), String.t()) :: String.t()

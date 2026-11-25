@@ -104,9 +104,8 @@ defmodule Alloy.Provider.Gemini do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    body = build_request_body(messages, tool_defs, config)
-
-    with {:ok, resp_body} <-
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, resp_body} <-
            HTTP.post_json(
              request_url(config, "generateContent"),
              build_headers(config),
@@ -122,8 +121,6 @@ defmodule Alloy.Provider.Gemini do
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
-    body = build_request_body(messages, tool_defs, config)
-
     # content_blocks is newest first. response and candidate hold the latest
     # top-level and candidate fields (usage, finishReason, promptFeedback).
     initial_acc = %{
@@ -135,7 +132,8 @@ defmodule Alloy.Provider.Gemini do
       on_chunk: on_chunk
     }
 
-    with {:ok, acc} <-
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, acc} <-
            HTTP.stream_sse(
              request_url(config, "streamGenerateContent"),
              build_headers(config),
@@ -211,11 +209,14 @@ defmodule Alloy.Provider.Gemini do
         settings -> Map.put(body, "safetySettings", Provider.stringify_keys(settings))
       end
 
-    OutputSchema.merge_extra_body(
-      body,
-      HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
-      "generationConfig"
-    )
+    body =
+      HTTP.merge_extra_body(
+        body,
+        HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
+        "generationConfig"
+      )
+
+    validate_output_schema_conflicts(body, config)
   end
 
   defp build_contents(messages) do
@@ -801,20 +802,42 @@ defmodule Alloy.Provider.Gemini do
         generation_config
 
       %{schema: schema} ->
-        if Map.has_key?(generation_config, "responseSchema") do
-          raise ArgumentError,
-                "cannot combine :output_schema with legacy generation_config[\"responseSchema\"] on Gemini"
-        end
+        generation_config
+        |> maybe_put_new("responseMimeType", "application/json")
+        |> maybe_put_new("responseJsonSchema", schema)
+    end
+  end
 
-        case Map.get(generation_config, "responseMimeType") do
-          mime when mime in [nil, "application/json"] ->
-            generation_config
-            |> Map.put("responseMimeType", "application/json")
-            |> maybe_put_new("responseJsonSchema", schema)
+  defp validate_output_schema_conflicts(body, config) do
+    case OutputSchema.wire(Map.get(config, :output_schema)) do
+      nil ->
+        {:ok, body}
 
-          other ->
-            raise ArgumentError,
-                  "cannot combine :output_schema with non-JSON generation_config[\"responseMimeType\"] (#{inspect(other)}) on Gemini"
+      _spec ->
+        generation_config = Map.get(body, "generationConfig", %{})
+
+        cond do
+          is_map(generation_config) and Map.has_key?(generation_config, "responseSchema") ->
+            {:error,
+             %Error{
+               kind: :invalid_request,
+               message:
+                 "cannot combine :output_schema with legacy generationConfig[\"responseSchema\"] on Gemini"
+             }}
+
+          is_map(generation_config) and
+              Map.get(generation_config, "responseMimeType") not in [nil, "application/json"] ->
+            mime = Map.get(generation_config, "responseMimeType")
+
+            {:error,
+             %Error{
+               kind: :invalid_request,
+               message:
+                 "cannot combine :output_schema with non-JSON generationConfig[\"responseMimeType\"] (#{inspect(mime)}) on Gemini"
+             }}
+
+          true ->
+            {:ok, body}
         end
     end
   end
