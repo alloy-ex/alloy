@@ -22,7 +22,6 @@
           "lib/",
           "test/",
           "examples/",
-          "checks/",
           "benchmarks/",
           "mix.exs",
           ".credo.exs"

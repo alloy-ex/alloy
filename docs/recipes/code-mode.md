@@ -9,7 +9,7 @@ and explicit timeout/call limits. The program receives a dispatch function:
 
 ```elixir
 program = fn dispatch ->
-  dispatch.([%{name: "read", input: %{"path" => "README.md"}}])
+  dispatch.([%{name: "read", input: %{"file_path" => "README.md"}}])
 end
 
 MinimalHost.CodeMode.run(program, state,

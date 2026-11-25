@@ -18,7 +18,8 @@ without taking on the persistence and scheduling of a durable runtime.
 - Keep required-key validation as the default. Opt-in schema validation uses the
   optional `ex_json_schema` adapter (drafts 4/6/7), without coercion or remote
   schema fetching. Invalid schemas are configuration errors. Resolved schemas
-  are cached in agent state after the first tool batch and reused only when
+  are preflighted and cached in agent state before the first provider request
+  (and refreshed before execution if middleware changes tools), reused only when
   their exact input schemas match. Each refresh retains only current tools;
   disabled validation clears the cache. No global cache, persistence or service
   is introduced. The cache is excluded from results and session metadata.
@@ -34,6 +35,18 @@ without taking on the persistence and scheduling of a durable runtime.
   Repair never executes tools and refuses ambiguous/orphaned results.
 - `tool_concurrency` caps parallel execution per run, retaining the existing
   scheduler-count default and sequential tool barriers.
+- `Alloy.Agent.Turn` owns the run's absolute monotonic deadline (`run_deadline = started + timeout_ms`)
+  and passes it into `Alloy.Provider.Retry` (`:alloy_request_deadline`, kept
+  outside `:req_options`), built-in HTTP/SSE and Codex runners, and
+  `Alloy.Tool.Executor`. Termination precedence is: an already-completed final
+  answer (`:end_turn` or successful `stop_after_tool`) is returned rather than
+  discarded; otherwise an expired `run_deadline` fails the run with
+  `%Alloy.Provider.Error{kind: :timeout}` ahead of `:max_turns`. Tool batches
+  that have not started before `run_deadline` expires still emit matching error
+  `tool_result` blocks (preserving `:before_tool_call` block reasons) so the
+  transcript stays valid, without dispatching tools, emitting
+  `:tool_start`/`:tool_end`, running `:after_tool_call`, or recording unstarted
+  calls in `result.tool_calls`.
 
 ## Consequences
 

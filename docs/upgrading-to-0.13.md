@@ -10,8 +10,8 @@ loudly, at compile time or with an `ArgumentError` at startup. A few
 changes don't, so check these by hand:
 
 - A `%Alloy.Agent.Config{}` you build yourself no longer compacts (§5).
-- Middleware that matches hooks exhaustively crashes only when a context
-  overflow actually happens (§5).
+- Middleware that matches hooks exhaustively crashes only when a new hook
+  (`:on_context_overflow` or `:after_tool_call`) runs (§5).
 - A memory store tied to the calling process fails as a tool error the
   model reads, not as a crash (§4).
 - Middleware reading removed `Config` fields (`config.memory`,
@@ -30,6 +30,10 @@ along with in-memory and disk memory stores.
 The `alloy_agent` project is not yet published to Hex as of Alloy 0.13.0.
 Applications using the removed server APIs should remain on 0.12.4 until they
 migrate to their own supervisor or a separately reviewed runtime integration.
+Note that 0.12.5's security fixes live on the 0.13 line: pinning `mint ~> 1.11`
+and `req >= 0.6.1` in your own `mix.exs` mitigates only the HTTP transport
+CVEs, not 0.12.5's `allowed_paths` boundary fix, `Bash` secret-environment
+scrubbing, or `Memory` path validation.
 Applications calling `Alloy.run/2` and `Alloy.stream/3` do not need that package.
 
 | Before | After |
@@ -139,7 +143,8 @@ chosen order.
   the loop's state).
 
 If your middleware matches hooks exhaustively, add a catch-all clause,
-`def call(_hook, state), do: state`, for `:on_context_overflow`.
+`def call(_hook, state), do: state`, for `:on_context_overflow` and
+`:after_tool_call`.
 
 ## 6. Messages record where they came from
 

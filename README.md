@@ -321,7 +321,8 @@ your application needs to own the handoff format. Both values must be strings;
 omitting them uses Alloy's default summary prompts.
 
 Compaction is ordinary middleware, `Alloy.Context.Compactor`, which
-`Alloy.run/2` puts first in `:middleware`. Pass `compaction: false` to turn it
+`Alloy.run/2` puts last in `:middleware` so it budgets inputs prepared by
+earlier middleware. Pass `compaction: false` to turn it
 off (for example when your application manages context itself), or list the
 compactor in `:middleware` to choose where it runs. When the provider rejects
 a request as too long, the loop runs the `:on_context_overflow` hook — the

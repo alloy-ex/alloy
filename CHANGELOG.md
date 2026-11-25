@@ -7,76 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.13.0] - 2026-10-14
+### Breaking Changes
 
-### Changed
-
-- Gemini preserves tool-result text inside explicit `output`/`error` envelopes
-  rather than decoding JSON-looking text into arbitrary response fields. Public
-  tool results and transcripts retain their original content and error status.
-
-- Tool argument edits now pass through later `:before_tool_call` middleware.
-  Previously the first edit ended the chain. Block and halt still stop it.
-- Default compaction runs after caller middleware so it budgets prepared inputs.
-  Explicit compactor placement remains respected.
-
-### Loop controls
-
-- `:after_tool_call` middleware can replace each result's content and structured
-  data before publication, while preserving success/error status.
-- Opt-in `tool_validation: :schema` validates arguments using the optional
-  `ex_json_schema` dependency (drafts 4/6/7, local references, no coercion).
-  The default remains object/required-key validation.
-- `stop_after_tool: "name"` completes successfully after a matching successful
-  call and the rest of its round settle. `result.text` is the selected output;
-  `result.metadata.final_tool` includes its ID, name, and structured data.
-- `Alloy.Agent.State.prepare/2` prepares messages, tools, system prompt, and
-  provider through existing middleware, rebuilding definitions and model limits.
-- `Alloy.Transcript.validate/1` checks client tool pairing; `repair/1` explicitly
-  supplies interrupted outcomes only where a result is missing.
-- `tool_concurrency:` caps parallel tool execution without changing sequential
-  tool barriers. The default remains the scheduler count.
-
-### Performance
-
-- Reuse resolved tool schemas across agent turns when their input schemas are
-  unchanged. Schema changes are checked before execution; cache entries remain
-  bounded to the active tool set and never appear in result/session metadata.
-
-### Fixed
-
-- Gemini tools use `parametersJsonSchema` so valid JSON Schema keywords such as
-  `additionalProperties` are accepted by the API instead of producing HTTP 400.
-
-- Compaction summary requests omit thinking and redacted thinking blocks,
-  including string-keyed blocks, while preserving visible text and tool evidence.
-- Subscription-sharing quota exhaustion is not retried as transient throttling.
-- Provider retries honor HTTP-date `Retry-After` headers as well as numeric delays.
-- Codex `tool_use` replies with no calls return a typed `:malformed_reply`
-  failure, retried within the existing attempt/deadline budget on fresh calls. Text accompanying
-  an empty call list is never silently treated as completed work.
+- **Run deadline enforcement (`:timeout_ms`, or `:infinity` to disable):** `Alloy.Agent.Turn`, `Alloy.Provider.Retry`, built-in HTTP/SSE and Codex runners, and `Alloy.Tool.Executor` now enforce `:timeout_ms` (default `120_000` ms) across stalled or trickling HTTP/SSE requests, provider retries, sequential tool batches, in-flight and queued tool tasks, and turn boundaries without renewing expired budgets. Previously, actively streaming requests and long tool batches could run past `:timeout_ms`.
+  - **Retry & timeout headroom:** Retries and fallback attempts stop 5 seconds before `:timeout_ms` (so `timeout_ms <= 5_000` skips both retries and fallback providers). Non-streaming requests reserve that 5-second headroom in `receive_timeout` once `:timeout_ms > 8_000` (with a 3-second floor clamped to remaining budget), while streaming requests receive the full remaining run budget up to `:timeout_ms` across both HTTP/1.1 and HTTP/2. Cancellation teardown adds a brief grace window (`~1.5s` for HTTP/SSE worker cleanup, up to `5s` for Codex subprocess cleanup), so hosts wrapping runs in `Task.await/2` should add buffer above `:timeout_ms`.
+  - **Termination precedence:** Already-completed `:end_turn` answers and successful `stop_after_tool` outcomes are returned rather than discarded; otherwise an expired deadline fails the run with `:timeout` ahead of `:max_turns`.
+  - **Unstarted tool batches:** Tool calls in a batch that has not started before `:timeout_ms` expires (including middleware-blocked calls in that batch) receive matching error `tool_result` blocks in the transcript (preserving any `:before_tool_call` block reason) without emitting `:tool_start`/`:tool_end`, running `:after_tool_call`, or appearing in `result.tool_calls`. Calls already queued inside an in-progress parallel batch whose `:tool_start` was already emitted still settle through `:tool_end`, `:after_tool_call`, and `result.tool_calls` with a run-deadline timeout error so start/end pairs stay balanced.
+  - **Migration:** Callers with multi-turn or streaming runs exceeding 2 minutes (or single non-streaming generations exceeding `timeout_ms - 5_000`) can raise `:timeout_ms` or pass `timeout_ms: :infinity` to disable the run-level deadline (per-tool `:tool_timeout`, Codex's own per-invocation `:timeout_ms` default of `120_000` ms, and a 60-second ceiling on unbounded retries — capping jitter at 60 s and aborting if `Retry-After` exceeds 60 s — still apply; HTTP requests default to `receive_timeout: :infinity`, so pass `req_options: [receive_timeout: ...]` if you still want a per-request idle/socket timeout). When `:timeout_ms` is finite, `:tool_timeout` (default `120_000` ms) is bounded by the remaining `:timeout_ms` run budget, and a tighter caller-provided `req_options[:receive_timeout]` is preserved.
+- **Supervised worker execution for deadline-bounded HTTP/SSE requests:** When `:timeout_ms` is finite (the default), built-in HTTP/SSE providers execute `Req` inside a linked worker under `Alloy.TaskSupervisor` (so the `:alloy` application must be started). `Logger.metadata/0`, OpenTelemetry context (`:"$__current_otel_ctx"`), and `$callers` are propagated to the worker, while other custom process-dictionary entries are not; custom `Req` test plugs that call `send(self(), ...)` run in the worker process and should capture the test PID in a closure instead.
+- **Internal `:alloy_request_deadline` provider config key:** When `:timeout_ms` is finite, Alloy now passes `:alloy_request_deadline` (an internal monotonic millisecond deadline) in the `provider_config` map given to providers, alongside existing runtime keys (`:system_prompt`, `:on_event`, `:provider_state`). Custom providers that validate `provider_config` strictly (for example via `Keyword.validate!/2` or `NimbleOptions`) should ignore unknown `:alloy_*` keys, as documented in `Alloy.Provider`.
+- `Alloy.Tool.Executor` now treats explicit `input: nil` (for example from a custom provider or `:before_tool_call` `{:edit, ...}` middleware) as an invalid non-object tool input instead of coercing it to `%{}`; omit `:input` or pass `%{}` for no-argument calls.
+- `Alloy.Provider.decode_body/1` now rejects non-object JSON (such as `null`, arrays, or scalars) and returns `{:error, %Alloy.Provider.Error{kind: :malformed_reply}}` instead of a bare string. `Error` implements `String.Chars`, so string interpolation continues to work, but callers pattern-matching a binary error or decoding non-object JSON via `decode_body/1` must update.
+- `Alloy.Agent.Config.from_opts/1` validates startup options strictly and raises `ArgumentError` on `provider: nil`, boolean provider values, non-positive `:max_turns` / `:max_tokens` / `:tool_timeout`, non-positive/non-`:infinity` `:timeout_ms`, negative `:max_retries` / `:retry_backoff_ms`, non-map `:context`, non-string `:system_prompt`, empty or non-string `:working_directory`, non-2-arity `:on_compaction`, non-boolean `:code_execution`, empty or non-string `:until_tool`, and invalid `:middleware` or `:fallback_providers` entries (including `{Mod, nil}`). (`retry_backoff_ms: 0` and `timeout_ms: :infinity` are valid.)
+- `Alloy.Tool.resolve_path/2` expands relative `:allowed_paths` entries against `:working_directory` rather than the BEAM process working directory, and rejects non-string paths, NUL bytes, and non-list `:allowed_paths`.
+- `Alloy.Provider.Codex` launches via non-login `sh -c` with explicit port `:env` instead of a login shell, rejects option-like `:codex_bin` values, and treats non-zero exits under `persist_session: true` as errors even when a `last_message` file exists. Set `:codex_bin` explicitly if `codex` is only on a login-profile `PATH`.
+- `Alloy.Testing.run_with_responses/3` now validates options through `Alloy.Agent.Config.from_opts/1` (defaulting to `compaction: false`, enforcing the scripted `Alloy.Provider.Test`, and clearing `:fallback_providers`) and raises `ArgumentError` on unknown or invalid options that were previously ignored.
+- `Alloy.Provider.OpenAI`, `Alloy.Provider.OpenAICompat`, and `Alloy.Provider.OpenAIStream` now require a non-empty string tool-call `"id"`/`"call_id"` and `"name"` (returning `:malformed_reply` if missing or empty instead of emitting tool calls with `nil` IDs), except under `finish_reason: "length"` / Responses `status: "incomplete"` (where cut-off calls receive unique placeholder `"truncated_<n>_<uniq>"` IDs, `"truncated"` names, and `input: %{}` so the loop abandons them with its `max_tokens` error and matching error tool results in `result.messages`) and `finish_reason: "content_filter"` / Responses `incomplete_details.reason: "content_filter"` (where partial calls are dropped so the refusal reaches the loop without retrying).
+- `Alloy.Provider.Error.kind()` adds `:shutdown` (non-retryable; skipped by retries and fallback loops) for supervisor shutdown interrupts across HTTP and Codex providers (including resumed Codex turns, which preserve `:shutdown` instead of `:session_uncertain` while noting `:session_generation` rotation in `error.message`); callers with exhaustive `case` matches on `error.kind` or rotating `:session_generation` by `kind` should handle `:shutdown`.
+- `tool_validation: :schema` now converts unsupported `$schema` dialects (`ExJsonSchema.Schema.UnsupportedSchemaVersionError`, e.g. Draft 2020-12) into an `ArgumentError` naming the tool and `$schema` value.
 
 ### Added
 
-- Opt-in Codex continuation with `persist_session: true`. The default remains
-  ephemeral. Continuation fingerprints the serialized transcript rather than
-  loop-added provenance, and starts fresh when execution configuration or
-  earlier history changes. Failed resumes return non-retryable `:session_uncertain`.
-  Hosts can change `:session_generation` after failure/cancellation to recover
-  without losing Alloy history. Continuation metadata is JSON-safe.
-- Codex streams the last validated structured answer at `turn.completed`, before process exit,
-  keeping command diagnostics and commentary out of answer text. Final-response
-  disagreement is an error; callbacks run in the caller and cancellation stops
-  the subprocess tree.
-- Tested host-only recipes for bounded producer-side output capture and nested
-  tool execution. No scripting runtime, file store, or Claude adapter is added
-  to Alloy's core or runtime dependencies.
+- `Alloy.Provider.OpenAI` and `Alloy.Provider.XAI` now accept `:extra_headers`.
+- `Alloy.Provider.Gemini` now accepts `:extra_body` (shallow-merged last with stringified keys).
+- CI now verifies compilation and tests without the optional `:ex_json_schema` dependency.
 
 ### Changed
 
-- Release publication now requires the full `mix ci` gate, warning-free docs,
-  and a tag matching the package version.
+- **Typed `:malformed_reply` errors:** Non-object top-level JSON replies, malformed or non-object tool-argument JSON across `OpenAI`, `OpenAICompat`, `OpenAIStream`, `Anthropic`, and `Gemini`, malformed choice/message/delta/content/candidate/parts structures across `OpenAICompat`, `OpenAIStream`, and `Gemini` (streaming and non-streaming), and undecodable or non-object SSE chunks across `Anthropic`, `OpenAI`, `OpenAIStream` (ignoring empty/whitespace keepalive `data:` lines), and `Gemini` return `%Alloy.Provider.Error{kind: :malformed_reply}` (retryable within `:max_retries` before output is emitted) instead of silently dropping chunks, crashing, or coercing `nil`/`false` inputs to `%{}`. Rescued SSE event-handler crashes halt the stream early, log only the exception module plus argument-stripped stacktrace, and return non-retryable `kind: :unknown`. Valid JSON objects with unexpected top-level keys return `kind: :unknown` (non-retryable) with bounded inspect output.
+- **Core tool & memory bounds:** `Alloy.Tool.Core.Edit` refuses binary files, files over 10 MiB, and non-boolean `replace_all` values; `Bash` and `Write` reject non-string inputs; custom `:bash_executor` functions returning shapes other than `{binary, integer}` now return `{:error, ...}` instead of misreporting a timeout or crashing; `Alloy.Memory.tool/1` caps results at 50,000 characters and rejects `create`/`str_replace`/`insert` on `/memories`.
+- **Event & stream callback resilience:** `Alloy.Events.emit/3` rescues raising `:on_event` callbacks (logging at most once per run with argument-stripped stacktraces) so a buggy UI callback cannot abort a run after side-effecting tools execute, and `Alloy.Provider.Retry` suppresses repeated warnings to at most once per callback per stream (likewise with argument-stripped stacktraces) when `:on_chunk` or `:on_event` raises.
+- **Sequential tool event ordering (`tool_concurrency: 1`):** `Alloy.Tool.Executor` now executes each tool call as a singleton batch when `tool_concurrency: 1`, so `:tool_start` and `:tool_end` events alternate per call instead of emitting all `:tool_start` events upfront, and later calls are cleanly skipped if `:timeout_ms` expires mid-round.
 
+### Fixed
+
+- **SSE framing, backpressure & cancellation:**
+  - Non-200 SSE error bodies (including multi-paragraph HTML/JSON with `\n\n`) are captured verbatim, scoped per response so redirect bodies never leak into later errors, and capped at 64 KiB (halting runaway non-200 streams early).
+  - `SSE.parse_event/1` strips at most one leading space and keeps the last `event:` line per the SSE spec.
+  - Deadline-bounded HTTP/SSE workers monitor caller termination and use acknowledged per-chunk delivery to preserve backpressure while executing callbacks in the caller process.
+- **Error classification & bounds (`Alloy.Provider.Error`):**
+  - Added dedicated non-retryable `:shutdown` kind for supervisor shutdown interrupts across HTTP and Codex providers (skipped by both retries and fallback loops, and never produced from provider error payloads).
+  - `Error.from_body/1` classifies numeric and string-numeric HTTP status codes (`400..599`) in in-band `error.code` fields (populating `:status` so typeless in-band errors format as `"HTTP <code>: <message>"`) and checks `error.type` before falling back to `error.status`.
+  - Overflow phrase checks scan the first 64 KiB of the sanitized message (skipped for 5xx, while explicit `context_length_exceeded` `code` or `type` labels still classify as `:context_overflow`), and stored error messages slice before UTF-8 sanitization and are capped by byte size (2,000 bytes for string error bodies/messages; 500 bytes for `Jason.encode/1`/`inspect/2` and transport fallbacks).
+- **Provider streaming & parsing:**
+  - `OpenAIStream` and `OpenAICompat`:
+    - Map non-truncation/non-refusal finish reasons (including `"stop"` and omitted reasons) with present tool calls to `:tool_use`, and tolerate truncated tool-call arguments under `finish_reason: "length"` and `"content_filter"` so `:max_tokens` tool abandonment and `:refusal` reach the loop without retrying.
+    - Support array-of-parts `content` (extracting text and thinking parts, skipping unknown well-formed part types forward-compatibly, tagging content-part thinking with JSON-safe `source: "content_part"` and withholding it from top-level `reasoning_content` on subsequent turns, and rejecting malformed present content/reasoning values).
+    - Preserve `usage` on non-empty `choices` chunks, capture `finish_reason` when `delta` is omitted, reject non-map choices and explicit non-map `delta`, validate `extra_content` shapes, and guard usage parsing against malformed fields.
+    - Support tool calls without an `index` (reusing slots for repeated `id`s, allocating fresh slots safely alongside sparse explicit indices, and routing id-less continuations to the most recently touched call) and accept missing or `""` no-arg tool call arguments (while still rejecting explicit `nil`/`false`/non-object arguments).
+  - `Anthropic`: concatenates split `signature_delta` chunks, rejects malformed SSE event/delta payloads and mismatched target-block deltas with `:malformed_reply` on every stop except `:refusal`, rejects invalid or unclosed streaming tool blocks outside `max_tokens`/`model_context_window_exceeded`/`refusal` stops, and adds a bounded `parse_response/1` catch-all.
+  - `Gemini`: rejects cut-off streams whose chunks carry `"finishReason": null`, guards usage parsing (preserving earlier non-nil counts over later `null`s), ignores `"error": null`, and prioritizes real object/string (and list-wrapped) in-band API errors over malformed or present candidates in both `complete/3` and `stream/4`.
+  - Trailing `/` is trimmed on `:api_url` across HTTP providers, and `ModelMetadata` matches `models/gemini-*` prefixes.
+- **Retry & fallback safety:**
+  - Fallback providers without optional `stream/4` fall back to `complete/3` (without emitting `on_chunk`/`:text_delta` chunks; the full reply is returned in `result.text` and `result.messages`); fallback `provider_state` is isolated from the primary origin; `:shutdown` interrupts skip fallback providers (both from primary and mid-fallback loop); `retry_backoff_ms: 0` no longer crashes `:rand.uniform(0)`; Alloy deadline metadata stays outside `req_options` so custom providers forwarding `req_options` to Req work without unknown-option errors; request timeouts scale monotonically across the 5-second headroom boundary.
+- **Tool loop & middleware controls:**
+  - `Message.normalize_for/3` uses round-local ID renaming so reused same-origin IDs stay paired.
+  - `tool_validation: :schema` preflights fail-fast (raising `ArgumentError` / `InvalidSchemaError` / `Jason.EncodeError` on invalid schemas) before the first provider request and whenever middleware changes tools, accepts tool properties literally named `"$ref"`, normalizes and scope-resolves subschemas under literal property names (`"default"`, `"const"`, `"enum"`, `"examples"`) while rejecting nested `$id`/`id` inside literal-keyword values and failing closed on `$ref` targets pointing into non-schema literal data (such as `#/default`), and enforces `$id`/`id`-scoped local-only `#`-prefixed `$ref` resolution (rejecting external and absolute self-references, verified against `ex_json_schema` `0.11.x`) so the remote schema resolver is never invoked.
+  - `stop_after_tool` succeeds when `:after_tool_execution` appends a user message; invalid middleware return values raise a descriptive `ArgumentError`.
+- **Compactor & overflow recovery:**
+  - `drop_thinking/1` and `compact_messages/2` drop empty `content: []` messages; `force_compact/2` shrinks large tool results on single-round overflows even with adaptive thinking blocks or under-estimated token counts; multimodal `tool_result` lists reuse fixed media token budgets instead of counting base64 bytes; `before_completion` skips `:after_compaction` when messages are unchanged.
+  - Summary requests sanitize primary and fallback provider configs (stripping session, tool/server-tool/web-search controls, OpenAI `"text"`, and Gemini `generationConfig` schema/thinking fields while preserving privacy keys like `:store` / `"store" => false`); `Turn` only sets `prompt_too_long_recovery: true` when recovery does not fail; eliminated O(N^2) `Enum.at/2` cut-point scans.
+- **Process cleanup & OTP hygiene:**
+  - Custom `:bash_executor` runs and `Provider.HTTP` share `Alloy.OwnedWorker` for supervised caller-monitored execution with Logger metadata and OpenTelemetry context propagation, killing workers on timeout/cancellation even when trapping exits, preserving abnormal worker crash propagation to linked children, re-raising caught Req adapter/plug crashes in the caller under `:deadline` with argument-stripped stacktraces, and returning `{:error, %Alloy.Provider.Error{kind: :unknown}}` with a sanitized exit reason on external worker/owner kills (such as `max_heap_size` or `Process.exit/2`) instead of crashing the caller.
+  - `Core.Bash` traps supervisor shutdown signals, checks for immediate caller exit before `Port.open`, and kills the process group on runner exits.
+  - `Codex` creates `0700` temp directories atomically with cryptographically random names (`umask 077` + `mkdir`, failing closed if unavailable), writes input files with `[:exclusive]` and `set -C` defense in depth, stops the process group on mid-stream crashes without unbounded stack traces, and wraps input-file write errors in `%Alloy.Provider.Error{}`.
+  - `OSProcess.signal_group/2` falls back cleanly when `/bin/sh` is absent; added `:crypto` to `extra_applications` in `mix.exs`; `Usage.merge/2` handles explicit `nil` fields; `Transcript.validate/1` omits spurious `:missing_result` for invalid call IDs.
+- **Docs & dependencies:** Fixed compactor order in `README.md` and `CHANGELOG.md` (including correcting the `[0.13.0]` compactor ordering note), added missing `Alloy` options and upgrade notes for `:after_tool_call`, fixed `docs/recipes/code-mode.md` and `livebooks/quickstart.livemd`, and updated `plug`/`plug_crypto` test dependencies to clear Hex advisories.
+
+## [0.13.0] - 2026-10-14
 
 Alloy 0.13 is the loop and nothing else: the supervised runtime moves to
 the `alloy_agent` package, memory and compaction become an ordinary tool
@@ -105,8 +103,54 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
 - `state.current_task` and `state.pending_requests`, which were server
   state.
 
+### Added
+
+- **Composable loop controls:**
+  - `:after_tool_call` middleware can replace each result's content and
+    structured data before publication, while preserving success/error status.
+  - Opt-in `tool_validation: :schema` validates arguments using the optional
+    `ex_json_schema` dependency (drafts 4/6/7, local references, no coercion).
+    The default remains object/required-key validation.
+  - `stop_after_tool: "name"` completes successfully after a matching successful
+    call and the rest of its round settle. `result.text` is the selected output;
+    `result.metadata.final_tool` includes its ID, name, and structured data.
+  - `Alloy.Agent.State.prepare/2` prepares messages, tools, system prompt, and
+    provider through existing middleware, rebuilding definitions and model limits.
+  - `Alloy.Transcript.validate/1` checks client tool pairing; `repair/1`
+    explicitly supplies interrupted outcomes only where a result is missing.
+  - `tool_concurrency:` caps parallel tool execution without changing sequential
+    tool barriers. The default remains the scheduler count.
+- **Opt-in Codex continuation (`persist_session: true`) and streaming:**
+  - The default remains ephemeral. Continuation fingerprints the serialized
+    transcript rather than loop-added provenance, and starts fresh when
+    execution configuration or earlier history changes. Failed resumes return
+    non-retryable `:session_uncertain`. Hosts can change `:session_generation`
+    after failure/cancellation to recover without losing Alloy history.
+    Continuation metadata is JSON-safe.
+  - Codex streams the last validated structured answer at `turn.completed`,
+    before process exit, keeping command diagnostics and commentary out of
+    answer text. Final-response disagreement is an error; callbacks run in the
+    caller and cancellation stops the subprocess tree.
+- `Alloy.Tool.native_types/0` (optional) and `:native_types` on inline
+  tools: a provider's built-in type for the tool, such as Anthropic's
+  `memory_20250818`.
+- The `:on_context_overflow` middleware hook.
+- `Alloy.Agent.State.deadline`: the monotonic deadline for the run's
+  provider requests, for middleware that makes its own.
+- `Alloy.Message.normalize_for/3` and `Alloy.Message.origin/2`, for
+  callers who call a provider directly.
+- Tested host-only recipes for bounded producer-side output capture and nested
+  tool execution. No scripting runtime, file store, or Claude adapter is added
+  to Alloy's core or runtime dependencies.
+
 ### Changed
 
+- **Tool argument edits compose:** `:before_tool_call` edits now pass through
+  later middleware instead of ending the chain. Block and halt still stop it.
+- **Gemini tool-result envelopes:** Gemini preserves tool-result text inside
+  explicit `output`/`error` envelopes rather than decoding JSON-looking text
+  into arbitrary response fields. Public tool results and transcripts retain
+  their original content and error status.
 - **Unknown options raise.** `Alloy.run/2`, `Alloy.stream/3` and
   `Config.from_opts/1` ignored options they did not know, so a typo ran
   silently without its setting. Server options name `alloy_agent` in the
@@ -132,8 +176,8 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
   - A store that raises now becomes an error result the model reads (and
     is logged), instead of crashing the run.
 - **Compaction is middleware.** `Alloy.Context.Compactor` implements
-  `Alloy.Middleware`, and `Alloy.run/2` puts it first, so default behaviour
-  is unchanged.
+  `Alloy.Middleware`, and `Alloy.run/2` puts it last so it budgets inputs
+  prepared by caller middleware.
   - `compaction: false` turns it off, and listing it in `:middleware`
     chooses its position.
   - A hand-built `%Config{}` gets no compaction unless it lists the
@@ -166,9 +210,26 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
     Messages you build yourself leave them `nil`.
   - Persist all three with transcripts. A message without an origin is
     sent as it is.
+- Release publication now requires the full `mix ci` gate, warning-free docs,
+  and a tag matching the package version.
+
+### Performance
+
+- Reuse resolved tool schemas across agent turns when their input schemas are
+  unchanged. Schema changes are checked before execution; cache entries remain
+  bounded to the active tool set and never appear in result/session metadata.
 
 ### Fixed
 
+- Gemini tools use `parametersJsonSchema` so valid JSON Schema keywords such as
+  `additionalProperties` are accepted by the API instead of producing HTTP 400.
+- Compaction summary requests omit thinking and redacted thinking blocks,
+  including string-keyed blocks, while preserving visible text and tool evidence.
+- Subscription-sharing quota exhaustion is not retried as transient throttling.
+- Provider retries honor HTTP-date `Retry-After` headers as well as numeric delays.
+- Codex `tool_use` replies with no calls return a typed `:malformed_reply`
+  failure, retried within the existing attempt/deadline budget on fresh calls.
+  Text accompanying an empty call list is never silently treated as completed work.
 - **Switching provider, endpoint or account mid-conversation** no longer
   sends one origin's signed reasoning to another. That failed with HTTP
   400s such as `invalid_encrypted_content` or an invalid thinking
@@ -194,17 +255,6 @@ and ordinary middleware, and what 0.12.5 deprecated is removed. See
 - **Anthropic thinking without a signature** (written by hand, or by a
   reasoning model behind OpenAICompat) is sent as text instead of failing
   the request; empty unsigned thinking is dropped.
-
-### Added
-
-- `Alloy.Tool.native_types/0` (optional) and `:native_types` on inline
-  tools: a provider's built-in type for the tool, such as Anthropic's
-  `memory_20250818`.
-- The `:on_context_overflow` middleware hook.
-- `Alloy.Agent.State.deadline`: the monotonic deadline for the run's
-  provider requests, for middleware that makes its own.
-- `Alloy.Message.normalize_for/3` and `Alloy.Message.origin/2`, for
-  callers who call a provider directly.
 
 ## [0.12.5] - 2026-10-09
 
@@ -1190,6 +1240,17 @@ Code that uses only `Alloy.run/2`, `Alloy.stream/3`, tools, providers, messages,
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.13.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.13.0
+[0.12.5]: https://github.com/alloy-ex/alloy/releases/tag/v0.12.5
+[0.12.4]: https://github.com/alloy-ex/alloy/releases/tag/v0.12.4
+[0.12.3]: https://github.com/alloy-ex/alloy/releases/tag/v0.12.3
+[0.12.2]: https://github.com/alloy-ex/alloy/releases/tag/v0.12.2
+[0.12.1]: https://github.com/alloy-ex/alloy/releases/tag/v0.12.1
+[0.12.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.12.0
+[0.11.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.11.0
+[0.10.2]: https://github.com/alloy-ex/alloy/releases/tag/v0.10.2
+[0.10.1]: https://github.com/alloy-ex/alloy/releases/tag/v0.10.1
+[0.10.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.10.0
 [0.9.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.9.0
 [0.8.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.8.0
 [0.7.6]: https://github.com/alloy-ex/alloy/releases/tag/v0.7.6

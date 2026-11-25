@@ -56,11 +56,13 @@ provider = {Alloy.Provider.Anthropic,
 Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 accept a replayed
 thinking block only while the `system` prompt, `tools` and earlier messages
 are unchanged. Accounts created on or after 31 August 2026 get a 400
-otherwise. Alloy keeps `system` and `tools` fixed for a run and only appends
-to `messages`, except when it compacts. After compaction it removes every
-thinking block it keeps, which is the documented valid change, so no beta
-header is needed. If you edit history yourself, either do the same or opt
-into the API dropping stale blocks:
+otherwise. By default Alloy keeps `system` and `tools` fixed for a run and only
+appends to `messages`, except when it compacts. After compaction it removes
+every thinking block it keeps, which is the documented valid change, so no beta
+header is needed. If your `:before_completion` middleware edits `system`,
+`tools`, or earlier `messages` mid-run via `Alloy.Agent.State.prepare/2` (or
+you edit history yourself), either drop earlier thinking blocks or opt into the
+API dropping stale blocks:
 
 ```elixir
 extra_headers: [{"anthropic-beta", "thinking-binding-controls-2026-08-01"}],
@@ -106,11 +108,23 @@ Known limits:
 - **Anthropic manual thinking** (`"type" => "enabled"`, Claude 4.6 and
   earlier) requires the turn in progress to start with a thinking block,
   which a turn written by another provider lacks. Adaptive thinking, the
-  only mode on current models, has no such rule.
+  only mode on current models, has no such rule. Anthropic streaming also
+  expects each block's `content_block_start` event before text, thinking, or
+  signature deltas for that index (standard Anthropic endpoints always emit
+  it; non-compliant gateways omitting it return `:malformed_reply`).
 - **`OpenAICompat`** reaches each vendor at its own `:api_url`, so
   switching vendors is a change of origin: earlier `reasoning_content` is
   sent as plain text in the assistant message, and Gemini signatures from
-  Google's compatibility endpoint are dropped.
+  Google's compatibility endpoint are dropped. Thinking extracted from
+  array-of-parts `content` (such as Mistral Magistral) is tagged
+  `source: "content_part"` and withheld from top-level `reasoning_content`
+  on later turns (not re-sent) so strict OpenAI-compatible APIs do not reject
+  unknown assistant keys. Under `finish_reason: "length"` (and `OpenAI`
+  Responses `status: "incomplete"`), cut-off tool calls whose id or name never
+  arrived receive unique placeholder `"truncated_<n>_<uniq>"` / `"truncated"`
+  fields and `input: %{}` so the loop abandons them with matching error
+  `tool_result` blocks in `result.messages` instead of retrying deterministic
+  truncations.
 
 The provider tests check serialization, stream parsing, and opaque state
 round-trips using fixtures. Those checks do not certify every current model

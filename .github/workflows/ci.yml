@@ -81,3 +81,33 @@ jobs:
       - name: Docs build without warnings
         if: ${{ matrix.docs }}
         run: MIX_ENV=dev mix docs --warnings-as-errors
+
+  no-optional-deps:
+    name: Test without optional ex_json_schema
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+
+      - name: Remove optional ex_json_schema and verify compile & tests
+        run: |
+          sed -i '/{:ex_json_schema,/d' mix.exs
+          ! grep -q '{:ex_json_schema,' mix.exs
+          mix deps.get
+          mix compile --warnings-as-errors --force
+          mix test --warnings-as-errors --exclude ex_json_schema
+          mix run --no-start -e '
+            tool = Alloy.Tool.inline(name: "t", description: "t", input_schema: %{type: "object"}, execute: fn _, _ -> {:ok, "ok"} end)
+            try do
+              Alloy.run("hi", provider: Alloy.Provider.Test, tools: [tool], tool_validation: :schema)
+              raise "expected ArgumentError"
+            rescue
+              e in ArgumentError ->
+                unless Exception.message(e) =~ "ex_json_schema", do: reraise(e, __STACKTRACE__)
+            end
+          '
