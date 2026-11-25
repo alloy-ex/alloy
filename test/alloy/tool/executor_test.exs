@@ -356,6 +356,78 @@ defmodule Alloy.Tool.ExecutorTest do
       end
     end
 
+    @tag capture_log: true
+    test "process exits from linked Task.await KeyError and GenServer.call timeout never leak context secrets" do
+      secret = "sk-exit-path-secret-999"
+      test_pid = self()
+      handler_id = "executor-exit-leak-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:alloy, :tool, :stop],
+        fn _event, _measurements, metadata, _cfg ->
+          send(test_pid, {:tool_stop, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      silent_server =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      on_exit(fn -> send(silent_server, :stop) end)
+
+      task_crash_tool =
+        Alloy.Tool.inline(
+          name: "task_crash",
+          description: "crashes inside Task.async",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, ctx ->
+            Task.async(fn -> Map.fetch!(ctx, :missing_db_url) end) |> Task.await()
+          end
+        )
+
+      call_timeout_tool =
+        Alloy.Tool.inline(
+          name: "call_timeout",
+          description: "times out in GenServer.call with secret in payload",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, ctx ->
+            GenServer.call(silent_server, {:query, ctx.api_key}, 10)
+          end
+        )
+
+      state = build_state([task_crash_tool, call_timeout_tool], context: %{api_key: secret})
+
+      calls = [
+        %{id: "c_task", name: "task_crash", type: "tool_use", input: %{}},
+        %{id: "c_call", name: "call_timeout", type: "tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{content: [task_block, call_block]}, [task_meta, call_meta]} =
+               Executor.execute_all(calls, state.tool_fns, state, [])
+
+      assert task_block.is_error == true
+      assert task_block.content =~ "KeyError (key :missing_db_url not found)"
+      refute task_block.content =~ secret
+      refute task_meta.error =~ secret
+
+      assert call_block.is_error == true
+      assert call_block.content =~ ":timeout"
+      refute call_block.content =~ secret
+      refute call_meta.error =~ secret
+
+      for _ <- 1..2 do
+        assert_receive {:tool_stop, meta}
+        refute to_string(meta.error) =~ secret
+      end
+    end
+
     test "tool_timeout applies to sequential tools" do
       tool =
         Alloy.Tool.inline(

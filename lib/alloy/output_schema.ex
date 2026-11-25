@@ -9,11 +9,10 @@ defmodule Alloy.OutputSchema do
   their wire formats without re-normalizing per request.
   """
 
-  alias Alloy.Provider
   alias Alloy.Tool.Validation
 
   @default_name "alloy_output"
-  @name_pattern ~r/^[a-zA-Z0-9_-]{1,64}$/
+  @name_pattern ~r/\A[a-zA-Z0-9_-]{1,64}\z/
   @wrapper_keys [:name, :schema, :strict, "name", "schema", "strict"]
 
   @derive {Inspect, except: [:resolved]}
@@ -93,20 +92,12 @@ defmodule Alloy.OutputSchema do
 
   Uses full Draft 4/6/7 validation via optional `:ex_json_schema` when loaded
   and the schema dialect is supported; falls back to top-level JSON `"type"`
-  and `"required"` checks otherwise.
+  and `"required"` checks otherwise. Returns `{:ok, decoded}` or
+  `{:error, %{kind: kind, message: message, decoded: decoded | nil}}`.
   """
-  @spec decode_and_validate(String.t() | nil, t() | map()) :: {:ok, term()} | {:error, String.t()}
-  def decode_and_validate(text, spec) do
-    case decode_and_validate_detailed(text, spec) do
-      {:ok, decoded} -> {:ok, decoded}
-      {:error, %{message: message}} -> {:error, message}
-    end
-  end
-
-  @doc false
-  @spec decode_and_validate_detailed(String.t() | nil, t() | map()) ::
+  @spec decode_and_validate(String.t() | nil, t() | map()) ::
           {:ok, term()} | {:error, output_error()}
-  def decode_and_validate_detailed(text, spec)
+  def decode_and_validate(text, spec)
       when is_binary(text) and text != "" and is_map(spec) do
     %__MODULE__{schema: schema, resolved: {:cached, _key, resolution}} = normalize!(spec)
 
@@ -130,7 +121,7 @@ defmodule Alloy.OutputSchema do
     end
   end
 
-  def decode_and_validate_detailed(_other, _spec) do
+  def decode_and_validate(_other, _spec) do
     {:error,
      %{
        kind: :missing_text,
@@ -213,15 +204,14 @@ defmodule Alloy.OutputSchema do
   end
 
   defp normalize_schema!(schema, name) do
-    # Encode strictly BEFORE stringifying keys so duplicate atom/string keys
-    # (e.g. %{type: "object", "type" => "array"}) fail loudly instead of silently
-    # colliding in Provider.stringify_keys/1.
+    # Round-trip through strict JSON encoding so duplicate atom/string keys
+    # (e.g. %{type: "object", "type" => "array"}) fail loudly and all map keys
+    # are normalized to strings.
     normalized =
       try do
         schema
         |> Jason.encode!(maps: :strict)
         |> Jason.decode!()
-        |> Provider.stringify_keys()
       rescue
         e in [Jason.EncodeError, ArgumentError] ->
           reraise ArgumentError,

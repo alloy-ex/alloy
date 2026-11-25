@@ -324,7 +324,7 @@ defmodule Alloy.Tool.Core.Bash do
          "Custom bash executor returned invalid result: #{Sanitize.inspect_bounded(other)}"}
 
       {:ok, {:worker_exit, {:worker_crash, kind, reason, stacktrace}}} ->
-        {:error, "Executor crashed: #{format_worker_crash(kind, reason, stacktrace)}"}
+        {:error, "Executor crashed: #{Sanitize.crash_summary(kind, reason, stacktrace)}"}
 
       {:ok, {:worker_exit, reason}} ->
         {:error, "Executor crashed: #{OwnedWorker.format_exit_reason(reason)}"}
@@ -343,17 +343,6 @@ defmodule Alloy.Tool.Core.Bash do
 
   defp maybe_add_cd(opts, nil), do: opts
   defp maybe_add_cd(opts, dir), do: [{:cd, dir} | opts]
-
-  defp format_worker_crash(:error, reason, stacktrace) do
-    :error
-    |> Exception.format_banner(reason, stacktrace)
-    |> Sanitize.cap_bytes(500)
-  end
-
-  defp format_worker_crash(kind, reason, _stacktrace) do
-    "#{kind}: #{Sanitize.inspect_bounded(reason)}"
-    |> Sanitize.cap_bytes(500)
-  end
 
   defp normalize_timeout(timeout, max) when is_integer(timeout) and timeout > 0,
     do: min(timeout, max)

@@ -162,7 +162,7 @@ defmodule Alloy do
     config = Config.from_opts(config_opts)
     messages = build_messages(message, run_opts)
 
-    %{State.init(config, messages) | status: :running}
+    State.init(config, messages)
     |> Turn.run_loop(turn_opts)
     |> Result.from_state()
     |> Result.wrap()

@@ -66,10 +66,12 @@ defmodule Alloy.Agent.Turn do
 
     state = %{
       state
-      | deadline: deadline,
+      | status: :running,
+        deadline: deadline,
         run_deadline: hard_deadline,
         error: nil,
         stop_reason: nil,
+        provider_response_metadata: %{},
         run_metadata: %{}
     }
 
@@ -287,8 +289,11 @@ defmodule Alloy.Agent.Turn do
 
     reason =
       case details do
-        nil -> "The model refused to continue (stop_reason: refusal)"
-        details -> "The model refused to continue (stop_reason: refusal): #{inspect(details)}"
+        nil ->
+          "The model refused to continue (stop_reason: refusal)"
+
+        details ->
+          "The model refused to continue (stop_reason: refusal): #{Sanitize.inspect_bounded(details)}"
       end
 
     state
@@ -579,14 +584,18 @@ defmodule Alloy.Agent.Turn do
   defp decode_structured_output(
          %State{config: %{output_schema: spec}, messages: messages} = state
        ) do
-    last_assistant = messages |> Enum.reverse() |> Enum.find(&(&1.role == :assistant))
+    last_assistant =
+      messages
+      |> Enum.reverse()
+      |> Enum.take_while(&(&1.role == :assistant))
+      |> List.first()
 
     if refusal_message?(last_assistant) do
       message = "The model refused to produce structured output"
       error = %{kind: :refusal, message: message, decoded: nil}
       {:error, State.merge_run_metadata(state, %{output_error: error}), message}
     else
-      case OutputSchema.decode_and_validate_detailed(raw_assistant_text(last_assistant), spec) do
+      case OutputSchema.decode_and_validate(raw_assistant_text(last_assistant), spec) do
         {:ok, decoded} when state.stop_reason == :max_tokens ->
           message = "Structured output was truncated at :max_tokens"
           error = %{kind: :truncated, message: message, decoded: decoded}

@@ -79,7 +79,7 @@ defmodule MyApp.AlloyOtel do
 
   def handle_event([:alloy, :run, :exception], _measurements, meta, _cfg) do
     OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, meta)
-    Tracer.set_status(:error, bounded_reason(meta[:reason]))
+    Tracer.set_status(:error, safe_error_status(meta[:kind], meta[:reason]))
     OpentelemetryTelemetry.end_telemetry_span(@tracer_id, meta)
   end
 
@@ -97,7 +97,7 @@ defmodule MyApp.AlloyOtel do
 
   def handle_event([:alloy, :turn, :exception], _measurements, meta, _cfg) do
     OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, meta)
-    Tracer.set_status(:error, bounded_reason(meta[:reason]))
+    Tracer.set_status(:error, safe_error_status(meta[:kind], meta[:reason]))
     OpentelemetryTelemetry.end_telemetry_span(@tracer_id, meta)
   end
 
@@ -134,9 +134,11 @@ defmodule MyApp.AlloyOtel do
     })
   end
 
-  defp bounded_reason(reason) do
-    inspect(reason, limit: 20, printable_limit: 500)
-  end
+  # Record only the exception module or crash kind so raw exception terms
+  # (such as KeyError/MatchError on structs holding provider_config or context)
+  # are never exported to your trace backend.
+  defp safe_error_status(_kind, reason) when is_exception(reason), do: inspect(reason.__struct__)
+  defp safe_error_status(kind, _reason), do: to_string(kind || :error)
 
   defp provider_name(Alloy.Provider.Anthropic), do: "anthropic"
   defp provider_name(Alloy.Provider.OpenAI), do: "openai"

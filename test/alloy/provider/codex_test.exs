@@ -399,6 +399,29 @@ defmodule Alloy.Provider.CodexTest do
       end
     end
 
+    test "non-map tool_calls entry returns non-retryable :protocol_error instead of raising" do
+      for bad_entry <- ["bad", nil, 123] do
+        config = %{
+          model: "test-model",
+          command_runner:
+            fake_runner(fn _args, _opts, output_path ->
+              File.write!(
+                output_path,
+                Jason.encode!(%{stop_reason: "tool_use", text: "", tool_calls: [bad_entry]})
+              )
+
+              ""
+            end)
+        }
+
+        assert {:error, %Error{kind: :protocol_error, message: msg} = error} =
+                 Codex.complete([Message.user("Work")], [], config)
+
+        assert msg =~ "invalid Codex tool call entry"
+        refute Error.retryable?(error)
+      end
+    end
+
     test "returns an end_turn assistant message from Codex JSON output" do
       config = %{
         model: "gpt-5.4",

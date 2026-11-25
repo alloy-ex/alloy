@@ -16,7 +16,7 @@ defmodule Alloy.OutputSchemaTest do
     additionalProperties: false
   }
 
-  describe "normalize!/1 and wire/1" do
+  describe "normalize!/1" do
     test "returns nil for nil and normalizes plain JSON Schema maps" do
       assert OutputSchema.normalize!(nil) == nil
 
@@ -102,6 +102,10 @@ defmodule Alloy.OutputSchemaTest do
 
       assert_raise ArgumentError, ~r/:name must match/, fn ->
         OutputSchema.normalize!(%{name: "bad name!", schema: @answer_schema})
+      end
+
+      assert_raise ArgumentError, ~r/:name must match/, fn ->
+        OutputSchema.normalize!(%{name: "out\n", schema: @answer_schema})
       end
 
       assert_raise ArgumentError, ~r/:strict must be a boolean/, fn ->
@@ -194,7 +198,7 @@ defmodule Alloy.OutputSchemaTest do
                  draft_2020.(%{"type" => ["string", "null"]})
                )
 
-      assert {:error, msg} =
+      assert {:error, %{kind: :schema_mismatch, message: msg}} =
                OutputSchema.decode_and_validate(
                  "123",
                  draft_2020.(%{"type" => ["string", "null"]})
@@ -202,12 +206,12 @@ defmodule Alloy.OutputSchemaTest do
 
       assert msg =~ "did not match any expected JSON type"
 
-      assert {:error, type_msg} =
+      assert {:error, %{kind: :schema_mismatch, message: type_msg}} =
                OutputSchema.decode_and_validate("123", draft_2020.(%{"type" => "string"}))
 
       assert type_msg =~ "expected JSON type"
 
-      assert {:error, missing_msg} =
+      assert {:error, %{kind: :missing_text, message: missing_msg}} =
                OutputSchema.decode_and_validate(nil, OutputSchema.normalize!(@answer_schema))
 
       assert missing_msg =~ "missing assistant text"
@@ -249,6 +253,17 @@ defmodule Alloy.OutputSchemaTest do
         })
       end
 
+      # Draft 2019-09/2020-12 dependentSchemas map values (including literal "default") are checked.
+      assert_raise ArgumentError, ~r/output_schema.*local \$ref/, fn ->
+        OutputSchema.normalize!(%{
+          "$schema" => "https://json-schema.org/draft/2020-12/schema",
+          "type" => "object",
+          "dependentSchemas" => %{
+            "default" => %{"$ref" => "https://attacker.example/dependent.json"}
+          }
+        })
+      end
+
       # Local $ref inside literal example/const keywords is ignored.
       spec =
         OutputSchema.normalize!(%{
@@ -268,7 +283,10 @@ defmodule Alloy.OutputSchemaTest do
         })
 
       bad_items = Jason.encode!(List.duplicate("not-an-int", 25))
-      assert {:error, msg} = OutputSchema.decode_and_validate(bad_items, array_spec)
+
+      assert {:error, %{kind: :schema_mismatch, message: msg}} =
+               OutputSchema.decode_and_validate(bad_items, array_spec)
+
       assert msg =~ "(+15 more)"
       assert byte_size(msg) <= 1_100
     end
@@ -1454,8 +1472,20 @@ defmodule Alloy.OutputSchemaTest do
       refute Map.has_key?(Map.get(result4.metadata, :run, %{}), :output_error)
 
       # Reused State after :stop_after_tool (final_tool) and provider_error must
-      # reset run_metadata, error, and stop_reason so subsequent runs still decode
-      # :output_schema and do not leak prior tool output or provider_error.
+      # reset status, run_metadata, provider_response_metadata, error, and
+      # stop_reason so subsequent runs see :running in middleware, decode
+      # :output_schema, and do not leak prior tool output, metadata, or errors.
+      defmodule RecordStatusMiddleware do
+        @behaviour Alloy.Middleware
+
+        def call(:before_completion, state) do
+          send(state.config.context.test_pid, {:before_completion_status, state.status})
+          state
+        end
+
+        def call(_hook, state), do: state
+      end
+
       finish_tool =
         Alloy.Tool.inline(
           name: "finish",
@@ -1464,9 +1494,11 @@ defmodule Alloy.OutputSchemaTest do
           execute: fn _, _ -> {:ok, "run 1 tool output"} end
         )
 
+      {:ok, tool_reply} = Alloy.Testing.tool_response("finish", %{})
+
       {:ok, reused_pid} =
         Alloy.Provider.Test.start_link([
-          Alloy.Testing.tool_response("finish", %{}),
+          {:ok, Map.put(tool_reply, :response_metadata, %{request_id: "req-run-1"})},
           {:error, %Error{kind: :auth, status: 401, message: "bad key"}},
           Alloy.Testing.text_response(~s({"answer":"fresh","confidence":1}))
         ])
@@ -1475,30 +1507,37 @@ defmodule Alloy.OutputSchemaTest do
         Config.from_opts(
           provider: {Alloy.Provider.Test, agent_pid: reused_pid},
           tools: [finish_tool],
+          middleware: [RecordStatusMiddleware],
+          context: %{test_pid: self()},
           stop_after_tool: "finish",
           output_schema: @answer_schema
         )
 
       s1 = State.init(reused_cfg, [Message.user("step 1")]) |> Turn.run_loop()
+      assert_received {:before_completion_status, :running}
       r1 = Result.from_state(s1)
       assert r1.status == :completed
       assert r1.text == "run 1 tool output"
       assert r1.metadata.final_tool.name == "finish"
+      assert r1.metadata.provider_response == %{request_id: "req-run-1"}
 
       s2 =
         s1
         |> State.append_messages([Message.user("step 2")])
         |> Turn.run_loop()
 
+      assert_received {:before_completion_status, :running}
       r2 = Result.from_state(s2)
       assert r2.status == :error
       assert %Error{kind: :auth} = r2.metadata.run.provider_error
+      refute Map.has_key?(r2.metadata, :provider_response)
 
       s3 =
         s2
         |> State.append_messages([Message.user("step 3")])
         |> Turn.run_loop()
 
+      assert_received {:before_completion_status, :running}
       r3 = Result.from_state(s3)
       assert r3.status == :completed
       assert r3.error == nil
@@ -1506,6 +1545,39 @@ defmodule Alloy.OutputSchemaTest do
       assert r3.output == %{"answer" => "fresh", "confidence" => 1}
       refute Map.has_key?(r3.metadata, :final_tool)
       refute Map.has_key?(Map.get(r3.metadata, :run, %{}), :provider_error)
+    end
+
+    test "does not decode an earlier turn's assistant JSON when the final turn returns no messages" do
+      {:ok, pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [],
+             usage: %{input_tokens: 2, output_tokens: 0}
+           }}
+        ])
+
+      prior_messages = [
+        Message.user("turn 1"),
+        Message.assistant(~s({"answer":"stale","confidence":0.99}))
+      ]
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                metadata: %{
+                  run: %{
+                    output_error: %{kind: :missing_text, decoded: nil}
+                  }
+                }
+              }} =
+               Alloy.run("turn 2",
+                 messages: prior_messages,
+                 provider: {Alloy.Provider.Test, agent_pid: pid},
+                 output_schema: @answer_schema
+               )
     end
 
     test "fails unconditionally with :truncated when :max_tokens cuts off a valid JSON prefix" do

@@ -494,12 +494,20 @@ defmodule Alloy.Provider.Codex do
   defp finalize_reduced_tool_blocks(blocks, text),
     do: finalize_tool_blocks(text, Enum.reverse(blocks))
 
-  defp build_tool_block(tool_call, index) do
+  defp build_tool_block(tool_call, index) when is_map(tool_call) do
     with {:ok, call_id} <- tool_call_id(tool_call, index),
          {:ok, name} <- fetch_string(tool_call, "name"),
          {:ok, arguments} <- fetch_arguments(tool_call) do
       {:ok, %{type: "tool_use", id: call_id, name: name, input: arguments}}
     end
+  end
+
+  defp build_tool_block(other, _index) do
+    {:error,
+     %Error{
+       kind: :protocol_error,
+       message: "invalid Codex tool call entry: #{Sanitize.inspect_bounded(other)}"
+     }}
   end
 
   defp finalize_tool_blocks(_text, []) do

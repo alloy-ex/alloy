@@ -490,6 +490,27 @@ defmodule Alloy.Tool.Core.BashTest do
       end
     end
 
+    test "custom executor crashes omit secrets captured in structural errors, exits, and throws" do
+      secret = "sk-bash-executor-secret-42"
+      creds = Map.new(api_key: secret, ssh_token: secret)
+
+      cases = [
+        {fn _, _ -> Map.fetch!(creds, :missing_key) end, "KeyError (key :missing_key not found)"},
+        {fn _, _ -> {:ok, _} = Function.identity({:error, creds}) end, "MatchError"},
+        {fn _, _ -> exit({:failed, creds}) end, "exit: unexpected tuple"},
+        {fn _, _ -> throw(creds) end, "throw: unexpected map"}
+      ]
+
+      for {executor, expected} <- cases do
+        assert {:error, msg} =
+                 Bash.execute(%{"command" => "echo hi"}, %{bash_executor: executor})
+
+        assert msg =~ "Executor crashed:"
+        assert msg =~ expected
+        refute msg =~ secret
+      end
+    end
+
     test "custom executor dies when caller is killed and inherits Logger metadata and OTel context" do
       test_pid = self()
       logger_meta = [request_id: "bash-req-7"]

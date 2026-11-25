@@ -52,4 +52,83 @@ defmodule Alloy.Internal.SanitizeTest do
              ]
     end
   end
+
+  describe "exception_summary/2" do
+    test "caps RuntimeError messages at UTF-8 boundaries and omits structural terms" do
+      long_msg = "boom " <> String.duplicate("🎉", 20)
+      summary = Sanitize.exception_summary(%RuntimeError{message: long_msg}, 12)
+      assert String.valid?(summary)
+      assert byte_size(summary) <= 12
+      assert String.starts_with?(summary, "boom ")
+
+      assert Sanitize.exception_summary(%ArgumentError{message: "argument error"}) ==
+               "argument error"
+
+      assert Sanitize.exception_summary(%ArgumentError{message: "bad secret sk-arg"}) ==
+               "ArgumentError"
+
+      assert Sanitize.exception_summary(%KeyError{key: :db_url, term: %{api_key: "sk-123"}}) ==
+               "KeyError (key :db_url not found)"
+
+      assert Sanitize.exception_summary(%KeyError{key: "sk-string-key", term: %{secret: "x"}}) ==
+               "KeyError"
+
+      assert Sanitize.exception_summary(%MatchError{term: %{api_key: "sk-match"}}) == "MatchError"
+
+      assert Sanitize.exception_summary(%CaseClauseError{term: %{api_key: "sk-case"}}) ==
+               "CaseClauseError"
+    end
+  end
+
+  describe "exit_summary/2 and crash_summary/4" do
+    test "unwraps stacktrace and OTP call-exit wrappers without leaking terms or args" do
+      stack = [{MyMod, :run, 1, [file: ~c"a.ex", line: 1]}]
+      fun_stack = [{&Function.identity/1, 1, [file: ~c"b.ex", line: 2]}]
+      secret = %{api_key: "sk-super-secret"}
+
+      assert Sanitize.exit_summary(
+               {{%KeyError{key: :db_url, term: secret}, stack}, {Task, :await, [secret, 5_000]}}
+             ) == "KeyError (key :db_url not found)"
+
+      assert Sanitize.exit_summary(
+               {:timeout, {GenServer, :call, [self(), {:query, secret}, 5_000]}}
+             ) == ":timeout"
+
+      assert Sanitize.exit_summary({{:badkey, :token, secret}, fun_stack}) ==
+               "KeyError (key :token not found)"
+
+      assert Sanitize.exit_summary({{:badmatch, secret}, stack}) == "MatchError"
+      assert Sanitize.exit_summary({{:nocatch, :boom}, stack}) == "nocatch: :boom"
+      assert Sanitize.exit_summary({{:nocatch, secret}, stack}) == "nocatch: unexpected map"
+      assert Sanitize.exit_summary({:custom_atom, stack}) == ":custom_atom"
+
+      assert Sanitize.exit_summary({%KeyError{key: :x, term: secret}, []}) ==
+               "KeyError (key :x not found)"
+
+      assert Sanitize.exit_summary({{:nocatch, :x}, [:not_a_stack]}) == "unexpected tuple"
+      assert Sanitize.exit_summary({:not_exception, [:not_a_stack]}) == "unexpected tuple"
+      assert Sanitize.exit_summary({:nocatch, :direct}) == "nocatch: :direct"
+      assert Sanitize.exit_summary({:shutdown, :closed}) == "{:shutdown, :closed}"
+      assert Sanitize.exit_summary({:shutdown, secret}) == "{:shutdown, ...}"
+      assert Sanitize.exit_summary(%MatchError{term: secret}) == "MatchError"
+      assert Sanitize.exit_summary(42) == "42"
+      assert Sanitize.exit_summary(URI.parse("https://example.com")) == "unexpected URI"
+      assert Sanitize.exit_summary(secret) == "unexpected map"
+      assert Sanitize.exit_summary({:secret, "sk-123"}) == "unexpected tuple"
+      assert Sanitize.exit_summary(["sk-123"]) == "unexpected list"
+      assert Sanitize.exit_summary("sk-123") == "unexpected binary"
+      assert Sanitize.exit_summary(self()) == "unexpected term"
+
+      assert Sanitize.crash_summary(:error, :badarg, stack) == "argument error"
+
+      assert Sanitize.crash_summary(:error, {:badkey, :k, secret}, stack) ==
+               "KeyError (key :k not found)"
+
+      assert Sanitize.crash_summary(:error, :custom_err, stack) == "error: :custom_err"
+      assert Sanitize.crash_summary(:throw, :stop_now, []) == "throw: :stop_now"
+      assert Sanitize.crash_summary(:throw, secret, []) == "throw: unexpected map"
+      assert Sanitize.crash_summary(:exit, :gone, []) == "exit: :gone"
+      assert Sanitize.crash_summary(:exit, {:secret, secret}, []) == "exit: unexpected tuple"
+    end
+  end
 end

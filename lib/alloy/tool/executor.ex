@@ -427,7 +427,7 @@ defmodule Alloy.Tool.Executor do
 
   defp exit_outcome(call, reason, _run, _deadline_capped?, _deadline_hit?) do
     {:error,
-     "Tool #{call[:name]} crashed during execution: #{Sanitize.inspect_bounded(exit_reason(reason))}. " <>
+     "Tool #{call[:name]} crashed during execution: #{Sanitize.exit_summary(reason)}. " <>
        "Check the input and try again.", nil}
   end
 
@@ -440,11 +440,6 @@ defmodule Alloy.Tool.Executor do
 
     {:error, "Tool #{call[:name]} timed out because the run deadline#{detail} was reached.", nil}
   end
-
-  # The model sees the reason without the stacktrace a throw or exit carries.
-  defp exit_reason({reason, [{_mod, _fun, _arity_or_args, _location} | _]}), do: reason
-  defp exit_reason({reason, [{_fun, _arity_or_args, _location} | _]}), do: reason
-  defp exit_reason(reason), do: reason
 
   defp finish(started, outcome, run) do
     %{call: call, start_seq: start_seq} = started

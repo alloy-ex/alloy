@@ -11,7 +11,7 @@ defmodule Alloy.Tool.Validation do
   @compile {:no_warn_undefined, [Schema, Ref, Root, Validator]}
 
   @literal_keywords ~w(const enum default examples)
-  @schema_map_keywords ~w(properties patternProperties definitions $defs dependencies)
+  @schema_map_keywords ~w(properties patternProperties definitions $defs dependencies dependentSchemas)
   @max_output_validation_errors 10
   @max_output_validation_bytes 1_000
 
