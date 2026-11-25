@@ -805,7 +805,7 @@ defmodule Alloy.Provider.Gemini do
   defp maybe_put_output_schema(generation_config, %{schema: schema}) do
     generation_config
     |> maybe_put_new("responseMimeType", "application/json")
-    |> maybe_put_new("responseJsonSchema", schema)
+    |> Map.put("responseJsonSchema", schema)
   end
 
   defp validate_output_schema_conflicts(body, _raw_generation_config, nil), do: {:ok, body}

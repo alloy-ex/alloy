@@ -16,14 +16,21 @@ defmodule Alloy.OutputSchema do
   @name_pattern ~r/^[a-zA-Z0-9_-]{1,64}$/
   @wrapper_keys [:name, :schema, :strict, "name", "schema", "strict"]
 
+  @derive {Inspect, except: [:resolved]}
   @enforce_keys [:name, :schema, :strict]
   defstruct [:name, :schema, :strict, :resolved]
 
+  @typedoc """
+  Normalized `:output_schema` struct.
+
+  `:resolved` is an internal validation cache bound to `{name, schema, strict}`
+  and excluded from `Inspect`.
+  """
   @type t :: %__MODULE__{
           name: String.t(),
           schema: map(),
           strict: boolean(),
-          resolved: {:ok, term()} | :fallback | nil
+          resolved: {:cached, {String.t(), map(), boolean()}, {:ok, term()} | :fallback} | nil
         }
 
   @type output_error_kind ::
@@ -48,11 +55,12 @@ defmodule Alloy.OutputSchema do
   @spec normalize!(term()) :: t() | nil
   def normalize!(nil), do: nil
 
-  def normalize!(%__MODULE__{resolved: {:ok, _}} = spec), do: spec
-  def normalize!(%__MODULE__{resolved: :fallback} = spec), do: spec
-
-  def normalize!(%__MODULE__{name: name, schema: schema, strict: strict}) do
-    normalize_wrapper!(%{name: name, schema: schema, strict: strict})
+  def normalize!(%__MODULE__{} = spec) do
+    if valid_cache?(spec) do
+      spec
+    else
+      normalize_wrapper!(%{name: spec.name, schema: spec.schema, strict: spec.strict})
+    end
   end
 
   def normalize!(%_{} = struct) do
@@ -70,7 +78,7 @@ defmodule Alloy.OutputSchema do
         name: @default_name,
         schema: normalized,
         strict: true,
-        resolved: resolved
+        resolved: {:cached, {@default_name, normalized, true}, resolved}
       }
     end
   end
@@ -83,7 +91,6 @@ defmodule Alloy.OutputSchema do
   @doc false
   @spec wire(term()) :: t() | nil
   def wire(nil), do: nil
-  def wire(%__MODULE__{} = spec), do: spec
   def wire(raw), do: normalize!(raw)
 
   @doc """
@@ -104,15 +111,13 @@ defmodule Alloy.OutputSchema do
   @doc false
   @spec decode_and_validate_detailed(String.t() | nil, t()) ::
           {:ok, term()} | {:error, output_error()}
-  def decode_and_validate_detailed(text, %__MODULE__{
-        name: name,
-        schema: schema,
-        resolved: resolved
-      })
+  def decode_and_validate_detailed(text, %__MODULE__{} = spec)
       when is_binary(text) and text != "" do
+    %__MODULE__{schema: schema, resolved: {:cached, _key, resolution}} = normalize!(spec)
+
     case Jason.decode(text) do
       {:ok, decoded} ->
-        case validate_decoded(decoded, schema, name, resolved) do
+        case validate_decoded(decoded, schema, resolution) do
           {:ok, value} ->
             {:ok, value}
 
@@ -171,7 +176,7 @@ defmodule Alloy.OutputSchema do
         name: name,
         schema: normalized,
         strict: strict,
-        resolved: resolved
+        resolved: {:cached, {name, normalized, strict}, resolved}
       }
     else
       raise ArgumentError,
@@ -237,23 +242,26 @@ defmodule Alloy.OutputSchema do
 
   # ── Validation ───────────────────────────────────────────────────────────
 
-  defp validate_decoded(decoded, _schema, _name, {:ok, resolved}) do
+  defp valid_cache?(%__MODULE__{
+         name: name,
+         schema: schema,
+         strict: strict,
+         resolved: {:cached, {name, schema, strict}, resolution}
+       }) do
+    Validation.valid_resolved_output?(resolution)
+  end
+
+  defp valid_cache?(_spec), do: false
+
+  defp validate_decoded(decoded, _schema, {:ok, resolved}) do
     case Validation.validate_resolved_output(resolved, decoded) do
       :ok -> {:ok, decoded}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp validate_decoded(decoded, schema, _name, :fallback) do
+  defp validate_decoded(decoded, schema, :fallback) do
     validate_basic(decoded, schema)
-  end
-
-  defp validate_decoded(decoded, schema, name, nil) do
-    case Validation.validate_output(schema, decoded, name) do
-      :ok -> {:ok, decoded}
-      {:error, reason} -> {:error, reason}
-      :fallback -> validate_basic(decoded, schema)
-    end
   end
 
   defp validate_basic(decoded, schema) do

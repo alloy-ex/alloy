@@ -133,9 +133,13 @@ automatically during compaction summaries, decodes the final JSON into
   `result.metadata.run.output_error` with
   `%{kind: :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text, message: ..., decoded: ...}`
   so host repair loops can inspect `kind` and any `decoded` value directly; no
-  automatic repair turn). The assistant reply stays in `result.messages` and
-  `result.text` (`result.text` joins multiple text blocks with `"\n"` whereas
-  JSON decoding joins them with `""`). When `:stop_after_tool` finishes a run,
+  automatic repair turn). For decode/validation failures and content-block
+  refusals (OpenAI Responses / Chat Completions), the assistant reply stays in
+  `result.messages` and `result.text` (`result.text` joins multiple text blocks
+  with `"\n"` whereas JSON decoding joins them with `""`); for stop-reason
+  refusals (Anthropic `stop_reason: "refusal"`, Gemini safety filters,
+  `content_filter`), Alloy discards the refused response so `result.text` /
+  `result.messages` do not contain it. When `:stop_after_tool` finishes a run,
   `:output_schema` decoding is skipped and `result.output` is `nil`.
 - **Strict mode & provider portability:** Pass `:output_schema` as a top-level
   `Alloy.run/2` / `Alloy.stream/3` option (passing it inside provider config

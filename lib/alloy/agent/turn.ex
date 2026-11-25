@@ -292,9 +292,6 @@ defmodule Alloy.Agent.Turn do
   defp maybe_record_refusal_output_error(%State{config: %{output_schema: nil}} = state, _reason),
     do: state
 
-  defp maybe_record_refusal_output_error(%State{run_metadata: %{final_tool: _}} = state, _reason),
-    do: state
-
   defp maybe_record_refusal_output_error(state, reason) do
     State.merge_run_metadata(state, %{
       output_error: %{kind: :refusal, message: reason, decoded: nil}

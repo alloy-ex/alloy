@@ -60,6 +60,19 @@ defmodule Alloy.Tool.Validation do
   end
 
   @doc false
+  # Returns true when a cached resolution term matches the current runtime
+  # environment and struct shape (preventing forged caches or missing optional
+  # dependency crashes).
+  @spec valid_resolved_output?(term()) :: boolean()
+  def valid_resolved_output?(:fallback), do: true
+
+  def valid_resolved_output?({:ok, root}) do
+    Code.ensure_loaded?(Validator) and is_map(root) and Map.get(root, :__struct__) == Root
+  end
+
+  def valid_resolved_output?(_other), do: false
+
+  @doc false
   # Validates decoded structured output against an already-resolved schema.
   @spec validate_resolved_output(term(), term()) :: :ok | {:error, String.t()}
   def validate_resolved_output(resolved, decoded) do
@@ -72,24 +85,10 @@ defmodule Alloy.Tool.Validation do
     end
   end
 
-  @doc false
-  # Validates decoded structured output against `schema` using `:ex_json_schema`
-  # when available and supported, or returns `:fallback` for basic structural
-  # validation when the optional dep is absent or the dialect is unsupported.
-  @spec validate_output(map(), term(), String.t()) :: :ok | {:error, String.t()} | :fallback
-  def validate_output(schema, decoded, name) when is_map(schema) do
-    case resolve_output_schema(schema, name) do
-      {:ok, resolved} -> validate_resolved_output(resolved, decoded)
-      :fallback -> :fallback
-    end
-  end
-
   defp resolve_output_schema(schema, name) do
-    local_refs_basic!(schema, :output)
+    local_refs!(schema, :output)
 
     if Code.ensure_loaded?(Schema) do
-      local_refs!(schema, :output)
-
       try do
         resolved = schema |> Schema.resolve() |> normalize_literal_property_schemas!(:output)
         {:ok, resolved}
@@ -114,63 +113,6 @@ defmodule Alloy.Tool.Validation do
     else
       :fallback
     end
-  end
-
-  defp local_refs_basic!(schema, subject) do
-    {defined_ids, refs} = collect_basic_scopes_and_refs(schema, "", MapSet.new(), [])
-    Enum.each(refs, &validate_basic_ref!(&1, defined_ids, subject))
-  end
-
-  defp collect_basic_scopes_and_refs(map, scope, defined_ids, refs) when is_map(map) do
-    {next_scope, defined_ids} = advance_scope(map, scope, defined_ids)
-
-    Enum.reduce(map, {defined_ids, refs}, fn
-      {key, _value}, acc when key in @literal_keywords ->
-        acc
-
-      {key, value}, acc when key in @schema_map_keywords and is_map(value) ->
-        Enum.reduce(value, acc, fn {_prop, subschema}, {ids, r} ->
-          collect_basic_scopes_and_refs(subschema, next_scope, ids, r)
-        end)
-
-      {"$ref", ref}, {ids, r} when is_binary(ref) ->
-        {ids, [{ref, next_scope} | r]}
-
-      {_key, value}, {ids, r} when is_map(value) ->
-        collect_basic_scopes_and_refs(value, next_scope, ids, r)
-
-      {_key, values}, acc when is_list(values) ->
-        Enum.reduce(values, acc, fn
-          item, {ids, r} when is_map(item) ->
-            collect_basic_scopes_and_refs(item, next_scope, ids, r)
-
-          _non_map, inner ->
-            inner
-        end)
-
-      {_key, _value}, acc ->
-        acc
-    end)
-  end
-
-  defp collect_basic_scopes_and_refs(_other, _scope, defined_ids, refs), do: {defined_ids, refs}
-
-  defp validate_basic_ref!({"#" <> _ref, ""}, _defined_ids, _subject), do: :ok
-
-  defp validate_basic_ref!({"#" <> _ = ref, ref_scope}, defined_ids, subject) do
-    scoped_str = scoped_ref_string(ref, ref_scope)
-    base = scoped_str |> URI.parse() |> Map.put(:fragment, nil) |> to_string()
-
-    unless base == "" or MapSet.member?(defined_ids, base) do
-      raise ArgumentError,
-            "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)} " <>
-              "(resolves to uncached #{inspect(scoped_str)} under $id scope #{inspect(ref_scope)})"
-    end
-  end
-
-  defp validate_basic_ref!({ref, _ref_scope}, _defined_ids, subject) do
-    raise ArgumentError,
-          "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)}"
   end
 
   defp format_output_errors(errors) do
@@ -242,34 +184,62 @@ defmodule Alloy.Tool.Validation do
   end
 
   defp local_refs!(schema, subject) do
-    {defined_ids, refs} = collect_scopes_and_refs(schema, "", MapSet.new(), [])
+    {defined_ids, refs} = collect_scopes_and_refs(schema, "", MapSet.new(), [], true)
+
     # Dynamic struct!/2 avoids a compile-time dependency on optional ex_json_schema.
-    root = struct!(Root, refs: Map.new(defined_ids, &{&1, true}))
-    Enum.each(refs, &validate_local_ref!(&1, root, subject))
+    root =
+      if Code.ensure_loaded?(Schema),
+        do: struct!(Root, refs: Map.new(defined_ids, &{&1, true})),
+        else: nil
+
+    Enum.each(refs, &validate_local_ref!(&1, defined_ids, root, subject))
   end
 
-  # Mirrors ExJsonSchema.Schema.resolve_with_root/3 and resolve_property/3
-  # (verified against ex_json_schema 0.11.x): tracks $id/id scopes on every map
-  # (including schema-map containers like $defs/properties), skips
-  # const/enum/default/examples everywhere, and only descends into maps directly
-  # inside lists (leaving nested lists untouched).
-  defp collect_scopes_and_refs(map, scope, defined_ids, refs) when is_map(map) do
-    {next_scope, defined_ids} = advance_scope(map, scope, defined_ids)
+  # Tracks $id/id scopes across schema maps and descends into schema-map
+  # containers (properties, $defs, etc.) including literal-named property keys
+  # and container-level $ref entries, while skipping schema-level literal
+  # keywords (const/enum/default/examples) and nested non-map list elements.
+  # Inside literal-named properties (e.g. properties.default), $ref entries are
+  # still collected and checked, but $id/id values are not added to defined_ids
+  # because ExJsonSchema does not cache them during Schema.resolve/1.
+  defp collect_scopes_and_refs(map, scope, defined_ids, refs, record_ids?) when is_map(map) do
+    {next_scope, defined_ids} =
+      if record_ids?,
+        do: advance_scope(map, scope, defined_ids),
+        else: {advance_scope_only(map, scope), defined_ids}
 
     Enum.reduce(map, {defined_ids, refs}, fn
       {key, _value}, acc when key in @literal_keywords ->
         acc
 
+      {key, value}, {ids, ref_acc} when key in @schema_map_keywords and is_map(value) ->
+        {map_scope, ids} =
+          if record_ids?,
+            do: advance_scope(value, next_scope, ids),
+            else: {advance_scope_only(value, next_scope), ids}
+
+        Enum.reduce(value, {ids, ref_acc}, fn
+          {"$ref", ref}, {i, r} when is_binary(ref) ->
+            {i, [{ref, map_scope} | r]}
+
+          {prop, subschema}, {i, r} ->
+            child_record_ids? = record_ids? and prop not in @literal_keywords
+            collect_scopes_and_refs(subschema, map_scope, i, r, child_record_ids?)
+        end)
+
       {"$ref", ref}, {ids, ref_acc} when is_binary(ref) ->
         {ids, [{ref, next_scope} | ref_acc]}
 
       {_key, value}, {ids, ref_acc} when is_map(value) ->
-        collect_scopes_and_refs(value, next_scope, ids, ref_acc)
+        collect_scopes_and_refs(value, next_scope, ids, ref_acc, record_ids?)
 
       {_key, values}, {ids, ref_acc} when is_list(values) ->
         Enum.reduce(values, {ids, ref_acc}, fn
-          item, {i, r} when is_map(item) -> collect_scopes_and_refs(item, next_scope, i, r)
-          _non_map, acc -> acc
+          item, {i, r} when is_map(item) ->
+            collect_scopes_and_refs(item, next_scope, i, r, record_ids?)
+
+          _non_map, acc ->
+            acc
         end)
 
       {_key, _value}, acc ->
@@ -277,7 +247,8 @@ defmodule Alloy.Tool.Validation do
     end)
   end
 
-  defp collect_scopes_and_refs(_value, _scope, defined_ids, refs), do: {defined_ids, refs}
+  defp collect_scopes_and_refs(_value, _scope, defined_ids, refs, _record_ids?),
+    do: {defined_ids, refs}
 
   # ExJsonSchema skips @literal_keywords during resolve_property/3 even when
   # used as property/definition names inside @schema_map_keywords. That skips
@@ -470,19 +441,27 @@ defmodule Alloy.Tool.Validation do
   end
 
   # Mirrors ExJsonSchema.Schema.resolve_property/3 and delegates cache-key
-  # matching to ExJsonSchema.Schema.Ref so preflight and resolution cannot drift.
-  defp validate_local_ref!({"#" <> _ = ref, ref_scope}, root, subject) do
+  # matching to ExJsonSchema.Schema.Ref when loaded (falling back to the
+  # defined_ids URI base check when :ex_json_schema is absent).
+  defp validate_local_ref!({"#" <> _ = ref, ref_scope}, defined_ids, root, subject) do
     scoped_str = scoped_ref_string(ref, ref_scope)
-    parsed_ref = Ref.from_string(scoped_str, root)
 
-    unless Ref.cached?(parsed_ref, root) do
+    cached? =
+      if root do
+        scoped_str |> Ref.from_string(root) |> Ref.cached?(root)
+      else
+        base = scoped_str |> URI.parse() |> Map.put(:fragment, nil) |> to_string()
+        base == "" or MapSet.member?(defined_ids, base)
+      end
+
+    unless cached? do
       raise ArgumentError,
             "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)} " <>
               "(resolves to uncached #{inspect(scoped_str)} under $id scope #{inspect(ref_scope)})"
     end
   end
 
-  defp validate_local_ref!({ref, _ref_scope}, _root, subject) do
+  defp validate_local_ref!({ref, _ref_scope}, _defined_ids, _root, subject) do
     raise ArgumentError,
           "#{schema_subject(subject, :require)} local $ref values, got: #{inspect(ref)}"
   end

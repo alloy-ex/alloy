@@ -35,6 +35,54 @@ defmodule Alloy.OutputSchemaTest do
 
       assert {:ok, %{"answer" => "ok", "confidence" => 1}} =
                OutputSchema.decode_and_validate(~s({"answer":"ok","confidence":1}), hand_built)
+
+      # Inspect omits the internal :resolved cache.
+      refute inspect(spec) =~ "resolved:"
+
+      # Mutating :schema on an already-normalized struct invalidates the cache on
+      # normalize!/1, State.prepare/2, and decode_and_validate/2.
+      new_schema = %{
+        type: "object",
+        properties: %{ok: %{type: "boolean"}},
+        required: ["ok"],
+        additionalProperties: false
+      }
+
+      mutated = %{spec | schema: new_schema}
+      config = Config.from_opts(provider: Alloy.Provider.Test, output_schema: @answer_schema)
+      prepared = State.prepare(State.init(config), output_schema: mutated)
+
+      assert {:ok, %{"ok" => true}} =
+               OutputSchema.decode_and_validate(~s({"ok":true}), prepared.config.output_schema)
+
+      assert {:error, _} =
+               OutputSchema.decode_and_validate(
+                 ~s({"answer":"old","confidence":1}),
+                 prepared.config.output_schema
+               )
+
+      assert_raise ArgumentError, ~r/local \$ref/, fn ->
+        State.prepare(State.init(config),
+          output_schema: %{
+            spec
+            | schema: %{
+                type: "object",
+                properties: %{x: %{"$ref" => "https://example.com/a.json"}}
+              }
+          }
+        )
+      end
+
+      # Forged :resolved cache is ignored and re-normalized safely.
+      forged = %OutputSchema{
+        name: "forged",
+        schema: spec.schema,
+        strict: true,
+        resolved: {:cached, {"forged", spec.schema, true}, {:ok, :fake_root}}
+      }
+
+      assert {:ok, %{"answer" => "ok", "confidence" => 1}} =
+               OutputSchema.decode_and_validate(~s({"answer":"ok","confidence":1}), forged)
     end
 
     test "normalizes wrapper maps with custom name and strict flag" do
@@ -174,6 +222,14 @@ defmodule Alloy.OutputSchemaTest do
         OutputSchema.normalize!(%{
           type: "object",
           properties: %{default: %{"$ref" => "https://example.com/default.json"}}
+        })
+      end
+
+      # Container-level $ref directly on "properties" is also rejected.
+      assert_raise ArgumentError, ~r/output_schema.*local \$ref/, fn ->
+        OutputSchema.normalize!(%{
+          type: "object",
+          properties: %{"$ref" => "https://example.com/container.json"}
         })
       end
 

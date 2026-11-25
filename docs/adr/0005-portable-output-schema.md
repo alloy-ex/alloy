@@ -67,13 +67,17 @@ decoded into `Alloy.Result.output`:
      machine-readable `result.metadata.run.output_error` carrying
      `%{kind: :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text, message: String.t(), decoded: term() | nil}`
      so host repair loops can branch without parsing error strings or
-     re-decoding mismatched JSON). The assistant reply stays in
-     `result.messages` and `result.text` (note `result.text` joins multiple
-     text blocks with `"\n"` while decoding joins with `""`). If
-     `:after_completion` middleware halts the run, `result.status` is `:halted`
-     and `result.output` is `nil` (the validated value was available inside
-     `:after_completion` on `state.run_metadata.output`). Alloy does not run an
-     automatic repair turn.
+     re-decoding mismatched JSON). For decode/validation failures and
+     content-block refusals (OpenAI Responses / Chat Completions), the
+     assistant reply stays in `result.messages` and `result.text` (note
+     `result.text` joins multiple text blocks with `"\n"` while decoding joins
+     with `""`). For stop-reason refusals (Anthropic `stop_reason: "refusal"`,
+     Gemini safety filters, `content_filter`), `Turn.refuse/2` discards the
+     refused response's messages, so `result.text` and `result.messages` do not
+     contain the refused reply. If `:after_completion` middleware halts the
+     run, `result.status` is `:halted` and `result.output` is `nil` (the
+     validated value was available inside `:after_completion` on
+     `state.run_metadata.output`). Alloy does not run an automatic repair turn.
 5. **Portability limits:** `:output_schema` is sent on every completion turn.
    Gemini models prior to Gemini 3 and some OpenAI-compatible servers reject
    combining tool declarations with native JSON Schema output; hosts targeting
