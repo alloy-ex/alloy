@@ -13,6 +13,7 @@ defmodule Alloy.Events do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Internal.Sanitize
 
   require Logger
 
@@ -91,7 +92,7 @@ defmodule Alloy.Events do
   rescue
     exception ->
       if should_log_error?(logged_ref) do
-        sanitized_trace = Alloy.OwnedWorker.sanitize_stacktrace(__STACKTRACE__)
+        sanitized_trace = Sanitize.stacktrace(__STACKTRACE__)
 
         Logger.warning(
           "[Alloy] on_event callback failed; the run continues (further failures in this run suppressed).\n" <>

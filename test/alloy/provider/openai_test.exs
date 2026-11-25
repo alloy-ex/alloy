@@ -1134,7 +1134,11 @@ defmodule Alloy.Provider.OpenAITest do
                  OpenAI.complete([Message.user("Hi")], [], config)
       end
 
-      for bad_sse <- ["data: null\n\n", "data: 123\n\n", "data: {broken\n\n"] do
+      for {bad_sse, expected_kind} <- [
+            {"data: null\n\n", :protocol_error},
+            {"data: 123\n\n", :protocol_error},
+            {"data: {broken\n\n", :malformed_reply}
+          ] do
         config =
           config_with_sse_stream([
             bad_sse,
@@ -1142,7 +1146,7 @@ defmodule Alloy.Provider.OpenAITest do
             "data: [DONE]\n\n"
           ])
 
-        assert {:error, %Error{kind: :malformed_reply}} =
+        assert {:error, %Error{kind: ^expected_kind}} =
                  OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
       end
 
@@ -1168,7 +1172,7 @@ defmodule Alloy.Provider.OpenAITest do
       refute_received {:chunk, _}
     end
 
-    test "rejects function_call items missing non-empty id or name with :malformed_reply" do
+    test "rejects function_call items missing non-empty id or name with :protocol_error" do
       for bad_item <- [
             %{"type" => "function_call", "name" => "read", "arguments" => "{}"},
             %{"type" => "function_call", "call_id" => "", "name" => "read", "arguments" => "{}"},
@@ -1178,7 +1182,7 @@ defmodule Alloy.Provider.OpenAITest do
         body = response_payload([bad_item])
         config = config_with_response(%{status: 200, body: Jason.encode!(body)})
 
-        assert {:error, %Error{kind: :malformed_reply}} =
+        assert {:error, %Error{kind: :protocol_error}} =
                  OpenAI.complete([Message.user("Hi")], [], config)
       end
     end

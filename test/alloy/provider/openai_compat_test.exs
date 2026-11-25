@@ -781,7 +781,7 @@ defmodule Alloy.Provider.OpenAICompatTest do
           })
         end)
 
-        assert {:error, %Error{kind: :malformed_reply}} =
+        assert {:error, %Error{kind: :protocol_error}} =
                  OpenAICompat.complete([Message.user("delete it")], [], %{
                    api_url: "http://localhost",
                    model: "m",
@@ -804,7 +804,7 @@ defmodule Alloy.Provider.OpenAICompatTest do
       end
     end
 
-    test "returns :malformed_reply for missing/null/non-map message or non-map choice and tolerates malformed usage" do
+    test "returns :protocol_error for missing/null/non-map message or non-map choice and tolerates malformed usage" do
       bad_payloads = [
         {:oc_missing_msg, %{"choices" => [%{"finish_reason" => "stop"}]}},
         {:oc_null_msg, %{"choices" => [%{"message" => nil, "finish_reason" => "stop"}]}},
@@ -830,7 +830,7 @@ defmodule Alloy.Provider.OpenAICompatTest do
       for {stub_name, payload} <- bad_payloads do
         Req.Test.stub(stub_name, fn conn -> Req.Test.json(conn, payload) end)
 
-        assert {:error, %Error{kind: :malformed_reply}} =
+        assert {:error, %Error{kind: :protocol_error}} =
                  OpenAICompat.complete([Message.user("Hi")], [], %{
                    api_url: "http://localhost",
                    model: "m",
@@ -1047,7 +1047,7 @@ defmodule Alloy.Provider.OpenAICompatTest do
                })
 
       # Under finish_reason: "length", structurally invalid tool_calls entries
-      # (non-map entry, non-map function, non-string name) still fail with :malformed_reply.
+      # (non-map entry, non-map function, non-string name) still fail with :protocol_error.
       for {stub, bad_calls} <- [
             {:oc_length_non_map_tc, ["not-a-map"]},
             {:oc_length_bad_func, [%{"id" => "c1", "function" => "bad"}]},
@@ -1064,7 +1064,7 @@ defmodule Alloy.Provider.OpenAICompatTest do
           })
         end)
 
-        assert {:error, %Error{kind: :malformed_reply}} =
+        assert {:error, %Error{kind: :protocol_error}} =
                  OpenAICompat.complete([Message.user("Hi")], [], %{
                    api_url: "http://localhost",
                    model: "m",

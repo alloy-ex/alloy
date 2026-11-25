@@ -69,8 +69,8 @@ defmodule Alloy.Tool.Core.Bash do
 
   @behaviour Alloy.Tool
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.{OSProcess, OwnedWorker}
-  alias Alloy.Provider.Error
 
   @typedoc """
   A custom command executor. Receives the shell command string and the working
@@ -140,9 +140,7 @@ defmodule Alloy.Tool.Core.Bash do
   end
 
   defp validate_command(command),
-    do:
-      {:error,
-       "command must be a string, got: #{inspect(command, limit: 20, printable_limit: 500)}"}
+    do: {:error, "command must be a string, got: #{Sanitize.inspect_bounded(command)}"}
 
   defp run_host(command, working_dir, timeout, context) do
     with {:ok, bash} <- find_bash(),
@@ -323,7 +321,7 @@ defmodule Alloy.Tool.Core.Bash do
 
       {:ok, {:ok, other}} ->
         {:error,
-         "Custom bash executor returned invalid result: #{inspect(other, limit: 20, printable_limit: 500)}"}
+         "Custom bash executor returned invalid result: #{Sanitize.inspect_bounded(other)}"}
 
       {:ok, {:worker_exit, {:worker_crash, kind, reason, stacktrace}}} ->
         {:error, "Executor crashed: #{format_worker_crash(kind, reason, stacktrace)}"}
@@ -349,12 +347,12 @@ defmodule Alloy.Tool.Core.Bash do
   defp format_worker_crash(:error, reason, stacktrace) do
     :error
     |> Exception.format_banner(reason, stacktrace)
-    |> Error.cap_bytes(500)
+    |> Sanitize.cap_bytes(500)
   end
 
   defp format_worker_crash(kind, reason, _stacktrace) do
-    "#{kind}: #{inspect(reason, limit: 20, printable_limit: 500)}"
-    |> Error.cap_bytes(500)
+    "#{kind}: #{Sanitize.inspect_bounded(reason)}"
+    |> Sanitize.cap_bytes(500)
   end
 
   defp normalize_timeout(timeout, max) when is_integer(timeout) and timeout > 0,

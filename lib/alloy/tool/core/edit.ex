@@ -22,6 +22,8 @@ defmodule Alloy.Tool.Core.Edit do
 
   @behaviour Alloy.Tool
 
+  alias Alloy.Internal.Sanitize
+
   @binary_sniff_bytes 8_192
   @max_file_bytes 10 * 1024 * 1024
 
@@ -72,9 +74,7 @@ defmodule Alloy.Tool.Core.Edit do
   defp parse_replace_all(value) when is_boolean(value), do: {:ok, value}
 
   defp parse_replace_all(value),
-    do:
-      {:error,
-       "replace_all must be a boolean, got: #{inspect(value, limit: 20, printable_limit: 500)}"}
+    do: {:error, "replace_all must be a boolean, got: #{Sanitize.inspect_bounded(value)}"}
 
   defp strings(old_string, new_string) when is_binary(old_string) and is_binary(new_string) do
     case {to_lf(old_string), to_lf(new_string)} do

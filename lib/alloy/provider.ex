@@ -113,7 +113,9 @@ defmodule Alloy.Provider do
   @doc """
   Decode a JSON binary response body, passing through maps unchanged.
 
-  Returns `{:ok, decoded_map}` or `{:error, %Alloy.Provider.Error{kind: :malformed_reply}}`.
+  Returns `{:ok, decoded_map}`, `{:error, %Alloy.Provider.Error{kind: :protocol_error}}`
+  for valid non-object JSON, or `{:error, %Alloy.Provider.Error{kind: :malformed_reply}}`
+  when JSON decoding fails.
   """
   @spec decode_body(binary() | map()) :: {:ok, map()} | {:error, Error.t()}
   def decode_body(body) when is_map(body), do: {:ok, body}
@@ -124,7 +126,7 @@ defmodule Alloy.Provider do
         {:ok, decoded}
 
       {:ok, _non_map} ->
-        {:error, %Error{kind: :malformed_reply, message: "Expected JSON object response body"}}
+        {:error, %Error{kind: :protocol_error, message: "Expected JSON object response body"}}
 
       {:error, _} ->
         {:error, %Error{kind: :malformed_reply, message: "Failed to decode response JSON"}}

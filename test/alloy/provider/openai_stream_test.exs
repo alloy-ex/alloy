@@ -440,24 +440,27 @@ defmodule Alloy.Provider.OpenAIStreamTest do
         })
 
       cases = [
-        {:stream_raw_nil_arg, [raw_arg_delta.(nil)], "Invalid tool call arguments delta"},
-        {:stream_raw_false_arg, [raw_arg_delta.(false)], "Invalid tool call arguments delta"},
-        {:stream_raw_list_arg, [raw_arg_delta.([])], "Invalid tool call arguments delta"},
-        {:stream_bad_extra_content, [extra_content_delta.(false, "false")],
+        {:stream_raw_nil_arg, [raw_arg_delta.(nil)], :protocol_error,
+         "Invalid tool call arguments delta"},
+        {:stream_raw_false_arg, [raw_arg_delta.(false)], :protocol_error,
+         "Invalid tool call arguments delta"},
+        {:stream_raw_list_arg, [raw_arg_delta.([])], :protocol_error,
+         "Invalid tool call arguments delta"},
+        {:stream_bad_extra_content, [extra_content_delta.(false, "false")], :protocol_error,
          "Invalid extra_content"},
         {:stream_bad_google_extra, [extra_content_delta.(%{"google" => false}, "{}")],
-         "Invalid extra_content.google"},
-        {:stream_nil_choice_delta, [nil_choice_delta], "Invalid choice delta"},
-        {:stream_encoded_null_arg, [sse_chunk(tool_call_args(0, "null"))],
+         :protocol_error, "Invalid extra_content.google"},
+        {:stream_nil_choice_delta, [nil_choice_delta], :protocol_error, "Invalid choice delta"},
+        {:stream_encoded_null_arg, [sse_chunk(tool_call_args(0, "null"))], :malformed_reply,
          "must be a JSON object"},
-        {:stream_encoded_false_arg, [sse_chunk(tool_call_args(0, "false"))],
+        {:stream_encoded_false_arg, [sse_chunk(tool_call_args(0, "false"))], :malformed_reply,
          "must be a JSON object"},
-        {:stream_encoded_array_arg, [sse_chunk(tool_call_args(0, "[]"))],
+        {:stream_encoded_array_arg, [sse_chunk(tool_call_args(0, "[]"))], :malformed_reply,
          "must be a JSON object"},
-        {:stream_bad_sse_json, ["data: {broken\n\n"], "Malformed JSON"}
+        {:stream_bad_sse_json, ["data: {broken\n\n"], :malformed_reply, "Malformed JSON"}
       ]
 
-      for validation <- modes, {stub_name, bad_chunks, expected_msg} <- cases do
+      for validation <- modes, {stub_name, bad_chunks, expected_kind, expected_msg} <- cases do
         body =
           ([sse_chunk(tool_call_start(0, "call_1", "delete_item"))] ++
              bad_chunks ++
@@ -470,7 +473,7 @@ defmodule Alloy.Provider.OpenAIStreamTest do
           |> Plug.Conn.send_resp(200, body)
         end)
 
-        assert {:error, %Error{kind: :malformed_reply, message: provider_msg}} =
+        assert {:error, %Error{kind: ^expected_kind, message: provider_msg}} =
                  OpenAICompat.stream(
                    [Message.user("delete it")],
                    [],
@@ -500,7 +503,7 @@ defmodule Alloy.Provider.OpenAIStreamTest do
         refute_received {:tool_executed, _}
       end
 
-      # Streamed tool call missing id or function name is also rejected with :malformed_reply.
+      # Streamed tool call missing id or function name is rejected with :protocol_error.
       missing_meta_chunks = [
         sse_chunk(%{
           "id" => "chatcmpl-bad",
@@ -522,7 +525,7 @@ defmodule Alloy.Provider.OpenAIStreamTest do
       {_collected, missing_result} =
         collect_stream(missing_meta_chunks, test_name: :tool_missing_id_or_name)
 
-      assert {:error, %Error{kind: :malformed_reply, message: msg}} = missing_result
+      assert {:error, %Error{kind: :protocol_error, message: msg}} = missing_result
       assert msg =~ "missing id or function name"
     end
 
@@ -604,7 +607,7 @@ defmodule Alloy.Provider.OpenAIStreamTest do
         sse_done()
       ]
 
-      {_collected, {:error, %Error{kind: :malformed_reply, message: bad_idx_msg}}} =
+      {_collected, {:error, %Error{kind: :protocol_error, message: bad_idx_msg}}} =
         collect_stream(bad_index_chunks, test_name: :tool_bad_index)
 
       assert bad_idx_msg =~ "Invalid tool call index"
@@ -855,7 +858,7 @@ defmodule Alloy.Provider.OpenAIStreamTest do
           ] do
         chunks = [sse_chunk(bad_chunk), sse_chunk(finish_chunk("stop")), sse_done()]
         {_collected, result} = collect_stream(chunks, test_name: name)
-        assert {:error, %Error{kind: :malformed_reply}} = result
+        assert {:error, %Error{kind: :protocol_error}} = result
       end
     end
 

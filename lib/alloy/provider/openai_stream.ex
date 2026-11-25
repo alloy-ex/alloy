@@ -189,7 +189,7 @@ defmodule Alloy.Provider.OpenAIStream do
           process_event(acc, parsed)
 
         {:ok, _non_map} ->
-          record_malformed_error(acc, "Malformed payload in Chat Completions SSE chunk")
+          record_protocol_error(acc, "Malformed payload in Chat Completions SSE chunk")
 
         {:error, _} ->
           record_malformed_error(acc, "Malformed JSON in Chat Completions SSE chunk")
@@ -214,17 +214,17 @@ defmodule Alloy.Provider.OpenAIStream do
         |> put_event_usage(event)
 
       {:ok, _non_map} ->
-        record_malformed_error(acc, "Invalid choice delta in Chat Completions SSE chunk")
+        record_protocol_error(acc, "Invalid choice delta in Chat Completions SSE chunk")
     end
   end
 
   defp process_event(acc, %{"choices" => [_non_map | _]}) do
-    record_malformed_error(acc, "Invalid choice in Chat Completions SSE chunk")
+    record_protocol_error(acc, "Invalid choice in Chat Completions SSE chunk")
   end
 
   defp process_event(acc, %{"choices" => choices})
        when choices != nil and not is_list(choices) do
-    record_malformed_error(acc, "Invalid choices in Chat Completions SSE chunk")
+    record_protocol_error(acc, "Invalid choices in Chat Completions SSE chunk")
   end
 
   # Usage event: either no choices key, or empty choices list.
@@ -278,7 +278,7 @@ defmodule Alloy.Provider.OpenAIStream do
         |> put_event_usage(event)
       end
     else
-      {:error, message} -> record_malformed_error(acc, message)
+      {:error, message} -> record_protocol_error(acc, message)
     end
   end
 
@@ -305,7 +305,7 @@ defmodule Alloy.Provider.OpenAIStream do
   end
 
   defp accumulate_tool_calls(acc, _invalid) do
-    record_malformed_error(acc, "Invalid tool_calls delta in Chat Completions SSE chunk")
+    record_protocol_error(acc, "Invalid tool_calls delta in Chat Completions SSE chunk")
   end
 
   @doc false
@@ -374,16 +374,16 @@ defmodule Alloy.Provider.OpenAIStream do
               last_tool_call_index: index
           }
         else
-          {:error, message} -> record_malformed_error(acc, message)
+          {:error, message} -> record_protocol_error(acc, message)
         end
 
       {:error, message} ->
-        record_malformed_error(acc, message)
+        record_protocol_error(acc, message)
     end
   end
 
   defp accumulate_tool_call_delta(_invalid, acc) do
-    record_malformed_error(acc, "Invalid tool call delta in Chat Completions SSE chunk")
+    record_protocol_error(acc, "Invalid tool call delta in Chat Completions SSE chunk")
   end
 
   # Some Chat Completions-compatible servers (notably Gemini's OpenAI-compat
@@ -451,10 +451,14 @@ defmodule Alloy.Provider.OpenAIStream do
     {:error, "Invalid tool call arguments delta for #{name}"}
   end
 
-  defp record_malformed_error(%{malformed_error: %Error{}} = acc, _message), do: acc
-
   defp record_malformed_error(acc, message) do
     %{acc | malformed_error: %Error{kind: :malformed_reply, message: message}}
+  end
+
+  defp record_protocol_error(%{malformed_error: %Error{}} = acc, _message), do: acc
+
+  defp record_protocol_error(acc, message) do
+    %{acc | malformed_error: %Error{kind: :protocol_error, message: message}}
   end
 
   # ── Response Building ────────────────────────────────────────────────
@@ -545,7 +549,7 @@ defmodule Alloy.Provider.OpenAIStream do
           {:halt,
            {:error,
             %Error{
-              kind: :malformed_reply,
+              kind: :protocol_error,
               message: "Malformed streamed tool call: missing id or function name"
             }}}
         end

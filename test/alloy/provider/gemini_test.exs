@@ -837,7 +837,7 @@ defmodule Alloy.Provider.GeminiTest do
   end
 
   describe "malformed candidate, error, and usage hardening" do
-    test "stream records sticky :malformed_reply on malformed content/parts/candidates and suppresses later text" do
+    test "stream records sticky :protocol_error on malformed content/parts/candidates and suppresses later text" do
       for {label, bad_chunk} <- [
             {"false content", %{"candidates" => [%{"content" => false}]}},
             {"non-list parts", %{"candidates" => [%{"content" => %{"parts" => "bad"}}]}},
@@ -869,7 +869,7 @@ defmodule Alloy.Provider.GeminiTest do
 
         config = config_with_sse_stream(chunks)
 
-        assert {:error, %Error{kind: :malformed_reply}} =
+        assert {:error, %Error{kind: :protocol_error}} =
                  Gemini.stream([Message.user("Hi")], [], config, fn text ->
                    send(test_pid, {:chunk, label, text})
                    :ok
@@ -880,7 +880,7 @@ defmodule Alloy.Provider.GeminiTest do
       end
     end
 
-    test "complete/3 returns :malformed_reply on malformed candidate, content, parts, or functionCall" do
+    test "complete/3 returns :protocol_error on malformed candidate, content, parts, or functionCall" do
       for payload <- [
             %{"candidates" => ["bad"]},
             %{"candidates" => "bad"},
@@ -898,7 +898,7 @@ defmodule Alloy.Provider.GeminiTest do
               ]
             }
           ] do
-        assert {:error, %Error{kind: :malformed_reply}} = complete_with(payload)
+        assert {:error, %Error{kind: :protocol_error}} = complete_with(payload)
       end
     end
 

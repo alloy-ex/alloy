@@ -61,6 +61,7 @@ defmodule Alloy.Provider.Gemini do
 
   @behaviour Alloy.Provider
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.Message
   alias Alloy.Provider
   alias Alloy.Provider.{Error, HTTP}
@@ -363,12 +364,12 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp parse_response(%{"candidates" => [_non_map | _]}) do
-    {:error, %Error{kind: :malformed_reply, message: "Malformed candidate in Gemini response"}}
+    {:error, %Error{kind: :protocol_error, message: "Malformed candidate in Gemini response"}}
   end
 
   defp parse_response(%{"candidates" => candidates})
        when candidates != nil and not is_list(candidates) do
-    {:error, %Error{kind: :malformed_reply, message: "Malformed candidates in Gemini response"}}
+    {:error, %Error{kind: :protocol_error, message: "Malformed candidates in Gemini response"}}
   end
 
   defp parse_response(%{"promptFeedback" => %{"blockReason" => _}} = resp),
@@ -378,8 +379,7 @@ defmodule Alloy.Provider.Gemini do
     {:error,
      %Error{
        kind: :unknown,
-       message:
-         "Unexpected Gemini response payload: #{inspect(other, limit: 20, printable_limit: 500)}"
+       message: "Unexpected Gemini response payload: #{Sanitize.inspect_bounded(other)}"
      }}
   end
 
@@ -442,7 +442,7 @@ defmodule Alloy.Provider.Gemini do
         extract_content_parts(content)
 
       {:ok, _invalid} ->
-        {:error, %Error{kind: :malformed_reply, message: "Malformed content in Gemini candidate"}}
+        {:error, %Error{kind: :protocol_error, message: "Malformed content in Gemini candidate"}}
     end
   end
 
@@ -459,7 +459,7 @@ defmodule Alloy.Provider.Gemini do
 
       {:ok, _invalid} ->
         {:error,
-         %Error{kind: :malformed_reply, message: "Malformed parts in Gemini candidate content"}}
+         %Error{kind: :protocol_error, message: "Malformed parts in Gemini candidate content"}}
     end
   end
 
@@ -507,12 +507,12 @@ defmodule Alloy.Provider.Gemini do
 
       _invalid ->
         {:error,
-         %Error{kind: :malformed_reply, message: "Malformed functionCall args in Gemini response"}}
+         %Error{kind: :protocol_error, message: "Malformed functionCall args in Gemini response"}}
     end
   end
 
   defp parse_content_part(%{"functionCall" => _invalid}) do
-    {:error, %Error{kind: :malformed_reply, message: "Malformed functionCall in Gemini response"}}
+    {:error, %Error{kind: :protocol_error, message: "Malformed functionCall in Gemini response"}}
   end
 
   defp parse_content_part(%{"inlineData" => %{"mimeType" => mime_type, "data" => data}})
@@ -538,8 +538,7 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp parse_content_part(_invalid) do
-    {:error,
-     %Error{kind: :malformed_reply, message: "Malformed part in Gemini candidate content"}}
+    {:error, %Error{kind: :protocol_error, message: "Malformed part in Gemini candidate content"}}
   end
 
   defp build_response_metadata(resp, candidate) do
@@ -637,7 +636,7 @@ defmodule Alloy.Provider.Gemini do
         {:ok, wrapper}
 
       {:ok, _non_map} ->
-        {:error, %Error{kind: :malformed_reply, message: "Malformed JSON in Gemini SSE chunk"}}
+        {:error, %Error{kind: :protocol_error, message: "Malformed JSON in Gemini SSE chunk"}}
 
       {:error, reason} ->
         {:error,
@@ -679,7 +678,7 @@ defmodule Alloy.Provider.Gemini do
     %{
       acc
       | stream_error: %Error{
-          kind: :malformed_reply,
+          kind: :protocol_error,
           message: "Malformed candidate in Gemini SSE chunk"
         }
     }
@@ -694,7 +693,7 @@ defmodule Alloy.Provider.Gemini do
     %{
       acc
       | stream_error: %Error{
-          kind: :malformed_reply,
+          kind: :protocol_error,
           message: "Malformed candidates in Gemini SSE chunk"
         }
     }

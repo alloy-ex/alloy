@@ -25,6 +25,7 @@ defmodule Alloy.Tool.Executor do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Internal.Sanitize
   alias Alloy.Message
   alias Alloy.Middleware
   alias Alloy.Tool.Inline
@@ -377,8 +378,7 @@ defmodule Alloy.Tool.Executor do
   end
 
   defp check_input(input, %Inline{name: name}) do
-    {:error,
-     "Input for #{name} must be a JSON object, got: #{inspect(input, limit: 20, printable_limit: 500)}",
+    {:error, "Input for #{name} must be a JSON object, got: #{Sanitize.inspect_bounded(input)}",
      nil}
   end
 

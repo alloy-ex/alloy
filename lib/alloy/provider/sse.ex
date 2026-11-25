@@ -11,6 +11,7 @@ defmodule Alloy.Provider.SSE do
   on the parsed events returned here.
   """
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.Provider.Error
 
   require Logger
@@ -150,7 +151,7 @@ defmodule Alloy.Provider.SSE do
       # cannot leak streamed model output or accumulator state into logs/errors.
       # Use :unknown (non-retryable) so local parser crashes do not burn retries.
       exception_name = inspect(e.__struct__)
-      sanitized_trace = Alloy.OwnedWorker.sanitize_stacktrace(__STACKTRACE__)
+      sanitized_trace = Sanitize.stacktrace(__STACKTRACE__)
 
       Logger.warning(
         "SSE event handler crashed (#{exception_name})\n#{Exception.format_stacktrace(sanitized_trace)}"

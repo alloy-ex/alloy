@@ -92,6 +92,7 @@ defmodule Alloy.Provider.Anthropic do
 
   @behaviour Alloy.Provider
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.Message
   alias Alloy.Provider.{Error, HTTP}
 
@@ -236,7 +237,7 @@ defmodule Alloy.Provider.Anthropic do
         )
 
       {:error, _} ->
-        record_protocol_error(
+        record_malformed_error(
           acc,
           "Malformed JSON in Anthropic SSE #{event_type} event"
         )
@@ -503,6 +504,10 @@ defmodule Alloy.Provider.Anthropic do
   defp record_protocol_error(%{protocol_error: %Error{}} = acc, _message), do: acc
 
   defp record_protocol_error(acc, message) do
+    %{acc | protocol_error: %Error{kind: :protocol_error, message: message}}
+  end
+
+  defp record_malformed_error(acc, message) do
     %{acc | protocol_error: %Error{kind: :malformed_reply, message: message}}
   end
 
@@ -911,8 +916,7 @@ defmodule Alloy.Provider.Anthropic do
     {:error,
      %Error{
        kind: :unknown,
-       message:
-         "Unexpected Anthropic response payload: #{inspect(resp, limit: 20, printable_limit: 500)}"
+       message: "Unexpected Anthropic response payload: #{Sanitize.inspect_bounded(resp)}"
      }}
   end
 
@@ -983,7 +987,7 @@ defmodule Alloy.Provider.Anthropic do
   defp parse_content_blocks(_non_list, _stop_reason) do
     {:error,
      %Error{
-       kind: :malformed_reply,
+       kind: :protocol_error,
        message: "Invalid content list in Anthropic response"
      }}
   end
@@ -1003,13 +1007,13 @@ defmodule Alloy.Provider.Anthropic do
 
       _invalid ->
         {:error,
-         %Error{kind: :malformed_reply, message: "Invalid thinking block in Anthropic response"}}
+         %Error{kind: :protocol_error, message: "Invalid thinking block in Anthropic response"}}
     end
   end
 
   defp parse_content_block(%{"type" => "thinking"}) do
     {:error,
-     %Error{kind: :malformed_reply, message: "Invalid thinking block in Anthropic response"}}
+     %Error{kind: :protocol_error, message: "Invalid thinking block in Anthropic response"}}
   end
 
   defp parse_content_block(%{"type" => "text", "text" => text}) when is_binary(text) do
@@ -1017,7 +1021,7 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp parse_content_block(%{"type" => "text"}) do
-    {:error, %Error{kind: :malformed_reply, message: "Invalid text block in Anthropic response"}}
+    {:error, %Error{kind: :protocol_error, message: "Invalid text block in Anthropic response"}}
   end
 
   # A programmatic call's `caller` must go back unchanged with the history.
@@ -1032,7 +1036,7 @@ defmodule Alloy.Provider.Anthropic do
 
   defp parse_content_block(%{"type" => "tool_use"}) do
     {:error,
-     %Error{kind: :malformed_reply, message: "Invalid tool_use block in Anthropic response"}}
+     %Error{kind: :protocol_error, message: "Invalid tool_use block in Anthropic response"}}
   end
 
   defp parse_content_block(%{
@@ -1048,7 +1052,7 @@ defmodule Alloy.Provider.Anthropic do
   defp parse_content_block(%{"type" => "server_tool_use"}) do
     {:error,
      %Error{
-       kind: :malformed_reply,
+       kind: :protocol_error,
        message: "Invalid server_tool_use block in Anthropic response"
      }}
   end
@@ -1057,7 +1061,7 @@ defmodule Alloy.Provider.Anthropic do
 
   defp parse_content_block(_non_map) do
     {:error,
-     %Error{kind: :malformed_reply, message: "Invalid content block in Anthropic response"}}
+     %Error{kind: :protocol_error, message: "Invalid content block in Anthropic response"}}
   end
 
   defp preserve_unknown_block(block) when is_map(block) do

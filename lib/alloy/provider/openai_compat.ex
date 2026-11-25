@@ -72,6 +72,7 @@ defmodule Alloy.Provider.OpenAICompat do
 
   @behaviour Alloy.Provider
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.Message
   alias Alloy.Provider.{Error, HTTP, OpenAIStream}
 
@@ -314,7 +315,7 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_response(%{"choices" => [_non_map | _]}) do
     {:error,
      %Error{
-       kind: :malformed_reply,
+       kind: :protocol_error,
        message: "Invalid choice in Chat Completions response"
      }}
   end
@@ -322,8 +323,7 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_response(resp) do
     {:error,
      %Error{
-       message:
-         "Unexpected chat completion payload: #{inspect(resp, limit: 20, printable_limit: 500)}"
+       message: "Unexpected chat completion payload: #{Sanitize.inspect_bounded(resp)}"
      }}
   end
 
@@ -351,7 +351,7 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_message_to_blocks(_invalid, _finish_reason) do
     {:error,
      %Error{
-       kind: :malformed_reply,
+       kind: :protocol_error,
        message: "Invalid choice message in Chat Completions response"
      }}
   end
@@ -362,7 +362,7 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_optional_reasoning_field(_invalid) do
     {:error,
      %Error{
-       kind: :malformed_reply,
+       kind: :protocol_error,
        message: "Invalid reasoning_content in Chat Completions response"
      }}
   end
@@ -370,7 +370,7 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_message_content(content) do
     case OpenAIStream.extract_content_parts(content) do
       {:ok, text, thinking} -> {:ok, text, thinking}
-      {:error, msg} -> {:error, %Error{kind: :malformed_reply, message: msg}}
+      {:error, msg} -> {:error, %Error{kind: :protocol_error, message: msg}}
     end
   end
 
@@ -412,7 +412,7 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_tool_calls(_invalid, _finish_reason) do
     {:error,
      %Error{
-       kind: :malformed_reply,
+       kind: :protocol_error,
        message: "Malformed tool_calls payload: expected a list"
      }}
   end
@@ -455,7 +455,7 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_truncated_tool_call(_invalid, _idx) do
     {:error,
      %Error{
-       kind: :malformed_reply,
+       kind: :protocol_error,
        message: "Malformed tool call: expected a map"
      }}
   end
@@ -464,7 +464,7 @@ defmodule Alloy.Provider.OpenAICompat do
     case Map.get(map, key) do
       nil -> {:ok, %{}}
       val when is_map(val) -> {:ok, val}
-      _invalid -> {:error, %Error{kind: :malformed_reply, message: err_msg}}
+      _invalid -> {:error, %Error{kind: :protocol_error, message: err_msg}}
     end
   end
 
@@ -473,7 +473,7 @@ defmodule Alloy.Provider.OpenAICompat do
       nil -> {:ok, default}
       "" -> {:ok, default}
       val when is_binary(val) -> {:ok, val}
-      _invalid -> {:error, %Error{kind: :malformed_reply, message: "Malformed tool call #{key}"}}
+      _invalid -> {:error, %Error{kind: :protocol_error, message: "Malformed tool call #{key}"}}
     end
   end
 
@@ -491,14 +491,14 @@ defmodule Alloy.Provider.OpenAICompat do
       {:ok, if(sig, do: Map.put(block, :thought_signature, sig), else: block)}
     else
       {:error, %Error{} = err} -> {:error, err}
-      {:error, msg} -> {:error, %Error{kind: :malformed_reply, message: msg}}
+      {:error, msg} -> {:error, %Error{kind: :protocol_error, message: msg}}
     end
   end
 
   defp parse_tool_call(_invalid) do
     {:error,
      %Error{
-       kind: :malformed_reply,
+       kind: :protocol_error,
        message: "Malformed tool call: missing valid id or function definition"
      }}
   end

@@ -299,4 +299,12 @@ defmodule Alloy.Provider.ErrorTest do
     error = Error.from_response(429, %{}, anthropic("rate_limit_error", "slow"))
     assert "failed: #{error}" == "failed: rate_limit_error: slow"
   end
+
+  test "protocol_error is non-retryable while malformed_reply is retryable" do
+    refute Error.retryable?(%Error{kind: :protocol_error, message: "bad wire shape"})
+    assert Error.retryable?(%Error{kind: :malformed_reply, message: "truncated json"})
+    assert {:error, %Error{kind: :protocol_error}} = Alloy.Provider.decode_body("null")
+    assert {:error, %Error{kind: :protocol_error}} = Alloy.Provider.decode_body("[1,2]")
+    assert {:error, %Error{kind: :malformed_reply}} = Alloy.Provider.decode_body("{broken")
+  end
 end

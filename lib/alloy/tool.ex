@@ -77,6 +77,8 @@ defmodule Alloy.Tool do
       end
   """
 
+  alias Alloy.Internal.Sanitize
+
   @doc "Unique tool name (used in API calls)."
   @callback name() :: String.t()
 
@@ -245,8 +247,7 @@ defmodule Alloy.Tool do
   """
   @spec resolve_path(term(), map()) :: {:ok, String.t()} | {:error, String.t()}
   def resolve_path(file_path, _context) when not is_binary(file_path) do
-    {:error,
-     "file_path must be a string, got: #{inspect(file_path, limit: 20, printable_limit: 500)}"}
+    {:error, "file_path must be a string, got: #{Sanitize.inspect_bounded(file_path)}"}
   end
 
   def resolve_path(file_path, context) do
@@ -265,7 +266,7 @@ defmodule Alloy.Tool do
 
         other ->
           {:error,
-           "allowed_paths must be a list of paths, got: #{inspect(other, limit: 20, printable_limit: 500)}"}
+           "allowed_paths must be a list of paths, got: #{Sanitize.inspect_bounded(other)}"}
       end
     end
   end
@@ -291,7 +292,7 @@ defmodule Alloy.Tool do
         if String.contains?(root, <<0>>) do
           {:halt,
            {:error,
-            "allowed_paths entries must be strings without NUL bytes, got: #{inspect(root, limit: 20, printable_limit: 500)}"}}
+            "allowed_paths entries must be strings without NUL bytes, got: #{Sanitize.inspect_bounded(root)}"}}
         else
           {:cont, :ok}
         end
@@ -299,7 +300,7 @@ defmodule Alloy.Tool do
       bad, :ok ->
         {:halt,
          {:error,
-          "allowed_paths entries must be strings without NUL bytes, got: #{inspect(bad, limit: 20, printable_limit: 500)}"}}
+          "allowed_paths entries must be strings without NUL bytes, got: #{Sanitize.inspect_bounded(bad)}"}}
     end)
   end
 

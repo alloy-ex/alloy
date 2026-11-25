@@ -4,6 +4,7 @@ defmodule Alloy.Provider.CodexRunner do
   # deadline enforcement, cancellation, streaming line framing, and injected
   # test-runner execution.
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.{OSProcess, OwnedWorker}
   alias Alloy.Provider.Error
 
@@ -428,8 +429,7 @@ defmodule Alloy.Provider.CodexRunner do
         {:error,
          %Error{
            kind: :unknown,
-           message:
-             "codex exec returned unexpected result: #{inspect(other, limit: 20, printable_limit: 500)}"
+           message: "codex exec returned unexpected result: #{Sanitize.inspect_bounded(other)}"
          }}
     end
   rescue

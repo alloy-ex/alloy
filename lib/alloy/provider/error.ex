@@ -19,17 +19,22 @@ defmodule Alloy.Provider.Error do
   ## Kinds
 
     * retried: `:rate_limited`, `:overloaded`, `:server_error`, `:timeout`,
-      `:network`, `:malformed_reply` (note: `:malformed_reply` covers both
-      transient garbled JSON/SSE and structurally invalid replies, so retries
+      `:network`, `:malformed_reply` (transient garbled/truncated JSON,
+      undecodable SSE frames, or invalid model tool-call argument JSON; retries
       only run before any stream output is emitted and are bounded by
       `:max_retries`)
     * not retried: `:context_overflow` (the loop compacts once instead),
+      `:protocol_error` (valid JSON that violates the provider wire schema —
+      non-object top-level responses, malformed choices/candidates/blocks,
+      missing required tool-call `id`/`name`, or mismatched SSE event deltas),
       `:quota` (billing or spend limit), `:auth`, `:invalid_request`,
       `:session_uncertain` (a persisted CLI turn may have been recorded),
       `:shutdown` (interrupted by supervisor shutdown; skips retries and
       fallbacks — on a resumed Codex session, also rotate `:session_generation`),
       `:unknown`
   """
+
+  alias Alloy.Internal.Sanitize
 
   @type kind ::
           :rate_limited
@@ -38,6 +43,7 @@ defmodule Alloy.Provider.Error do
           | :timeout
           | :network
           | :malformed_reply
+          | :protocol_error
           | :session_uncertain
           | :context_overflow
           | :quota
@@ -177,7 +183,7 @@ defmodule Alloy.Provider.Error do
   """
   @spec from_transport(term()) :: t()
   def from_transport(reason) do
-    detail = reason |> inspect(limit: 20, printable_limit: 500) |> cap_bytes(500)
+    detail = Sanitize.inspect_capped(reason, 500)
 
     %__MODULE__{
       kind: transport_kind(reason),
@@ -222,45 +228,15 @@ defmodule Alloy.Provider.Error do
     raw =
       case Jason.encode(term) do
         {:ok, json} -> json
-        {:error, _} -> inspect(term, limit: 20, printable_limit: 500)
+        {:error, _} -> Sanitize.inspect_bounded(term)
       end
 
-    {raw, cap_bytes(raw, 500)}
+    {raw, Sanitize.cap_bytes(raw, 500)}
   end
 
-  # Slices before sanitizing invalid UTF-8 so multi-MB invalid binaries never
-  # allocate proportionally, then normalizes invalid bytes and caps by UTF-8
-  # byte size while preserving valid UTF-8.
   @doc false
   @spec cap_bytes(String.t(), pos_integer()) :: String.t()
-  def cap_bytes(str, max_bytes) do
-    slice =
-      if byte_size(str) <= max_bytes do
-        str
-      else
-        # Keep up to max_bytes + 3 bytes before sanitizing so a valid 4-byte
-        # UTF-8 codepoint starting just before max_bytes stays intact.
-        binary_part(str, 0, min(byte_size(str), max_bytes + 3))
-      end
-
-    valid = if String.valid?(slice), do: slice, else: String.replace_invalid(slice)
-
-    if byte_size(valid) <= max_bytes do
-      valid
-    else
-      valid
-      |> binary_part(0, max_bytes)
-      |> drop_incomplete_utf8_tail()
-    end
-  end
-
-  defp drop_incomplete_utf8_tail(bin) do
-    if String.valid?(bin) do
-      bin
-    else
-      bin |> binary_part(0, byte_size(bin) - 1) |> drop_incomplete_utf8_tail()
-    end
-  end
+  defdelegate cap_bytes(str, max_bytes), to: Sanitize
 
   defp label(value) when is_binary(value) and value != "", do: value
   defp label(_value), do: nil

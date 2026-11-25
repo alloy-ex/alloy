@@ -2083,7 +2083,7 @@ defmodule Alloy.Provider.AnthropicTest do
     end
 
     test "rejects mismatched block deltas, invalid text/message_delta shapes, and protocol errors on max_tokens" do
-      for {stub_name, events, expected_error} <- [
+      for {stub_name, events, expected_kind, expected_error} <- [
             {:anthropic_thinking_delta_on_text,
              [
                ant_event("message_start", %{"message" => %{"id" => "m7", "usage" => %{}}}),
@@ -2100,7 +2100,7 @@ defmodule Alloy.Provider.AnthropicTest do
                  "delta" => %{"stop_reason" => "end_turn"},
                  "usage" => %{}
                })
-             ], "Mismatched thinking_delta for content block 0"},
+             ], :protocol_error, "Mismatched thinking_delta for content block 0"},
             {:anthropic_nil_text_start,
              [
                ant_event("message_start", %{"message" => %{"id" => "m8", "usage" => %{}}}),
@@ -2117,7 +2117,7 @@ defmodule Alloy.Provider.AnthropicTest do
                  "delta" => %{"stop_reason" => "end_turn"},
                  "usage" => %{}
                })
-             ], "Invalid content_block_start block at index 0"},
+             ], :protocol_error, "Invalid content_block_start block at index 0"},
             {:anthropic_nil_tool_input_start,
              [
                ant_event("message_start", %{"message" => %{"id" => "m8b", "usage" => %{}}}),
@@ -2135,7 +2135,7 @@ defmodule Alloy.Provider.AnthropicTest do
                  "delta" => %{"stop_reason" => "tool_use"},
                  "usage" => %{}
                })
-             ], "Invalid content_block_start block at index 0"},
+             ], :protocol_error, "Invalid content_block_start block at index 0"},
             {:anthropic_input_json_delta_on_text,
              [
                ant_event("message_start", %{"message" => %{"id" => "m9", "usage" => %{}}}),
@@ -2152,12 +2152,12 @@ defmodule Alloy.Provider.AnthropicTest do
                  "delta" => %{"stop_reason" => "end_turn"},
                  "usage" => %{}
                })
-             ], "Mismatched input_json_delta for content block 0"},
+             ], :protocol_error, "Mismatched input_json_delta for content block 0"},
             {:anthropic_invalid_message_delta,
              [
                ant_event("message_start", %{"message" => %{"id" => "m10", "usage" => %{}}}),
                ant_event("message_delta", %{"delta" => nil})
-             ], "Invalid message_delta payload"},
+             ], :protocol_error, "Invalid message_delta payload"},
             {:anthropic_protocol_error_on_max_tokens,
              [
                ant_event("message_start", %{"message" => %{"id" => "m11", "usage" => %{}}}),
@@ -2166,7 +2166,7 @@ defmodule Alloy.Provider.AnthropicTest do
                  "delta" => %{"stop_reason" => "max_tokens"},
                  "usage" => %{}
                })
-             ], "Malformed JSON in Anthropic SSE"}
+             ], :malformed_reply, "Malformed JSON in Anthropic SSE"}
           ] do
         body = Enum.join(events)
 
@@ -2176,7 +2176,7 @@ defmodule Alloy.Provider.AnthropicTest do
           |> Plug.Conn.send_resp(200, body)
         end)
 
-        assert {:error, %Error{kind: :malformed_reply, message: msg}} =
+        assert {:error, %Error{kind: ^expected_kind, message: msg}} =
                  Anthropic.stream(
                    [Message.user("hi")],
                    [],
@@ -2422,7 +2422,7 @@ defmodule Alloy.Provider.AnthropicTest do
       refute_received {:chunk, "stale chunk"}
     end
 
-    test "complete/3 rejects malformed tool_use blocks with :malformed_reply" do
+    test "complete/3 rejects malformed tool_use blocks with :protocol_error" do
       Req.Test.stub(:anthropic_complete_bad_tool_block, fn conn ->
         Req.Test.json(conn, %{
           "id" => "msg_bad",
@@ -2434,7 +2434,7 @@ defmodule Alloy.Provider.AnthropicTest do
         })
       end)
 
-      assert {:error, %Error{kind: :malformed_reply}} =
+      assert {:error, %Error{kind: :protocol_error}} =
                Anthropic.complete(
                  [Message.user("hi")],
                  [],

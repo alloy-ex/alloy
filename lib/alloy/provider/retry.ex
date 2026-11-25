@@ -9,6 +9,7 @@ defmodule Alloy.Provider.Retry do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Internal.Sanitize
   alias Alloy.Message
   alias Alloy.Provider.Error
 
@@ -362,7 +363,7 @@ defmodule Alloy.Provider.Retry do
   rescue
     exception ->
       if :atomics.compare_exchange(ref, log_slot, 0, 1) == :ok do
-        sanitized_trace = Alloy.OwnedWorker.sanitize_stacktrace(__STACKTRACE__)
+        sanitized_trace = Sanitize.stacktrace(__STACKTRACE__)
 
         Logger.warning(
           "[Alloy] #{name} callback failed; the stream continues (further failures in this stream suppressed).\n" <>

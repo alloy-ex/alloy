@@ -76,13 +76,7 @@ defmodule Alloy.OwnedWorker do
   def format_exit_reason(_other), do: "unexpected exit"
 
   @spec sanitize_stacktrace(Exception.stacktrace()) :: Exception.stacktrace()
-  def sanitize_stacktrace(stacktrace) when is_list(stacktrace) do
-    Enum.map(stacktrace, fn
-      {mod, fun, args, location} when is_list(args) -> {mod, fun, length(args), location}
-      {fun, args, location} when is_list(args) -> {fun, length(args), location}
-      entry -> entry
-    end)
-  end
+  defdelegate sanitize_stacktrace(stacktrace), to: Alloy.Internal.Sanitize, as: :stacktrace
 
   defp run_worker(owner, done_ref, fun) do
     result = fun.()

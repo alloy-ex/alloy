@@ -17,6 +17,8 @@ defmodule Alloy.Tool.Core.Write do
 
   @behaviour Alloy.Tool
 
+  alias Alloy.Internal.Sanitize
+
   @impl true
   def name, do: "write"
 
@@ -52,9 +54,7 @@ defmodule Alloy.Tool.Core.Write do
   defp validate_content(content) when is_binary(content), do: {:ok, content}
 
   defp validate_content(content),
-    do:
-      {:error,
-       "content must be a string, got: #{inspect(content, limit: 20, printable_limit: 500)}"}
+    do: {:error, "content must be a string, got: #{Sanitize.inspect_bounded(content)}"}
 
   defp make_parent_dir(path) do
     case path |> Path.dirname() |> File.mkdir_p() do

@@ -72,6 +72,7 @@ defmodule Alloy.Provider.OpenAI do
 
   @behaviour Alloy.Provider
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.Message
   alias Alloy.Provider.{Error, HTTP}
 
@@ -402,7 +403,7 @@ defmodule Alloy.Provider.OpenAI do
           %{
             acc
             | malformed_error: %Error{
-                kind: :malformed_reply,
+                kind: :protocol_error,
                 message: "Malformed payload in OpenAI SSE event"
               }
           }
@@ -533,8 +534,7 @@ defmodule Alloy.Provider.OpenAI do
   defp parse_response(resp) do
     {:error,
      %Error{
-       message:
-         "Unexpected OpenAI response payload: #{inspect(resp, limit: 20, printable_limit: 500)}"
+       message: "Unexpected OpenAI response payload: #{Sanitize.inspect_bounded(resp)}"
      }}
   end
 
@@ -631,7 +631,7 @@ defmodule Alloy.Provider.OpenAI do
       _missing ->
         {:error,
          %Error{
-           kind: :malformed_reply,
+           kind: :protocol_error,
            message: "OpenAI function_call missing non-empty call_id/id"
          }}
     end
@@ -645,7 +645,7 @@ defmodule Alloy.Provider.OpenAI do
       _missing ->
         {:error,
          %Error{
-           kind: :malformed_reply,
+           kind: :protocol_error,
            message: "OpenAI function_call missing non-empty name"
          }}
     end
