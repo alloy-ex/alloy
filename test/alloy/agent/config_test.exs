@@ -212,6 +212,8 @@ defmodule Alloy.Agent.ConfigTest do
       refute Exception.message(err3) =~ secret
 
       for bad_shape <- [
+            secret,
+            {secret, []},
             [api_key: secret],
             %{module: Alloy.Provider.Test, api_key: secret},
             {Alloy.Provider.Test, [api_key: secret], :extra},

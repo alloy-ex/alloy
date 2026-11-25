@@ -720,13 +720,7 @@ defmodule Alloy.Context.Compactor do
   defp sanitize_summary_provider_config(provider_config) when is_map(provider_config) do
     provider_config
     |> Map.drop(@summary_stripped_provider_keys)
-    |> sanitize_generation_config_key(:generation_config)
-    |> sanitize_generation_config_key("generation_config")
-    |> sanitize_summary_extra_body()
-  end
-
-  defp sanitize_summary_extra_body(config) do
-    config
+    |> sanitize_generation_config_keys([:generation_config, "generation_config"])
     |> sanitize_extra_body_key(:extra_body)
     |> sanitize_extra_body_key("extra_body")
   end
@@ -737,16 +731,22 @@ defmodule Alloy.Context.Compactor do
         cleaned =
           extra
           |> Map.drop(@summary_stripped_extra_body_keys)
-          |> sanitize_generation_config_key(:generationConfig)
-          |> sanitize_generation_config_key("generationConfig")
-          |> sanitize_generation_config_key(:generation_config)
-          |> sanitize_generation_config_key("generation_config")
+          |> sanitize_generation_config_keys([
+            :generationConfig,
+            "generationConfig",
+            :generation_config,
+            "generation_config"
+          ])
 
         if cleaned == %{}, do: Map.delete(config, key), else: Map.put(config, key, cleaned)
 
       _other ->
         Map.delete(config, key)
     end
+  end
+
+  defp sanitize_generation_config_keys(map, keys) do
+    Enum.reduce(keys, map, &sanitize_generation_config_key(&2, &1))
   end
 
   defp sanitize_generation_config_key(map, key) do

@@ -80,6 +80,29 @@ defmodule Alloy.Provider.HTTP do
   def maybe_put(map, key, value), do: Map.put(map, key, value)
 
   @doc false
+  @spec maybe_put_non_empty(map(), term(), term()) :: map()
+  def maybe_put_non_empty(map, _key, value) when value in [nil, [], %{}], do: map
+  def maybe_put_non_empty(map, key, value), do: Map.put(map, key, value)
+
+  @doc false
+  @spec maybe_put_new(map(), term(), term()) :: map()
+  def maybe_put_new(map, _key, nil), do: map
+  def maybe_put_new(map, key, value), do: Map.put_new(map, key, value)
+
+  @doc false
+  @spec non_neg_int(term()) :: non_neg_integer()
+  def non_neg_int(n) when is_integer(n) and n >= 0, do: n
+  def non_neg_int(_other), do: 0
+
+  @doc false
+  @spec record_sticky_error(map(), Error.kind(), String.t()) :: map()
+  def record_sticky_error(%{sticky_error: %Error{}} = acc, _kind, _message), do: acc
+
+  def record_sticky_error(acc, kind, message) do
+    %{acc | sticky_error: %Error{kind: kind, message: message}}
+  end
+
+  @doc false
   @spec stringify_extra_body(term()) :: map()
   def stringify_extra_body(extra_body) when is_map(extra_body) and not is_struct(extra_body) do
     Map.new(extra_body, fn

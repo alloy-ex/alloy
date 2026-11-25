@@ -188,6 +188,28 @@ defmodule Alloy.Internal.Sanitize do
   def exit_summary(_other, _max_bytes), do: "unexpected term"
 
   @doc """
+  Returns a value-safe outer shape summary for error messages on untrusted or
+  potentially secret-bearing terms (provider tuples, middleware return values).
+  Only atoms and numbers are printed verbatim; strings and compound structures
+  are reduced to type labels while preserving atom tags on 2/3-tuples.
+  """
+  @spec shape_summary(term()) :: String.t()
+  def shape_summary({tag, val}) when is_atom(tag),
+    do: "{#{inspect(tag)}, #{shape_summary(val)}}"
+
+  def shape_summary({tag, val1, val2}) when is_atom(tag),
+    do: "{#{inspect(tag)}, #{shape_summary(val1)}, #{shape_summary(val2)}}"
+
+  def shape_summary({first, _second}), do: "{#{shape_summary(first)}, ...}"
+  def shape_summary(v) when is_atom(v) or is_number(v), do: inspect(v)
+  def shape_summary(v) when is_binary(v), do: "string"
+  def shape_summary(%mod{}), do: "%#{inspect(mod)}{}"
+  def shape_summary(v) when is_map(v), do: "map"
+  def shape_summary(v) when is_list(v), do: "list"
+  def shape_summary(v) when is_tuple(v), do: "tuple"
+  def shape_summary(_other), do: "term"
+
+  @doc """
   Replaces argument lists in stacktrace entries with their arity so secrets
   captured in function arguments never leak into logs or error reports.
   """

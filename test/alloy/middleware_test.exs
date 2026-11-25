@@ -224,6 +224,28 @@ defmodule Alloy.MiddlewareTest do
       assert_raise ArgumentError, ~r/unsupported value/, fn ->
         Middleware.run_before_tool_call(bad_edit_state, tool_call)
       end
+
+      defmodule SecretMapMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, state), do: {:block, state.config.context}
+        def call(_hook, state), do: {:halt, state.config.provider_config}
+      end
+
+      secret_mw_state = %{state | config: %{state.config | middleware: [SecretMapMiddleware]}}
+
+      err4 =
+        assert_raise ArgumentError, ~r/\{:halt, map\}/, fn ->
+          Middleware.run(:before_completion, secret_mw_state)
+        end
+
+      refute Exception.message(err4) =~ api_secret
+
+      err5 =
+        assert_raise ArgumentError, ~r/\{:block, map\}/, fn ->
+          Middleware.run_before_tool_call(secret_mw_state, tool_call)
+        end
+
+      refute Exception.message(err5) =~ ctx_secret
     end
   end
 

@@ -1731,6 +1731,26 @@ defmodule Alloy.OutputSchemaTest do
                  provider: {Alloy.Provider.Test, agent_pid: pid},
                  output_schema: @answer_schema
                )
+
+      # Even when messages end with an assistant prefill (Alloy.run(nil, messages: ...)),
+      # an empty final turn must not decode the pre-turn assistant message.
+      {:ok, prefill_pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{stop_reason: :end_turn, messages: [], usage: %{input_tokens: 1, output_tokens: 0}}}
+        ])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                metadata: %{run: %{output_error: %{kind: :missing_text, decoded: nil}}}
+              }} =
+               Alloy.run(nil,
+                 messages: prior_messages,
+                 provider: {Alloy.Provider.Test, agent_pid: prefill_pid},
+                 output_schema: @answer_schema
+               )
     end
 
     test "classifies whitespace-only assistant text as :missing_text and decodes only the final assistant message" do

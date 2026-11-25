@@ -147,4 +147,20 @@ defmodule Alloy.Internal.SanitizeTest do
       assert Sanitize.crash_summary(:exit, {:secret, secret}, []) == "exit: {:secret, ...}"
     end
   end
+
+  describe "shape_summary/1" do
+    test "reports outer shapes without leaking strings or compound payloads" do
+      assert Sanitize.shape_summary(:ok) == ":ok"
+      assert Sanitize.shape_summary(42) == "42"
+      assert Sanitize.shape_summary("sk-secret") == "string"
+      assert Sanitize.shape_summary(URI.parse("https://secret@example.com")) == "%URI{}"
+      assert Sanitize.shape_summary(%{api_key: "sk-secret"}) == "map"
+      assert Sanitize.shape_summary(["sk-secret"]) == "list"
+      assert Sanitize.shape_summary({1, 2, 3}) == "tuple"
+      assert Sanitize.shape_summary({"sk-secret", []}) == "{string, ...}"
+      assert Sanitize.shape_summary({:halt, %{api_key: "sk-secret"}}) == "{:halt, map}"
+      assert Sanitize.shape_summary({:halt, "sk-secret", %{}}) == "{:halt, string, map}"
+      assert Sanitize.shape_summary(self()) == "term"
+    end
+  end
 end

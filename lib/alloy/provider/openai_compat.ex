@@ -154,19 +154,10 @@ defmodule Alloy.Provider.OpenAICompat do
     openai_messages = build_messages(messages, config)
 
     body =
-      HTTP.maybe_put(
-        %{"model" => config.model, "messages" => openai_messages},
-        "max_tokens",
-        Map.get(config, :max_tokens)
-      )
-
-    body =
-      case tool_defs do
-        [] -> body
-        defs -> Map.put(body, "tools", Enum.map(defs, &format_tool_def/1))
-      end
-
-    body = maybe_put_output_schema(body, config)
+      %{"model" => config.model, "messages" => openai_messages}
+      |> HTTP.maybe_put("max_tokens", Map.get(config, :max_tokens))
+      |> HTTP.maybe_put_non_empty("tools", Enum.map(tool_defs, &format_tool_def/1))
+      |> maybe_put_output_schema(config)
 
     # Merge extra_body LAST so caller can override any field. Keys are
     # stringified first: an atom key would sit beside the string key it
@@ -238,15 +229,9 @@ defmodule Alloy.Provider.OpenAICompat do
       |> Enum.filter(&(is_map(&1) and &1[:type] == "text" and is_binary(&1[:text])))
       |> Enum.map_join("\n", & &1[:text])
 
-    msg = %{"role" => "assistant"}
-
     msg =
-      if(text_parts == "",
-        do: Map.put(msg, "content", nil),
-        else: Map.put(msg, "content", text_parts)
-      )
-
-    msg = if(tool_calls == [], do: msg, else: Map.put(msg, "tool_calls", tool_calls))
+      %{"role" => "assistant", "content" => if(text_parts == "", do: nil, else: text_parts)}
+      |> HTTP.maybe_put_non_empty("tool_calls", tool_calls)
 
     # Thinking modes (DeepSeek, Kimi, GLM) need earlier reasoning back to
     # keep continuity; DeepSeek rejects a tool loop without it (HTTP 400).
@@ -348,8 +333,9 @@ defmodule Alloy.Provider.OpenAICompat do
 
   defp parse_message_to_blocks(message, finish_reason) when is_map(message) do
     with {:ok, reasoning_field} <-
-           parse_optional_reasoning_field(Map.get(message, "reasoning_content")),
-         {:ok, refusal_field} <- parse_optional_refusal_field(Map.get(message, "refusal")),
+           parse_optional_string_field(Map.get(message, "reasoning_content"), "reasoning_content"),
+         {:ok, refusal_field} <-
+           parse_optional_string_field(Map.get(message, "refusal"), "refusal"),
          {:ok, content_text, content_thinking, content_refusal} <-
            parse_message_content(Map.get(message, "content")),
          {:ok, tool_blocks} <- parse_tool_calls(Map.get(message, "tool_calls"), finish_reason) do
@@ -384,25 +370,14 @@ defmodule Alloy.Provider.OpenAICompat do
      }}
   end
 
-  defp parse_optional_reasoning_field(nil), do: {:ok, ""}
-  defp parse_optional_reasoning_field(text) when is_binary(text), do: {:ok, text}
+  defp parse_optional_string_field(nil, _field), do: {:ok, ""}
+  defp parse_optional_string_field(text, _field) when is_binary(text), do: {:ok, text}
 
-  defp parse_optional_reasoning_field(_invalid) do
+  defp parse_optional_string_field(_invalid, field) do
     {:error,
      %Error{
        kind: :protocol_error,
-       message: "Invalid reasoning_content in Chat Completions response"
-     }}
-  end
-
-  defp parse_optional_refusal_field(nil), do: {:ok, ""}
-  defp parse_optional_refusal_field(text) when is_binary(text), do: {:ok, text}
-
-  defp parse_optional_refusal_field(_invalid) do
-    {:error,
-     %Error{
-       kind: :protocol_error,
-       message: "Invalid refusal in Chat Completions response"
+       message: "Invalid #{field} in Chat Completions response"
      }}
   end
 
@@ -417,35 +392,13 @@ defmodule Alloy.Provider.OpenAICompat do
   defp parse_tool_calls(nil, _finish_reason), do: {:ok, []}
 
   defp parse_tool_calls(tool_calls, "length") when is_list(tool_calls) do
-    result =
-      tool_calls
-      |> Enum.with_index()
-      |> Enum.reduce_while({:ok, []}, fn {tc, idx}, {:ok, acc} ->
-        case parse_truncated_tool_call(tc, idx) do
-          {:ok, block} -> {:cont, {:ok, [block | acc]}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
-
-    case result do
-      {:ok, blocks} -> {:ok, Enum.reverse(blocks)}
-      {:error, _} = err -> err
-    end
+    tool_calls
+    |> Enum.with_index()
+    |> map_tool_calls(fn {tc, idx} -> parse_truncated_tool_call(tc, idx) end)
   end
 
   defp parse_tool_calls(tool_calls, _finish_reason) when is_list(tool_calls) do
-    result =
-      Enum.reduce_while(tool_calls, {:ok, []}, fn tc, {:ok, acc} ->
-        case parse_tool_call(tc) do
-          {:ok, block} -> {:cont, {:ok, [block | acc]}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
-
-    case result do
-      {:ok, blocks} -> {:ok, Enum.reverse(blocks)}
-      {:error, _} = err -> err
-    end
+    map_tool_calls(tool_calls, &parse_tool_call/1)
   end
 
   defp parse_tool_calls(_invalid, _finish_reason) do
@@ -454,6 +407,18 @@ defmodule Alloy.Provider.OpenAICompat do
        kind: :protocol_error,
        message: "Malformed tool_calls payload: expected a list"
      }}
+  end
+
+  defp map_tool_calls(items, parser) do
+    case Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+           case parser.(item) do
+             {:ok, block} -> {:cont, {:ok, [block | acc]}}
+             {:error, _} = err -> {:halt, err}
+           end
+         end) do
+      {:ok, blocks} -> {:ok, Enum.reverse(blocks)}
+      {:error, _} = err -> err
+    end
   end
 
   defp parse_truncated_tool_call(tc, idx) when is_map(tc) do

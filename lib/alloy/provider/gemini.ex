@@ -186,10 +186,10 @@ defmodule Alloy.Provider.Gemini do
       # default truncates thinking models; each model's own limit is larger.
       generation_config =
         raw_generation_config
-        |> maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
+        |> HTTP.maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
         |> maybe_put_output_schema(output_schema)
 
-      body = maybe_put(body, "generationConfig", generation_config)
+      body = HTTP.maybe_put_non_empty(body, "generationConfig", generation_config)
 
       body =
         case tool_defs do
@@ -295,12 +295,12 @@ defmodule Alloy.Provider.Gemini do
 
   defp format_content_block(%{type: "thinking", thinking: thinking} = block, _messages) do
     %{"text" => thinking, "thought" => true}
-    |> maybe_put("thoughtSignature", block[:signature])
+    |> HTTP.maybe_put("thoughtSignature", block[:signature])
   end
 
   defp format_content_block(%{type: "text", text: text} = block, _messages) do
     %{"text" => text}
-    |> maybe_put("thoughtSignature", block[:signature])
+    |> HTTP.maybe_put("thoughtSignature", block[:signature])
   end
 
   defp format_content_block(
@@ -314,7 +314,7 @@ defmodule Alloy.Provider.Gemini do
         "args" => Alloy.Provider.stringify_keys(input)
       }
     }
-    |> maybe_put("thoughtSignature", block[:signature])
+    |> HTTP.maybe_put("thoughtSignature", block[:signature])
   end
 
   defp format_content_block(
@@ -521,11 +521,12 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp parse_content_part(%{"text" => text, "thought" => true} = part) when is_binary(text) do
-    {:ok, %{type: "thinking", thinking: text} |> maybe_put(:signature, part["thoughtSignature"])}
+    {:ok,
+     %{type: "thinking", thinking: text} |> HTTP.maybe_put(:signature, part["thoughtSignature"])}
   end
 
   defp parse_content_part(%{"text" => text} = part) when is_binary(text) do
-    {:ok, %{type: "text", text: text} |> maybe_put(:signature, part["thoughtSignature"])}
+    {:ok, %{type: "text", text: text} |> HTTP.maybe_put(:signature, part["thoughtSignature"])}
   end
 
   defp parse_content_part(%{"functionCall" => %{"name" => name} = call} = part)
@@ -540,12 +541,12 @@ defmodule Alloy.Provider.Gemini do
       nil ->
         {:ok,
          %{type: "tool_use", id: id, name: name, input: %{}}
-         |> maybe_put(:signature, part["thoughtSignature"])}
+         |> HTTP.maybe_put(:signature, part["thoughtSignature"])}
 
       args when is_map(args) ->
         {:ok,
          %{type: "tool_use", id: id, name: name, input: args}
-         |> maybe_put(:signature, part["thoughtSignature"])}
+         |> HTTP.maybe_put(:signature, part["thoughtSignature"])}
 
       _invalid ->
         {:error,
@@ -585,11 +586,14 @@ defmodule Alloy.Provider.Gemini do
 
   defp build_response_metadata(resp, candidate) do
     %{}
-    |> maybe_put(:finish_reason, candidate["finishReason"])
-    |> maybe_put(:finish_message, candidate["finishMessage"])
-    |> maybe_put(:prompt_feedback, resp["promptFeedback"])
-    |> maybe_put(:grounding_metadata, candidate["groundingMetadata"] || resp["groundingMetadata"])
-    |> maybe_put(:stop_details, refusal_details(candidate))
+    |> HTTP.maybe_put_non_empty(:finish_reason, candidate["finishReason"])
+    |> HTTP.maybe_put_non_empty(:finish_message, candidate["finishMessage"])
+    |> HTTP.maybe_put_non_empty(:prompt_feedback, resp["promptFeedback"])
+    |> HTTP.maybe_put_non_empty(
+      :grounding_metadata,
+      candidate["groundingMetadata"] || resp["groundingMetadata"]
+    )
+    |> HTTP.maybe_put_non_empty(:stop_details, refusal_details(candidate))
   end
 
   # Like every provider, the API's own fields with its own (string) keys.
@@ -614,14 +618,15 @@ defmodule Alloy.Provider.Gemini do
   # model) is reported apart from the prompt but billed as input. Thinking
   # tokens are billed as output, yet candidatesTokenCount leaves them out.
   defp parse_usage(usage) when is_map(usage) do
-    cached = non_neg_int(usage["cachedContentTokenCount"])
+    cached = HTTP.non_neg_int(usage["cachedContentTokenCount"])
 
     %{
       input_tokens:
-        max(non_neg_int(usage["promptTokenCount"]) - cached, 0) +
-          non_neg_int(usage["toolUsePromptTokenCount"]),
+        max(HTTP.non_neg_int(usage["promptTokenCount"]) - cached, 0) +
+          HTTP.non_neg_int(usage["toolUsePromptTokenCount"]),
       output_tokens:
-        non_neg_int(usage["candidatesTokenCount"]) + non_neg_int(usage["thoughtsTokenCount"]),
+        HTTP.non_neg_int(usage["candidatesTokenCount"]) +
+          HTTP.non_neg_int(usage["thoughtsTokenCount"]),
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: cached
     }
@@ -635,9 +640,6 @@ defmodule Alloy.Provider.Gemini do
       cache_read_input_tokens: 0
     }
   end
-
-  defp non_neg_int(n) when is_integer(n) and n >= 0, do: n
-  defp non_neg_int(_), do: 0
 
   defp handle_sse_event(acc, %{data: "[DONE]"}), do: acc
 
@@ -825,18 +827,11 @@ defmodule Alloy.Provider.Gemini do
     "gemini_call_#{name}_#{System.unique_integer([:positive])}"
   end
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, _key, value) when value == %{}, do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
-  defp maybe_put_new(map, _key, nil), do: map
-  defp maybe_put_new(map, key, value), do: Map.put_new(map, key, value)
-
   defp maybe_put_output_schema(generation_config, nil), do: generation_config
 
   defp maybe_put_output_schema(generation_config, %OutputSchema{schema: schema}) do
     generation_config
-    |> maybe_put_new("responseMimeType", "application/json")
+    |> HTTP.maybe_put_new("responseMimeType", "application/json")
     |> Map.put("responseJsonSchema", schema)
   end
 
@@ -884,7 +879,7 @@ defmodule Alloy.Provider.Gemini do
          %Error{
            kind: :invalid_request,
            message:
-             "cannot combine :output_schema with non-JSON generationConfig[\"responseMimeType\"] (#{inspect(mime)}) on Gemini"
+             "cannot combine :output_schema with non-JSON generationConfig[\"responseMimeType\"] (#{Sanitize.inspect_bounded(mime)}) on Gemini"
          }}
 
       true ->

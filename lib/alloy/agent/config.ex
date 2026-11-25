@@ -184,7 +184,12 @@ defmodule Alloy.Agent.Config do
       provider: provider_mod,
       provider_config: provider_config,
       tools: tools,
-      system_prompt: validate_optional_string!(Keyword.get(opts, :system_prompt), :system_prompt),
+      system_prompt:
+        require_opt!(
+          is_nil(opts[:system_prompt]) or is_binary(opts[:system_prompt]),
+          opts[:system_prompt],
+          "system_prompt must be a string or nil"
+        ),
       max_turns: validate_pos_integer!(Keyword.get(opts, :max_turns, 25), :max_turns),
       max_tokens: max_tokens,
       max_tokens_explicit?: max_tokens_explicit?,
@@ -195,8 +200,17 @@ defmodule Alloy.Agent.Config do
       tool_timeout:
         validate_pos_integer!(Keyword.get(opts, :tool_timeout, 120_000), :tool_timeout),
       tool_concurrency: validate_tool_concurrency!(Keyword.get(opts, :tool_concurrency)),
-      tool_validation: validate_tool_validation!(Keyword.get(opts, :tool_validation, :required)),
-      stop_after_tool: validate_stop_after_tool!(Keyword.get(opts, :stop_after_tool)),
+      tool_validation:
+        require_opt!(
+          Keyword.get(opts, :tool_validation, :required) in [:required, :schema],
+          Keyword.get(opts, :tool_validation, :required),
+          "tool_validation must be :required or :schema"
+        ),
+      stop_after_tool:
+        validate_optional_non_empty_string!(
+          Keyword.get(opts, :stop_after_tool),
+          "stop_after_tool must be a nonempty tool name"
+        ),
       output_schema: OutputSchema.normalize!(Keyword.get(opts, :output_schema)),
       middleware:
         resolve_middleware(
@@ -207,121 +221,102 @@ defmodule Alloy.Agent.Config do
       compaction_explicit: compaction_explicit,
       working_directory:
         validate_non_empty_string!(Keyword.get(opts, :working_directory, "."), :working_directory),
-      context: validate_context!(Keyword.get(opts, :context, %{})),
-      on_compaction: validate_on_compaction!(Keyword.get(opts, :on_compaction, nil)),
+      context:
+        require_opt!(
+          is_map(Keyword.get(opts, :context, %{})),
+          Keyword.get(opts, :context, %{}),
+          "context must be a map"
+        ),
+      on_compaction:
+        require_opt!(
+          is_nil(opts[:on_compaction]) or is_function(opts[:on_compaction], 2),
+          opts[:on_compaction],
+          "on_compaction must be a 2-arity function or nil"
+        ),
       fallback_providers:
         opts
         |> Keyword.get(:fallback_providers, [])
         |> validate_fallback_providers!(),
       code_execution:
-        validate_boolean!(Keyword.get(opts, :code_execution, false), :code_execution),
+        require_opt!(
+          is_boolean(Keyword.get(opts, :code_execution, false)),
+          Keyword.get(opts, :code_execution, false),
+          "code_execution must be a boolean"
+        ),
       model_metadata_overrides: model_metadata_overrides,
       model_catalog: model_catalog,
-      until_tool: validate_optional_non_empty_string!(Keyword.get(opts, :until_tool), :until_tool)
+      until_tool:
+        validate_optional_non_empty_string!(
+          Keyword.get(opts, :until_tool),
+          "until_tool must be a nonempty string or nil"
+        )
     }
   end
 
+  defp require_opt!(true, value, _msg), do: value
+
+  defp require_opt!(false, value, msg),
+    do: raise(ArgumentError, "#{msg}, got: #{Sanitize.inspect_bounded(value)}")
+
   defp validate_timeout_ms!(:infinity), do: :infinity
-  defp validate_timeout_ms!(n) when is_integer(n) and n > 0, do: n
 
   defp validate_timeout_ms!(value),
     do:
-      raise(
-        ArgumentError,
-        "timeout_ms must be a positive integer or :infinity, got: #{inspect(value)}"
+      require_opt!(
+        is_integer(value) and value > 0,
+        value,
+        "timeout_ms must be a positive integer or :infinity"
       )
-
-  defp validate_pos_integer!(n, _field) when is_integer(n) and n > 0, do: n
 
   defp validate_pos_integer!(value, field),
-    do: raise(ArgumentError, "#{field} must be a positive integer, got: #{inspect(value)}")
-
-  defp validate_non_neg_integer!(n, _field) when is_integer(n) and n >= 0, do: n
+    do:
+      require_opt!(is_integer(value) and value > 0, value, "#{field} must be a positive integer")
 
   defp validate_non_neg_integer!(value, field),
-    do: raise(ArgumentError, "#{field} must be a non-negative integer, got: #{inspect(value)}")
-
-  defp validate_boolean!(value, _field) when is_boolean(value), do: value
-
-  defp validate_boolean!(value, field),
-    do: raise(ArgumentError, "#{field} must be a boolean, got: #{inspect(value)}")
-
-  defp validate_optional_string!(nil, _field), do: nil
-  defp validate_optional_string!(value, _field) when is_binary(value), do: value
-
-  defp validate_optional_string!(value, field),
-    do: raise(ArgumentError, "#{field} must be a string or nil, got: #{inspect(value)}")
-
-  defp validate_non_empty_string!(value, _field) when is_binary(value) and byte_size(value) > 0,
-    do: value
-
-  defp validate_non_empty_string!(value, field),
-    do: raise(ArgumentError, "#{field} must be a nonempty string, got: #{inspect(value)}")
-
-  defp validate_optional_non_empty_string!(nil, _field), do: nil
-
-  defp validate_optional_non_empty_string!(value, _field)
-       when is_binary(value) and byte_size(value) > 0,
-       do: value
-
-  defp validate_optional_non_empty_string!(value, field),
-    do: raise(ArgumentError, "#{field} must be a nonempty string or nil, got: #{inspect(value)}")
-
-  defp validate_context!(context) when is_map(context), do: context
-
-  defp validate_context!(value),
-    do: raise(ArgumentError, "context must be a map, got: #{inspect(value)}")
-
-  defp validate_on_compaction!(nil), do: nil
-  defp validate_on_compaction!(fun) when is_function(fun, 2), do: fun
-
-  defp validate_on_compaction!(value),
     do:
-      raise(
-        ArgumentError,
-        "on_compaction must be a 2-arity function or nil, got: #{inspect(value)}"
+      require_opt!(
+        is_integer(value) and value >= 0,
+        value,
+        "#{field} must be a non-negative integer"
       )
 
-  defp validate_middleware!(middleware) when is_list(middleware) do
-    if Enum.all?(middleware, &valid_module_atom?/1) do
-      middleware
-    else
-      raise ArgumentError,
-            "middleware must be a list of module atoms, got: #{inspect(middleware)}"
-    end
-  end
+  defp validate_non_empty_string!(value, field),
+    do:
+      require_opt!(
+        is_binary(value) and byte_size(value) > 0,
+        value,
+        "#{field} must be a nonempty string"
+      )
 
-  defp validate_middleware!(value),
-    do: raise(ArgumentError, "middleware must be a list of module atoms, got: #{inspect(value)}")
+  defp validate_optional_non_empty_string!(nil, _msg), do: nil
 
-  defp validate_fallback_providers!(fallbacks) when is_list(fallbacks) do
-    Enum.map(fallbacks, &parse_fallback_provider/1)
-  end
-
-  defp validate_fallback_providers!(value),
-    do: raise(ArgumentError, "fallback_providers must be a list, got: #{inspect(value)}")
-
-  defp valid_module_atom?(mod), do: is_atom(mod) and not is_nil(mod) and not is_boolean(mod)
+  defp validate_optional_non_empty_string!(value, msg),
+    do: require_opt!(is_binary(value) and byte_size(value) > 0, value, msg)
 
   defp validate_tool_concurrency!(nil), do: nil
-  defp validate_tool_concurrency!(n) when is_integer(n) and n > 0, do: n
 
   defp validate_tool_concurrency!(value),
     do:
-      raise(ArgumentError, "tool_concurrency must be a positive integer, got: #{inspect(value)}")
+      require_opt!(
+        is_integer(value) and value > 0,
+        value,
+        "tool_concurrency must be a positive integer"
+      )
 
-  defp validate_tool_validation!(mode) when mode in [:required, :schema], do: mode
+  defp validate_middleware!(value) do
+    require_opt!(
+      is_list(value) and Enum.all?(value, &valid_module_atom?/1),
+      value,
+      "middleware must be a list of module atoms"
+    )
+  end
 
-  defp validate_tool_validation!(value),
-    do:
-      raise(ArgumentError, "tool_validation must be :required or :schema, got: #{inspect(value)}")
+  defp validate_fallback_providers!(value) do
+    require_opt!(is_list(value), value, "fallback_providers must be a list")
+    |> Enum.map(&parse_fallback_provider/1)
+  end
 
-  defp validate_stop_after_tool!(nil), do: nil
-  defp validate_stop_after_tool!(name) when is_binary(name) and byte_size(name) > 0, do: name
-
-  defp validate_stop_after_tool!(value),
-    do:
-      raise(ArgumentError, "stop_after_tool must be a nonempty tool name, got: #{inspect(value)}")
+  defp valid_module_atom?(mod), do: is_atom(mod) and not is_nil(mod) and not is_boolean(mod)
 
   # A misspelt or removed option used to be ignored silently, which hides
   # mistakes such as a budget or tool list that never applies.
@@ -444,50 +439,29 @@ defmodule Alloy.Agent.Config do
     }
   end
 
-  defp parse_provider({module, config})
-       when is_atom(module) and not is_nil(module) and not is_boolean(module) and
-              (is_list(config) or is_map(config)) do
-    {module, config}
+  defp parse_provider(entry), do: parse_provider_entry(entry, "provider", [])
+
+  defp parse_fallback_provider(entry) do
+    {mod, cfg} = parse_provider_entry(entry, "fallback provider", %{})
+    {mod, cfg |> normalize_provider_config() |> reject_removed!(mod)}
   end
 
-  defp parse_provider(module)
-       when is_atom(module) and not is_nil(module) and not is_boolean(module) do
-    {module, []}
-  end
+  defp parse_provider_entry({mod, cfg}, _label, _default)
+       when is_atom(mod) and not is_nil(mod) and not is_boolean(mod) and
+              (is_list(cfg) or is_map(cfg)),
+       do: {mod, cfg}
 
-  defp parse_provider(other) do
+  defp parse_provider_entry(mod, _label, default)
+       when is_atom(mod) and not is_nil(mod) and not is_boolean(mod),
+       do: {mod, default}
+
+  defp parse_provider_entry(other, label, _default) do
     raise ArgumentError,
-          "provider must be a module or {module, config} tuple, got: #{format_invalid_provider(other)}"
+          "#{label} must be a module or {module, config} tuple, got: #{format_invalid_provider(other)}"
   end
 
-  defp parse_fallback_provider({module, provider_config})
-       when is_atom(module) and not is_nil(module) and not is_boolean(module) and
-              (is_list(provider_config) or is_map(provider_config)) do
-    {module, provider_config |> normalize_provider_config() |> reject_removed!(module)}
-  end
-
-  defp parse_fallback_provider(module)
-       when is_atom(module) and not is_nil(module) and not is_boolean(module) do
-    {module, %{}}
-  end
-
-  defp parse_fallback_provider(other) do
-    raise ArgumentError,
-          "fallback provider must be a module or {module, config} tuple, got: #{format_invalid_provider(other)}"
-  end
-
-  defp format_invalid_provider({mod, _config}),
-    do: "{#{format_invalid_provider(mod)}, ...}"
-
-  defp format_invalid_provider(other)
-       when is_atom(other) or is_number(other) or is_binary(other),
-       do: Sanitize.inspect_bounded(other)
-
-  defp format_invalid_provider(%mod{}), do: "%#{inspect(mod)}{...}"
-  defp format_invalid_provider(other) when is_map(other), do: "a map"
-  defp format_invalid_provider(other) when is_list(other), do: "a list"
-  defp format_invalid_provider(other) when is_tuple(other), do: "a tuple"
-  defp format_invalid_provider(_other), do: "an unsupported value"
+  defp format_invalid_provider({mod, _config}), do: "{#{Sanitize.shape_summary(mod)}, ...}"
+  defp format_invalid_provider(other), do: Sanitize.shape_summary(other)
 
   defp normalize_provider_config(config) when is_map(config), do: config
   defp normalize_provider_config(config) when is_list(config), do: Map.new(config)

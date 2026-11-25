@@ -501,16 +501,11 @@ defmodule Alloy.Provider.Anthropic do
 
   defp tool_use_block?(_block), do: false
 
-  defp record_protocol_error(acc, message), do: record_sticky_error(acc, :protocol_error, message)
+  defp record_protocol_error(acc, message),
+    do: HTTP.record_sticky_error(acc, :protocol_error, message)
 
   defp record_malformed_error(acc, message),
-    do: record_sticky_error(acc, :malformed_reply, message)
-
-  defp record_sticky_error(%{sticky_error: %Error{}} = acc, _kind, _message), do: acc
-
-  defp record_sticky_error(acc, kind, message) do
-    %{acc | sticky_error: %Error{kind: kind, message: message}}
-  end
+    do: HTTP.record_sticky_error(acc, :malformed_reply, message)
 
   defp record_tool_json_error(%{tool_json_error: %Error{}} = acc, _message), do: acc
 
@@ -630,7 +625,7 @@ defmodule Alloy.Provider.Anthropic do
 
     body =
       body
-      |> maybe_put_tools(tools)
+      |> HTTP.maybe_put_non_empty("tools", tools)
       |> maybe_put_container(config)
       |> maybe_put_output_schema(config)
 
@@ -663,9 +658,6 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp reject_extended_thinking!(_config), do: :ok
-
-  defp maybe_put_tools(body, []), do: body
-  defp maybe_put_tools(body, tools), do: Map.put(body, "tools", tools)
 
   defp code_execution_tools(%{code_execution: true}),
     do: [%{"type" => @code_execution_tool_type, "name" => "code_execution"}]
@@ -880,43 +872,29 @@ defmodule Alloy.Provider.Anthropic do
     do: %{"type" => type, "name" => name}
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema} = def_map) do
-    base =
-      %{
-        "name" => name,
-        "description" => desc,
-        "input_schema" => Alloy.Provider.stringify_keys(schema)
-      }
-      |> maybe_put_strict(def_map)
-      |> maybe_put_input_examples(def_map)
-      |> maybe_put_defer_loading(def_map)
-
-    maybe_put_allowed_callers(base, def_map)
+    %{
+      "name" => name,
+      "description" => desc,
+      "input_schema" => Alloy.Provider.stringify_keys(schema)
+    }
+    |> HTTP.maybe_put("strict", if(def_map[:strict] == true, do: true))
+    |> HTTP.maybe_put(
+      "input_examples",
+      if(is_list(def_map[:input_examples]), do: def_map[:input_examples])
+    )
+    |> HTTP.maybe_put("defer_loading", if(def_map[:defer_loading] == true, do: true))
+    |> HTTP.maybe_put(
+      "allowed_callers",
+      if(is_list(def_map[:allowed_callers]),
+        do: Enum.map(def_map[:allowed_callers], &allowed_caller/1)
+      )
+    )
   end
-
-  defp maybe_put_allowed_callers(tool, %{allowed_callers: callers}) when is_list(callers),
-    do: Map.put(tool, "allowed_callers", Enum.map(callers, &allowed_caller/1))
-
-  defp maybe_put_allowed_callers(tool, _def_map), do: tool
 
   # Alloy's :human and :code_execution predate the API's caller names.
   defp allowed_caller(caller) when caller in [:human, :direct], do: "direct"
   defp allowed_caller(:code_execution), do: @code_execution_caller
   defp allowed_caller(caller), do: to_string(caller)
-
-  defp maybe_put_strict(tool, %{strict: true}), do: Map.put(tool, "strict", true)
-  defp maybe_put_strict(tool, _def_map), do: tool
-
-  defp maybe_put_input_examples(tool, %{input_examples: examples}) when is_list(examples) do
-    Map.put(tool, "input_examples", examples)
-  end
-
-  defp maybe_put_input_examples(tool, _def_map), do: tool
-
-  defp maybe_put_defer_loading(tool, %{defer_loading: true}) do
-    Map.put(tool, "defer_loading", true)
-  end
-
-  defp maybe_put_defer_loading(tool, _def_map), do: tool
 
   # --- Response Parsing ---
 

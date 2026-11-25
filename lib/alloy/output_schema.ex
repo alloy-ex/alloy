@@ -60,6 +60,7 @@ defmodule Alloy.OutputSchema do
     `state.run_metadata.output`). Alloy does not run an automatic repair turn.
   """
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.Tool.Validation
 
   @default_name "alloy_output"
@@ -140,7 +141,7 @@ defmodule Alloy.OutputSchema do
 
   def normalize!(other) do
     raise ArgumentError,
-          "output_schema must be a non-empty JSON Schema map or nil, got: #{inspect(other)}"
+          "output_schema must be a non-empty JSON Schema map or nil, got: #{Sanitize.inspect_bounded(other)}"
   end
 
   @doc """
@@ -200,7 +201,7 @@ defmodule Alloy.OutputSchema do
 
     if unknown_keys != [] do
       raise ArgumentError,
-            "output_schema wrapper map contains unsupported key(s): #{inspect(unknown_keys)}. " <>
+            "output_schema wrapper map contains unsupported key(s): #{Sanitize.inspect_bounded(unknown_keys)}. " <>
               "Allowed wrapper keys are :name, :schema, and :strict " <>
               "(put schema metadata like \"description\" inside the :schema map)."
     end
@@ -223,7 +224,7 @@ defmodule Alloy.OutputSchema do
       }
     else
       raise ArgumentError,
-            "output_schema :schema must be a non-empty JSON Schema map, got: #{inspect(raw_schema)}"
+            "output_schema :schema must be a non-empty JSON Schema map, got: #{Sanitize.inspect_bounded(raw_schema)}"
     end
   end
 
@@ -247,19 +248,20 @@ defmodule Alloy.OutputSchema do
   defp validate_name!(name) when is_binary(name) do
     unless Regex.match?(@name_pattern, name) do
       raise ArgumentError,
-            "output_schema :name must match ^[a-zA-Z0-9_-]{1,64}$, got: #{inspect(name)}"
+            "output_schema :name must match ^[a-zA-Z0-9_-]{1,64}$, got: #{Sanitize.inspect_bounded(name)}"
     end
   end
 
   defp validate_name!(name) do
     raise ArgumentError,
-          "output_schema :name must be a string matching ^[a-zA-Z0-9_-]{1,64}$, got: #{inspect(name)}"
+          "output_schema :name must be a string matching ^[a-zA-Z0-9_-]{1,64}$, got: #{Sanitize.inspect_bounded(name)}"
   end
 
   defp validate_strict!(strict) when is_boolean(strict), do: :ok
 
   defp validate_strict!(strict) do
-    raise ArgumentError, "output_schema :strict must be a boolean, got: #{inspect(strict)}"
+    raise ArgumentError,
+          "output_schema :strict must be a boolean, got: #{Sanitize.inspect_bounded(strict)}"
   end
 
   defp normalize_schema!(schema, name) do

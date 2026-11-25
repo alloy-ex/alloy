@@ -270,12 +270,13 @@ defmodule Alloy.Agent.Turn do
     case extract_tool_calls(new_msgs) do
       # Only server-executed tools ran: there is nothing for the client to
       # answer, and an empty tool-results message is rejected by every API.
-      [] -> finish(state)
+      [] -> finish(state, new_msgs)
       calls -> handle_tool_use(state, calls, prepared_schemas, opts)
     end
   end
 
-  defp continue_after(state, :end_turn, _new_msgs, _prepared_schemas, _opts), do: finish(state)
+  defp continue_after(state, :end_turn, new_msgs, _prepared_schemas, _opts),
+    do: finish(state, new_msgs)
 
   defp continue_after(state, :pause_turn, _new_msgs, _prepared_schemas, _opts),
     do: {:continue, state}
@@ -283,7 +284,7 @@ defmodule Alloy.Agent.Turn do
   defp continue_after(state, :max_tokens, new_msgs, _prepared_schemas, _opts) do
     case extract_tool_calls(new_msgs) do
       [] ->
-        finish(state)
+        finish(state, new_msgs)
 
       calls ->
         reason =
@@ -478,7 +479,7 @@ defmodule Alloy.Agent.Turn do
         selected |> Map.take([:id, :name, :structured_data]) |> Map.put(:content, content)
 
       state = State.merge_run_metadata(state, %{final_tool: final_tool})
-      finish(state)
+      finish(state, [])
     else
       _ -> next
     end
@@ -557,9 +558,6 @@ defmodule Alloy.Agent.Turn do
   defp maybe_put_output_schema(provider_config, %OutputSchema{} = spec),
     do: Map.put(provider_config, :output_schema, spec)
 
-  defp maybe_put_output_schema(provider_config, spec),
-    do: Map.put(provider_config, :output_schema, OutputSchema.normalize!(spec))
-
   defp extract_tool_calls(messages) do
     Enum.flat_map(messages, &Message.tool_calls/1)
   end
@@ -572,9 +570,9 @@ defmodule Alloy.Agent.Turn do
   # discard it on timeout (which would push callers to retry completed side
   # effects). When until_tool requires another turn, returning {:continue, state}
   # enters loop/2's turn > 0 deadline check before starting it.
-  defp finish(state) do
+  defp finish(state, new_msgs) do
     cond do
-      structured_output_refusal?(state) ->
+      structured_output_refusal?(state, new_msgs) ->
         message = "The model refused to produce structured output"
         error = %{kind: :refusal, message: message, decoded: nil}
         {:halt, state |> State.merge_run_metadata(%{output_error: error}) |> fail(message)}
@@ -588,7 +586,7 @@ defmodule Alloy.Agent.Turn do
         {:continue, State.append_messages(state, [reminder])}
 
       true ->
-        case decode_structured_output(state) do
+        case decode_structured_output(state, new_msgs) do
           {:ok, state} ->
             case run_middleware(:after_completion, state) do
               {:continue, state} -> {:halt, %{state | status: :completed}}
@@ -601,21 +599,21 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  defp structured_output_refusal?(%State{config: %{output_schema: nil}}), do: false
-  defp structured_output_refusal?(%State{run_metadata: %{final_tool: _}}), do: false
+  defp structured_output_refusal?(%State{config: %{output_schema: nil}}, _new_msgs), do: false
+  defp structured_output_refusal?(%State{run_metadata: %{final_tool: _}}, _new_msgs), do: false
 
-  defp structured_output_refusal?(%State{messages: messages}) do
-    messages |> last_assistant_message() |> refusal_message?()
+  defp structured_output_refusal?(_state, new_msgs) do
+    new_msgs |> last_assistant_message() |> refusal_message?()
   end
 
-  defp decode_structured_output(%State{config: %{output_schema: nil}} = state), do: {:ok, state}
+  defp decode_structured_output(%State{config: %{output_schema: nil}} = state, _new_msgs),
+    do: {:ok, state}
 
-  defp decode_structured_output(%State{run_metadata: %{final_tool: _}} = state), do: {:ok, state}
+  defp decode_structured_output(%State{run_metadata: %{final_tool: _}} = state, _new_msgs),
+    do: {:ok, state}
 
-  defp decode_structured_output(
-         %State{config: %{output_schema: spec}, messages: messages} = state
-       ) do
-    text = messages |> last_assistant_message() |> raw_assistant_text()
+  defp decode_structured_output(%State{config: %{output_schema: spec}} = state, new_msgs) do
+    text = new_msgs |> last_assistant_message() |> raw_assistant_text()
     handle_decoded_output(state, OutputSchema.decode_and_validate(text, spec))
   end
 

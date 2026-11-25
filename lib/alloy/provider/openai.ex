@@ -167,30 +167,20 @@ defmodule Alloy.Provider.OpenAI do
 
     body =
       %{"model" => config.model, "input" => input_items}
-      |> maybe_put_optional_request_field("max_output_tokens", Map.get(config, :max_tokens))
-      |> maybe_put_optional_request_field(
-        "previous_response_id",
-        Map.get(config, :previous_response_id)
-      )
-      |> maybe_put_optional_request_field("store", Map.get(config, :store))
-      |> maybe_put_optional_request_field("include", Map.get(config, :include))
+      |> HTTP.maybe_put_non_empty("max_output_tokens", Map.get(config, :max_tokens))
+      |> HTTP.maybe_put_non_empty("previous_response_id", Map.get(config, :previous_response_id))
+      |> HTTP.maybe_put_non_empty("store", Map.get(config, :store))
+      |> HTTP.maybe_put_non_empty("include", Map.get(config, :include))
       |> maybe_put_reasoning_include(config)
-      |> maybe_put_optional_request_field("tool_choice", Map.get(config, :tool_choice))
-      |> maybe_put_optional_request_field(
-        "parallel_tool_calls",
-        Map.get(config, :parallel_tool_calls)
-      )
+      |> HTTP.maybe_put_non_empty("tool_choice", Map.get(config, :tool_choice))
+      |> HTTP.maybe_put_non_empty("parallel_tool_calls", Map.get(config, :parallel_tool_calls))
 
-    tools =
-      Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
+    tools = Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
 
     body =
-      case tools do
-        [] -> body
-        defs -> Map.put(body, "tools", defs)
-      end
-
-    body = maybe_put_output_schema(body, config)
+      body
+      |> HTTP.maybe_put_non_empty("tools", tools)
+      |> maybe_put_output_schema(config)
 
     # Merge extra_body LAST so caller can override any field (#18), preserving
     # sibling keys inside "text" (e.g. verbosity alongside format).
@@ -217,10 +207,6 @@ defmodule Alloy.Provider.OpenAI do
         })
     end
   end
-
-  defp maybe_put_optional_request_field(body, _key, nil), do: body
-  defp maybe_put_optional_request_field(body, _key, value) when value == [], do: body
-  defp maybe_put_optional_request_field(body, key, value), do: Map.put(body, key, value)
 
   defp maybe_put_reasoning_include(body, config) do
     if stateless_reasoning_echo?(config) do
@@ -348,7 +334,7 @@ defmodule Alloy.Provider.OpenAI do
   defp format_assistant_block(%{type: "text", text: text} = block, _stateless?)
        when is_binary(text) and text != "" do
     [
-      maybe_put_optional_request_field(
+      HTTP.maybe_put(
         %{"role" => "assistant", "content" => text},
         "phase",
         block[:phase]
@@ -424,22 +410,10 @@ defmodule Alloy.Provider.OpenAI do
           process_stream_event(acc, event_type, parsed)
 
         {:ok, _non_map} ->
-          %{
-            acc
-            | sticky_error: %Error{
-                kind: :protocol_error,
-                message: "Malformed payload in OpenAI SSE event"
-              }
-          }
+          HTTP.record_sticky_error(acc, :protocol_error, "Malformed payload in OpenAI SSE event")
 
         {:error, _} ->
-          %{
-            acc
-            | sticky_error: %Error{
-                kind: :malformed_reply,
-                message: "Malformed JSON in OpenAI SSE event"
-              }
-          }
+          HTTP.record_sticky_error(acc, :malformed_reply, "Malformed JSON in OpenAI SSE event")
       end
     end
   end
@@ -775,20 +749,13 @@ defmodule Alloy.Provider.OpenAI do
 
   defp response_metadata_from_response(resp) do
     %{}
-    |> maybe_put_response_metadata(:citations, Map.get(resp, "citations"))
-    |> maybe_put_response_metadata(
-      :server_side_tool_usage,
-      Map.get(resp, "server_side_tool_usage")
-    )
-    |> maybe_put_response_metadata(:stop_details, stop_details(resp))
+    |> HTTP.maybe_put_non_empty(:citations, Map.get(resp, "citations"))
+    |> HTTP.maybe_put_non_empty(:server_side_tool_usage, Map.get(resp, "server_side_tool_usage"))
+    |> HTTP.maybe_put_non_empty(:stop_details, stop_details(resp))
   end
 
   defp stop_details(%{"status" => "incomplete"} = resp), do: resp["incomplete_details"]
   defp stop_details(_resp), do: nil
-
-  defp maybe_put_response_metadata(metadata, _key, nil), do: metadata
-  defp maybe_put_response_metadata(metadata, _key, value) when value == [], do: metadata
-  defp maybe_put_response_metadata(metadata, key, value), do: Map.put(metadata, key, value)
 
   defp maybe_put_annotations(block, annotations)
        when is_list(annotations) and annotations != [] do

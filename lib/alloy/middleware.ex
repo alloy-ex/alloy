@@ -100,13 +100,13 @@ defmodule Alloy.Middleware do
 
         {:block, reason} ->
           raise ArgumentError,
-                "#{inspect(middleware)} returned {:block, #{Sanitize.inspect_bounded(reason)}} " <>
+                "#{inspect(middleware)} returned {:block, #{Sanitize.shape_summary(reason)}} " <>
                   "from hook #{inspect(hook)}, but {:block, reason} is only valid for " <>
                   "the :before_tool_call hook. Use {:halt, reason} to stop the agent loop."
 
         other ->
           raise ArgumentError,
-                "#{inspect(middleware)} returned unsupported value #{Sanitize.inspect_bounded(other)} " <>
+                "#{inspect(middleware)} returned unsupported value #{Sanitize.shape_summary(other)} " <>
                   "from hook #{inspect(hook)}. Expected %Alloy.Agent.State{}, {:halt, reason}, " <>
                   "or {:halt, reason, state}."
       end
@@ -153,7 +153,7 @@ defmodule Alloy.Middleware do
 
           other ->
             raise ArgumentError,
-                  "#{inspect(middleware)} returned unsupported value #{Sanitize.inspect_bounded(other)} " <>
+                  "#{inspect(middleware)} returned unsupported value #{Sanitize.shape_summary(other)} " <>
                     "from :before_tool_call. Expected %Alloy.Agent.State{}, {:edit, call}, " <>
                     "{:block, reason}, or {:halt, reason}."
         end
@@ -185,7 +185,7 @@ defmodule Alloy.Middleware do
 
         other ->
           raise ArgumentError,
-                "#{inspect(middleware)} returned unsupported value #{Sanitize.inspect_bounded(other)} " <>
+                "#{inspect(middleware)} returned unsupported value #{Sanitize.shape_summary(other)} " <>
                   "from :after_tool_call. Expected %Alloy.Agent.State{} or {:result, result}."
       end
     end)

@@ -156,15 +156,12 @@ defmodule Alloy.Provider.OpenAIStream do
       end
 
     HTTP.cache_adjusted_usage(
-      non_neg_int(usage["prompt_tokens"]),
-      non_neg_int(usage["completion_tokens"]),
-      non_neg_int(details["cached_tokens"]),
-      non_neg_int(details["cache_write_tokens"])
+      HTTP.non_neg_int(usage["prompt_tokens"]),
+      HTTP.non_neg_int(usage["completion_tokens"]),
+      HTTP.non_neg_int(details["cached_tokens"]),
+      HTTP.non_neg_int(details["cache_write_tokens"])
     )
   end
-
-  defp non_neg_int(n) when is_integer(n) and n >= 0, do: n
-  defp non_neg_int(_), do: 0
 
   # Request usage by default, but preserve custom options and omit the field
   # entirely when the caller disables it for a less compatible endpoint.
@@ -476,16 +473,10 @@ defmodule Alloy.Provider.OpenAIStream do
   end
 
   defp record_malformed_error(acc, message),
-    do: record_sticky_error(acc, :malformed_reply, message)
+    do: HTTP.record_sticky_error(acc, :malformed_reply, message)
 
   defp record_protocol_error(acc, message),
-    do: record_sticky_error(acc, :protocol_error, message)
-
-  defp record_sticky_error(%{sticky_error: %Error{}} = acc, _kind, _message), do: acc
-
-  defp record_sticky_error(acc, kind, message) do
-    %{acc | sticky_error: %Error{kind: kind, message: message}}
-  end
+    do: HTTP.record_sticky_error(acc, :protocol_error, message)
 
   # ── Response Building ────────────────────────────────────────────────
 

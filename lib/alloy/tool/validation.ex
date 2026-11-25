@@ -143,18 +143,9 @@ defmodule Alloy.Tool.Validation do
     end
   rescue
     error ->
-      cond do
-        error.__struct__ in [
-          ExJsonSchema.Schema.InvalidReferenceError,
-          ExJsonSchema.Schema.InvalidSchemaError
-        ] ->
-          {:error, :invalid_schema, "Invalid output_schema: #{Exception.message(error)}"}
-
-        error.__struct__ == ExJsonSchema.Schema.MissingJsonDecoderError ->
-          {:error, :invalid_schema, missing_json_decoder_message()}
-
-        true ->
-          reraise error, __STACKTRACE__
+      case rescue_schema_error(error, :output) do
+        {:ok, message} -> {:error, :invalid_schema, message}
+        :reraise -> reraise error, __STACKTRACE__
       end
   end
 
@@ -187,19 +178,36 @@ defmodule Alloy.Tool.Validation do
       {:error, "Invalid input for #{name}: #{Exception.message(error)}", nil}
 
     error ->
-      cond do
-        error.__struct__ in [
-          ExJsonSchema.Schema.InvalidReferenceError,
-          ExJsonSchema.Schema.InvalidSchemaError
-        ] ->
-          {:error, "Invalid schema for #{name}: #{Exception.message(error)}", nil}
-
-        error.__struct__ == ExJsonSchema.Schema.MissingJsonDecoderError ->
-          {:error, "Invalid schema for #{name}: #{missing_json_decoder_message()}", nil}
-
-        true ->
-          reraise error, __STACKTRACE__
+      case rescue_schema_error(error, {:tool, name}) do
+        {:ok, message} -> {:error, message, nil}
+        :reraise -> reraise error, __STACKTRACE__
       end
+  end
+
+  defp rescue_schema_error(error, target) do
+    prefix =
+      case target do
+        :output -> "Invalid output_schema"
+        {:tool, name} -> "Invalid schema for #{name}"
+      end
+
+    cond do
+      error.__struct__ in [
+        ExJsonSchema.Schema.InvalidReferenceError,
+        ExJsonSchema.Schema.InvalidSchemaError
+      ] ->
+        {:ok, "#{prefix}: #{Exception.message(error)}"}
+
+      error.__struct__ == ExJsonSchema.Schema.MissingJsonDecoderError ->
+        {:ok,
+         if(target == :output,
+           do: missing_json_decoder_message(),
+           else: "#{prefix}: #{missing_json_decoder_message()}"
+         )}
+
+      true ->
+        :reraise
+    end
   end
 
   defp missing_json_decoder_message do
@@ -255,39 +263,36 @@ defmodule Alloy.Tool.Validation do
   # still collected and checked, but $id/id values are not added to defined_ids
   # because ExJsonSchema does not cache them during Schema.resolve/1.
   defp collect_scopes_and_refs(map, scope, defined_ids, refs, record_ids?) when is_map(map) do
-    {next_scope, defined_ids} =
-      if record_ids?,
-        do: advance_scope(map, scope, defined_ids),
-        else: {advance_scope_only(map, scope), defined_ids}
+    {next_scope, defined_ids} = advance_scope(map, scope, defined_ids, record_ids?)
 
     Enum.reduce(map, {defined_ids, refs}, fn
       {key, _value}, acc when key in @literal_keywords ->
         acc
 
       {key, value}, {ids, ref_acc} when key in @schema_map_keywords and is_map(value) ->
-        {map_scope, ids} =
-          if record_ids?,
-            do: advance_scope(value, next_scope, ids),
-            else: {advance_scope_only(value, next_scope), ids}
+        {map_scope, ids} = advance_scope(value, next_scope, ids, record_ids?)
 
         Enum.reduce(value, {ids, ref_acc}, fn
           {"$ref", ref}, {i, r} when is_binary(ref) ->
             {i, [{ref, map_scope} | r]}
 
           {prop, subschema}, {i, r} when is_map(subschema) ->
-            child_record_ids? = record_ids? and prop not in @literal_keywords
-            collect_scopes_and_refs(subschema, map_scope, i, r, child_record_ids?)
+            collect_scopes_and_refs(
+              subschema,
+              map_scope,
+              i,
+              r,
+              record_ids? and prop not in @literal_keywords
+            )
 
           {prop, subschemas}, {i, r} when is_list(subschemas) ->
-            child_record_ids? = record_ids? and prop not in @literal_keywords
-
-            Enum.reduce(subschemas, {i, r}, fn
-              item, {ii, rr} when is_map(item) ->
-                collect_scopes_and_refs(item, map_scope, ii, rr, child_record_ids?)
-
-              _non_map, inner ->
-                inner
-            end)
+            collect_map_list(
+              subschemas,
+              map_scope,
+              i,
+              r,
+              record_ids? and prop not in @literal_keywords
+            )
 
           {_prop, _other}, inner ->
             inner
@@ -300,13 +305,7 @@ defmodule Alloy.Tool.Validation do
         collect_scopes_and_refs(value, next_scope, ids, ref_acc, record_ids?)
 
       {_key, values}, {ids, ref_acc} when is_list(values) ->
-        Enum.reduce(values, {ids, ref_acc}, fn
-          item, {i, r} when is_map(item) ->
-            collect_scopes_and_refs(item, next_scope, i, r, record_ids?)
-
-          _non_map, acc ->
-            acc
-        end)
+        collect_map_list(values, next_scope, ids, ref_acc, record_ids?)
 
       {_key, _value}, acc ->
         acc
@@ -315,6 +314,13 @@ defmodule Alloy.Tool.Validation do
 
   defp collect_scopes_and_refs(_value, _scope, defined_ids, refs, _record_ids?),
     do: {defined_ids, refs}
+
+  defp collect_map_list(values, scope, ids, ref_acc, record_ids?) do
+    Enum.reduce(values, {ids, ref_acc}, fn
+      item, {i, r} when is_map(item) -> collect_scopes_and_refs(item, scope, i, r, record_ids?)
+      _non_map, acc -> acc
+    end)
+  end
 
   # ExJsonSchema skips @literal_keywords during resolve_property/3 even when
   # used as property/definition names inside @schema_map_keywords. That skips
@@ -468,12 +474,20 @@ defmodule Alloy.Tool.Validation do
 
       {:ok, target} ->
         raise ArgumentError,
-              "#{schema_subject(subject, :singular)} $ref #{inspect(display_ref)} must target a schema object or boolean, got: #{inspect(target)}"
+              "#{schema_subject(subject, :singular)} $ref #{inspect(display_ref)} must target a schema object or boolean, got: #{Sanitize.inspect_bounded(target)}"
 
       {:error, _reason} ->
         raise ArgumentError,
               "#{schema_subject(subject, :singular)} contains unresolved local $ref: #{inspect(display_ref)}"
     end
+  end
+
+  defp advance_scope(map, scope, defined_ids, record_ids?) do
+    next = advance_scope_only(map, scope)
+
+    if record_ids? and has_nested_id?(map),
+      do: {next, MapSet.put(defined_ids, next)},
+      else: {next, defined_ids}
   end
 
   defp advance_scope_only(%{"$ref" => ref}, scope) when is_binary(ref) or is_struct(ref),
@@ -482,21 +496,6 @@ defmodule Alloy.Tool.Validation do
   defp advance_scope_only(%{"$id" => id}, scope) when is_binary(id), do: merge_scope(scope, id)
   defp advance_scope_only(%{"id" => id}, scope) when is_binary(id), do: merge_scope(scope, id)
   defp advance_scope_only(_map, scope), do: scope
-
-  defp advance_scope(%{"$ref" => ref}, scope, defined_ids) when is_binary(ref),
-    do: {scope, defined_ids}
-
-  defp advance_scope(%{"$id" => id}, scope, defined_ids) when is_binary(id) do
-    next = merge_scope(scope, id)
-    {next, MapSet.put(defined_ids, next)}
-  end
-
-  defp advance_scope(%{"id" => id}, scope, defined_ids) when is_binary(id) do
-    next = merge_scope(scope, id)
-    {next, MapSet.put(defined_ids, next)}
-  end
-
-  defp advance_scope(_map, scope, defined_ids), do: {scope, defined_ids}
 
   # Mirrors ExJsonSchema.Schema.resolve_with_id/4.
   defp merge_scope(scope, id) do
