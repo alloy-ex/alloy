@@ -58,6 +58,63 @@ defmodule Alloy.OutputSchemaTest do
       assert_raise ArgumentError, ~r/Invalid output_schema/, fn ->
         OutputSchema.normalize!(%{:type => "object", "type" => "array"})
       end
+
+      assert_raise ArgumentError, ~r/:schema must be a non-empty/, fn ->
+        OutputSchema.normalize!(%{schema: %{}})
+      end
+
+      assert_raise ArgumentError, ~r/:name must be a string/, fn ->
+        OutputSchema.normalize!(%{name: 123, schema: @answer_schema})
+      end
+    end
+
+    test "basic fallback validation covers JSON types, union types, and missing assistant text" do
+      draft_2020 = fn extra ->
+        Map.merge(%{"$schema" => "https://json-schema.org/draft/2020-12/schema"}, extra)
+        |> OutputSchema.normalize!()
+      end
+
+      assert {:ok, [1, 2]} =
+               OutputSchema.decode_and_validate("[1,2]", draft_2020.(%{"type" => "array"}))
+
+      assert {:ok, "hi"} =
+               OutputSchema.decode_and_validate(~s("hi"), draft_2020.(%{"type" => "string"}))
+
+      assert {:ok, 7} =
+               OutputSchema.decode_and_validate("7", draft_2020.(%{"type" => "integer"}))
+
+      assert {:ok, 1.5} =
+               OutputSchema.decode_and_validate("1.5", draft_2020.(%{"type" => "number"}))
+
+      assert {:ok, true} =
+               OutputSchema.decode_and_validate("true", draft_2020.(%{"type" => "boolean"}))
+
+      assert {:ok, nil} =
+               OutputSchema.decode_and_validate("null", draft_2020.(%{"type" => "null"}))
+
+      assert {:ok, "ok"} =
+               OutputSchema.decode_and_validate(
+                 ~s("ok"),
+                 draft_2020.(%{"type" => ["string", "null"]})
+               )
+
+      assert {:error, msg} =
+               OutputSchema.decode_and_validate(
+                 "123",
+                 draft_2020.(%{"type" => ["string", "null"]})
+               )
+
+      assert msg =~ "did not match any expected JSON type"
+
+      assert {:error, type_msg} =
+               OutputSchema.decode_and_validate("123", draft_2020.(%{"type" => "string"}))
+
+      assert type_msg =~ "expected JSON type"
+
+      assert {:error, missing_msg} =
+               OutputSchema.decode_and_validate(nil, OutputSchema.normalize!(@answer_schema))
+
+      assert missing_msg =~ "missing assistant text"
     end
 
     @tag :ex_json_schema

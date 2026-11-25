@@ -57,7 +57,7 @@ defmodule Alloy.Tool.Validation do
       local_refs!(schema)
 
       try do
-        schema |> Schema.resolve() |> normalize_literal_property_schemas!()
+        _resolved = schema |> Schema.resolve() |> normalize_literal_property_schemas!()
         :ok
       rescue
         error ->

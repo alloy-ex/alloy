@@ -5,10 +5,10 @@ OpenTelemetry into its core dependencies. You can bridge them to OpenTelemetry
 (following the OpenTelemetry GenAI semantic conventions) in your application
 startup with ~80 lines of Elixir.
 
-When `:timeout_ms` is finite, `Alloy.OwnedWorker` automatically propagates your
-process's OpenTelemetry context (`:"$__current_otel_ctx"`) into supervised
-HTTP/SSE and custom bash workers, so child Finch/HTTP spans stay parented under
-the active Alloy span.
+When `:timeout_ms` is finite, Alloy's supervised HTTP/SSE and custom bash
+workers automatically propagate your process's OpenTelemetry context
+(`:"$__current_otel_ctx"`), so child Finch/HTTP spans stay parented under the
+active Alloy span.
 
 ## Dependencies (in your host application)
 
@@ -130,9 +130,9 @@ end
 
 ## Notes
 
-- **Context propagation:** `Alloy.OwnedWorker` copies `:"$__current_otel_ctx"`
-  into supervised HTTP/SSE and custom bash workers, so downstream Finch/HTTP
-  spans stay linked to your active `alloy.turn` span.
+- **Context propagation:** Alloy copies `:"$__current_otel_ctx"` into
+  supervised HTTP/SSE and custom bash workers, so downstream Finch/HTTP spans
+  stay linked to your active `alloy.turn` span.
 - **Usage attributes:** Attach `result.usage` (`input_tokens`, `output_tokens`,
   `cache_read_input_tokens`, `cache_creation_input_tokens`) at the `Alloy.run/2`
   call site or inside `:after_completion` middleware to record token totals on

@@ -69,7 +69,7 @@ cancellation, and deadlines stop requests immediately.
   `:code_execution`/`:until_tool`, and invalid `:middleware`/`:fallback_providers`
   entries.
 - `Alloy.Testing.run_with_responses/3` now validates options through
-  `Config.from_opts/1` (defaulting `compaction: false`).
+  `Alloy.Agent.Config.from_opts/1` (defaulting `compaction: false`).
 - `Alloy.Tool.Executor` rejects explicit `input: nil` as a non-object tool input
   (omit `:input` or pass `%{}` for no-arg calls).
 - `Alloy.Tool.resolve_path/2` now expands relative `:allowed_paths` entries

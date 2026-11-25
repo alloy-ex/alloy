@@ -78,6 +78,12 @@ defmodule Alloy.Agent.Config do
           keep_recent_tool_results: non_neg_integer()
         }
 
+  @type output_schema :: %{
+          name: String.t(),
+          schema: map(),
+          strict: boolean()
+        }
+
   @type t :: %__MODULE__{
           provider: module(),
           provider_config: map(),
@@ -93,7 +99,7 @@ defmodule Alloy.Agent.Config do
           tool_concurrency: pos_integer() | nil,
           tool_validation: :required | :schema,
           stop_after_tool: String.t() | nil,
-          output_schema: OutputSchema.t() | nil,
+          output_schema: output_schema() | nil,
           middleware: [module()],
           compaction: compaction(),
           compaction_explicit: %{
