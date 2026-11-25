@@ -86,16 +86,18 @@ defmodule Alloy.Provider.OpenAIStream do
   # Extracts text and thinking text from Chat Completions content fields,
   # supporting both string content and structured part lists (e.g. Mistral
   # Magistral reasoning models) while rejecting malformed present shapes.
-  @spec extract_content_parts(term()) :: {:ok, String.t(), String.t()} | {:error, String.t()}
-  def extract_content_parts(nil), do: {:ok, "", ""}
-  def extract_content_parts(text) when is_binary(text), do: {:ok, text, ""}
+  @spec extract_content_parts(term()) ::
+          {:ok, String.t(), String.t(), String.t()} | {:error, String.t()}
+  def extract_content_parts(nil), do: {:ok, "", "", ""}
+  def extract_content_parts(text) when is_binary(text), do: {:ok, text, "", ""}
 
   def extract_content_parts(parts) when is_list(parts) do
-    Enum.reduce_while(parts, {:ok, "", ""}, fn part, {:ok, text_acc, thinking_acc} ->
+    Enum.reduce_while(parts, {:ok, "", "", ""}, fn part, {:ok, text_acc, thinking_acc, ref_acc} ->
       case extract_content_part(part) do
-        {:ok, :text, t} -> {:cont, {:ok, text_acc <> t, thinking_acc}}
-        {:ok, :thinking, t} -> {:cont, {:ok, text_acc, thinking_acc <> t}}
-        {:ok, :ignore} -> {:cont, {:ok, text_acc, thinking_acc}}
+        {:ok, :text, t} -> {:cont, {:ok, text_acc <> t, thinking_acc, ref_acc}}
+        {:ok, :thinking, t} -> {:cont, {:ok, text_acc, thinking_acc <> t, ref_acc}}
+        {:ok, :refusal, t} -> {:cont, {:ok, text_acc, thinking_acc, ref_acc <> t}}
+        {:ok, :ignore} -> {:cont, {:ok, text_acc, thinking_acc, ref_acc}}
         {:error, _} = err -> {:halt, err}
       end
     end)
@@ -110,6 +112,12 @@ defmodule Alloy.Provider.OpenAIStream do
   defp extract_content_part(%{"type" => "text"}),
     do: {:error, "Invalid text content part in Chat Completions payload"}
 
+  defp extract_content_part(%{"type" => "refusal", "refusal" => text}) when is_binary(text),
+    do: {:ok, :refusal, text}
+
+  defp extract_content_part(%{"type" => "refusal"}),
+    do: {:error, "Invalid refusal content part in Chat Completions payload"}
+
   defp extract_content_part(%{"type" => "thinking", "thinking" => text}) when is_binary(text),
     do: {:ok, :thinking, text}
 
@@ -118,8 +126,11 @@ defmodule Alloy.Provider.OpenAIStream do
 
   defp extract_content_part(%{"type" => "thinking", "thinking" => nested}) when is_list(nested) do
     case extract_content_parts(nested) do
-      {:ok, nested_text, nested_thinking} -> {:ok, :thinking, nested_text <> nested_thinking}
-      {:error, _} -> {:error, "Invalid thinking content part in Chat Completions payload"}
+      {:ok, nested_text, nested_thinking, _nested_refusal} ->
+        {:ok, :thinking, nested_text <> nested_thinking}
+
+      {:error, _} ->
+        {:error, "Invalid thinking content part in Chat Completions payload"}
     end
   end
 
@@ -245,7 +256,8 @@ defmodule Alloy.Provider.OpenAIStream do
   defp apply_choice_delta(acc, delta, choice, event) do
     # Validate delta text fields and tool_calls before emitting text deltas so
     # a malformed field on the same chunk cannot leak text before failing.
-    with {:ok, text, content_thinking} <- extract_content_parts(Map.get(delta, "content")),
+    with {:ok, text, content_thinking, content_refusal} <-
+           extract_content_parts(Map.get(delta, "content")),
          {:ok, reasoning} <-
            validate_optional_delta_text(
              Map.get(delta, "reasoning_content"),
@@ -257,6 +269,7 @@ defmodule Alloy.Provider.OpenAIStream do
              "Invalid delta refusal in Chat Completions SSE chunk"
            ) do
       acc = accumulate_tool_calls(acc, Map.get(delta, "tool_calls", []))
+      combined_refusal = content_refusal <> refusal
 
       if acc.sticky_error do
         acc
@@ -280,8 +293,8 @@ defmodule Alloy.Provider.OpenAIStream do
             else: acc
 
         acc =
-          if refusal != "",
-            do: %{acc | refusal: acc.refusal <> refusal},
+          if combined_refusal != "",
+            do: %{acc | refusal: acc.refusal <> combined_refusal},
             else: acc
 
         acc
@@ -462,14 +475,16 @@ defmodule Alloy.Provider.OpenAIStream do
     {:error, "Invalid tool call arguments delta for #{name}"}
   end
 
-  defp record_malformed_error(acc, message) do
-    %{acc | sticky_error: %Error{kind: :malformed_reply, message: message}}
-  end
+  defp record_malformed_error(acc, message),
+    do: record_sticky_error(acc, :malformed_reply, message)
 
-  defp record_protocol_error(%{sticky_error: %Error{}} = acc, _message), do: acc
+  defp record_protocol_error(acc, message),
+    do: record_sticky_error(acc, :protocol_error, message)
 
-  defp record_protocol_error(acc, message) do
-    %{acc | sticky_error: %Error{kind: :protocol_error, message: message}}
+  defp record_sticky_error(%{sticky_error: %Error{}} = acc, _kind, _message), do: acc
+
+  defp record_sticky_error(acc, kind, message) do
+    %{acc | sticky_error: %Error{kind: kind, message: message}}
   end
 
   # ── Response Building ────────────────────────────────────────────────

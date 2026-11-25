@@ -5,6 +5,7 @@ defmodule Alloy.Internal.Sanitize do
   # secrets captured in raw payloads or function arguments.
 
   @default_inspect_opts [limit: 20, printable_limit: 500]
+  @default_max_inspect_bytes 500
 
   @doc """
   Slices before sanitizing invalid UTF-8 so multi-MB invalid binaries never
@@ -34,22 +35,20 @@ defmodule Alloy.Internal.Sanitize do
   end
 
   @doc """
-  Inspects a term with bounded collection and printable limits so unexpected
-  payloads or model-supplied inputs cannot blow up error messages.
+  Inspects a term with bounded collection/printable limits and caps the total
+  UTF-8 byte size (default: 500 bytes, configurable via `:max_bytes`) so nested
+  collections or unexpected model payloads cannot blow up error messages.
   """
   @spec inspect_bounded(term(), keyword()) :: String.t()
   def inspect_bounded(term, opts \\ []) do
-    inspect(term, Keyword.merge(@default_inspect_opts, opts))
-  end
+    {max_bytes, inspect_opts} = Keyword.pop(opts, :max_bytes, @default_max_inspect_bytes)
+    rendered = inspect(term, Keyword.merge(@default_inspect_opts, inspect_opts))
 
-  @doc """
-  Inspects a term with bounded limits and caps the resulting UTF-8 byte size.
-  """
-  @spec inspect_capped(term(), pos_integer(), keyword()) :: String.t()
-  def inspect_capped(term, max_bytes, opts \\ []) do
-    term
-    |> inspect_bounded(opts)
-    |> cap_bytes(max_bytes)
+    if byte_size(rendered) > max_bytes and max_bytes > 3 do
+      cap_bytes(rendered, max_bytes - 3) <> "..."
+    else
+      cap_bytes(rendered, max_bytes)
+    end
   end
 
   @doc """

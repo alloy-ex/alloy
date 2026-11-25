@@ -65,9 +65,15 @@ defmodule Alloy.Agent.Turn do
           {hard - @deadline_headroom_ms, hard}
       end
 
+    normalized_config = %{
+      state.config
+      | output_schema: OutputSchema.normalize!(state.config.output_schema)
+    }
+
     state = %{
       state
-      | status: :running,
+      | config: normalized_config,
+        status: :running,
         deadline: deadline,
         run_deadline: hard_deadline,
         error: nil,
@@ -84,11 +90,12 @@ defmodule Alloy.Agent.Turn do
   # emitted by hand with the same start/stop/exception shape.
   defp run_span(model, fun) do
     started = System.monotonic_time(:millisecond)
+    span_ctx = make_ref()
 
     :telemetry.execute(
       [:alloy, :run, :start],
       %{system_time: System.system_time()},
-      %{model: model}
+      %{model: model, telemetry_span_context: span_ctx}
     )
 
     try do
@@ -97,7 +104,12 @@ defmodule Alloy.Agent.Turn do
       :telemetry.execute(
         [:alloy, :run, :stop],
         %{duration_ms: System.monotonic_time(:millisecond) - started},
-        %{status: final_state.status, turns: final_state.turn, model: model}
+        %{
+          status: final_state.status,
+          turns: final_state.turn,
+          model: model,
+          telemetry_span_context: span_ctx
+        }
       )
 
       final_state
@@ -110,7 +122,8 @@ defmodule Alloy.Agent.Turn do
             model: model,
             kind: kind,
             reason: reason,
-            stacktrace: Sanitize.stacktrace(__STACKTRACE__)
+            stacktrace: Sanitize.stacktrace(__STACKTRACE__),
+            telemetry_span_context: span_ctx
           }
         )
 
@@ -542,7 +555,7 @@ defmodule Alloy.Agent.Turn do
     do: Map.delete(provider_config, :output_schema)
 
   defp maybe_put_output_schema(provider_config, spec),
-    do: Map.put(provider_config, :output_schema, spec)
+    do: Map.put(provider_config, :output_schema, OutputSchema.normalize!(spec))
 
   defp extract_tool_calls(messages) do
     Enum.flat_map(messages, &Message.tool_calls/1)

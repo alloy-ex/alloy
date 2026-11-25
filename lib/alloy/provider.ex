@@ -98,7 +98,7 @@ defmodule Alloy.Provider do
   Used by providers to prepare JSON-compatible request bodies.
   """
   @spec stringify_keys(term()) :: term()
-  def stringify_keys(map) when is_map(map) do
+  def stringify_keys(map) when is_map(map) and not is_struct(map) do
     Map.new(map, fn
       {k, v} when is_atom(k) ->
         {Atom.to_string(k), stringify_keys(v)}

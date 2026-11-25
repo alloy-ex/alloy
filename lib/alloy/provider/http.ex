@@ -81,7 +81,7 @@ defmodule Alloy.Provider.HTTP do
 
   @doc false
   @spec stringify_extra_body(term()) :: map()
-  def stringify_extra_body(extra_body) when is_map(extra_body) do
+  def stringify_extra_body(extra_body) when is_map(extra_body) and not is_struct(extra_body) do
     Map.new(extra_body, fn
       {key, value} when is_atom(key) -> {Atom.to_string(key), value}
       {key, value} -> {key, value}

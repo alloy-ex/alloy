@@ -234,9 +234,12 @@ defmodule Alloy.Provider.Codex do
       tools: tools
     }
 
-    case OutputSchema.normalize!(Map.get(config, :output_schema)) do
-      nil -> base
-      spec -> Map.put(base, :output_schema, {spec.name, spec.schema, spec.strict})
+    case Map.get(config, :output_schema) do
+      nil ->
+        base
+
+      %OutputSchema{} = spec ->
+        Map.put(base, :output_schema, {spec.name, spec.schema, spec.strict})
     end
   end
 
@@ -631,7 +634,7 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp build_prompt(messages, tool_defs, config) do
-    output_schema = OutputSchema.normalize!(Map.get(config, :output_schema))
+    output_schema = Map.get(config, :output_schema)
 
     payload = %{
       system_prompt: Map.get(config, :system_prompt),

@@ -144,7 +144,7 @@ defmodule Alloy.Middleware do
           {:halt, reason, %State{}} when is_binary(reason) ->
             {:halt, {:halted, reason}}
 
-          {:edit, modified_call} ->
+          {:edit, modified_call} when is_map(modified_call) and not is_struct(modified_call) ->
             validate_edit!(tool_call, modified_call)
             {:cont, {:edit, modified_call}}
 

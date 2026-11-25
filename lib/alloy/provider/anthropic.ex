@@ -501,14 +501,15 @@ defmodule Alloy.Provider.Anthropic do
 
   defp tool_use_block?(_block), do: false
 
-  defp record_protocol_error(%{sticky_error: %Error{}} = acc, _message), do: acc
+  defp record_protocol_error(acc, message), do: record_sticky_error(acc, :protocol_error, message)
 
-  defp record_protocol_error(acc, message) do
-    %{acc | sticky_error: %Error{kind: :protocol_error, message: message}}
-  end
+  defp record_malformed_error(acc, message),
+    do: record_sticky_error(acc, :malformed_reply, message)
 
-  defp record_malformed_error(acc, message) do
-    %{acc | sticky_error: %Error{kind: :malformed_reply, message: message}}
+  defp record_sticky_error(%{sticky_error: %Error{}} = acc, _kind, _message), do: acc
+
+  defp record_sticky_error(acc, kind, message) do
+    %{acc | sticky_error: %Error{kind: kind, message: message}}
   end
 
   defp record_tool_json_error(%{tool_json_error: %Error{}} = acc, _message), do: acc
@@ -643,11 +644,11 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp maybe_put_output_schema(body, config) do
-    case OutputSchema.normalize!(Map.get(config, :output_schema)) do
+    case Map.get(config, :output_schema) do
       nil ->
         body
 
-      %{schema: schema} ->
+      %OutputSchema{schema: schema} ->
         Map.put(body, "output_config", %{
           "format" => %{"type" => "json_schema", "schema" => schema}
         })

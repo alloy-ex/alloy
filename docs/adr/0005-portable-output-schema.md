@@ -76,7 +76,7 @@ decoded into `Alloy.Result.output`:
      schema violations fail the run terminally (`{:error, result}` with
      `status: :error`, `output: nil`, human-readable `result.error`, and
      machine-readable `result.metadata.run.output_error` carrying
-     `%{kind: :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text, message: String.t(), decoded: term() | nil}`
+     `%{kind: :invalid_json | :schema_mismatch | :invalid_schema | :truncated | :refusal | :missing_text, message: String.t(), decoded: term() | nil}`
      so host repair loops can branch without parsing error strings or
      re-decoding mismatched JSON). For decode/validation failures and
      content-block refusals (OpenAI Responses / Chat Completions), the

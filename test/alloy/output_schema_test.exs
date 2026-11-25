@@ -124,6 +124,12 @@ defmodule Alloy.OutputSchemaTest do
         OutputSchema.normalize!(%{schema: %{}})
       end
 
+      for bad_dialect <- [nil, "", 123] do
+        assert_raise ArgumentError, ~r/"\$schema" must be a non-empty string/, fn ->
+          OutputSchema.normalize!(%{"$schema" => bad_dialect, "type" => "object"})
+        end
+      end
+
       assert_raise ArgumentError, ~r/:name must be a string/, fn ->
         OutputSchema.normalize!(%{name: 123, schema: @answer_schema})
       end
@@ -319,7 +325,7 @@ defmodule Alloy.OutputSchemaTest do
 
       spec = OutputSchema.normalize!(media_schema)
 
-      assert {:error, %{kind: :schema_mismatch, message: msg}} =
+      assert {:error, %{kind: :invalid_schema, decoded: nil, message: msg}} =
                OutputSchema.decode_and_validate(~s({"payload":"{}"}), spec)
 
       assert msg =~ "decode_json"
@@ -535,7 +541,9 @@ defmodule Alloy.OutputSchemaTest do
       assert body["generationConfig"]["responseMimeType"] == "application/json"
       assert body["generationConfig"]["responseJsonSchema"]["type"] == "object"
 
-      # Explicit generation_config: nil does not crash with BadMapError.
+      spec = OutputSchema.normalize!(@answer_schema)
+
+      # Explicit generation_config: nil and keyword lists work; invalid shapes return :invalid_request.
       assert {:ok, %{messages: _}} =
                Gemini.complete(
                  [Message.user("hi")],
@@ -544,13 +552,45 @@ defmodule Alloy.OutputSchemaTest do
                    api_key: "k",
                    model: "gemini-3.8-flash",
                    generation_config: nil,
-                   output_schema: @answer_schema,
+                   output_schema: spec,
                    req_options: [plug: {Req.Test, :output_schema_gemini}]
                  }
                )
 
       assert_received {:gemini_body, nil_cfg_body}
       assert nil_cfg_body["generationConfig"]["responseJsonSchema"]["type"] == "object"
+
+      assert {:ok, %{messages: _}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3.8-flash",
+                   generation_config: [temperature: 0.3],
+                   extra_body: %{"timestamp" => ~U[2026-11-25 00:00:00Z]},
+                   output_schema: spec,
+                   req_options: [plug: {Req.Test, :output_schema_gemini}]
+                 }
+               )
+
+      assert_received {:gemini_body, kw_cfg_body}
+      assert kw_cfg_body["generationConfig"]["temperature"] == 0.3
+      assert kw_cfg_body["generationConfig"]["responseJsonSchema"]["type"] == "object"
+
+      assert {:error, %Error{kind: :invalid_request, message: bad_cfg_msg}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3.8-flash",
+                   generation_config: "not-a-map",
+                   output_schema: spec
+                 }
+               )
+
+      assert bad_cfg_msg =~ "Invalid :generation_config"
 
       assert {:error, %Error{kind: :invalid_request, message: msg1}} =
                Gemini.complete(
@@ -560,7 +600,7 @@ defmodule Alloy.OutputSchemaTest do
                    api_key: "k",
                    model: "gemini-3.8-flash",
                    generation_config: %{responseSchema: %{type: "OBJECT"}},
-                   output_schema: @answer_schema
+                   output_schema: spec
                  }
                )
 
@@ -574,7 +614,7 @@ defmodule Alloy.OutputSchemaTest do
                    api_key: "k",
                    model: "gemini-3.8-flash",
                    generation_config: %{responseMimeType: "text/plain"},
-                   output_schema: @answer_schema
+                   output_schema: spec
                  }
                )
 
@@ -590,7 +630,7 @@ defmodule Alloy.OutputSchemaTest do
                    extra_body: %{
                      "generationConfig" => %{"responseSchema" => %{"type" => "OBJECT"}}
                    },
-                   output_schema: @answer_schema
+                   output_schema: spec
                  }
                )
 
@@ -604,7 +644,7 @@ defmodule Alloy.OutputSchemaTest do
                    api_key: "k",
                    model: "gemini-3.8-flash",
                    extra_body: %{generationConfig: %{responseMimeType: "text/plain"}},
-                   output_schema: @answer_schema
+                   output_schema: spec
                  }
                )
 
@@ -618,7 +658,7 @@ defmodule Alloy.OutputSchemaTest do
                    api_key: "k",
                    model: "gemini-3.8-flash",
                    generation_config: %{response_schema: %{type: "OBJECT"}},
-                   output_schema: @answer_schema
+                   output_schema: spec
                  }
                )
 
@@ -632,7 +672,7 @@ defmodule Alloy.OutputSchemaTest do
                    api_key: "k",
                    model: "gemini-3.8-flash",
                    generation_config: %{response_mime_type: "application/json"},
-                   output_schema: @answer_schema
+                   output_schema: spec
                  }
                )
 
@@ -646,7 +686,7 @@ defmodule Alloy.OutputSchemaTest do
                    api_key: "k",
                    model: "gemini-3.8-flash",
                    extra_body: %{generationConfig: %{response_json_schema: %{type: "object"}}},
-                   output_schema: @answer_schema
+                   output_schema: spec
                  }
                )
 
@@ -660,7 +700,7 @@ defmodule Alloy.OutputSchemaTest do
                    api_key: "k",
                    model: "gemini-3.8-flash",
                    generation_config: %{responseJsonSchema: %{type: "object"}},
-                   output_schema: @answer_schema
+                   output_schema: spec
                  }
                )
 
@@ -1769,22 +1809,77 @@ defmodule Alloy.OutputSchemaTest do
                )
     end
 
-    test "accepts raw map output_schema on struct-literal %Config{}" do
-      {:ok, pid} =
-        Alloy.Provider.Test.start_link([
+    test "accepts raw map output_schema on struct-literal %Config{} and normalizes it for custom providers" do
+      defmodule InspectOutputSchemaProvider do
+        @behaviour Alloy.Provider
+
+        def complete(_messages, _tools, config) do
+          send(config.test_pid, {:received_output_schema, config.output_schema})
           Alloy.Testing.text_response(~s({"answer":"literal","confidence":1}))
-        ])
+        end
+      end
 
       config = %Config{
-        provider: Alloy.Provider.Test,
-        provider_config: %{agent_pid: pid},
+        provider: InspectOutputSchemaProvider,
+        provider_config: %{test_pid: self()},
         output_schema: @answer_schema
       }
 
       state = State.init(config, [Message.user("hi")]) |> Turn.run_loop()
+      assert_received {:received_output_schema, %OutputSchema{name: "alloy_output", strict: true}}
       result = Result.from_state(state)
       assert result.status == :completed
       assert result.output == %{"answer" => "literal", "confidence" => 1}
+    end
+
+    test "OpenAICompat extracts array-of-parts refusal blocks in complete and stream and run_span emits telemetry_span_context" do
+      test_pid = self()
+      handler_id = "run-span-ctx-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach_many(
+        handler_id,
+        [[:alloy, :run, :start], [:alloy, :run, :stop]],
+        fn event, _m, meta, _cfg -> send(test_pid, {:run_span, event, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Req.Test.stub(:compat_part_refusal, fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "message" => %{
+                "role" => "assistant",
+                "content" => [%{"type" => "refusal", "refusal" => "Policy refused"}]
+              },
+              "finish_reason" => "stop"
+            }
+          ],
+          "usage" => %{"prompt_tokens" => 2, "completion_tokens" => 1}
+        })
+      end)
+
+      assert {:error,
+              %Result{
+                status: :error,
+                output: nil,
+                text: "Policy refused",
+                metadata: %{run: %{output_error: %{kind: :refusal, decoded: nil}}}
+              }} =
+               Alloy.run("nope",
+                 provider:
+                   {OpenAICompat,
+                    api_key: "k",
+                    model: "m",
+                    api_url: "https://example.test/v1",
+                    req_options: [plug: {Req.Test, :compat_part_refusal}]},
+                 output_schema: @answer_schema
+               )
+
+      assert_received {:run_span, [:alloy, :run, :start], %{telemetry_span_context: ctx_start}}
+      assert_received {:run_span, [:alloy, :run, :stop], %{telemetry_span_context: ctx_stop}}
+      assert is_reference(ctx_start) and ctx_start == ctx_stop
     end
 
     test "does not duplicate :output inside result.metadata.run and skips validation on stop_after_tool" do

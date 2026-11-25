@@ -163,22 +163,10 @@ defmodule Alloy.MiddlewareTest do
       assert result == {:halted, "limit"}
     end
 
-    test "raises ArgumentError when middleware returns {:halt, non_binary} such as {:halt, state}" do
+    test "raises ArgumentError without leaking secrets when middleware returns {:halt, state}, {:block, state}, or {:edit, non_map}" do
       defmodule HaltStateMiddleware do
         @behaviour Alloy.Middleware
         def call(_hook, state), do: {:halt, state}
-      end
-
-      state = build_state(middleware: [HaltStateMiddleware])
-
-      assert_raise ArgumentError, ~r/unsupported value/, fn ->
-        Middleware.run(:after_completion, state)
-      end
-
-      tool_call = %{id: "tc_1", name: "read", input: %{"path" => "mix.exs"}}
-
-      assert_raise ArgumentError, ~r/unsupported value/, fn ->
-        Middleware.run_before_tool_call(state, tool_call)
       end
 
       defmodule BlockStateMiddleware do
@@ -187,10 +175,54 @@ defmodule Alloy.MiddlewareTest do
         def call(_hook, state), do: state
       end
 
-      block_state = build_state(middleware: [BlockStateMiddleware])
+      defmodule BadEditNonMapMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, _state), do: {:edit, nil}
+        def call(_hook, state), do: state
+      end
+
+      api_secret = "sk-middleware-api-secret"
+      ctx_secret = "ctx-middleware-token"
+
+      state =
+        build_state(
+          provider: {Alloy.Provider.Test, api_key: api_secret},
+          context: %{db_token: ctx_secret},
+          middleware: [HaltStateMiddleware]
+        )
+
+      err1 =
+        assert_raise ArgumentError, ~r/unsupported value/, fn ->
+          Middleware.run(:after_completion, state)
+        end
+
+      refute Exception.message(err1) =~ api_secret
+      refute Exception.message(err1) =~ ctx_secret
+
+      tool_call = %{id: "tc_1", name: "read", input: %{"path" => "mix.exs"}}
+
+      err2 =
+        assert_raise ArgumentError, ~r/unsupported value/, fn ->
+          Middleware.run_before_tool_call(state, tool_call)
+        end
+
+      refute Exception.message(err2) =~ api_secret
+      refute Exception.message(err2) =~ ctx_secret
+
+      block_state = %{state | config: %{state.config | middleware: [BlockStateMiddleware]}}
+
+      err3 =
+        assert_raise ArgumentError, ~r/unsupported value/, fn ->
+          Middleware.run_before_tool_call(block_state, tool_call)
+        end
+
+      refute Exception.message(err3) =~ api_secret
+      refute Exception.message(err3) =~ ctx_secret
+
+      bad_edit_state = %{state | config: %{state.config | middleware: [BadEditNonMapMiddleware]}}
 
       assert_raise ArgumentError, ~r/unsupported value/, fn ->
-        Middleware.run_before_tool_call(block_state, tool_call)
+        Middleware.run_before_tool_call(bad_edit_state, tool_call)
       end
     end
   end

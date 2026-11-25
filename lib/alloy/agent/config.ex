@@ -110,6 +110,7 @@ defmodule Alloy.Agent.Config do
           until_tool: String.t() | nil
         }
 
+  @derive {Inspect, except: [:provider_config, :fallback_providers, :context]}
   @enforce_keys [:provider, :provider_config]
   defstruct [
     :provider,

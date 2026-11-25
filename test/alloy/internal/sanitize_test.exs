@@ -23,13 +23,21 @@ defmodule Alloy.Internal.SanitizeTest do
     end
   end
 
-  describe "inspect_bounded/2 and inspect_capped/3" do
-    test "bounds large collections and caps total byte size" do
+  describe "inspect_bounded/2" do
+    test "bounds large and nested collections and caps total UTF-8 byte size" do
       huge = Map.new(1..100, &{"k#{&1}", String.duplicate("x", 100)})
       bounded = Sanitize.inspect_bounded(huge)
       assert bounded =~ "..."
+      assert byte_size(bounded) <= 500
 
-      capped = Sanitize.inspect_capped(huge, 80)
+      nested =
+        Map.new(1..20, &{"outer_#{&1}", Map.new(1..20, fn j -> {"inner_#{j}", "value"} end)})
+
+      nested_bounded = Sanitize.inspect_bounded(nested)
+      assert String.valid?(nested_bounded)
+      assert byte_size(nested_bounded) <= 500
+
+      capped = Sanitize.inspect_bounded(huge, max_bytes: 80)
       assert String.valid?(capped)
       assert byte_size(capped) <= 80
     end

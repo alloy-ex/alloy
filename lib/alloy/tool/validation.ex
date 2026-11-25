@@ -7,6 +7,8 @@ defmodule Alloy.Tool.Validation do
   alias ExJsonSchema.Schema.{Ref, Root}
   alias ExJsonSchema.Validator
 
+  require Logger
+
   # Optional dependency: consumers using required-key validation need not install it.
   @compile {:no_warn_undefined, [Schema, Ref, Root, Validator]}
 
@@ -56,6 +58,7 @@ defmodule Alloy.Tool.Validation do
   # newer dialects such as Draft 2020-12 or when `:ex_json_schema` is absent).
   @spec prepare_output_schema!(map(), String.t()) :: {:ok, term()} | :fallback
   def prepare_output_schema!(schema, name) when is_map(schema) do
+    validate_schema_dialect!(schema, name)
     local_refs!(schema, :output)
 
     if Code.ensure_loaded?(Schema) do
@@ -66,6 +69,12 @@ defmodule Alloy.Tool.Validation do
         error ->
           cond do
             error.__struct__ == ExJsonSchema.Schema.UnsupportedSchemaVersionError ->
+              Logger.warning(
+                "output_schema #{inspect(name)} uses unsupported $schema dialect " <>
+                  "#{inspect(Map.get(schema, "$schema"))} for :ex_json_schema; " <>
+                  "falling back to top-level JSON type and required checks only"
+              )
+
               :fallback
 
             error.__struct__ in [
@@ -85,6 +94,21 @@ defmodule Alloy.Tool.Validation do
     end
   end
 
+  defp validate_schema_dialect!(schema, name) do
+    case Map.fetch(schema, "$schema") do
+      :error ->
+        :ok
+
+      {:ok, dialect} when is_binary(dialect) and dialect != "" ->
+        :ok
+
+      {:ok, bad_dialect} ->
+        raise ArgumentError,
+              "Invalid output_schema #{inspect(name)}: \"$schema\" must be a non-empty string, " <>
+                "got: #{Sanitize.inspect_bounded(bad_dialect)}"
+    end
+  end
+
   @doc false
   # Returns true when a cached resolution term matches the current runtime
   # environment and struct shape (preventing forged caches or missing optional
@@ -100,7 +124,8 @@ defmodule Alloy.Tool.Validation do
 
   @doc false
   # Validates decoded structured output against an already-resolved schema.
-  @spec validate_resolved_output(term(), term()) :: :ok | {:error, String.t()}
+  @spec validate_resolved_output(term(), term()) ::
+          :ok | {:error, String.t()} | {:error, :invalid_schema, String.t()}
   def validate_resolved_output(resolved, decoded) do
     case Validator.validate(resolved, decoded) do
       :ok ->
@@ -117,10 +142,10 @@ defmodule Alloy.Tool.Validation do
           ExJsonSchema.Schema.InvalidReferenceError,
           ExJsonSchema.Schema.InvalidSchemaError
         ] ->
-          {:error, "Invalid output_schema: #{Exception.message(error)}"}
+          {:error, :invalid_schema, "Invalid output_schema: #{Exception.message(error)}"}
 
         error.__struct__ == ExJsonSchema.Schema.MissingJsonDecoderError ->
-          {:error, missing_json_decoder_message()}
+          {:error, :invalid_schema, missing_json_decoder_message()}
 
         true ->
           reraise error, __STACKTRACE__

@@ -43,7 +43,11 @@ defmodule Alloy.OutputSchema do
     or whitespace-only text, and schema violations fail terminally with
     `{:error, result}` (`status: :error`, `output: nil`, and machine-readable
     `result.metadata.run.output_error` with
-    `%{kind: :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text, message: String.t(), decoded: term() | nil}`).
+    `%{kind: :invalid_json | :schema_mismatch | :invalid_schema | :truncated | :refusal | :missing_text, message: String.t(), decoded: term() | nil}`).
+    Runtime schema/configuration errors (such as missing `:ex_json_schema`
+    `:decode_json` for `contentMediaType: "application/json"` or invalid local
+    references) report `kind: :invalid_schema` with `decoded: nil` so host
+    repair loops do not retry unfixable schema errors.
     Decode/validation failures and content-block refusals keep the assistant
     reply in `result.messages` / `result.text`, while stop-reason refusals
     discard the refused reply. If `:after_completion` halts with
@@ -76,7 +80,12 @@ defmodule Alloy.OutputSchema do
         }
 
   @type output_error_kind ::
-          :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text
+          :invalid_json
+          | :schema_mismatch
+          | :invalid_schema
+          | :truncated
+          | :refusal
+          | :missing_text
 
   @type output_error :: %{
           kind: output_error_kind(),
@@ -157,6 +166,9 @@ defmodule Alloy.OutputSchema do
           case validate_decoded(decoded, schema, resolution) do
             {:ok, value} ->
               {:ok, value}
+
+            {:error, :invalid_schema, message} ->
+              {:error, %{kind: :invalid_schema, message: message, decoded: nil}}
 
             {:error, message} ->
               {:error, %{kind: :schema_mismatch, message: message, decoded: decoded}}
@@ -282,6 +294,7 @@ defmodule Alloy.OutputSchema do
   defp validate_decoded(decoded, _schema, {:ok, resolved}) do
     case Validation.validate_resolved_output(resolved, decoded) do
       :ok -> {:ok, decoded}
+      {:error, :invalid_schema, reason} -> {:error, :invalid_schema, reason}
       {:error, reason} -> {:error, reason}
     end
   end

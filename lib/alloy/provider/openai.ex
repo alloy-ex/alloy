@@ -202,11 +202,11 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp maybe_put_output_schema(body, config) do
-    case OutputSchema.normalize!(Map.get(config, :output_schema)) do
+    case Map.get(config, :output_schema) do
       nil ->
         body
 
-      %{name: name, schema: schema, strict: strict} ->
+      %OutputSchema{name: name, schema: schema, strict: strict} ->
         Map.put(body, "text", %{
           "format" => %{
             "type" => "json_schema",

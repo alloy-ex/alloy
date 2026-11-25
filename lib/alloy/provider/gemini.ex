@@ -179,49 +179,80 @@ defmodule Alloy.Provider.Gemini do
           body
       end
 
-    output_schema = OutputSchema.normalize!(Map.get(config, :output_schema))
+    output_schema = Map.get(config, :output_schema)
 
-    raw_generation_config =
-      (Map.get(config, :generation_config) || %{}) |> Provider.stringify_keys()
+    with {:ok, raw_generation_config} <- normalize_generation_config(config) do
+      # No default maxOutputTokens: the budget includes thinking, so a fixed
+      # default truncates thinking models; each model's own limit is larger.
+      generation_config =
+        raw_generation_config
+        |> maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
+        |> maybe_put_output_schema(output_schema)
 
-    # No default maxOutputTokens: the budget includes thinking, so a fixed
-    # default truncates thinking models; each model's own limit is larger.
-    generation_config =
-      raw_generation_config
-      |> maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
-      |> maybe_put_output_schema(output_schema)
+      body = maybe_put(body, "generationConfig", generation_config)
 
-    body = maybe_put(body, "generationConfig", generation_config)
+      body =
+        case tool_defs do
+          [] ->
+            body
 
-    body =
-      case tool_defs do
-        [] ->
-          body
+          defs ->
+            Map.put(body, "tools", [
+              %{"functionDeclarations" => Enum.map(defs, &format_tool_def/1)}
+            ])
+        end
 
-        defs ->
-          Map.put(body, "tools", [%{"functionDeclarations" => Enum.map(defs, &format_tool_def/1)}])
-      end
+      body =
+        case Map.get(config, :tool_config) do
+          nil -> body
+          tool_config -> Map.put(body, "toolConfig", Alloy.Provider.stringify_keys(tool_config))
+        end
 
-    body =
-      case Map.get(config, :tool_config) do
-        nil -> body
-        tool_config -> Map.put(body, "toolConfig", Alloy.Provider.stringify_keys(tool_config))
-      end
+      body =
+        case Map.get(config, :safety_settings) do
+          nil -> body
+          settings -> Map.put(body, "safetySettings", Provider.stringify_keys(settings))
+        end
 
-    body =
-      case Map.get(config, :safety_settings) do
-        nil -> body
-        settings -> Map.put(body, "safetySettings", Provider.stringify_keys(settings))
-      end
+      body =
+        HTTP.merge_extra_body(
+          body,
+          HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
+          "generationConfig"
+        )
 
-    body =
-      HTTP.merge_extra_body(
-        body,
-        HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
-        "generationConfig"
-      )
+      validate_output_schema_conflicts(body, raw_generation_config, output_schema)
+    end
+  end
 
-    validate_output_schema_conflicts(body, raw_generation_config, output_schema)
+  defp normalize_generation_config(config) do
+    case Map.get(config, :generation_config) do
+      nil ->
+        {:ok, %{}}
+
+      map when is_map(map) and not is_struct(map) ->
+        {:ok, Provider.stringify_keys(map)}
+
+      list when is_list(list) ->
+        if Keyword.keyword?(list) do
+          {:ok, list |> Map.new() |> Provider.stringify_keys()}
+        else
+          {:error,
+           %Error{
+             kind: :invalid_request,
+             message:
+               "Invalid :generation_config for Gemini: expected a map or keyword list, got #{Sanitize.inspect_bounded(list)}"
+           }}
+        end
+
+      other ->
+        {:error,
+         %Error{
+           kind: :invalid_request,
+           message:
+             "Invalid :generation_config for Gemini: expected a map or keyword list, got #{Sanitize.inspect_bounded(other)}"
+         }}
+    end
   end
 
   defp build_contents(messages) do
@@ -803,7 +834,7 @@ defmodule Alloy.Provider.Gemini do
 
   defp maybe_put_output_schema(generation_config, nil), do: generation_config
 
-  defp maybe_put_output_schema(generation_config, %{schema: schema}) do
+  defp maybe_put_output_schema(generation_config, %OutputSchema{schema: schema}) do
     generation_config
     |> maybe_put_new("responseMimeType", "application/json")
     |> Map.put("responseJsonSchema", schema)

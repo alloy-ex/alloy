@@ -472,6 +472,27 @@ defmodule Alloy.Tool.ExecutorTest do
       refute custom_block.content =~ secret
       assert String.starts_with?(custom_meta.error, "** (#{inspect(CustomQuotaError)})\n")
       refute custom_meta.error =~ secret
+
+      # RuntimeError whose message starts with "RuntimeError..." must not be corrupted
+      # by grapheme-set stripping.
+      prefix_tool =
+        Alloy.Tool.inline(
+          name: "prefix_crash",
+          description: "raises RuntimeError with RuntimeError prefix",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> raise "RuntimeErrorout of memory" end
+        )
+
+      prefix_state = build_state([prefix_tool])
+      prefix_call = %{id: "c_prefix", name: "prefix_crash", type: "tool_use", input: %{}}
+
+      assert {:ok, _msg, [prefix_meta]} =
+               Executor.execute_all([prefix_call], prefix_state.tool_fns, prefix_state, [])
+
+      assert String.starts_with?(
+               prefix_meta.error,
+               "** (RuntimeError) RuntimeErrorout of memory\n"
+             )
     end
 
     test "tool_timeout applies to sequential tools" do

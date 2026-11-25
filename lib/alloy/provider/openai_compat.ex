@@ -175,11 +175,11 @@ defmodule Alloy.Provider.OpenAICompat do
   end
 
   defp maybe_put_output_schema(body, config) do
-    case OutputSchema.normalize!(Map.get(config, :output_schema)) do
+    case Map.get(config, :output_schema) do
       nil ->
         body
 
-      %{name: name, schema: schema, strict: strict} ->
+      %OutputSchema{name: name, schema: schema, strict: strict} ->
         Map.put(body, "response_format", %{
           "type" => "json_schema",
           "json_schema" => %{
@@ -350,7 +350,7 @@ defmodule Alloy.Provider.OpenAICompat do
     with {:ok, reasoning_field} <-
            parse_optional_reasoning_field(Map.get(message, "reasoning_content")),
          {:ok, refusal_field} <- parse_optional_refusal_field(Map.get(message, "refusal")),
-         {:ok, content_text, content_thinking} <-
+         {:ok, content_text, content_thinking, content_refusal} <-
            parse_message_content(Map.get(message, "content")),
          {:ok, tool_blocks} <- parse_tool_calls(Map.get(message, "tool_calls"), finish_reason) do
       reasoning_blocks =
@@ -364,10 +364,11 @@ defmodule Alloy.Provider.OpenAICompat do
           else: []
 
       text_blocks = if content_text != "", do: [%{type: "text", text: content_text}], else: []
+      combined_refusal = content_refusal <> refusal_field
 
       refusal_blocks =
-        if refusal_field != "",
-          do: [%{type: "text", text: refusal_field, refusal: true}],
+        if combined_refusal != "",
+          do: [%{type: "text", text: combined_refusal, refusal: true}],
           else: []
 
       {:ok,
@@ -407,7 +408,7 @@ defmodule Alloy.Provider.OpenAICompat do
 
   defp parse_message_content(content) do
     case OpenAIStream.extract_content_parts(content) do
-      {:ok, text, thinking} -> {:ok, text, thinking}
+      {:ok, text, thinking, refusal} -> {:ok, text, thinking, refusal}
       {:error, msg} -> {:error, %Error{kind: :protocol_error, message: msg}}
     end
   end

@@ -183,7 +183,7 @@ defmodule Alloy.Provider.Error do
   """
   @spec from_transport(term()) :: t()
   def from_transport(reason) do
-    detail = Sanitize.inspect_capped(reason, 500)
+    detail = Sanitize.inspect_bounded(reason)
 
     %__MODULE__{
       kind: transport_kind(reason),

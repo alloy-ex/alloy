@@ -403,10 +403,15 @@ defmodule Alloy.Tool.Executor do
       mod_name = inspect(e.__struct__)
 
       diagnostic_header =
-        if String.starts_with?(summary, mod_name) do
-          "** (#{mod_name})#{String.trim_leading(summary, mod_name)}"
-        else
-          "** (#{mod_name}) #{summary}"
+        cond do
+          summary == mod_name ->
+            "** (#{mod_name})"
+
+          String.starts_with?(summary, mod_name <> " ") ->
+            "** (#{mod_name}) #{String.replace_prefix(summary, mod_name <> " ", "")}"
+
+          true ->
+            "** (#{mod_name}) #{summary}"
         end
 
       Logger.error("Tool #{call[:name]} crashed: #{summary}\n#{formatted_trace}")

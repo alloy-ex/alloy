@@ -90,8 +90,8 @@ end
 Upgrading from 0.13? See [Upgrading to 0.14](docs/upgrading-to-0.14.md).
 For a supervised agent process — sessions, async dispatch over
 Phoenix.PubSub, backpressure, and ready-made memory stores — see
-[Upgrading to 0.13](docs/upgrading-to-0.13.md) (the companion `alloy_agent`
-runtime split).
+[`alloy_agent`](https://github.com/alloy-ex/alloy_agent) (and
+[Upgrading to 0.13](docs/upgrading-to-0.13.md) for the runtime split).
 
 ## Quick Start
 
@@ -506,9 +506,9 @@ logging, or custom metrics:
 
 | Event | Measurements | Metadata |
 |-------|-------------|----------|
-| `[:alloy, :run, :start]` | `system_time` | `model` |
-| `[:alloy, :run, :stop]` | `duration_ms` | `status`, `turns`, `model` |
-| `[:alloy, :run, :exception]` | `duration_ms` | `kind`, `reason`, `stacktrace`, `model` |
+| `[:alloy, :run, :start]` | `system_time` | `model`, `telemetry_span_context` |
+| `[:alloy, :run, :stop]` | `duration_ms` | `status`, `turns`, `model`, `telemetry_span_context` |
+| `[:alloy, :run, :exception]` | `duration_ms` | `kind`, `reason`, `stacktrace`, `model`, `telemetry_span_context` |
 | `[:alloy, :turn, :start]` | `system_time`, `monotonic_time` | `turn`, `telemetry_span_context` |
 | `[:alloy, :turn, :stop]` | `duration`, `monotonic_time` | `turn`, `status`, `telemetry_span_context` |
 | `[:alloy, :turn, :exception]` | `duration`, `monotonic_time` | `turn`, `kind`, `reason`, `stacktrace`, `telemetry_span_context` |

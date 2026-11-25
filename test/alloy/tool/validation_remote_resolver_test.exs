@@ -589,7 +589,7 @@ defmodule Alloy.Tool.ValidationRemoteResolverTest do
 
     spec = OutputSchema.normalize!(schema)
 
-    assert {:error, %{kind: :schema_mismatch, message: msg}} =
+    assert {:error, %{kind: :invalid_schema, decoded: nil, message: msg}} =
              OutputSchema.decode_and_validate(~s({"a":"x"}), spec)
 
     assert msg =~ "Invalid output_schema"
