@@ -966,9 +966,12 @@ defmodule Alloy.Context.Compactor do
   rescue
     e ->
       stacktrace = Sanitize.stacktrace(__STACKTRACE__)
+      mod_name = inspect(e.__struct__)
+      summary = Sanitize.exception_summary(e, 500)
+      detail = if summary == mod_name, do: "", else: ": #{summary}"
 
       Logger.warning(
-        "on_compaction callback crashed (#{inspect(e.__struct__)})\n" <>
+        "on_compaction callback crashed (#{mod_name})#{detail}\n" <>
           "Stacktrace: #{Exception.format_stacktrace(stacktrace)}"
       )
 

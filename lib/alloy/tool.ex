@@ -30,6 +30,16 @@ defmodule Alloy.Tool do
   human-readable result and `data` is a map of structured data for
   programmatic consumption (e.g., by a code execution sandbox).
 
+  ## Error Handling
+
+  Return `{:error, message}` (or raise a `RuntimeError` via `raise "message"`)
+  for failure reasons the model or telemetry should see. Other raised exceptions
+  (such as `KeyError`, `MatchError`, `ArgumentError` with custom messages, or
+  custom `defexception`s) are summarized as module-only (plus atom key name on
+  `KeyError`, or `"argument error"` on `:badarg`) so captured `context` or
+  credential maps cannot leak into model-visible tool results, logs, or
+  telemetry.
+
   ## Path Security
 
   Set `:allowed_paths` in the agent context to restrict file access:

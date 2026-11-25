@@ -89,6 +89,12 @@ cancellation, and deadlines stop requests immediately.
   exists.
 - `tool_validation: :schema` converts unsupported `$schema` dialects (e.g. Draft
   2020-12) into a descriptive `ArgumentError`.
+- **Tool & custom `:bash_executor` exception redaction:** Raised exceptions
+  other than `RuntimeError` (capped to 500 bytes), standard `:badarg`, and
+  atom-key `KeyError` now report only their exception module in `tool_result`
+  blocks, `result.tool_calls[].error`, `[:alloy, :tool, :stop]`, and logs so
+  captured `context` or credential maps cannot leak. Return `{:error, message}`
+  or `raise "..."` for errors the model or telemetry should see.
 
 ## 6. Portable structured outputs (`:output_schema`)
 
@@ -115,56 +121,31 @@ result.output
 
 Alloy translates `:output_schema` into each provider's native structured-output
 field (`output_config.format`, `text.format`, `response_format`,
-`generationConfig.responseJsonSchema`, or Codex prompt instructions) — preserving
-sibling `extra_body` keys such as Anthropic `output_config.effort`, OpenAI
-`text.verbosity`, and Gemini `generationConfig.temperature` on main completion
-turns — omits `:output_schema` (and drops raw `extra_body` `output_config`,
-`text`, `response_format`, and Gemini schema/thinking fields, including sibling
-keys such as `output_config.effort` and `text.verbosity`) during compaction
-summaries, decodes the final JSON into `result.output` before
-`:after_completion`, and validates it:
+`generationConfig.responseJsonSchema`, or Codex prompt instructions), forwards
+it to fallback providers, omits it (and drops raw `extra_body` `output_config`,
+`text`, `response_format`, and Gemini schema/thinking containers, including
+sibling keys such as `output_config.effort` and `text.verbosity`) during
+compaction summaries, and decodes/validates the final JSON into `result.output`
+before `:after_completion`.
 
-- **Validation levels:** Full Draft 4/6/7 validation runs when optional
-  `:ex_json_schema` is installed. Without `:ex_json_schema` (or when `$schema`
-  uses an unsupported dialect such as Draft 2019-09 or Draft 2020-12), Alloy
-  falls back to **top-level JSON `type` and `required` checks only** (nested
-  properties, enums, and formats are not validated locally).
-- **Failure semantics:** Invalid JSON, `:max_tokens`-truncated JSON (reported
-  explicitly as truncated), model refusals, missing assistant text, or schema
-  violations fail the run terminally (`{:error, result}` with `status: :error`,
-  `output: nil`, `result.error`, and machine-readable
-  `result.metadata.run.output_error` with
-  `%{kind: :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text, message: ..., decoded: ...}`
-  so host repair loops can inspect `kind` and any `decoded` value directly; no
-  automatic repair turn). For decode/validation failures and content-block
-  refusals (OpenAI Responses / Chat Completions), the assistant reply stays in
-  `result.messages` and `result.text` (`result.text` joins multiple text blocks
-  with `"\n"` whereas JSON decoding joins them with `""`); for stop-reason
-  refusals (Anthropic `stop_reason: "refusal"`, Gemini safety filters,
-  `content_filter`), Alloy discards the refused response so `result.text` /
-  `result.messages` do not contain it. When `:stop_after_tool` finishes a run,
-  `:output_schema` decoding is skipped and `result.output` is `nil`.
-- **Strict mode & provider portability:** Pass `:output_schema` as a top-level
-  `Alloy.run/2` / `Alloy.stream/3` option (passing it inside provider config
-  raises `ArgumentError`). `:strict` defaults to `true`, which on OpenAI/xAI
-  requires every property in `"required"` and `"additionalProperties" => false`
-  on every object (pass `%{schema: schema, strict: false}` to opt out). Because
-  `:output_schema` is sent on every completion turn (including fallback
-  providers), Gemini models prior to Gemini 3 and some OpenAICompat servers
-  reject combining `tools` with native JSON Schema output; use Gemini 3+
-  (`gemini-3.8-flash`), use `until_tool` / `stop_after_tool`, or drive a separate
-  follow-up no-tools `Alloy.run/2` turn with `:output_schema`. On Gemini,
-  combining `:output_schema` with `generation_config["responseJsonSchema"]`,
-  legacy `generation_config` / `extra_body["generationConfig"]`
-  `responseSchema` (`response_schema`), snake_case `response_json_schema` /
-  `response_mime_type`, or a non-JSON `responseMimeType` returns a
-  non-retryable `{:error, %Alloy.Provider.Error{kind: :invalid_request}}`, so
-  the run ends with `{:error, result}` unless a fallback provider succeeds.
-  Note that explicitly overriding a provider's wire schema key via
-  `:extra_body` (`output_config.format`, `text.format`, `response_format`,
-  `generationConfig.responseJsonSchema`) replaces what is sent on the wire
-  only — Alloy still validates the decoded reply against the top-level
-  `:output_schema`. When `:after_completion` middleware returns `{:halt, reason}`
-  (or `{:halt, reason, state}`), `result.status` is `:halted` and `result.output`
-  is `nil` (the validated value was available inside `:after_completion` on
-  `state.run_metadata.output`).
+Key highlights (see `Alloy.OutputSchema` for the full failure, refusal,
+validation-tier, and Gemini conflict contract):
+
+- **Top-level option only:** Pass `:output_schema` to `Alloy.run/2`,
+  `Alloy.stream/3`, or `Alloy.Agent.State.prepare/2` (passing it inside provider
+  config raises `ArgumentError`). Wrapper keys `:name` (default `"alloy_output"`)
+  and `:strict` (default `true`) apply to OpenAI, xAI, and OpenAICompat and are
+  ignored on Anthropic, Gemini, and Codex.
+- **Validation tiers:** Full Draft 4/6/7 validation runs when optional
+  `:ex_json_schema` is installed; without it (or for Draft 2019-09/2020-12),
+  Alloy falls back to top-level JSON `"type"` and `"required"` checks only.
+- **Terminal failures:** Invalid JSON, `:max_tokens` truncation, refusals,
+  missing/whitespace text, and schema mismatches return `{:error, result}` with
+  `output: nil` and machine-readable `result.metadata.run.output_error` (no
+  automatic repair turn). When `:stop_after_tool` completes or
+  `:after_completion` returns `{:halt, reason}` / `{:halt, reason, state}`,
+  `result.output` is `nil`.
+- **Tools + schema compatibility:** Gemini models prior to Gemini 3 and some
+  OpenAICompat servers reject combining `tools` with JSON Schema output; use
+  Gemini 3+ (`gemini-3.8-flash`), `:until_tool` / `:stop_after_tool`, or a
+  separate follow-up no-tools turn.

@@ -557,25 +557,39 @@ defmodule Alloy.Agent.Turn do
   # effects). When until_tool requires another turn, returning {:continue, state}
   # enters loop/2's turn > 0 deadline check before starting it.
   defp finish(state) do
-    if until_tool_pending?(state) do
-      reminder =
-        Message.user(
-          "Continue. You must call the #{state.config.until_tool} tool before finishing."
-        )
+    cond do
+      structured_output_refusal?(state) ->
+        message = "The model refused to produce structured output"
+        error = %{kind: :refusal, message: message, decoded: nil}
+        {:halt, state |> State.merge_run_metadata(%{output_error: error}) |> fail(message)}
 
-      {:continue, State.append_messages(state, [reminder])}
-    else
-      case decode_structured_output(state) do
-        {:ok, state} ->
-          case run_middleware(:after_completion, state) do
-            {:continue, state} -> {:halt, %{state | status: :completed}}
-            {:halt, state} -> {:halt, state}
-          end
+      until_tool_pending?(state) ->
+        reminder =
+          Message.user(
+            "Continue. You must call the #{state.config.until_tool} tool before finishing."
+          )
 
-        {:error, state, reason} ->
-          {:halt, fail(state, reason)}
-      end
+        {:continue, State.append_messages(state, [reminder])}
+
+      true ->
+        case decode_structured_output(state) do
+          {:ok, state} ->
+            case run_middleware(:after_completion, state) do
+              {:continue, state} -> {:halt, %{state | status: :completed}}
+              {:halt, state} -> {:halt, state}
+            end
+
+          {:error, state, reason} ->
+            {:halt, fail(state, reason)}
+        end
     end
+  end
+
+  defp structured_output_refusal?(%State{config: %{output_schema: nil}}), do: false
+  defp structured_output_refusal?(%State{run_metadata: %{final_tool: _}}), do: false
+
+  defp structured_output_refusal?(%State{messages: messages}) do
+    messages |> last_assistant_message() |> refusal_message?()
   end
 
   defp decode_structured_output(%State{config: %{output_schema: nil}} = state), do: {:ok, state}
@@ -585,34 +599,34 @@ defmodule Alloy.Agent.Turn do
   defp decode_structured_output(
          %State{config: %{output_schema: spec}, messages: messages} = state
        ) do
-    last_assistant =
-      case List.last(messages) do
-        %Message{role: :assistant} = msg -> msg
-        _ -> nil
+    text = messages |> last_assistant_message() |> raw_assistant_text()
+    handle_decoded_output(state, OutputSchema.decode_and_validate(text, spec))
+  end
+
+  defp handle_decoded_output(%State{stop_reason: :max_tokens} = state, result) do
+    {detail, decoded} =
+      case result do
+        {:ok, value} -> {"", value}
+        {:error, %{message: reason, decoded: value}} -> {" (#{reason})", value}
       end
 
-    if refusal_message?(last_assistant) do
-      message = "The model refused to produce structured output"
-      error = %{kind: :refusal, message: message, decoded: nil}
-      {:error, State.merge_run_metadata(state, %{output_error: error}), message}
-    else
-      case OutputSchema.decode_and_validate(raw_assistant_text(last_assistant), spec) do
-        {:ok, decoded} when state.stop_reason == :max_tokens ->
-          message = "Structured output was truncated at :max_tokens"
-          error = %{kind: :truncated, message: message, decoded: decoded}
-          {:error, State.merge_run_metadata(state, %{output_error: error}), message}
+    message = "Structured output was truncated at :max_tokens#{detail}"
+    error = %{kind: :truncated, message: message, decoded: decoded}
+    {:error, State.merge_run_metadata(state, %{output_error: error}), message}
+  end
 
-        {:ok, decoded} ->
-          {:ok, State.merge_run_metadata(state, %{output: decoded})}
+  defp handle_decoded_output(state, {:ok, decoded}) do
+    {:ok, State.merge_run_metadata(state, %{output: decoded})}
+  end
 
-        {:error, %{message: reason, decoded: decoded}} when state.stop_reason == :max_tokens ->
-          message = "Structured output was truncated at :max_tokens (#{reason})"
-          error = %{kind: :truncated, message: message, decoded: decoded}
-          {:error, State.merge_run_metadata(state, %{output_error: error}), message}
+  defp handle_decoded_output(state, {:error, %{message: message} = error}) do
+    {:error, State.merge_run_metadata(state, %{output_error: error}), message}
+  end
 
-        {:error, %{message: message} = error} ->
-          {:error, State.merge_run_metadata(state, %{output_error: error}), message}
-      end
+  defp last_assistant_message(messages) do
+    case List.last(messages) do
+      %Message{role: :assistant} = msg -> msg
+      _ -> nil
     end
   end
 

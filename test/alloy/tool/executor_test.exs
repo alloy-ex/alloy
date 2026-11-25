@@ -428,6 +428,52 @@ defmodule Alloy.Tool.ExecutorTest do
       end
     end
 
+    @tag capture_log: true
+    test "non-RuntimeError exceptions (ArgumentError and custom defexception) report module-only without stuttering" do
+      defmodule CustomQuotaError do
+        defexception [:message]
+      end
+
+      secret = "sk-custom-exception-secret"
+
+      arg_tool =
+        Alloy.Tool.inline(
+          name: "arg_crash",
+          description: "raises ArgumentError",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> raise ArgumentError, "bad value #{secret}" end
+        )
+
+      custom_tool =
+        Alloy.Tool.inline(
+          name: "custom_crash",
+          description: "raises custom defexception",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> raise CustomQuotaError, message: "quota #{secret}" end
+        )
+
+      state = build_state([arg_tool, custom_tool])
+
+      calls = [
+        %{id: "c_arg", name: "arg_crash", type: "tool_use", input: %{}},
+        %{id: "c_custom", name: "custom_crash", type: "tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{content: [arg_block, custom_block]}, [arg_meta, custom_meta]} =
+               Executor.execute_all(calls, state.tool_fns, state, [])
+
+      assert arg_block.content =~ "ArgumentError"
+      refute arg_block.content =~ secret
+      assert String.starts_with?(arg_meta.error, "** (ArgumentError)\n")
+      refute arg_meta.error =~ "(ArgumentError) ArgumentError"
+      refute arg_meta.error =~ secret
+
+      assert custom_block.content =~ "CustomQuotaError"
+      refute custom_block.content =~ secret
+      assert String.starts_with?(custom_meta.error, "** (#{inspect(CustomQuotaError)})\n")
+      refute custom_meta.error =~ secret
+    end
+
     test "tool_timeout applies to sequential tools" do
       tool =
         Alloy.Tool.inline(

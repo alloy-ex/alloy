@@ -105,8 +105,11 @@ defmodule Alloy.Internal.SanitizeTest do
       assert Sanitize.exit_summary({%KeyError{key: :x, term: secret}, []}) ==
                "KeyError (key :x not found)"
 
+      assert Sanitize.exit_summary({:nocatch, :x}) == "nocatch: :x"
       assert Sanitize.exit_summary({{:nocatch, :x}, [:not_a_stack]}) == "unexpected tuple"
-      assert Sanitize.exit_summary({:not_exception, [:not_a_stack]}) == "unexpected tuple"
+      assert Sanitize.exit_summary({:shutdown, [:x]}) == "{:shutdown, ...}"
+      assert Sanitize.exit_summary({:custom, ["secret"]}) == "{:custom, ...}"
+      assert Sanitize.exit_summary({1, [:not_a_stack]}) == "unexpected tuple"
       assert Sanitize.exit_summary({:nocatch, :direct}) == "nocatch: :direct"
       assert Sanitize.exit_summary({:shutdown, :closed}) == "{:shutdown, :closed}"
       assert Sanitize.exit_summary({:shutdown, secret}) == "{:shutdown, ...}"

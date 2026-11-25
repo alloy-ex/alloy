@@ -31,11 +31,15 @@ decoded into `Alloy.Result.output`:
    and final response validation do not re-normalize or re-resolve per request
    (while `Codex` embeds the normalized schema into its prompt).
 2. **Provider wire translation & `extra_body` preservation:** Each built-in
-   HTTP provider translates `:output_schema` into its native wire field and
-   merges one level deep on the enclosing container (`output_config`, `text`,
-   `generationConfig`) so sibling caller `extra_body` keys (e.g.
-   `output_config.effort`, `text.verbosity`, `generationConfig.temperature`) are
-   preserved while explicit caller overrides for the schema key still win.
+   HTTP provider translates `:output_schema` into its native wire field.
+   Anthropic (`output_config`), OpenAI/xAI (`text`), and Gemini
+   (`generationConfig`) merge one level deep on their enclosing container so
+   sibling caller `extra_body` keys (e.g. `output_config.effort`,
+   `text.verbosity`, `generationConfig.temperature`) are preserved while
+   explicit caller overrides for the schema key still win; OpenAICompat merges
+   at the top level so `extra_body["response_format"]` replaces the whole
+   object. Wrapper `:name` and `:strict` apply to OpenAI, xAI, and OpenAICompat
+   and are ignored on Anthropic, Gemini, and Codex.
    On Gemini, conflicting `generation_config` / `extra_body["generationConfig"]`
    keys (`responseJsonSchema`, legacy `responseSchema`, snake_case equivalents,
    or non-JSON `responseMimeType`) are rejected locally with non-retryable

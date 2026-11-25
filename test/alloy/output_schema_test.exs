@@ -304,6 +304,41 @@ defmodule Alloy.OutputSchemaTest do
       assert msg =~ "(+15 more)"
       assert byte_size(msg) <= 1_100
     end
+
+    @tag :ex_json_schema
+    test "handles Draft 7 contentMediaType application/json without crashing when decode_json is unset" do
+      alias Alloy.Tool.Validation
+
+      media_schema = %{
+        "type" => "object",
+        "properties" => %{
+          "payload" => %{"type" => "string", "contentMediaType" => "application/json"}
+        },
+        "required" => ["payload"]
+      }
+
+      spec = OutputSchema.normalize!(media_schema)
+
+      assert {:error, %{kind: :schema_mismatch, message: msg}} =
+               OutputSchema.decode_and_validate(~s({"payload":"{}"}), spec)
+
+      assert msg =~ "decode_json"
+
+      tool =
+        Alloy.Tool.inline(
+          name: "ingest",
+          description: "ingest",
+          input_schema: media_schema,
+          execute: fn _, _ -> {:ok, "ok"} end
+        )
+
+      {schemas, _cache} = Validation.prepare(%{"ingest" => tool}, :schema, %{})
+
+      assert {:error, tool_msg, nil} =
+               Validation.check(%{"payload" => "{}"}, "ingest", schemas)
+
+      assert tool_msg =~ "decode_json"
+    end
   end
 
   describe "provider wire-format translation" do
@@ -499,6 +534,23 @@ defmodule Alloy.OutputSchemaTest do
       assert body["generationConfig"]["temperature"] == 0.2
       assert body["generationConfig"]["responseMimeType"] == "application/json"
       assert body["generationConfig"]["responseJsonSchema"]["type"] == "object"
+
+      # Explicit generation_config: nil does not crash with BadMapError.
+      assert {:ok, %{messages: _}} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "gemini-3.8-flash",
+                   generation_config: nil,
+                   output_schema: @answer_schema,
+                   req_options: [plug: {Req.Test, :output_schema_gemini}]
+                 }
+               )
+
+      assert_received {:gemini_body, nil_cfg_body}
+      assert nil_cfg_body["generationConfig"]["responseJsonSchema"]["type"] == "object"
 
       assert {:error, %Error{kind: :invalid_request, message: msg1}} =
                Gemini.complete(
@@ -1641,6 +1693,46 @@ defmodule Alloy.OutputSchemaTest do
                Alloy.run("go",
                  provider: {Alloy.Provider.Test, agent_pid: multi_pid},
                  output_schema: @answer_schema
+               )
+    end
+
+    test "content-block refusal under :output_schema short-circuits :until_tool immediately" do
+      tool =
+        Alloy.Tool.inline(
+          name: "submit",
+          description: "submit",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> {:ok, "done"} end
+        )
+
+      {:ok, pid} =
+        Alloy.Provider.Test.start_link([
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [
+               %Message{
+                 role: :assistant,
+                 content: [%{type: "text", text: "I cannot comply.", refusal: true}]
+               }
+             ],
+             usage: %{input_tokens: 3, output_tokens: 2}
+           }}
+        ])
+
+      assert {:error,
+              %Result{
+                status: :error,
+                turns: 1,
+                output: nil,
+                metadata: %{run: %{output_error: %{kind: :refusal, decoded: nil}}}
+              }} =
+               Alloy.run("do something unsafe",
+                 provider: {Alloy.Provider.Test, agent_pid: pid},
+                 tools: [tool],
+                 until_tool: "submit",
+                 output_schema: @answer_schema,
+                 max_turns: 5
                )
     end
 

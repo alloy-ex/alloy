@@ -182,7 +182,7 @@ defmodule Alloy.Provider.Gemini do
     output_schema = OutputSchema.normalize!(Map.get(config, :output_schema))
 
     raw_generation_config =
-      config |> Map.get(:generation_config, %{}) |> Provider.stringify_keys()
+      (Map.get(config, :generation_config) || %{}) |> Provider.stringify_keys()
 
     # No default maxOutputTokens: the budget includes thinking, so a fixed
     # default truncates thinking models; each model's own limit is larger.

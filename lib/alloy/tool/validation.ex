@@ -112,13 +112,18 @@ defmodule Alloy.Tool.Validation do
     end
   rescue
     error ->
-      if error.__struct__ in [
-           ExJsonSchema.Schema.InvalidReferenceError,
-           ExJsonSchema.Schema.InvalidSchemaError
-         ] do
-        {:error, "Invalid output_schema: #{Exception.message(error)}"}
-      else
-        reraise error, __STACKTRACE__
+      cond do
+        error.__struct__ in [
+          ExJsonSchema.Schema.InvalidReferenceError,
+          ExJsonSchema.Schema.InvalidSchemaError
+        ] ->
+          {:error, "Invalid output_schema: #{Exception.message(error)}"}
+
+        error.__struct__ == ExJsonSchema.Schema.MissingJsonDecoderError ->
+          {:error, missing_json_decoder_message()}
+
+        true ->
+          reraise error, __STACKTRACE__
       end
   end
 
@@ -151,14 +156,24 @@ defmodule Alloy.Tool.Validation do
       {:error, "Invalid input for #{name}: #{Exception.message(error)}", nil}
 
     error ->
-      if error.__struct__ in [
-           ExJsonSchema.Schema.InvalidReferenceError,
-           ExJsonSchema.Schema.InvalidSchemaError
-         ] do
-        {:error, "Invalid schema for #{name}: #{Exception.message(error)}", nil}
-      else
-        reraise error, __STACKTRACE__
+      cond do
+        error.__struct__ in [
+          ExJsonSchema.Schema.InvalidReferenceError,
+          ExJsonSchema.Schema.InvalidSchemaError
+        ] ->
+          {:error, "Invalid schema for #{name}: #{Exception.message(error)}", nil}
+
+        error.__struct__ == ExJsonSchema.Schema.MissingJsonDecoderError ->
+          {:error, "Invalid schema for #{name}: #{missing_json_decoder_message()}", nil}
+
+        true ->
+          reraise error, __STACKTRACE__
       end
+  end
+
+  defp missing_json_decoder_message do
+    "Schema uses contentMediaType \"application/json\", which requires " <>
+      "`config :ex_json_schema, decode_json: &Jason.decode/1`"
   end
 
   defp validate(schema, input, name) do

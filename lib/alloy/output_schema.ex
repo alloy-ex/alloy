@@ -7,6 +7,49 @@ defmodule Alloy.OutputSchema do
   `%{name: ..., schema: ..., strict: ...}`. Stored on `state.config.output_schema`
   so middleware can inspect it and built-in providers can translate it into
   their wire formats without re-normalizing per request.
+
+  ## Semantics
+
+  - **Provider translation & wrapper options:** Sent on every completion turn
+    and forwarded to fallback providers (omitted on compaction summaries, which
+    also drop raw `extra_body` `output_config`, `text`, `response_format`, and
+    Gemini schema/thinking containers). `:name` (default `"alloy_output"`) and
+    `:strict` (default `true`) apply to OpenAI, xAI, and OpenAICompat and are
+    ignored on Anthropic, Gemini, and Codex. OpenAI/xAI strict mode requires
+    every property in `"required"` and `"additionalProperties" => false` on
+    every object (pass `%{schema: schema, strict: false}` to opt out).
+  - **Provider compatibility:** Gemini models prior to Gemini 3 and some
+    OpenAICompat servers reject combining `tools` with JSON Schema output; use
+    Gemini 3+ (`gemini-3.8-flash`), `:until_tool` / `:stop_after_tool`, or a
+    host-driven follow-up no-tools turn. On Gemini, conflicting
+    `generation_config` / `extra_body["generationConfig"]` keys
+    (`responseJsonSchema`, legacy `responseSchema`, snake_case equivalents, or
+    non-JSON `responseMimeType`) fail locally with non-retryable
+    `%Alloy.Provider.Error{kind: :invalid_request}`. Overriding a provider's
+    wire schema key via `:extra_body` changes the wire payload only; Alloy still
+    validates against the top-level `:output_schema`.
+  - **Validation tiers:** Remote (non-`#`) `$ref`s are always rejected at
+    startup. Full Draft 4/6/7 validation runs when optional `:ex_json_schema` is
+    loaded (bounded to 10 errors / 1,000 bytes; Draft 7
+    `contentMediaType: "application/json"` requires
+    `config :ex_json_schema, decode_json: &Jason.decode/1`); without
+    `:ex_json_schema` or for newer dialects (Draft 2019-09 / 2020-12), Alloy
+    falls back to top-level JSON `"type"` and `"required"` checks only.
+  - **Decoding & terminal failures:** Runs before `:after_completion` and is
+    skipped when `:stop_after_tool` completes a run. Final assistant text blocks
+    are joined with `""` for JSON decoding (whereas `result.text` joins blocks
+    with `"\n"`). Invalid JSON, `:max_tokens` truncation (even when the prefix
+    parses), refusals (taking precedence over `:until_tool` reminders), missing
+    or whitespace-only text, and schema violations fail terminally with
+    `{:error, result}` (`status: :error`, `output: nil`, and machine-readable
+    `result.metadata.run.output_error` with
+    `%{kind: :invalid_json | :schema_mismatch | :truncated | :refusal | :missing_text, message: String.t(), decoded: term() | nil}`).
+    Decode/validation failures and content-block refusals keep the assistant
+    reply in `result.messages` / `result.text`, while stop-reason refusals
+    discard the refused reply. If `:after_completion` halts with
+    `{:halt, reason}` or `{:halt, reason, state}`, `result.status` is `:halted`
+    and `result.output` is `nil` (the validated value was available on
+    `state.run_metadata.output`). Alloy does not run an automatic repair turn.
   """
 
   alias Alloy.Tool.Validation

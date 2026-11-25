@@ -552,28 +552,14 @@ result.output
 #=> %{"answer" => "Paris", "confidence" => 0.99}
 ```
 
-A few details to keep in mind:
-- Invalid JSON, truncated `:max_tokens` output, refusals, missing text, or
-  non-conforming JSON fails the run terminally (`{:error, result}` with
-  `status: :error`, `output: nil`, and machine-readable
-  `result.metadata.run.output_error` containing `:kind`, `:message`, and any
-  `:decoded` value; decode/validation failures and content-block refusals keep
-  the reply in `result.messages` / `result.text` — note `result.text` joins
-  multiple text blocks with `"\n"` while decoding joins with `""` — whereas
-  stop-reason refusals discard the refused response, and Alloy does not run an
-  automatic repair turn). When `:stop_after_tool` finishes the run,
-  `result.output` stays `nil`.
-- Full Draft 4/6/7 validation runs when optional `:ex_json_schema` is loaded;
-  without it (or for unsupported dialects like Draft 2019-09/2020-12), Alloy
-  falls back to **top-level `type` and `required` checks only**.
-- `:strict` defaults to `true` (OpenAI/xAI strict mode requires every property
-  in `"required"` and `"additionalProperties" => false` on every object; pass
-  `%{schema: schema, strict: false}` to opt out).
-- `:output_schema` is sent on every completion turn (including fallback
-  providers). Gemini models before Gemini 3 and some OpenAICompat servers
-  reject combining `tools` with JSON Schema output — use Gemini 3+
-  (`gemini-3.8-flash`), `until_tool` / `stop_after_tool`, or a separate
-  host-driven no-tools `Alloy.run/2` turn for final formatting.
+Invalid, truncated, refused, missing, or non-conforming output fails terminally
+with `{:error, result}` (`output: nil`, `result.metadata.run.output_error`);
+full Draft 4/6/7 validation runs when optional `:ex_json_schema` is loaded
+(otherwise top-level `type`/`required` only). `:name` and `:strict` (default
+`true`) apply to OpenAI, xAI, and OpenAICompat and are ignored on Anthropic,
+Gemini, and Codex. See `Alloy.OutputSchema` and
+[Provider compatibility](docs/provider-compatibility.md) for full failure,
+strict-mode, and tool-combination details.
 
 Or force the model to call a specific tool before the loop completes using
 `until_tool` (optionally paired with `stop_after_tool`):

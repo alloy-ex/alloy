@@ -112,25 +112,15 @@ Known limits:
   expects each block's `content_block_start` event before text, thinking, or
   signature deltas for that index (standard Anthropic endpoints always emit
   it; non-compliant gateways omitting it return `:protocol_error`).
-- **Portable `:output_schema` with tools:** Alloy sends `:output_schema` on
-  every completion turn (including fallback providers). Gemini models prior to
-  Gemini 3 and some OpenAI-compatible servers reject requests that combine tool
-  declarations with native JSON Schema output (`responseJsonSchema` /
-  `response_format`). On those endpoints, use Gemini 3+ (`gemini-3.8-flash`), use
-  `until_tool` / `stop_after_tool`, or run a separate host-driven no-tools turn
-  with `:output_schema` to format the final answer. On Gemini, combining
-  `:output_schema` with `generation_config["responseJsonSchema"]`, legacy
-  `generation_config` / `extra_body["generationConfig"]` `responseSchema`
-  (`response_schema`), snake_case `response_json_schema` /
-  `response_mime_type`, or a non-JSON `responseMimeType` returns a
-  non-retryable `{:error, %Alloy.Provider.Error{kind: :invalid_request}}`, so
-  the run ends with `{:error, result}` unless a fallback provider succeeds.
-  Overriding a provider's wire schema key via `:extra_body` replaces what is
-  sent on the wire only — Alloy still validates the reply against top-level
-  `:output_schema`. OpenAI and xAI strict
-  mode (`strict: true`, the default) requires every property in `"required"`
-  and `"additionalProperties" => false` on every object; pass
-  `%{schema: schema, strict: false}` to opt out.
+- **Portable `:output_schema` with tools & wrapper options:** Alloy sends
+  `:output_schema` on every completion turn (including fallback providers).
+  Gemini models prior to Gemini 3 and some OpenAI-compatible servers reject
+  combining tool declarations with native JSON Schema output — use Gemini 3+
+  (`gemini-3.8-flash`), `:until_tool` / `:stop_after_tool`, or a separate
+  no-tools follow-up turn. `:name` and `:strict` (default `true`) apply to
+  OpenAI, xAI, and OpenAICompat and are ignored on Anthropic, Gemini, and
+  Codex. See `Alloy.OutputSchema` for full Gemini conflict, override, and
+  failure semantics.
 - **`OpenAICompat`** reaches each vendor at its own `:api_url`, so
   switching vendors is a change of origin: earlier `reasoning_content` is
   sent as plain text in the assistant message, and Gemini signatures from

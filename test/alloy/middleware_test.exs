@@ -180,6 +180,18 @@ defmodule Alloy.MiddlewareTest do
       assert_raise ArgumentError, ~r/unsupported value/, fn ->
         Middleware.run_before_tool_call(state, tool_call)
       end
+
+      defmodule BlockStateMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, state), do: {:block, state}
+        def call(_hook, state), do: state
+      end
+
+      block_state = build_state(middleware: [BlockStateMiddleware])
+
+      assert_raise ArgumentError, ~r/unsupported value/, fn ->
+        Middleware.run_before_tool_call(block_state, tool_call)
+      end
     end
   end
 

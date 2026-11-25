@@ -29,6 +29,7 @@ defmodule Alloy.Middleware do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Internal.Sanitize
 
   @type hook ::
           :before_completion
@@ -99,13 +100,13 @@ defmodule Alloy.Middleware do
 
         {:block, reason} ->
           raise ArgumentError,
-                "#{inspect(middleware)} returned {:block, #{inspect(reason)}} " <>
+                "#{inspect(middleware)} returned {:block, #{Sanitize.inspect_bounded(reason)}} " <>
                   "from hook #{inspect(hook)}, but {:block, reason} is only valid for " <>
                   "the :before_tool_call hook. Use {:halt, reason} to stop the agent loop."
 
         other ->
           raise ArgumentError,
-                "#{inspect(middleware)} returned unsupported value #{inspect(other)} " <>
+                "#{inspect(middleware)} returned unsupported value #{Sanitize.inspect_bounded(other)} " <>
                   "from hook #{inspect(hook)}. Expected %Alloy.Agent.State{}, {:halt, reason}, " <>
                   "or {:halt, reason, state}."
       end
@@ -134,7 +135,7 @@ defmodule Alloy.Middleware do
         updated_state = tool_state(state, current)
 
         case middleware.call(:before_tool_call, updated_state) do
-          {:block, reason} ->
+          {:block, reason} when is_binary(reason) ->
             {:halt, {:block, reason}}
 
           {:halt, reason} when is_binary(reason) ->
@@ -152,7 +153,7 @@ defmodule Alloy.Middleware do
 
           other ->
             raise ArgumentError,
-                  "#{inspect(middleware)} returned unsupported value #{inspect(other)} " <>
+                  "#{inspect(middleware)} returned unsupported value #{Sanitize.inspect_bounded(other)} " <>
                     "from :before_tool_call. Expected %Alloy.Agent.State{}, {:edit, call}, " <>
                     "{:block, reason}, or {:halt, reason}."
         end
@@ -184,7 +185,7 @@ defmodule Alloy.Middleware do
 
         other ->
           raise ArgumentError,
-                "#{inspect(middleware)} returned unsupported value #{inspect(other)} " <>
+                "#{inspect(middleware)} returned unsupported value #{Sanitize.inspect_bounded(other)} " <>
                   "from :after_tool_call. Expected %Alloy.Agent.State{} or {:result, result}."
       end
     end)

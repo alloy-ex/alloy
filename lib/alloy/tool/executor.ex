@@ -400,11 +400,19 @@ defmodule Alloy.Tool.Executor do
       stacktrace = Sanitize.stacktrace(__STACKTRACE__)
       summary = Sanitize.exception_summary(e, 500)
       formatted_trace = Exception.format_stacktrace(stacktrace)
+      mod_name = inspect(e.__struct__)
+
+      diagnostic_header =
+        if String.starts_with?(summary, mod_name) do
+          "** (#{mod_name})#{String.trim_leading(summary, mod_name)}"
+        else
+          "** (#{mod_name}) #{summary}"
+        end
 
       Logger.error("Tool #{call[:name]} crashed: #{summary}\n#{formatted_trace}")
 
       {:error, tool_crash_message(call[:name], summary, stacktrace),
-       "** (#{inspect(e.__struct__)}) #{summary}\n#{formatted_trace}"}
+       "#{diagnostic_header}\n#{formatted_trace}"}
   end
 
   defp exit_outcome(call, :killed, run, _deadline_capped?, true = _deadline_hit?) do

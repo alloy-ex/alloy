@@ -138,6 +138,9 @@ defmodule Alloy.Internal.Sanitize do
       stack == [] and is_atom(inner) ->
         inspect(inner)
 
+      is_atom(inner) ->
+        "{#{inspect(inner)}, ...}"
+
       true ->
         "unexpected tuple"
     end
