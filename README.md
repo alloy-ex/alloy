@@ -68,12 +68,12 @@ application layer. The library stays small so those choices remain yours.
 - **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
 - **Reasoning blocks** — OpenAI encrypted reasoning, Anthropic and Gemini signed thinking, and DeepSeek/Kimi/GLM `reasoning_content` are kept as blocks and sent back the way each API requires
 - **Tool guardrails** — `concurrent?/0` controls parallel execution, `max_result_chars/0` caps output, prompt-too-long auto-recovery. Note: the bash tool's restricted mode is a guardrail, not a sandbox — see [Built-in tools](#built-in-tools)
-- **Structured output** — `until_tool` forces the loop to continue until a specific tool is called
+- **Structured output** — portable `:output_schema` (translated to each provider's native JSON Schema field and decoded into `result.output`) plus `until_tool` / `stop_after_tool` for tool-enforced output
 - **Provider passthrough** — `extra_body` injects arbitrary provider-specific params (response_format, temperature, reasoning_effort)
-- **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
+- **Telemetry** — run, turn, provider, tool, event, and compaction lifecycle events for OTEL/logging/metrics (see [OpenTelemetry recipe](docs/recipes/opentelemetry.md))
 - **Budget limits** — a small `:before_completion` middleware [recipe](#budget-limits) prices usage and halts the run
 - **Pluggable model catalog** — `Alloy.ModelCatalog` behaviour; bring your own context-window source (e.g., an `llm_db` adapter)
-- **~10,000 lines** — small enough to read, understand, and extend
+- **Small, inspectable core** — 4 mandatory runtime dependencies (`req`, `mint`, `jason`, `telemetry`) plus optional `ex_json_schema`
 
 ## Installation
 
@@ -82,15 +82,16 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.13"}
+    {:alloy, "~> 0.14"}
   ]
 end
 ```
 
+Upgrading from 0.13? See [Upgrading to 0.14](docs/upgrading-to-0.14.md).
 For a supervised agent process — sessions, async dispatch over
-Phoenix.PubSub, backpressure, and ready-made memory stores — add
-[`alloy_agent`](https://github.com/alloy-ex/alloy_agent) as well. It moved
-out of Alloy in 0.13; see [Upgrading to 0.13](docs/upgrading-to-0.13.md).
+Phoenix.PubSub, backpressure, and ready-made memory stores — see
+[Upgrading to 0.13](docs/upgrading-to-0.13.md) (the companion `alloy_agent`
+runtime split).
 
 ## Quick Start
 
@@ -514,17 +515,41 @@ logging, or custom metrics:
 | `[:alloy, :provider, :request]` | `duration_ms` | `provider`, `model`, `streaming`, `attempt`, `result` |
 | `[:alloy, :compaction, :cleared]` | `results_cleared`, `bytes_cleared` | `turn` |
 | `[:alloy, :compaction, :done]` | `messages_before`, `messages_after` | `turn` |
-| `[:alloy, :tool, :start]` | — | tool identity, correlation |
-| `[:alloy, :tool, :stop]` | `duration_ms` | tool identity, result |
+| `[:alloy, :tool, :start]` | `event_seq` | `correlation_id`, `turn`, `tool_id`, `tool_name` |
+| `[:alloy, :tool, :stop]` | `event_seq`, `duration_ms` | `correlation_id`, `turn`, `tool_id`, `tool_name`, `error`, `start_event_seq` |
+| `[:alloy, :turn, :prompt_too_long_recovery]` | — | `turn` |
+| `[:alloy, :event]` | `seq` | `v`, `event`, `correlation_id`, `turn` |
 
 Each turn's stop fires when that turn ends. A turn the loop continues past
 reports `status: :running`; the run's outcome is on `[:alloy, :run, :stop]`.
+See [OpenTelemetry tracing recipe](docs/recipes/opentelemetry.md) for a
+copy-pasteable GenAI OTel bridge.
 
-### Structured output with `until_tool`
+### Structured output with `:output_schema` or `until_tool`
 
-Force the model to call a specific tool before the loop completes. This is more
-reliable than response format instructions because the tool schema is validated
-at the API level:
+Pass `:output_schema` to request native JSON Schema output across Anthropic,
+OpenAI, xAI, OpenAICompat, Gemini, and Codex and decode/validate the result
+into `result.output`:
+
+```elixir
+schema = %{
+  type: "object",
+  properties: %{answer: %{type: "string"}, confidence: %{type: "number"}},
+  required: ["answer", "confidence"],
+  additionalProperties: false
+}
+
+{:ok, result} = Alloy.run("What is the capital of France?",
+  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-5-5"},
+  output_schema: schema
+)
+
+result.output
+#=> %{"answer" => "Paris", "confidence" => 0.99}
+```
+
+Or force the model to call a specific tool before the loop completes using
+`until_tool` (optionally paired with `stop_after_tool`):
 
 ```elixir
 defmodule SubmitAnswer do

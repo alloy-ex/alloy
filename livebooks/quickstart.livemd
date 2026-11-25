@@ -2,7 +2,7 @@
 
 ```elixir
 Mix.install([
-  {:alloy, "~> 0.13"},
+  {:alloy, "~> 0.14"},
   {:kino, "~> 0.14"}
 ])
 ```
