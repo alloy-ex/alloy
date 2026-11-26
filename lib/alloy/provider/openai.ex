@@ -664,11 +664,12 @@ defmodule Alloy.Provider.OpenAI do
       emitted_args =
         maybe_emit_whole_item_args(acc.on_event, base_meta, item, event_type, emitted_args)
 
-      meta = Map.merge(base_meta, %{item_id: item_id, emitted_args: emitted_args})
+      effective_item_id = item_id || (is_map(existing) && Map.get(existing, :item_id)) || nil
+      meta = Map.merge(base_meta, %{item_id: effective_item_id, emitted_args: emitted_args})
 
       function_calls =
         acc.function_calls
-        |> maybe_put_call_meta(item_id, meta)
+        |> maybe_put_call_meta(effective_item_id, meta)
         |> Map.put({:index, index}, meta)
 
       %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
@@ -798,25 +799,29 @@ defmodule Alloy.Provider.OpenAI do
         acc
 
       %{id: id, index: idx, name: name} = meta ->
-        acc.on_event.(
-          {:tool_call_delta,
-           %{
-             id: id,
-             index: raw_index || idx,
-             name: name,
-             arguments_delta: delta
-           }}
-        )
+        if is_nil(raw_index) or raw_index == idx do
+          acc.on_event.(
+            {:tool_call_delta,
+             %{
+               id: id,
+               index: idx,
+               name: name,
+               arguments_delta: delta
+             }}
+          )
 
-        updated_meta = %{meta | emitted_args: Map.get(meta, :emitted_args, "") <> delta}
+          updated_meta = %{meta | emitted_args: Map.get(meta, :emitted_args, "") <> delta}
 
-        function_calls =
-          acc.function_calls
-          |> maybe_put_call_meta(item_id, updated_meta)
-          |> maybe_put_call_meta(Map.get(meta, :item_id), updated_meta)
-          |> Map.put({:index, idx}, updated_meta)
+          function_calls =
+            acc.function_calls
+            |> maybe_put_call_meta(item_id, updated_meta)
+            |> maybe_put_call_meta(Map.get(meta, :item_id), updated_meta)
+            |> Map.put({:index, idx}, updated_meta)
 
-        %{acc | function_calls: function_calls}
+          %{acc | function_calls: function_calls}
+        else
+          acc
+        end
 
       nil ->
         buffer_pending_delta(acc, item_id, raw_index, delta)
@@ -862,17 +867,21 @@ defmodule Alloy.Provider.OpenAI do
 
   defp emit_buffered_args(on_event, meta, deltas, emitted_args) do
     Enum.reduce(deltas, emitted_args, fn {raw_index, delta}, acc_args ->
-      on_event.(
-        {:tool_call_delta,
-         %{
-           id: meta.id,
-           index: raw_index || meta.index,
-           name: meta.name,
-           arguments_delta: delta
-         }}
-      )
+      if is_nil(raw_index) or raw_index == meta.index do
+        on_event.(
+          {:tool_call_delta,
+           %{
+             id: meta.id,
+             index: meta.index,
+             name: meta.name,
+             arguments_delta: delta
+           }}
+        )
 
-      acc_args <> delta
+        acc_args <> delta
+      else
+        acc_args
+      end
     end)
   end
 

@@ -3653,6 +3653,171 @@ defmodule Alloy.ReasoningAndEventsTest do
         assert Enum.all?(nd_deltas, &(&1.id == "call_pref_nodelta" and &1.name == "echo"))
         assert Enum.map_join(nd_deltas, & &1.arguments_delta) == "{\"x\":1}"
       end
+
+      # 8. OpenAI/xAI: omitting optional item.id on output_item.done and re-supplying it on
+      #    response.completed must NOT duplicate arguments, and contradictory item_id/output_index
+      #    deltas must be suppressed instead of mis-indexed across calls.
+      omit_id_done_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_a",
+              "call_id" => "call_a",
+              "name" => "echo",
+              "arguments" => ""
+            }
+          }) <>
+            sse_oai("response.output_item.done", %{
+              "type" => "response.output_item.done",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "call_id" => "call_a",
+                "name" => "echo",
+                "arguments" => "{\"x\":1}"
+              }
+            }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_omit_id",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_a",
+                    "call_id" => "call_a",
+                    "name" => "echo",
+                    "arguments" => "{\"x\":1}"
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      {:ok, %{messages: [omit_msg]}} =
+        OpenAI.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "sk-oai",
+            model: "gpt-5.4",
+            req_options: [plug: omit_id_done_plug],
+            on_event: &send(parent, {:omit_id_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      assert [%{type: "tool_use", id: "call_a", name: "echo", input: %{"x" => 1}}] =
+               omit_msg.content
+
+      omit_deltas =
+        drain_tagged(:omit_id_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.map_join(omit_deltas, & &1.arguments_delta) == "{\"x\":1}"
+
+      # Contradictory item_id / output_index delta across two calls must be suppressed.
+      conflict_idx_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_0",
+              "call_id" => "call_0",
+              "name" => "echo",
+              "arguments" => ""
+            }
+          }) <>
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 1,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_1",
+                "call_id" => "call_1",
+                "name" => "echo",
+                "arguments" => ""
+              }
+            }) <>
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "item_id" => "fc_0",
+              "output_index" => 1,
+              "delta" => "{\"wrong\":true}"
+            }) <>
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "item_id" => "fc_0",
+              "output_index" => 0,
+              "delta" => "{\"ok\":0}"
+            }) <>
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "item_id" => "fc_1",
+              "output_index" => 1,
+              "delta" => "{\"ok\":1}"
+            }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_conflict",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_0",
+                    "call_id" => "call_0",
+                    "name" => "echo",
+                    "arguments" => "{\"ok\":0}"
+                  },
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_1",
+                    "call_id" => "call_1",
+                    "name" => "echo",
+                    "arguments" => "{\"ok\":1}"
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      {:ok, _} =
+        OpenAI.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "sk-oai",
+            model: "gpt-5.4",
+            req_options: [plug: conflict_idx_plug],
+            on_event: &send(parent, {:conflict_idx_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      conflict_deltas =
+        drain_tagged(:conflict_idx_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      refute Enum.any?(conflict_deltas, &(&1.arguments_delta =~ "wrong"))
+
+      assert conflict_deltas
+             |> Enum.filter(&(&1.id == "call_0"))
+             |> Enum.all?(&(&1.index == 0))
+
+      assert conflict_deltas
+             |> Enum.filter(&(&1.id == "call_1"))
+             |> Enum.all?(&(&1.index == 1))
     end
   end
 
