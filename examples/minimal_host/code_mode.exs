@@ -3,8 +3,11 @@ defmodule MinimalHost.CodeMode do
   Host-owned nested execution experiment for trusted programs.
 
   This is not a sandbox and never evaluates model-supplied Elixir. A host may
-  connect a separately sandboxed interpreter to the dispatch capability. All
-  child calls pass through Alloy's existing middleware and tool executor.
+  connect a separately sandboxed interpreter to the dispatch capability. Single
+  child calls route through `Alloy.Tool.Executor.run_tool/3` and multi-call
+  batches route through `Alloy.Tool.Executor.execute_all/4`, preserving Alloy's
+  middleware, schema validation, deadlines, cooperative cancellation, and
+  native `:parent_call_id` event tagging.
   """
 
   alias Alloy.Agent.State
@@ -22,7 +25,9 @@ defmodule MinimalHost.CodeMode do
       raise ArgumentError, "positive timeout/max_calls and a parent_call_id are required"
     end
 
-    task = Task.async(fn -> run_program(program, state, opts) end)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    run_opts = Keyword.put(opts, :run_deadline, deadline)
+    task = Task.async(fn -> run_program(program, state, run_opts) end)
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
       {:ok, result} -> result
@@ -38,11 +43,11 @@ defmodule MinimalHost.CodeMode do
     Process.put(key, {state, 0})
 
     try do
-      dispatch = fn calls ->
+      dispatch = fn calls_or_call ->
         if self() != owner,
           do: raise(ArgumentError, "dispatch must run in the interpreter process")
 
-        dispatch(calls, key, opts)
+        dispatch(calls_or_call, key, opts)
       end
 
       {:ok, program.(dispatch)}
@@ -51,6 +56,11 @@ defmodule MinimalHost.CodeMode do
     after
       Process.delete(key)
     end
+  end
+
+  defp dispatch(call, key, opts) when is_map(call) and not is_struct(call) do
+    %{results: [result], metadata: metadata} = dispatch([call], key, opts)
+    %{result: result, metadata: List.first(metadata)}
   end
 
   defp dispatch(calls, key, opts) when is_list(calls) do
@@ -77,12 +87,15 @@ defmodule MinimalHost.CodeMode do
         Message.assistant_blocks(Enum.map(calls, &Map.put(&1, :type, "tool_use")))
       )
 
-    notify = Keyword.get(opts, :on_event, fn _event -> :ok end)
-    on_event = fn {type, event} -> notify.({type, Map.put(event, :parent_call_id, parent)}) end
+    executor_opts =
+      [
+        parent_call_id: parent,
+        run_deadline: Keyword.get(opts, :run_deadline)
+      ]
+      |> maybe_put_on_event(Keyword.get(opts, :on_event))
 
     with %State{} = ready <- Middleware.run(:after_tool_request, requested),
-         {:ok, results, metadata} <-
-           Executor.execute_all(calls, ready.tool_fns, ready, on_event: on_event),
+         {:ok, results, metadata} <- run_child_calls(calls, ready, executor_opts),
          %State{} = finished <-
            ready
            |> State.append_messages(results)
@@ -94,4 +107,22 @@ defmodule MinimalHost.CodeMode do
       {:halted, reason} -> throw({:halted, reason})
     end
   end
+
+  defp run_child_calls([single_call], ready, executor_opts) do
+    case Executor.run_tool(single_call, ready, executor_opts) do
+      {:ok, result_block, meta} ->
+        metadata = if meta, do: [meta], else: []
+        {:ok, Message.tool_results([result_block]), metadata}
+
+      {:halted, reason} ->
+        {:halted, reason}
+    end
+  end
+
+  defp run_child_calls(calls, ready, executor_opts) do
+    Executor.execute_all(calls, ready.tool_fns, ready, executor_opts)
+  end
+
+  defp maybe_put_on_event(opts, nil), do: opts
+  defp maybe_put_on_event(opts, on_event), do: Keyword.put(opts, :on_event, on_event)
 end

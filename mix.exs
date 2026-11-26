@@ -107,6 +107,7 @@ defmodule Alloy.MixProject do
         "docs/recipes/sub-agents.md",
         "docs/recipes/mcp-tools.md",
         "docs/recipes/code-mode.md",
+        "docs/recipes/llm-db-catalog.md",
         "docs/recipes/output-capture.md",
         "docs/recipes/opentelemetry.md",
         "livebooks/quickstart.livemd"

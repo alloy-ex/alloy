@@ -37,6 +37,65 @@ defmodule Alloy.Tool.Executor do
   @max_inflight_tool_updates 256
   @cancel_poll_ms 25
 
+  @doc """
+  Executes a single tool call through the same pipeline as `execute_all/4`.
+
+  Runs `:before_tool_call` middleware, input required-key and optional JSON
+  Schema validation, supervised worker execution bounded by `:tool_timeout` and
+  `:run_deadline` with cooperative `:cancel_token` cancellation, crash/exit
+  sanitization, incremental `:tool_update` marshalling back to the caller
+  process, `:after_tool_call` middleware, result truncation, and `:tool_start` /
+  `:tool_update` / `:tool_end` events.
+
+  `tool_call` is a map with `:id`, `:name`, and `:input` (the same shape
+  returned by `Alloy.Message.tool_calls/1`).
+
+  ## Options
+
+  - `:tool_fns` — tool registry map overriding `state.tool_fns`
+  - `:tool_timeout` — positive integer ms overriding `state.config.tool_timeout`
+  - `:run_deadline` — monotonic ms deadline; clamped to `state.run_deadline`
+    when the outer state already carries a deadline
+  - `:cancel_token` — `Alloy.Cancel.t()` or `nil` (defaults to
+    `state.config.cancel_token`)
+  - `:parent_call_id` — optional non-empty `String.t()` attached as
+    `:parent_call_id` on emitted `:tool_start`, `:tool_update`, and `:tool_end`
+    events, tool telemetry metadata, and returned tool-call metadata
+  - `:on_event` — `(event -> any())` invoked in the caller process
+  - `:event_subscriber?` — boolean enabling `:tool_update` streaming (defaults
+    to `Keyword.has_key?(opts, :on_event)`)
+  - `:event_seq_ref`, `:event_correlation_id`, `:event_turn` — event envelope
+    coordination options
+  - `:tool_schemas` — precompiled validation schemas
+
+  ## Returns
+
+  - `{:ok, result_block, tool_call_meta}` — `result_block` is a normalized
+    `tool_result` content block (`%{type: "tool_result", ...}`), and
+    `tool_call_meta` is the execution metadata map (or `nil` if the call was not
+    started because `:cancel_token` was already cancelled or `:run_deadline` had
+    already expired)
+  - `{:halted, reason}` — `:before_tool_call` middleware halted execution
+  """
+  @spec run_tool(map(), State.t(), keyword()) ::
+          {:ok, map(), map() | nil} | {:halted, String.t()}
+  def run_tool(tool_call, %State{} = state, opts \\ [])
+      when is_map(tool_call) and not is_struct(tool_call) and is_list(opts) do
+    tool_fns = Keyword.get(opts, :tool_fns, state.tool_fns)
+
+    unless is_map(tool_fns) and not is_struct(tool_fns) do
+      raise ArgumentError,
+            ":tool_fns must be a map of tool name => tool, got: #{inspect(tool_fns)}"
+    end
+
+    {run, _inline_tools} = build_run(tool_fns, state, opts)
+
+    with {:ok, [tagged]} <- tag_tool_calls(run.state, [tool_call]) do
+      [{result_block, meta}] = run_batch([tagged], run)
+      {:ok, result_block, meta}
+    end
+  end
+
   @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t()) ::
           Message.t() | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state) do
@@ -92,8 +151,20 @@ defmodule Alloy.Tool.Executor do
     emit_tool_updates? =
       Keyword.get(opts, :event_subscriber?, Keyword.has_key?(opts, :on_event))
 
-    cancel_token = Keyword.get(opts, :cancel_token, state.config.cancel_token)
-    effective_state = %{state | config: %{state.config | cancel_token: cancel_token}}
+    cancel_token =
+      validate_cancel_token!(Keyword.get(opts, :cancel_token, state.config.cancel_token))
+
+    timeout = validate_tool_timeout!(Keyword.get(opts, :tool_timeout, state.config.tool_timeout))
+    opt_deadline = validate_run_deadline!(Keyword.get(opts, :run_deadline))
+    run_deadline = resolve_run_deadline(state.run_deadline, opt_deadline)
+    parent_call_id = validate_parent_call_id!(Keyword.get(opts, :parent_call_id))
+    on_event = validate_on_event!(Keyword.get(opts, :on_event, fn _ -> :ok end))
+
+    effective_state = %{
+      state
+      | config: %{state.config | cancel_token: cancel_token, tool_timeout: timeout},
+        run_deadline: run_deadline
+    }
 
     run = %{
       state: effective_state,
@@ -101,10 +172,11 @@ defmodule Alloy.Tool.Executor do
       concurrency: state.config.tool_concurrency || System.schedulers_online(),
       tool_fns: inline_tools,
       context: build_context(effective_state),
-      timeout: state.config.tool_timeout,
-      run_deadline: Keyword.get(opts, :run_deadline),
+      timeout: timeout,
+      run_deadline: run_deadline,
       cancel_token: cancel_token,
-      on_event: Keyword.get(opts, :on_event, fn _ -> :ok end),
+      parent_call_id: parent_call_id,
+      on_event: on_event,
       emit_tool_updates?: emit_tool_updates?,
       seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
       corr_id: Keyword.get(opts, :event_correlation_id, random_id()),
@@ -112,6 +184,46 @@ defmodule Alloy.Tool.Executor do
     }
 
     {run, inline_tools}
+  end
+
+  defp resolve_run_deadline(nil, deadline), do: deadline
+  defp resolve_run_deadline(deadline, nil), do: deadline
+  defp resolve_run_deadline(state_deadline, opt_deadline), do: min(state_deadline, opt_deadline)
+
+  defp validate_tool_timeout!(timeout) when is_integer(timeout) and timeout > 0, do: timeout
+
+  defp validate_tool_timeout!(bad) do
+    raise ArgumentError, ":tool_timeout must be a positive integer, got: #{inspect(bad)}"
+  end
+
+  defp validate_run_deadline!(nil), do: nil
+  defp validate_run_deadline!(deadline) when is_integer(deadline), do: deadline
+
+  defp validate_run_deadline!(bad) do
+    raise ArgumentError, ":run_deadline must be an integer or nil, got: #{inspect(bad)}"
+  end
+
+  defp validate_cancel_token!(nil), do: nil
+  defp validate_cancel_token!(%Cancel{ref: ref} = token) when is_reference(ref), do: token
+
+  defp validate_cancel_token!(bad) do
+    raise ArgumentError,
+          ":cancel_token must be an Alloy.Cancel token or nil, got: #{inspect(bad)}"
+  end
+
+  defp validate_parent_call_id!(nil), do: nil
+
+  defp validate_parent_call_id!(id) when is_binary(id) and byte_size(id) > 0, do: id
+
+  defp validate_parent_call_id!(bad) do
+    raise ArgumentError,
+          ":parent_call_id must be a non-empty string or nil, got: #{inspect(bad)}"
+  end
+
+  defp validate_on_event!(fun) when is_function(fun, 1), do: fun
+
+  defp validate_on_event!(bad) do
+    raise ArgumentError, ":on_event must be a 1-arity function, got: #{inspect(bad)}"
   end
 
   defp run_batches([], _run, _poll_steering, results_rev, metas_rev) do
@@ -674,14 +786,16 @@ defmodule Alloy.Tool.Executor do
   defp emit_update(call_id, name, start_seq, chunk, run) do
     seq = :atomics.add_get(run.seq_ref, 1, 1)
 
-    event = %{
-      id: call_id,
-      name: name,
-      chunk: valid_text(chunk),
-      start_event_seq: start_seq,
-      event_seq: seq,
-      correlation_id: run.corr_id
-    }
+    event =
+      %{
+        id: call_id,
+        name: name,
+        chunk: valid_text(chunk),
+        start_event_seq: start_seq,
+        event_seq: seq,
+        correlation_id: run.corr_id
+      }
+      |> maybe_put_parent_call_id(run.parent_call_id)
 
     run.on_event.({:tool_update, event})
     :ok
@@ -756,23 +870,28 @@ defmodule Alloy.Tool.Executor do
     call = call_from(tag)
     seq = :atomics.add_get(run.seq_ref, 1, 1)
 
-    run.on_event.(
-      {:tool_start,
-       %{
-         id: call[:id],
-         name: call[:name],
-         input: Map.get(call, :input, %{}),
-         event_seq: seq,
-         correlation_id: run.corr_id
-       }}
-    )
+    start_event =
+      %{
+        id: call[:id],
+        name: call[:name],
+        input: Map.get(call, :input, %{}),
+        event_seq: seq,
+        correlation_id: run.corr_id
+      }
+      |> maybe_put_parent_call_id(run.parent_call_id)
 
-    :telemetry.execute([:alloy, :tool, :start], %{event_seq: seq}, %{
-      correlation_id: run.corr_id,
-      turn: run.turn,
-      tool_id: call[:id],
-      tool_name: call[:name]
-    })
+    run.on_event.({:tool_start, start_event})
+
+    telemetry_meta =
+      %{
+        correlation_id: run.corr_id,
+        turn: run.turn,
+        tool_id: call[:id],
+        tool_name: call[:name]
+      }
+      |> maybe_put_parent_call_id(run.parent_call_id)
+
+    :telemetry.execute([:alloy, :tool, :start], %{event_seq: seq}, telemetry_meta)
 
     %{
       index: index,
@@ -907,13 +1026,15 @@ defmodule Alloy.Tool.Executor do
 
     block = %{block | content: bounded_result(result.content, original.content, call, run)}
 
-    meta = %{
-      id: call[:id],
-      name: call[:name],
-      input: Map.get(call, :input, %{}),
-      duration_ms: max(System.monotonic_time(:millisecond) - started.started_at, 0),
-      error: result_error(error, original, result)
-    }
+    meta =
+      %{
+        id: call[:id],
+        name: call[:name],
+        input: Map.get(call, :input, %{}),
+        duration_ms: max(System.monotonic_time(:millisecond) - started.started_at, 0),
+        error: result_error(error, original, result)
+      }
+      |> maybe_put_parent_call_id(run.parent_call_id)
 
     end_seq = emit_end(meta, start_seq, run)
 
@@ -956,9 +1077,7 @@ defmodule Alloy.Tool.Executor do
 
     run.on_event.({:tool_end, event})
 
-    :telemetry.execute(
-      [:alloy, :tool, :stop],
-      %{event_seq: seq, duration_ms: meta.duration_ms},
+    telemetry_meta =
       %{
         correlation_id: run.corr_id,
         turn: run.turn,
@@ -967,6 +1086,12 @@ defmodule Alloy.Tool.Executor do
         error: meta.error,
         start_event_seq: start_seq
       }
+      |> maybe_put_parent_call_id(run.parent_call_id)
+
+    :telemetry.execute(
+      [:alloy, :tool, :stop],
+      %{event_seq: seq, duration_ms: meta.duration_ms},
+      telemetry_meta
     )
 
     seq
@@ -998,6 +1123,11 @@ defmodule Alloy.Tool.Executor do
 
   defp maybe_put_structured_data(meta, nil), do: meta
   defp maybe_put_structured_data(meta, data), do: Map.put(meta, :structured_data, data)
+
+  defp maybe_put_parent_call_id(map, nil), do: map
+
+  defp maybe_put_parent_call_id(map, parent_call_id),
+    do: Map.put(map, :parent_call_id, parent_call_id)
 
   defp random_id, do: "run_" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
 

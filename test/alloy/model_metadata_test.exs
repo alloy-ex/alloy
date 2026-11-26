@@ -216,4 +216,92 @@ defmodule Alloy.ModelMetadataTest do
   test "default_context_window/0 is 200k" do
     assert ModelMetadata.default_context_window() == 200_000
   end
+
+  describe "max_output_tokens/1" do
+    test "returns output token limits for built-in families and nil for unknown/retired" do
+      assert ModelMetadata.max_output_tokens("claude-opus-4-6") == 128_000
+      assert ModelMetadata.max_output_tokens("claude-opus-5-5") == 128_000
+      assert ModelMetadata.max_output_tokens("claude-sonnet-4-5-20250929") == 64_000
+      assert ModelMetadata.max_output_tokens("gpt-6-astra") == 128_000
+      assert ModelMetadata.max_output_tokens("gpt-5.4-2026-03-05") == 128_000
+      assert ModelMetadata.max_output_tokens("gpt-5-mini") == 128_000
+      assert ModelMetadata.max_output_tokens("gemini-2.5-pro") == 65_536
+      assert ModelMetadata.max_output_tokens("models/gemini-3.8-flash") == 65_536
+      assert ModelMetadata.max_output_tokens("grok-4.7") == 131_072
+      assert ModelMetadata.max_output_tokens("grok-build-0.1") == 131_072
+
+      assert ModelMetadata.max_output_tokens("unknown-model") == nil
+      assert ModelMetadata.max_output_tokens("claude-3-7-sonnet-20250219") == nil
+    end
+  end
+
+  describe "capabilities/1" do
+    test "returns capability maps for built-in families and distinguishes non-reasoning Grok" do
+      for model <- ~w(
+            claude-opus-4-6 claude-sonnet-4-5 gpt-6-astra gpt-5.4
+            gemini-2.5-pro models/gemini-3.8-flash grok-4.20-0309-reasoning grok-4.7
+          ) do
+        caps = ModelMetadata.capabilities(model)
+        assert caps.reasoning? == true
+        assert caps.vision? == true
+        assert caps.documents? == true
+        assert caps.tools? == true
+        assert caps.structured_output? == true
+        assert caps.prompt_caching? == true
+      end
+
+      non_reasoning = ModelMetadata.capabilities("grok-4.20-0309-non-reasoning")
+      assert non_reasoning.reasoning? == false
+      assert non_reasoning.tools? == true
+
+      assert ModelMetadata.capabilities("unknown-model") == nil
+      assert ModelMetadata.capabilities("gpt-5-codex") == nil
+    end
+  end
+
+  describe "pricing/1" do
+    test "returns indicative reference pricing for bundled public models and nil otherwise" do
+      assert %{input_per_million: 5.0, output_per_million: 25.0, cache_read_per_million: 0.5} =
+               ModelMetadata.pricing("claude-opus-4-6")
+
+      assert %{input_per_million: 3.0, output_per_million: 15.0} =
+               ModelMetadata.pricing("claude-sonnet-4-5-20250929")
+
+      assert %{input_per_million: 1.0, output_per_million: 5.0} =
+               ModelMetadata.pricing("claude-haiku-4-5-20251001")
+
+      assert %{input_per_million: 2.5, output_per_million: 15.0} =
+               ModelMetadata.pricing("gpt-5.4-2026-03-05")
+
+      assert %{input_per_million: 0.75, output_per_million: 4.5} =
+               ModelMetadata.pricing("gpt-5.4-mini")
+
+      assert %{input_per_million: 0.2, output_per_million: 1.25} =
+               ModelMetadata.pricing("gpt-5.4-nano")
+
+      assert %{input_per_million: 1.75, output_per_million: 14.0} =
+               ModelMetadata.pricing("gpt-5.2")
+
+      assert %{input_per_million: 1.25, output_per_million: 10.0} =
+               ModelMetadata.pricing("gpt-5")
+
+      assert %{input_per_million: 0.25, output_per_million: 2.0} =
+               ModelMetadata.pricing("gpt-5-mini")
+
+      assert %{input_per_million: 0.05, output_per_million: 0.4} =
+               ModelMetadata.pricing("gpt-5-nano")
+
+      assert %{input_per_million: 1.25, output_per_million: 10.0} =
+               ModelMetadata.pricing("models/gemini-2.5-pro")
+
+      assert %{input_per_million: 0.3, output_per_million: 2.5} =
+               ModelMetadata.pricing("gemini-2.5-flash")
+
+      assert %{input_per_million: 0.1, output_per_million: 0.4} =
+               ModelMetadata.pricing("gemini-2.5-flash-lite")
+
+      assert ModelMetadata.pricing("unknown-model") == nil
+      assert ModelMetadata.pricing("claude-3-7-sonnet-20250219") == nil
+    end
+  end
 end

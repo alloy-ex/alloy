@@ -90,6 +90,40 @@ defmodule MinimalHostTest do
     assert_receive {:event, {:tool_end, %{parent_call_id: "script-1", id: "script-1-3"}}}
   end
 
+  test "single-call dispatch routes through Executor.run_tool/3 with native parent_call_id" do
+    parent = self()
+
+    execute = fn input, ctx ->
+      if ctx[:on_tool_update], do: ctx.on_tool_update.("step:" <> input["value"])
+      {:ok, "single:" <> input["value"], %{single: true}}
+    end
+
+    initial = state([tool("read", execute)])
+
+    program = fn dispatch ->
+      dispatch.(%{name: "read", input: %{"value" => "one"}})
+    end
+
+    assert {:ok, %{result: result, metadata: meta}} =
+             CodeMode.run(
+               program,
+               initial,
+               Keyword.put(opts(), :on_event, &send(parent, {:event, &1}))
+             )
+
+    refute Map.get(result, :is_error, false)
+    assert result.content == "single:one"
+    assert meta.parent_call_id == "script-1"
+    assert meta.structured_data == %{single: true}
+    assert_receive {:event, {:tool_start, %{parent_call_id: "script-1", id: "script-1-1"}}}
+
+    assert_receive {:event,
+                    {:tool_update,
+                     %{parent_call_id: "script-1", id: "script-1-1", chunk: "step:one"}}}
+
+    assert_receive {:event, {:tool_end, %{parent_call_id: "script-1", id: "script-1-1"}}}
+  end
+
   test "sequential child calls remain ordered" do
     parent = self()
 

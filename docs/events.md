@@ -63,9 +63,9 @@ Field guarantees:
 | `:text_delta` | `String.t()` — text fragment | streaming providers emit assistant text |
 | `:thinking_delta` | `String.t()` — reasoning fragment | streaming providers emit reasoning/thinking deltas (Anthropic, OpenAI/xAI Responses, Gemini, OpenAICompat) |
 | `:tool_call_delta` | `%{id:, index:, name:, arguments_delta:}` | streaming providers emit tool-call headers or partial argument JSON deltas (`id` and `name` are non-empty strings, `index` is provider-scoped — e.g. Anthropic content-block index, OpenAI Responses `output_index`, Gemini tool ordinal, Chat Completions `tool_calls[].index` — correlate calls alongside `id`; for zero-argument tools, concatenated `arguments_delta` may be `""` or `"{}"` depending on the provider) |
-| `:tool_start` | `%{id:, name:, input:}` | a tool call begins executing |
-| `:tool_update` | `%{id:, name:, chunk:, start_event_seq:}` | a running tool emits incremental output (for example `Alloy.Tool.Core.Bash`); marshalled to the caller process strictly between `:tool_start` and `:tool_end` |
-| `:tool_end` | `%{id:, name:, input:, duration_ms:, error:, start_event_seq:}` | a tool call finishes; `error` is `nil` on success, a string otherwise; `start_event_seq` links back to the matching `:tool_start` envelope |
+| `:tool_start` | `%{id:, name:, input:}` (plus optional `:parent_call_id` for nested calls) | a tool call begins executing |
+| `:tool_update` | `%{id:, name:, chunk:, start_event_seq:}` (plus optional `:parent_call_id` for nested calls) | a running tool emits incremental output (for example `Alloy.Tool.Core.Bash`); marshalled to the caller process strictly between `:tool_start` and `:tool_end` |
+| `:tool_end` | `%{id:, name:, input:, duration_ms:, error:, start_event_seq:}` (plus optional `:parent_call_id` for nested calls) | a tool call finishes; `error` is `nil` on success, a string otherwise; `start_event_seq` links back to the matching `:tool_start` envelope |
 | `:runtime_event` | `term()` — the raw event | anything emitted that isn't a recognized tuple; a forward-compatibility escape hatch |
 
 Consumers should match on the `event` atoms they know and ignore the

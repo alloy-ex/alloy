@@ -22,6 +22,32 @@ defmodule Alloy.ModelCatalogTest do
     def default_context_window, do: 8_192
   end
 
+  defmodule FullCatalog do
+    @behaviour Alloy.ModelCatalog
+
+    @impl true
+    def context_window("custom-pro"), do: 512_000
+    def context_window(_), do: nil
+
+    @impl true
+    def max_output_tokens("custom-pro"), do: 32_768
+    def max_output_tokens(_), do: nil
+
+    @impl true
+    def capabilities("custom-pro") do
+      %{reasoning?: true, vision?: true, documents?: false, tools?: true}
+    end
+
+    def capabilities(_), do: nil
+
+    @impl true
+    def pricing("custom-pro") do
+      %{input_per_million: 2.0, output_per_million: 8.0, cache_read_per_million: 0.2}
+    end
+
+    def pricing(_), do: nil
+  end
+
   defp opts(extra) do
     Keyword.merge(
       [provider: {Alloy.Provider.Test, model: "my-finetune-v3"}],
@@ -112,6 +138,59 @@ defmodule Alloy.ModelCatalogTest do
       # Overrides reuse built-in suffix patterns for known families
       assert Alloy.ModelMetadata.override_window("gpt-5-2026-01-01", %{"gpt-5" => 123_456}) ==
                123_456
+    end
+  end
+
+  describe "Alloy.ModelCatalog.info/1,2" do
+    test "defaults to Alloy.ModelMetadata" do
+      info = Alloy.ModelCatalog.info("claude-sonnet-4-6")
+
+      assert info.model == "claude-sonnet-4-6"
+      assert info.context_window == 1_000_000
+      assert info.max_output_tokens == 128_000
+      assert info.capabilities.reasoning? == true
+      assert info.capabilities.documents? == true
+      assert info.pricing.input_per_million == 3.0
+    end
+
+    test "returns nil for unimplemented optional callbacks on minimal catalogs" do
+      info = Alloy.ModelCatalog.info(StaticCatalog, "my-finetune-v3")
+
+      assert info == %{
+               model: "my-finetune-v3",
+               context_window: 32_768,
+               max_output_tokens: nil,
+               capabilities: nil,
+               pricing: nil
+             }
+    end
+
+    test "returns all optional metadata when exported by a custom catalog" do
+      info = Alloy.ModelCatalog.info(FullCatalog, "custom-pro")
+
+      assert info == %{
+               model: "custom-pro",
+               context_window: 512_000,
+               max_output_tokens: 32_768,
+               capabilities: %{reasoning?: true, vision?: true, documents?: false, tools?: true},
+               pricing: %{
+                 input_per_million: 2.0,
+                 output_per_million: 8.0,
+                 cache_read_per_million: 0.2
+               }
+             }
+
+      unknown = Alloy.ModelCatalog.info(FullCatalog, "missing")
+      assert unknown.context_window == nil
+      assert unknown.max_output_tokens == nil
+      assert unknown.capabilities == nil
+      assert unknown.pricing == nil
+    end
+
+    test "rejects invalid catalog modules" do
+      assert_raise ArgumentError, ~r/:model_catalog must be a module/, fn ->
+        Alloy.ModelCatalog.info(Enum, "gpt-5")
+      end
     end
   end
 end
