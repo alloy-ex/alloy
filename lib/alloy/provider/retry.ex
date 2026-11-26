@@ -31,7 +31,7 @@ defmodule Alloy.Provider.Retry do
   @spec call_with_retry(State.t(), module(), map(), boolean(), function(), integer() | nil) ::
           {:ok, map()} | {:error, term()}
   def call_with_retry(state, provider, provider_config, streaming?, on_chunk, deadline) do
-    {result, _messages} =
+    {result, _messages, _chunks_emitted?} =
       call_with_retry_attributed(state, provider, provider_config, streaming?, on_chunk, deadline)
 
     result
@@ -46,7 +46,7 @@ defmodule Alloy.Provider.Retry do
           function(),
           integer() | nil
         ) ::
-          {{:ok, map()} | {:error, term()}, [Message.t()]}
+          {{:ok, map()} | {:error, term()}, [Message.t()], boolean()}
   def call_with_retry_attributed(state, provider, provider_config, streaming?, on_chunk, deadline) do
     primary_origin = Message.origin(provider, provider_config)
     base_messages = Message.attribute_file_blocks(state.messages, primary_origin, provider)
@@ -65,16 +65,16 @@ defmodule Alloy.Provider.Retry do
 
     case result do
       {:ok, _} = success ->
-        {success, base_messages}
+        {success, base_messages, chunks_emitted?}
 
       # Once any streamed output/event was emitted, never switch providers:
       # mixing chunks from multiple providers in one stream breaks turn semantics.
       {:error, _reason} = error when chunks_emitted? ->
-        {error, base_messages}
+        {error, base_messages, true}
 
       # Do not spawn fallback workers against a supervisor that is shutting down.
       {:error, %Error{kind: :shutdown}} = error ->
-        {error, base_messages}
+        {error, base_messages, false}
 
       {:error, _reason} = error ->
         try_fallback_providers(
@@ -165,12 +165,12 @@ defmodule Alloy.Provider.Retry do
 
     Enum.reduce_while(
       state.config.fallback_providers,
-      {last_error, state.messages},
-      fn {fb_provider, fb_config}, {acc_err, messages_acc} ->
+      {last_error, state.messages, false},
+      fn {fb_provider, fb_config}, {acc_err, messages_acc, _emitted?} ->
         now = System.monotonic_time(:millisecond)
 
         if is_integer(deadline) and deadline - now <= 0 do
-          {:halt, {acc_err, messages_acc}}
+          {:halt, {acc_err, messages_acc, false}}
         else
           fb_provider_config =
             fb_config
@@ -205,16 +205,16 @@ defmodule Alloy.Provider.Retry do
                    fb_provider,
                    fb_provider_config,
                    primary_origin
-                 )}, attempt_messages}}
+                 )}, attempt_messages, chunks_emitted?}}
 
             {:error, _} = error when chunks_emitted? ->
-              {:halt, {error, attempt_messages}}
+              {:halt, {error, attempt_messages, true}}
 
             {:error, %Error{kind: :shutdown}} = error ->
-              {:halt, {error, attempt_messages}}
+              {:halt, {error, attempt_messages, false}}
 
             {:error, _} = error ->
-              {:cont, {error, attempt_messages}}
+              {:cont, {error, attempt_messages, false}}
           end
         end
       end

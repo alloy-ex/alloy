@@ -329,21 +329,10 @@ defmodule Alloy.Agent.Turn do
     provider_event_turn = state.turn + 1
 
     streaming? = Keyword.get(opts, :streaming, false) && Retry.supports_streaming?(provider)
-    emitted_ref = :atomics.new(1, signed: false)
-    raw_on_chunk = Keyword.get(opts, :on_chunk, fn _chunk -> :ok end)
-
-    on_chunk = fn chunk ->
-      :atomics.put(emitted_ref, 1, 1)
-      raw_on_chunk.(chunk)
-    end
+    on_chunk = Keyword.get(opts, :on_chunk, fn _chunk -> :ok end)
 
     on_event = fn raw_event ->
       Events.emit(opts, provider_event_turn, raw_event)
-    end
-
-    provider_on_event = fn raw_event ->
-      :atomics.put(emitted_ref, 1, 1)
-      on_event.(raw_event)
     end
 
     # Only attach provider-side :on_event when a caller passed :on_event.
@@ -363,20 +352,17 @@ defmodule Alloy.Agent.Turn do
         if streaming?, do: Map.put(cfg, :alloy_on_text_event, on_event), else: cfg
       end)
       |> then(fn cfg ->
-        if emit_provider_events?, do: Map.put(cfg, :on_event, provider_on_event), else: cfg
+        if emit_provider_events?, do: Map.put(cfg, :on_event, on_event), else: cfg
       end)
 
-    {result, attributed_messages} =
-      Retry.call_with_retry_attributed(
-        state,
-        provider,
-        provider_config,
-        streaming?,
-        on_chunk,
-        state.deadline
-      )
-
-    {result, attributed_messages, :atomics.get(emitted_ref, 1) == 1}
+    Retry.call_with_retry_attributed(
+      state,
+      provider,
+      provider_config,
+      streaming?,
+      on_chunk,
+      state.deadline
+    )
   end
 
   defp account_response(state, %{stop_reason: stop_reason, usage: usage} = response) do

@@ -678,21 +678,27 @@ defmodule Alloy.Provider.OpenAI do
 
         case plan_call_events(base_meta, item, pending_deltas, plan_opts) do
           {:ok, events, next_emitted_args} ->
-            effective_item_id =
-              item_id || (is_map(existing) && Map.get(existing, :item_id)) || nil
+            existing_item_ids =
+              if is_map(existing),
+                do: Map.get(existing, :item_ids, MapSet.new()),
+                else: MapSet.new()
+
+            next_item_ids =
+              if is_binary(item_id) and item_id != "",
+                do: MapSet.put(existing_item_ids, item_id),
+                else: existing_item_ids
 
             meta =
               Map.merge(base_meta, %{
-                item_id: effective_item_id,
+                item_ids: next_item_ids,
                 emitted_args: next_emitted_args
               })
 
             function_calls =
               acc.function_calls
-              |> maybe_put_call_meta(effective_item_id, meta)
-              |> maybe_put_call_meta(is_map(existing) && Map.get(existing, :item_id), meta)
               |> Map.put({:call_id, call_id}, meta)
-              |> Map.put({:index, stable_index}, meta)
+              |> maybe_put_call_alias(item_id, call_id)
+              |> Map.put({:index, stable_index}, {:alias, call_id})
 
             {:ok, %{acc | function_calls: function_calls, pending_function_deltas: next_pending},
              events}
@@ -920,19 +926,22 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp lookup_function_call_item(calls, item_id, call_id, index) do
-    maybe_get_by_id(calls, item_id) ||
-      maybe_get_by_call_id(calls, call_id) ||
-      lookup_call_by_index(calls, index)
+    resolve_call_entry(calls, maybe_get_by_id(calls, item_id)) ||
+      resolve_call_entry(calls, maybe_get_by_call_id(calls, call_id)) ||
+      resolve_call_entry(calls, lookup_call_by_index(calls, index))
   end
 
   defp lookup_function_call_meta(calls, item_id, index) do
-    case maybe_get_by_id(calls, item_id) do
+    case resolve_call_entry(calls, maybe_get_by_id(calls, item_id)) do
       nil ->
-        case lookup_call_by_index(calls, index) do
-          %{item_id: existing_id}
-          when is_binary(item_id) and item_id != "" and is_binary(existing_id) and
-                 existing_id != "" and existing_id != item_id ->
-            nil
+        case resolve_call_entry(calls, lookup_call_by_index(calls, index)) do
+          %{item_ids: item_ids} = found ->
+            if is_binary(item_id) and item_id != "" and MapSet.size(item_ids) > 0 and
+                 not MapSet.member?(item_ids, item_id) do
+              nil
+            else
+              found
+            end
 
           other ->
             other
@@ -943,6 +952,9 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
+  defp resolve_call_entry(calls, {:alias, call_id}), do: Map.get(calls, {:call_id, call_id})
+  defp resolve_call_entry(_calls, entry), do: entry
+
   defp maybe_get_by_id(calls, id) when is_binary(id) and id != "", do: Map.get(calls, id)
   defp maybe_get_by_id(_calls, _id), do: nil
 
@@ -950,6 +962,11 @@ defmodule Alloy.Provider.OpenAI do
     do: Map.get(calls, {:call_id, call_id})
 
   defp maybe_get_by_call_id(_calls, _call_id), do: nil
+
+  defp maybe_put_call_alias(map, id, call_id) when is_binary(id) and id != "",
+    do: Map.put(map, id, {:alias, call_id})
+
+  defp maybe_put_call_alias(map, _id, _call_id), do: map
 
   defp maybe_put_call_meta(map, id, meta) when is_binary(id) and id != "",
     do: Map.put(map, id, meta)
@@ -985,13 +1002,7 @@ defmodule Alloy.Provider.OpenAI do
           )
 
           updated_meta = %{meta | emitted_args: Map.get(meta, :emitted_args, "") <> delta}
-
-          function_calls =
-            acc.function_calls
-            |> maybe_put_call_meta(item_id, updated_meta)
-            |> maybe_put_call_meta(Map.get(meta, :item_id), updated_meta)
-            |> Map.put({:call_id, id}, updated_meta)
-            |> Map.put({:index, idx}, updated_meta)
+          function_calls = Map.put(acc.function_calls, {:call_id, id}, updated_meta)
 
           %{acc | function_calls: function_calls}
         else

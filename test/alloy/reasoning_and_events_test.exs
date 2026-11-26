@@ -4498,6 +4498,223 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert Task.await(owner, 1_000) == :timeout
       refute_received :expired_worker_ran
+
+      # 18. OpenAI/xAI: item_id alias rotation followed by argument deltas and terminal reuse of
+      #     the older item_id reconciles against the single canonical call record (succeeding on
+      #     matching args with no duplicate deltas, failing with :malformed_reply on conflict).
+      alias_conflict_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_old",
+              "call_id" => "call_alias",
+              "name" => "echo",
+              "arguments" => ""
+            }
+          }) <>
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_new",
+                "call_id" => "call_alias",
+                "name" => "echo",
+                "arguments" => ""
+              }
+            }) <>
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "item_id" => "fc_new",
+              "output_index" => 0,
+              "delta" => "{\"x\":1}"
+            }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_alias_conflict",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_old",
+                    "call_id" => "call_alias",
+                    "name" => "echo",
+                    "arguments" => "{\"x\":2}"
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      assert {:error, %Error{kind: :malformed_reply}} =
+               OpenAI.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "sk-oai",
+                   model: "gpt-5.4",
+                   req_options: [plug: alias_conflict_plug],
+                   on_event: &send(parent, {:alias_c_ev, &1})
+                 },
+                 fn _ -> :ok end
+               )
+
+      alias_c_deltas =
+        drain_tagged(:alias_c_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.map_join(alias_c_deltas, & &1.arguments_delta) == "{\"x\":1}"
+
+      alias_match_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_old",
+              "call_id" => "call_alias_ok",
+              "name" => "echo",
+              "arguments" => ""
+            }
+          }) <>
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_new",
+                "call_id" => "call_alias_ok",
+                "name" => "echo",
+                "arguments" => ""
+              }
+            }) <>
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "item_id" => "fc_new",
+              "output_index" => 0,
+              "delta" => "{\"x\":1}"
+            }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_alias_match",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_old",
+                    "call_id" => "call_alias_ok",
+                    "name" => "echo",
+                    "arguments" => "{\"x\":1}"
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      {:ok, %{messages: [alias_ok_msg]}} =
+        OpenAI.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "sk-oai",
+            model: "gpt-5.4",
+            req_options: [plug: alias_match_plug],
+            on_event: &send(parent, {:alias_ok_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      assert [%{type: "tool_use", id: "call_alias_ok", name: "echo", input: %{"x" => 1}}] =
+               alias_ok_msg.content
+
+      alias_ok_deltas =
+        drain_tagged(:alias_ok_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.map_join(alias_ok_deltas, & &1.arguments_delta) == "{\"x\":1}"
+
+      # 19. Provider-level :on_event callback (without a top-level :on_event subscriber) still
+      #     propagates chunks_emitted? from Retry to Turn so context-overflow recovery never
+      #     starts a second request after emitting deltas.
+      provider_cb_reqs = :atomics.new(1, signed: false)
+
+      provider_cb_overflow_plug = fn conn ->
+        attempt = :atomics.add_get(provider_cb_reqs, 1, 1)
+
+        sse =
+          if attempt == 1 do
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_pcb_1",
+                "call_id" => "call_pcb_1",
+                "name" => "echo",
+                "arguments" => "{\"x\":1}"
+              }
+            }) <>
+              sse_oai("response.failed", %{
+                "type" => "response.failed",
+                "response" => %{
+                  "id" => "resp_pcb_1",
+                  "status" => "failed",
+                  "error" => %{
+                    "code" => "context_length_exceeded",
+                    "message" => "Your input exceeds the context window of this model."
+                  }
+                }
+              })
+          else
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_pcb_2",
+                "status" => "completed",
+                "output" => [],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:error, %Alloy.Result{status: :error}} =
+               Alloy.stream(
+                 "hi",
+                 fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai",
+                    model: "gpt-5.4",
+                    on_event: &send(parent, {:pcb_ev, &1}),
+                    req_options: [plug: provider_cb_overflow_plug]},
+                 max_retries: 0,
+                 middleware: [ShrinkOverflowMiddleware]
+               )
+
+      assert :atomics.get(provider_cb_reqs, 1) == 1
+
+      pcb_ids =
+        drain_tagged(:pcb_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p.id end)
+        |> Enum.uniq()
+
+      assert pcb_ids == ["call_pcb_1"]
     end
   end
 
