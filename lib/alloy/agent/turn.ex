@@ -12,7 +12,7 @@ defmodule Alloy.Agent.Turn do
   alias Alloy.Cancel
   alias Alloy.Events
   alias Alloy.Internal.Sanitize
-  alias Alloy.{Message, Middleware, OutputSchema, Provider, Usage}
+  alias Alloy.{Message, Middleware, OutputSchema, Provider, Transcript, Usage}
   alias Alloy.Provider.{Error, Retry}
   alias Alloy.Tool.{Executor, Validation}
 
@@ -475,13 +475,16 @@ defmodule Alloy.Agent.Turn do
           "The model refused to continue (stop_reason: refusal): #{Sanitize.inspect_bounded(details)}"
       end
 
-    accounted =
-      state
-      |> account_response(response)
-      |> maybe_record_refusal_output_error(reason)
-
+    accounted = account_response(state, response)
     record_turn_progress(opts, accounted.stop_reason, accounted.usage)
-    fail(accounted, reason)
+
+    if Cancel.cancelled?(accounted.config.cancel_token) do
+      cancel_state(accounted)
+    else
+      accounted
+      |> maybe_record_refusal_output_error(reason)
+      |> fail(reason)
+    end
   end
 
   defp maybe_record_refusal_output_error(%State{config: %{output_schema: nil}} = state, _reason),
@@ -528,6 +531,7 @@ defmodule Alloy.Agent.Turn do
   defp run_middleware(hook, %State{} = state) do
     case Middleware.run_hook(hook, state) do
       {:halted, reason, halted} -> {:halt, halt(halted, reason)}
+      %State{status: :cancelled} = cancelled -> {:halt, cancelled}
       %State{} = state -> {:continue, state}
     end
   end
@@ -535,8 +539,8 @@ defmodule Alloy.Agent.Turn do
   defp halt(%State{} = state, reason),
     do: %{state | status: :halted, error: "Halted by middleware: #{reason}"}
 
-  defp handle_provider_error(%Error{kind: :cancelled}, state, _opts, _overflow_retried?),
-    do: {:halt, cancel_state(state)}
+  defp handle_provider_error(%Error{kind: :cancelled} = error, state, _opts, _overflow_retried?),
+    do: {:halt, state |> put_provider_error(error) |> cancel_state()}
 
   defp handle_provider_error(reason, state, opts, false = _overflow_retried?) do
     cond do
@@ -563,6 +567,10 @@ defmodule Alloy.Agent.Turn do
   # middleware's own changes (a summary request's usage) are kept either way.
   defp recover_from_overflow(reason, state, opts) do
     case run_middleware(:on_context_overflow, state) do
+      {:halt, %State{status: :cancelled} = cancelled} ->
+        overflow_event(state, false)
+        {:halt, cancelled}
+
       {:halt, halted} ->
         overflow_event(state, false)
         {:halt, put_provider_error(halted, reason)}
@@ -647,20 +655,23 @@ defmodule Alloy.Agent.Turn do
         {:halt, failed}
 
       {:ok, result_blocks, tool_call_meta, steering_msgs} ->
+        steered? = steering_msgs != []
+
         state =
           state
           |> answer_tool_calls(tool_calls, result_blocks)
           |> State.append_tool_calls(tool_call_meta)
+          |> then(&if(steered?, do: State.append_messages(&1, steering_msgs), else: &1))
 
         if Cancel.cancelled?(state.config.cancel_token) do
           {:halt, cancel_state(state)}
         else
-          finish_tool_round(state, tool_call_meta, steering_msgs)
+          finish_tool_round(state, tool_call_meta, steered?)
         end
     end
   end
 
-  defp finish_tool_round(state, tool_call_meta, steering_msgs) do
+  defp finish_tool_round(state, tool_call_meta, steered?) do
     case run_middleware(:after_tool_execution, state) do
       {:halt, _halted} = halted ->
         halted
@@ -670,8 +681,8 @@ defmodule Alloy.Agent.Turn do
           Cancel.cancelled?(next_state.config.cancel_token) ->
             {:halt, cancel_state(next_state)}
 
-          steering_msgs != [] ->
-            {:continue, State.append_messages(next_state, steering_msgs)}
+          steered? ->
+            {:continue, next_state}
 
           true ->
             maybe_finish_after_tool({:continue, next_state}, tool_call_meta)
@@ -1009,12 +1020,7 @@ defmodule Alloy.Agent.Turn do
   defp poll_messages_callback(name, callback, state) do
     case callback.(state) do
       msgs when is_list(msgs) ->
-        if Enum.all?(msgs, &valid_callback_message?/1) do
-          {:ok, msgs}
-        else
-          {:error,
-           "#{name} callback returned invalid messages: expected a list of Alloy.Message structs, got #{Sanitize.shape_summary(msgs)}"}
-        end
+        validate_callback_messages(name, msgs)
 
       other ->
         {:error,
@@ -1028,9 +1034,25 @@ defmodule Alloy.Agent.Turn do
       {:error, "#{name} callback #{kind}: #{Sanitize.exit_summary(reason, :redact)}"}
   end
 
+  defp validate_callback_messages(name, msgs) do
+    cond do
+      not Enum.all?(msgs, &valid_callback_message?/1) ->
+        {:error,
+         "#{name} callback returned invalid messages: expected a list of Alloy.Message structs, got #{Sanitize.shape_summary(msgs)}"}
+
+      Transcript.validate(msgs) != :ok ->
+        {:error, "#{name} callback returned messages with invalid tool pairing"}
+
+      true ->
+        {:ok, msgs}
+    end
+  end
+
   defp valid_callback_message?(%Message{role: role, content: content})
        when role in [:user, :assistant] do
-    is_binary(content) or (is_list(content) and Enum.all?(content, &is_map/1))
+    is_binary(content) or
+      (is_list(content) and content != [] and
+         Enum.all?(content, &(is_map(&1) and not is_struct(&1))))
   end
 
   defp valid_callback_message?(_other), do: false

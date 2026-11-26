@@ -95,6 +95,9 @@ defmodule Alloy.Middleware do
         {:halt, reason, %State{} = halted} when is_binary(reason) ->
           {:halt, {:halted, reason, halted}}
 
+        %State{status: :cancelled} = cancelled ->
+          {:halt, cancelled}
+
         %State{} = new_state ->
           {:cont, new_state}
 

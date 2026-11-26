@@ -125,9 +125,9 @@ defmodule Alloy do
   receives lifecycle and tool events (`:turn_start`, `:turn_end`, `:tool_start`,
   `:tool_update`, `:tool_end`) but no streaming model deltas.
 
-  Built-in HTTP/SSE providers (when `:timeout_ms` is finite), Codex, and tool
-  execution require the `:alloy` application (and its `Alloy.TaskSupervisor`)
-  to be started.
+  Built-in HTTP/SSE providers (when `:timeout_ms` is finite or `:cancel_token`
+  is set), Codex, and tool execution require the `:alloy` application (and its
+  `Alloy.TaskSupervisor`) to be started.
 
   Returns `{:ok, result}` on completion or `{:error, result}` on failure.
   """

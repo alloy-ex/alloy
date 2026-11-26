@@ -433,11 +433,24 @@ defmodule Alloy.Provider.HTTP do
           )
 
         case await_monitored_post(owner, deadline, cancel_token) do
-          {:ok, result} -> decode_post_result(result)
-          :cancelled -> cancelled_error("Request cancelled")
-          {:shutdown, _reason} -> shutdown_error()
-          {:worker_exit, reason} -> propagate_worker_exit(reason)
-          :timeout -> {:error, %Error{kind: :timeout, message: "Request exceeded deadline"}}
+          {:ok, result} ->
+            maybe_override_cancelled(
+              decode_post_result(result),
+              cancel_token,
+              "Request cancelled"
+            )
+
+          :cancelled ->
+            cancelled_error("Request cancelled")
+
+          {:shutdown, _reason} ->
+            shutdown_error()
+
+          {:worker_exit, reason} ->
+            propagate_worker_exit(reason)
+
+          :timeout ->
+            {:error, %Error{kind: :timeout, message: "Request exceeded deadline"}}
         end
     end
   end
@@ -595,7 +608,12 @@ defmodule Alloy.Provider.HTTP do
 
         {^ref, {:ok, req_result}} ->
           _ = Task.ignore(owner)
-          finish_stream_result(req_result, acc)
+
+          maybe_override_cancelled(
+            finish_stream_result(req_result, acc),
+            cancel_token,
+            "Stream cancelled"
+          )
 
         {^ref, {:worker_exit, reason}} ->
           _ = Task.ignore(owner)
@@ -744,6 +762,12 @@ defmodule Alloy.Provider.HTTP do
   defp cancelled_error(message) do
     {:error, %Error{kind: :cancelled, message: message}}
   end
+
+  defp maybe_override_cancelled({:error, _} = err, cancel_token, message) do
+    if Cancel.cancelled?(cancel_token), do: cancelled_error(message), else: err
+  end
+
+  defp maybe_override_cancelled(ok, _cancel_token, _message), do: ok
 
   # Dedicated non-retryable :shutdown kind (never produced from provider
   # payloads) so Retry neither retries nor spawns fallback workers against a

@@ -49,7 +49,9 @@ defmodule Alloy.Provider.CodexRunner do
          {:ok, _timeout, _deadline} <- resolve_deadline(config) do
       in_temp_dir(config, fn paths ->
         with :ok <- write_inputs(paths, schema_json, prompt) do
-          run_injected(runner, build_args.(paths) ++ [prompt], codex_home, paths, config)
+          runner
+          |> run_injected(build_args.(paths) ++ [prompt], codex_home, paths, config)
+          |> maybe_override_cancelled(cancel_token)
         end
       end)
     else
@@ -90,7 +92,7 @@ defmodule Alloy.Provider.CodexRunner do
 
       case await_task(task, tag, on_chunk, deadline + @reply_grace_ms, cancel_token) do
         {:ok, result} ->
-          result
+          maybe_override_cancelled(result, cancel_token)
 
         :cancelled ->
           {:error, cancelled_error()}
@@ -411,6 +413,17 @@ defmodule Alloy.Provider.CodexRunner do
   end
 
   defp cancelled_error, do: %Error{kind: :cancelled, message: "codex exec cancelled"}
+
+  defp maybe_override_cancelled({:error, _} = err, cancel_token) do
+    if Cancel.cancelled?(cancel_token), do: {:error, cancelled_error()}, else: err
+  end
+
+  defp maybe_override_cancelled({:ok, %{status: status}} = result, cancel_token)
+       when status != 0 do
+    if Cancel.cancelled?(cancel_token), do: {:error, cancelled_error()}, else: result
+  end
+
+  defp maybe_override_cancelled(ok, _cancel_token), do: ok
 
   defp check_deadline(deadline, timeout) do
     if deadline <= System.monotonic_time(:millisecond),

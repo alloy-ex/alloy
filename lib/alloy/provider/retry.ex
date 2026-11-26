@@ -71,14 +71,20 @@ defmodule Alloy.Provider.Retry do
       {:ok, _} = success ->
         {success, base_messages, chunks_emitted?}
 
+      # Preserve explicit :cancelled errors (e.g. Codex resume rotation guidance)
+      # even when chunks were emitted; convert non-cancelled errors after cancel.
+      {:error, %Error{kind: :cancelled}} = error ->
+        {error, base_messages, chunks_emitted?}
+
       # Once any streamed output/event was emitted, never switch providers:
       # mixing chunks from multiple providers in one stream breaks turn semantics.
       {:error, _reason} = error when chunks_emitted? ->
-        {error, base_messages, true}
+        if Cancel.cancelled?(cancel_token),
+          do: {{:error, cancelled_error()}, base_messages, true},
+          else: {error, base_messages, true}
 
-      # Do not spawn fallback workers against a supervisor that is shutting down
-      # or after cooperative cancellation.
-      {:error, %Error{kind: kind}} = error when kind in [:shutdown, :cancelled] ->
+      # Do not spawn fallback workers against a supervisor that is shutting down.
+      {:error, %Error{kind: :shutdown}} = error ->
         {error, base_messages, false}
 
       {:error, _reason} = error ->
@@ -241,27 +247,40 @@ defmodule Alloy.Provider.Retry do
   end
 
   defp handle_fallback_result(
-         {:error, _} = error,
-         true,
+         {:error, %Error{kind: :cancelled}} = error,
+         chunks_emitted?,
          _fb_provider,
          _fb_provider_config,
          _primary_origin,
          attempt_messages,
          _cancel_token
        ) do
-    {:halt, {error, attempt_messages, true}}
+    {:halt, {error, attempt_messages, chunks_emitted?}}
   end
 
   defp handle_fallback_result(
-         {:error, %Error{kind: kind}} = error,
+         {:error, _} = error,
+         true,
+         _fb_provider,
+         _fb_provider_config,
+         _primary_origin,
+         attempt_messages,
+         cancel_token
+       ) do
+    if Cancel.cancelled?(cancel_token),
+      do: {:halt, {{:error, cancelled_error()}, attempt_messages, true}},
+      else: {:halt, {error, attempt_messages, true}}
+  end
+
+  defp handle_fallback_result(
+         {:error, %Error{kind: :shutdown}} = error,
          _chunks_emitted?,
          _fb_provider,
          _fb_provider_config,
          _primary_origin,
          attempt_messages,
          _cancel_token
-       )
-       when kind in [:shutdown, :cancelled] do
+       ) do
     {:halt, {error, attempt_messages, false}}
   end
 
@@ -370,6 +389,9 @@ defmodule Alloy.Provider.Retry do
         {error, chunks_emitted?}
     end
   end
+
+  defp maybe_retry_attempt(%Error{kind: :cancelled} = error, chunks_emitted?, _ctx),
+    do: {{:error, error}, chunks_emitted?}
 
   defp maybe_retry_attempt(reason, chunks_emitted?, ctx) do
     cancel_token = effective_cancel_token(ctx.state, ctx.provider_config)

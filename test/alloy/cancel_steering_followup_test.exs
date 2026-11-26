@@ -63,6 +63,19 @@ defmodule Alloy.CancelSteeringFollowUpTest do
       state
     end
 
+    def call(:on_error, state) do
+      if pid = state.config.context[:test_pid], do: send(pid, :on_error_ran)
+      state
+    end
+
+    def call(_hook, state), do: state
+  end
+
+  defmodule HaltAfterToolExecutionMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:after_tool_execution, _state), do: {:halt, "stop after tool"}
     def call(_hook, state), do: state
   end
 
@@ -724,6 +737,79 @@ defmodule Alloy.CancelSteeringFollowUpTest do
       cfg = Config.from_opts(provider: {TestProvider, []}, cancel_token: token3)
       st = State.init(cfg, history)
       assert Compactor.force_compact(st).messages == history
+
+      # Explicit provider %Error{kind: :cancelled} during summary (WITHOUT a shared cancel_token)
+      # must halt the run as :cancelled, preserve original messages verbatim, and NOT consume the next turn.
+      {:ok, no_tok_pid} =
+        TestProvider.start_link([
+          {:error, %Error{kind: :cancelled, message: "upstream cancelled summary"}},
+          TestProvider.text_response("should never run")
+        ])
+
+      assert {:error, %Result{status: :cancelled, error: :cancelled, turns: 0} = no_tok_res} =
+               Alloy.run("final question",
+                 messages: history,
+                 provider: {TestProvider, agent_pid: no_tok_pid},
+                 middleware: [AfterToolExecutionRecorder],
+                 context: %{test_pid: parent},
+                 max_tokens: 500,
+                 compaction: [reserve_tokens: 100, keep_recent_tokens: 100]
+               )
+
+      assert no_tok_res.messages == expected_messages
+
+      assert %Error{kind: :cancelled, message: "upstream cancelled summary"} =
+               no_tok_res.metadata.run.provider_error
+
+      assert length(Agent.get(no_tok_pid, & &1)) == 1
+      refute_received :after_compaction_ran
+
+      # Same for force_compact/2 directly when provider returns %Error{kind: :cancelled} without cancel_token.
+      {:ok, fc_pid} =
+        TestProvider.start_link([
+          {:error, %Error{kind: :cancelled, message: "force compact cancelled"}}
+        ])
+
+      fc_cfg = Config.from_opts(provider: {TestProvider, agent_pid: fc_pid})
+      fc_st = State.init(fc_cfg, history)
+      fc_after = Compactor.force_compact(fc_st)
+      assert fc_after.status == :cancelled
+      assert fc_after.messages == history
+    end
+
+    test "honors cancellation precedence on stop_reason: :refusal while preserving accounted usage" do
+      parent = self()
+      token = Cancel.new()
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          {:ok,
+           %{
+             stop_reason: :refusal,
+             messages: [Message.assistant("cannot comply")],
+             usage: %{input_tokens: 11, output_tokens: 3}
+           }}
+        ])
+
+      assert {:error,
+              %Result{
+                status: :cancelled,
+                error: :cancelled,
+                turns: 1,
+                stop_reason: :refusal
+              } = res} =
+               Alloy.run("hi",
+                 provider:
+                   {RecordingProvider,
+                    agent_pid: pid, record_pid: parent, cancel_on_complete: token},
+                 middleware: [AfterToolExecutionRecorder],
+                 context: %{test_pid: parent},
+                 cancel_token: token
+               )
+
+      assert res.usage.input_tokens == 11
+      assert res.usage.output_tokens == 3
+      refute_received :on_error_ran
     end
 
     test "cancels CodexRunner subprocess cleanly, removes temp dir, and annotates resumed sessions" do
@@ -865,6 +951,34 @@ defmodule Alloy.CancelSteeringFollowUpTest do
         )
 
       assert msg =~ "session_generation"
+
+      # End-to-end Alloy.run/2 preserves Codex's :session_generation guidance in result.metadata.run.provider_error.
+      token_run = Cancel.new()
+
+      run_runner = fn _bin, _args, _opts ->
+        Cancel.cancel(token_run)
+        {"interrupted", 1}
+      end
+
+      assert {:error,
+              %Result{
+                status: :cancelled,
+                error: :cancelled,
+                metadata: %{run: %{provider_error: %Error{kind: :cancelled, message: run_msg}}}
+              }} =
+               Alloy.run("turn 2",
+                 messages: [Message.user("turn 1")] ++ first_resp.messages,
+                 provider:
+                   {Codex,
+                    model: "gpt-5.4",
+                    persist_session: true,
+                    workdir: workdir,
+                    provider_state: first_resp.provider_state,
+                    command_runner: run_runner},
+                 cancel_token: token_run
+               )
+
+      assert run_msg =~ "session_generation"
     end
   end
 
@@ -997,6 +1111,20 @@ defmodule Alloy.CancelSteeringFollowUpTest do
             fn _ -> ["not a message struct"] end,
             fn _ -> [%Message{role: :system, content: "bad role"}] end,
             fn _ -> [%Message{role: :user, content: nil}] end,
+            fn _ -> [%Message{role: :user, content: []}] end,
+            fn _ -> [%Message{role: :user, content: [Message.user("nested")]}] end,
+            fn _ -> [%Message{role: :assistant, content: [%URI{}]}] end,
+            fn _ ->
+              [
+                %Message{
+                  role: :assistant,
+                  content: [%{type: "tool_use", id: "unanswered_1", name: "t", input: %{}}]
+                }
+              ]
+            end,
+            fn _ ->
+              [Message.tool_results([Message.tool_result_block("orphan_1", "nope", false)])]
+            end,
             fn _ -> raise "credential=sk-runtime-secret" end,
             fn _ -> raise KeyError, key: :missing, term: %{secret: "sk-leak-999"} end,
             fn _ -> throw(%{secret: "sk-throw-999"}) end
@@ -1079,6 +1207,54 @@ defmodule Alloy.CancelSteeringFollowUpTest do
       assert_received :par_ran
       refute_received :seq_ran
       assert :ok == Transcript.validate(mix_res.messages)
+
+      # 1b. Steering accepts valid paired assistant tool_use + tool_result messages, and preserves
+      #     dequeued steering messages in result.messages even if :after_tool_execution halts.
+      paired_msgs = [
+        %Message{
+          role: :assistant,
+          content: [%{type: "tool_use", id: "pair_1", name: "par_t", input: %{}}]
+        },
+        Message.tool_results([Message.tool_result_block("pair_1", "paired ok", false)]),
+        Message.user("now continue")
+      ]
+
+      {:ok, pid_pair} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "x1", name: "par_t", input: %{}},
+            %{id: "x2", name: "seq_t", input: %{}}
+          ]),
+          TestProvider.text_response("paired steering ok")
+        ])
+
+      assert {:ok, %Result{status: :completed, text: "paired steering ok"} = pair_res} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid_pair},
+                 tools: [par_tool, seq_tool],
+                 steering: fn _ -> paired_msgs end
+               )
+
+      assert :ok == Transcript.validate(pair_res.messages)
+
+      {:ok, pid_halt} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "h1", name: "par_t", input: %{}},
+            %{id: "h2", name: "seq_t", input: %{}}
+          ])
+        ])
+
+      assert {:error, %Result{status: :halted} = halt_res} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid_halt},
+                 tools: [par_tool, seq_tool],
+                 middleware: [HaltAfterToolExecutionMiddleware],
+                 steering: fn _ -> [Message.user("preserved steering message")] end
+               )
+
+      assert List.last(halt_res.messages) == Message.user("preserved steering message")
+      assert :ok == Transcript.validate(halt_res.messages)
 
       # 2. Cancellation inside :steering overrides non-empty messages, invalid returns, raises, throws, and exits
       for steering_action <- [
@@ -1369,29 +1545,76 @@ defmodule Alloy.CancelSteeringFollowUpTest do
       refute_received {:follow_up_until_turn, 1}
       assert_received {:follow_up_until_turn, 3}
 
-      # 5. Invalid returns and exceptions (including RuntimeError secrets) in :follow_up are sanitized
+      # 5. Invalid returns, malformed block lists, unpaired tool blocks, and exceptions in :follow_up are sanitized
       for bad_fu <- [
             fn _ -> %{secret: "sk-fu-secret"} end,
             fn _ -> [%Message{role: :system, content: "bad role"}] end,
             fn _ -> [%Message{role: :user, content: nil}] end,
+            fn _ -> [%Message{role: :user, content: []}] end,
+            fn _ -> [%Message{role: :user, content: [Message.user("nested")]}] end,
+            fn _ ->
+              [
+                %Message{
+                  role: :assistant,
+                  content: [%{type: "tool_use", id: "fu_unanswered", name: "t", input: %{}}]
+                }
+              ]
+            end,
+            fn _ ->
+              [Message.tool_results([Message.tool_result_block("fu_orphan", "nope", false)])]
+            end,
             fn _ -> raise "credential=sk-fu-runtime" end,
             fn _ -> raise MatchError, term: %{token: "sk-fu-match"} end,
             fn _ -> exit(%{secret: "sk-fu-exit"}) end
           ] do
         {:ok, pid_bad} = TestProvider.start_link([TestProvider.text_response("ok")])
 
-        assert {:error, %Result{status: :error, error: err}} =
+        assert {:error, %Result{status: :error, error: err} = bad_res} =
                  Alloy.run("hi",
                    provider: {TestProvider, agent_pid: pid_bad},
+                   max_turns: 1,
                    follow_up: bad_fu
                  )
 
         assert err =~ "follow_up callback"
+        assert :ok == Transcript.validate(bad_res.messages)
 
         for secret <- ["sk-fu-secret", "sk-fu-runtime", "sk-fu-match", "sk-fu-exit"] do
           refute err =~ secret
         end
       end
+
+      # 6. Valid paired messages in :follow_up succeed and preserve Transcript.validate/1 == :ok
+      {:ok, pid_fu_pair} =
+        TestProvider.start_link([
+          TestProvider.text_response("turn 1"),
+          TestProvider.text_response("turn 2")
+        ])
+
+      fu_once = :atomics.new(1, signed: false)
+
+      assert {:ok, %Result{status: :completed, text: "turn 2", turns: 2} = fu_pair_res} =
+               Alloy.run("hi",
+                 provider: {TestProvider, agent_pid: pid_fu_pair},
+                 follow_up: fn _ ->
+                   if :atomics.compare_exchange(fu_once, 1, 0, 1) == :ok do
+                     [
+                       %Message{
+                         role: :assistant,
+                         content: [
+                           %{type: "tool_use", id: "fu_p1", name: "done_tool", input: %{}}
+                         ]
+                       },
+                       Message.tool_results([Message.tool_result_block("fu_p1", "ok", false)]),
+                       Message.user("now finish")
+                     ]
+                   else
+                     []
+                   end
+                 end
+               )
+
+      assert :ok == Transcript.validate(fu_pair_res.messages)
     end
   end
 end
