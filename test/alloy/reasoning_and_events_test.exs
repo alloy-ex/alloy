@@ -4784,6 +4784,136 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert length(slow_cb_ends) == 2
       assert List.last(slow_cb_ends).payload.status == :error
+
+      # 21. OpenAI/xAI: multi-key map arguments (including nested maps and partial key prefixes)
+      #     reconcile cleanly against already-emitted prefixes whose key order differs from
+      #     Jason.encode!/1, across both .done and terminal-only .completed, with and without
+      #     an :on_event subscriber — while genuinely conflicting values still fail with
+      #     :malformed_reply when subscribed.
+      for {prefix, final_map} <- [
+            {"{\"z\":", %{"a" => 1, "z" => 2}},
+            {"{\"z\": 2, \"m\": {\"y\": ", %{"a" => 1, "m" => %{"x" => 10, "y" => 20}, "z" => 2}},
+            {"{\"ze", %{"alpha" => 1, "zeta" => 2}},
+            {"{\"z\":", %{"a" => 1, "z" => nil}}
+          ],
+          include_done? <- [false, true],
+          subscribed? <- [false, true] do
+        final_item = %{
+          "type" => "function_call",
+          "id" => "fc_map_order",
+          "call_id" => "call_map_order",
+          "name" => "echo",
+          "arguments" => final_map
+        }
+
+        done_chunk =
+          if include_done? do
+            sse_oai("response.output_item.done", %{
+              "type" => "response.output_item.done",
+              "output_index" => 0,
+              "item" => final_item
+            })
+          else
+            ""
+          end
+
+        map_order_plug =
+          sse_plug(
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_map_order",
+                "call_id" => "call_map_order",
+                "name" => "echo",
+                "arguments" => prefix
+              }
+            }) <>
+              done_chunk <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_map_order",
+                  "status" => "completed",
+                  "output" => [final_item],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        cfg =
+          %{
+            api_key: "sk-oai",
+            model: "gpt-5.4",
+            req_options: [plug: map_order_plug]
+          }
+          |> then(fn base ->
+            if subscribed?, do: Map.put(base, :on_event, &send(parent, {:mo_ev, &1})), else: base
+          end)
+
+        {:ok, %{messages: [mo_msg]}} =
+          OpenAI.stream([Message.user("hi")], [], cfg, fn _ -> :ok end)
+
+        assert [%{type: "tool_use", id: "call_map_order", name: "echo", input: ^final_map}] =
+                 mo_msg.content
+
+        if subscribed? do
+          mo_deltas =
+            drain_tagged(:mo_ev)
+            |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+            |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+          assert Jason.decode!(Enum.map_join(mo_deltas, & &1.arguments_delta)) == final_map
+        end
+      end
+
+      bad_map_order_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_map_bad",
+              "call_id" => "call_map_bad",
+              "name" => "echo",
+              "arguments" => "{\"z\":99,"
+            }
+          }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_map_bad",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_map_bad",
+                    "call_id" => "call_map_bad",
+                    "name" => "echo",
+                    "arguments" => %{"a" => 1, "z" => 2}
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      assert {:error, %Error{kind: :malformed_reply}} =
+               OpenAI.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "sk-oai",
+                   model: "gpt-5.4",
+                   req_options: [plug: bad_map_order_plug],
+                   on_event: &send(parent, {:mb_ev, &1})
+                 },
+                 fn _ -> :ok end
+               )
+
+      _ = drain_tagged(:mb_ev)
     end
   end
 

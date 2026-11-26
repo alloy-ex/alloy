@@ -139,6 +139,8 @@ defmodule Alloy.Provider.OpenAI do
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
+    has_on_event? = is_function(Map.get(config, :on_event), 1)
+
     initial_acc = %{
       buffer: "",
       response: nil,
@@ -147,8 +149,9 @@ defmodule Alloy.Provider.OpenAI do
       function_calls: %{},
       pending_function_deltas: %{},
       pending_delta_seq: 0,
+      has_on_event?: has_on_event?,
       on_chunk: on_chunk,
-      on_event: Map.get(config, :on_event, fn _ -> :ok end)
+      on_event: if(has_on_event?, do: config.on_event, else: fn _ -> :ok end)
     }
 
     with {:ok, body} <- build_request_body(messages, tool_defs, config),
@@ -837,13 +840,189 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp reconcile_ws_prefix(emitted, canonical_args, expected_input) do
-    with {:ok, suffix} when suffix != "" <- json_ws_suffix(canonical_args, emitted),
+    case try_ws_suffix(emitted, canonical_args, expected_input) do
+      {:ok, _suffix, _combined} = ok ->
+        ok
+
+      :conflict ->
+        ordered_args = encode_map_matching_prefix(expected_input, emitted)
+        try_ws_suffix(emitted, ordered_args, expected_input)
+    end
+  end
+
+  defp try_ws_suffix(emitted, full_args, expected_input) do
+    with {:ok, suffix} when suffix != "" <- json_ws_suffix(full_args, emitted),
          combined = emitted <> suffix,
          {:ok, ^expected_input} <- Jason.decode(combined) do
       {:ok, suffix, combined}
     else
       _ -> :conflict
     end
+  end
+
+  # Re-encodes a decoded map preserving key order observed in `prefix` so
+  # map-typed terminal arguments (whose JSON key order was lost on decode)
+  # reconcile cleanly against already-emitted prefixes.
+  defp encode_map_matching_prefix(map, prefix) when is_map(map) and is_binary(prefix) do
+    {ordered, _rest} = order_value_for_prefix(map, prefix)
+    Jason.encode!(ordered)
+  end
+
+  defp order_value_for_prefix(map, prefix) when is_map(map) do
+    case skip_json_ws(prefix) do
+      <<"{", rest::binary>> ->
+        {ordered_pairs, rest_after} = order_map_entries(map, rest, [])
+        {%Jason.OrderedObject{values: ordered_pairs}, rest_after}
+
+      rest ->
+        {map, rest}
+    end
+  end
+
+  defp order_value_for_prefix(list, prefix) when is_list(list) do
+    case skip_json_ws(prefix) do
+      <<"[", rest::binary>> -> order_list_entries(list, rest, [])
+      rest -> {list, rest}
+    end
+  end
+
+  defp order_value_for_prefix(scalar, prefix) do
+    {scalar, skip_json_scalar(skip_json_ws(prefix))}
+  end
+
+  defp order_map_entries(remaining, rest, acc_rev) do
+    case skip_json_ws(rest) do
+      <<>> ->
+        {finalize_ordered_pairs(acc_rev, remaining), <<>>}
+
+      <<"}", after_close::binary>> ->
+        {finalize_ordered_pairs(acc_rev, remaining), after_close}
+
+      <<",", after_comma::binary>> ->
+        order_map_entries(remaining, after_comma, acc_rev)
+
+      <<"\"", _::binary>> = str_start ->
+        order_map_key(remaining, str_start, acc_rev)
+
+      other ->
+        {finalize_ordered_pairs(acc_rev, remaining), other}
+    end
+  end
+
+  defp order_map_key(remaining, str_start, acc_rev) do
+    case scan_json_string(str_start) do
+      {:ok, key, after_key} ->
+        order_complete_map_key(remaining, key, after_key, acc_rev)
+
+      {:partial, partial_key} ->
+        order_partial_map_key(remaining, partial_key, acc_rev)
+
+      :error ->
+        {finalize_ordered_pairs(acc_rev, remaining), <<>>}
+    end
+  end
+
+  defp order_complete_map_key(remaining, key, after_key, acc_rev) do
+    case Map.fetch(remaining, key) do
+      :error ->
+        {finalize_ordered_pairs(acc_rev, remaining), after_key}
+
+      {:ok, val} ->
+        next_remaining = Map.delete(remaining, key)
+
+        case skip_json_ws(after_key) do
+          <<":", after_colon::binary>> ->
+            {ordered_val, after_val} = order_value_for_prefix(val, after_colon)
+            order_map_entries(next_remaining, after_val, [{key, ordered_val} | acc_rev])
+
+          other ->
+            {finalize_ordered_pairs([{key, val} | acc_rev], next_remaining), other}
+        end
+    end
+  end
+
+  defp order_partial_map_key(remaining, partial_key, acc_rev) do
+    case Enum.find(remaining, fn {k, _v} -> String.starts_with?(k, partial_key) end) do
+      {key, val} ->
+        next_remaining = Map.delete(remaining, key)
+        {finalize_ordered_pairs([{key, val} | acc_rev], next_remaining), <<>>}
+
+      nil ->
+        {finalize_ordered_pairs(acc_rev, remaining), <<>>}
+    end
+  end
+
+  defp order_list_entries([], rest, acc_rev) do
+    case skip_json_ws(rest) do
+      <<"]", after_close::binary>> -> {Enum.reverse(acc_rev), after_close}
+      other -> {Enum.reverse(acc_rev), other}
+    end
+  end
+
+  defp order_list_entries([head | tail] = remaining, rest, acc_rev) do
+    case skip_json_ws(rest) do
+      <<>> ->
+        {Enum.reverse(acc_rev, remaining), <<>>}
+
+      <<"]", after_close::binary>> ->
+        {Enum.reverse(acc_rev, remaining), after_close}
+
+      <<",", after_comma::binary>> ->
+        order_list_entries(remaining, after_comma, acc_rev)
+
+      val_start ->
+        {ordered_head, after_head} = order_value_for_prefix(head, val_start)
+        order_list_entries(tail, after_head, [ordered_head | acc_rev])
+    end
+  end
+
+  defp scan_json_string(<<"\"", rest::binary>>) do
+    case find_string_end(rest, 0, false) do
+      {:ok, len} ->
+        raw = binary_part(rest, 0, len)
+        after_str = binary_part(rest, len + 1, byte_size(rest) - len - 1)
+
+        case Jason.decode(<<?", raw::binary, ?">>) do
+          {:ok, decoded} when is_binary(decoded) -> {:ok, decoded, after_str}
+          _ -> :error
+        end
+
+      :unterminated ->
+        case Jason.decode(<<?", rest::binary, ?">>) do
+          {:ok, partial} when is_binary(partial) -> {:partial, partial}
+          _ -> :error
+        end
+    end
+  end
+
+  defp find_string_end(<<>>, _idx, _escaped), do: :unterminated
+  defp find_string_end(<<_, rest::binary>>, idx, true), do: find_string_end(rest, idx + 1, false)
+
+  defp find_string_end(<<?\\, rest::binary>>, idx, false),
+    do: find_string_end(rest, idx + 1, true)
+
+  defp find_string_end(<<?", _rest::binary>>, idx, false), do: {:ok, idx}
+  defp find_string_end(<<_, rest::binary>>, idx, false), do: find_string_end(rest, idx + 1, false)
+
+  defp skip_json_scalar(<<"\"", _::binary>> = str) do
+    case scan_json_string(str) do
+      {:ok, _decoded, after_str} -> after_str
+      _ -> <<>>
+    end
+  end
+
+  defp skip_json_scalar(<<c, rest::binary>>) when c not in [?,, ?}, ?], ?\s, ?\t, ?\r, ?\n],
+    do: skip_json_scalar(rest)
+
+  defp skip_json_scalar(rest), do: rest
+
+  defp skip_json_ws(<<ws, rest::binary>>) when ws in [?\s, ?\t, ?\r, ?\n],
+    do: skip_json_ws(rest)
+
+  defp skip_json_ws(rest), do: rest
+
+  defp finalize_ordered_pairs(acc_rev, remaining) do
+    Enum.reverse(acc_rev) ++ Map.to_list(remaining)
   end
 
   # Matches a JSON prefix against a valid JSON document ignoring insignificant
@@ -1094,6 +1273,8 @@ defmodule Alloy.Provider.OpenAI do
        }}
     end)
   end
+
+  defp flush_pending_from_response(%{has_on_event?: false}, _response), do: :ok
 
   defp flush_pending_from_response(acc, %{"output" => output} = response) when is_list(output) do
     case parse_output_mode(response) do
