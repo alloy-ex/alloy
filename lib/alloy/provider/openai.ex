@@ -782,9 +782,8 @@ defmodule Alloy.Provider.OpenAI do
     case decode_function_call_arguments(item) do
       {:ok, expected_input} ->
         args = item_args_delta(item, event_type)
-        canonical_args = if args == "", do: "{}", else: args
 
-        case reconcile_decoded_args(emitted_args, args, canonical_args, expected_input) do
+        case reconcile_decoded_args(emitted_args, args, expected_input) do
           {:ok, suffix, next_emitted} ->
             {:ok, suffix, next_emitted}
 
@@ -818,248 +817,563 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp reconcile_decoded_args("", "", _canonical_args, _expected_input), do: {:ok, "", ""}
-  defp reconcile_decoded_args("", args, _canonical_args, _expected_input), do: {:ok, args, args}
+  defp reconcile_decoded_args("", "", _expected_input), do: {:ok, "", ""}
+  defp reconcile_decoded_args("", args, _expected_input), do: {:ok, args, args}
+  defp reconcile_decoded_args(emitted, emitted, _expected_input), do: {:ok, "", emitted}
 
-  defp reconcile_decoded_args(emitted, emitted, _canonical_args, _expected_input),
-    do: {:ok, "", emitted}
-
-  defp reconcile_decoded_args(emitted, args, canonical_args, expected_input) do
+  defp reconcile_decoded_args(emitted, args, expected_input) do
     cond do
       args != "" and String.starts_with?(args, emitted) ->
         prefix_len = byte_size(emitted)
         suffix = binary_part(args, prefix_len, byte_size(args) - prefix_len)
         {:ok, suffix, args}
 
-      Jason.decode(emitted) == {:ok, expected_input} ->
+      json_equal?(emitted, expected_input) ->
         {:ok, "", emitted}
 
       true ->
-        reconcile_ws_prefix(emitted, canonical_args, expected_input)
+        reconcile_json_prefix(emitted, expected_input)
     end
   end
 
-  defp reconcile_ws_prefix(emitted, canonical_args, expected_input) do
-    case try_ws_suffix(emitted, canonical_args, expected_input) do
-      {:ok, _suffix, _combined} = ok ->
-        ok
-
-      :conflict ->
-        ordered_args = encode_map_matching_prefix(expected_input, emitted)
-        try_ws_suffix(emitted, ordered_args, expected_input)
+  defp json_equal?(json, expected) do
+    case Jason.decode(json) do
+      {:ok, decoded} -> decoded == expected
+      {:error, _} -> false
     end
   end
 
-  defp try_ws_suffix(emitted, full_args, expected_input) do
-    with {:ok, suffix} when suffix != "" <- json_ws_suffix(full_args, emitted),
+  # Token-level JSON prefix completion: preserves already-emitted whitespace,
+  # map key order, string escapes (\uXXXX, \/, etc.), and numeric spellings
+  # (e.g. 1e2) while verifying that the completed JSON decodes to `expected_input`.
+  defp reconcile_json_prefix(emitted, expected_input) do
+    with {:ok, suffix} <- complete_json_prefix(expected_input, emitted),
          combined = emitted <> suffix,
-         {:ok, ^expected_input} <- Jason.decode(combined) do
+         {:ok, decoded} <- Jason.decode(combined),
+         true <- decoded == expected_input do
       {:ok, suffix, combined}
     else
       _ -> :conflict
     end
   end
 
-  # Re-encodes a decoded map preserving key order observed in `prefix` so
-  # map-typed terminal arguments (whose JSON key order was lost on decode)
-  # reconcile cleanly against already-emitted prefixes.
-  defp encode_map_matching_prefix(map, prefix) when is_map(map) and is_binary(prefix) do
-    {ordered, _rest} = order_value_for_prefix(map, prefix)
-    Jason.encode!(ordered)
-  end
-
-  defp order_value_for_prefix(map, prefix) when is_map(map) do
-    case skip_json_ws(prefix) do
-      <<"{", rest::binary>> ->
-        {ordered_pairs, rest_after} = order_map_entries(map, rest, [])
-        {%Jason.OrderedObject{values: ordered_pairs}, rest_after}
-
-      rest ->
-        {map, rest}
+  defp complete_json_prefix(expected, prefix) do
+    case complete_value(expected, prefix) do
+      {:suffix, suffix} -> {:ok, suffix}
+      {:complete, rest} -> if skip_json_ws(rest) == <<>>, do: {:ok, ""}, else: :error
+      :error -> :error
     end
   end
 
-  defp order_value_for_prefix(list, prefix) when is_list(list) do
+  defp complete_value(expected, prefix) do
     case skip_json_ws(prefix) do
-      <<"[", rest::binary>> -> order_list_entries(list, rest, [])
-      rest -> {list, rest}
+      <<>> -> {:suffix, Jason.encode!(expected)}
+      rest -> complete_non_empty_value(expected, rest)
     end
   end
 
-  defp order_value_for_prefix(scalar, prefix) do
-    {scalar, skip_json_scalar(skip_json_ws(prefix))}
+  defp complete_non_empty_value(map, <<"{", rest::binary>>) when is_map(map),
+    do: complete_map_entries(map, rest, false)
+
+  defp complete_non_empty_value(list, <<"[", rest::binary>>) when is_list(list),
+    do: complete_list_entries(list, rest, false)
+
+  defp complete_non_empty_value(str, <<"\"", _::binary>> = rest) when is_binary(str) do
+    case parse_json_string_prefix(rest) do
+      {:complete, decoded, after_str} ->
+        if decoded == str, do: {:complete, after_str}, else: :error
+
+      {:partial, decoded_prefix, partial_escape} ->
+        case complete_string_tail(str, decoded_prefix, partial_escape) do
+          {:ok, tail} -> {:suffix, tail}
+          :error -> :error
+        end
+
+      :error ->
+        :error
+    end
   end
 
-  defp order_map_entries(remaining, rest, acc_rev) do
+  defp complete_non_empty_value(num, rest) when is_number(num),
+    do: complete_number_value(num, rest)
+
+  defp complete_non_empty_value(val, rest) when is_boolean(val) or is_nil(val),
+    do: complete_literal_value(val, rest)
+
+  defp complete_non_empty_value(_expected, _rest), do: :error
+
+  defp complete_map_entries(remaining, rest, expect_comma?) do
     case skip_json_ws(rest) do
       <<>> ->
-        {finalize_ordered_pairs(acc_rev, remaining), <<>>}
+        {:suffix, finish_map_suffix(remaining, expect_comma?)}
 
       <<"}", after_close::binary>> ->
-        {finalize_ordered_pairs(acc_rev, remaining), after_close}
+        if map_size(remaining) == 0, do: {:complete, after_close}, else: :error
 
-      <<",", after_comma::binary>> ->
-        order_map_entries(remaining, after_comma, acc_rev)
+      <<",", after_comma::binary>> when expect_comma? ->
+        complete_map_after_comma(remaining, after_comma)
 
-      <<"\"", _::binary>> = str_start ->
-        order_map_key(remaining, str_start, acc_rev)
+      <<"\"", _::binary>> = str_start when not expect_comma? ->
+        complete_map_key(remaining, str_start)
 
-      other ->
-        {finalize_ordered_pairs(acc_rev, remaining), other}
+      _ ->
+        :error
     end
   end
 
-  defp order_map_key(remaining, str_start, acc_rev) do
-    case scan_json_string(str_start) do
-      {:ok, key, after_key} ->
-        order_complete_map_key(remaining, key, after_key, acc_rev)
+  defp finish_map_suffix(remaining, _expect_comma?) when map_size(remaining) == 0, do: "}"
+  defp finish_map_suffix(remaining, true), do: "," <> encode_remaining_pairs(remaining) <> "}"
+  defp finish_map_suffix(remaining, false), do: encode_remaining_pairs(remaining) <> "}"
 
-      {:partial, partial_key} ->
-        order_partial_map_key(remaining, partial_key, acc_rev)
+  defp complete_map_after_comma(remaining, after_comma) do
+    case skip_json_ws(after_comma) do
+      <<>> when map_size(remaining) == 0 -> :error
+      <<>> -> {:suffix, encode_remaining_pairs(remaining) <> "}"}
+      <<"\"", _::binary>> = str_start -> complete_map_key(remaining, str_start)
+      _ -> :error
+    end
+  end
+
+  defp complete_map_key(remaining, str_start) do
+    case parse_json_string_prefix(str_start) do
+      {:complete, key, after_key} ->
+        complete_map_key_value(remaining, key, after_key)
+
+      {:partial, decoded_prefix, partial_escape} ->
+        complete_partial_map_key(remaining, decoded_prefix, partial_escape)
 
       :error ->
-        {finalize_ordered_pairs(acc_rev, remaining), <<>>}
+        :error
     end
   end
 
-  defp order_complete_map_key(remaining, key, after_key, acc_rev) do
+  defp complete_map_key_value(remaining, key, after_key) do
     case Map.fetch(remaining, key) do
       :error ->
-        {finalize_ordered_pairs(acc_rev, remaining), after_key}
+        :error
 
       {:ok, val} ->
         next_remaining = Map.delete(remaining, key)
 
         case skip_json_ws(after_key) do
-          <<":", after_colon::binary>> ->
-            {ordered_val, after_val} = order_value_for_prefix(val, after_colon)
-            order_map_entries(next_remaining, after_val, [{key, ordered_val} | acc_rev])
+          <<>> ->
+            {:suffix, ":" <> Jason.encode!(val) <> close_remaining_map(next_remaining)}
 
-          other ->
-            {finalize_ordered_pairs([{key, val} | acc_rev], next_remaining), other}
+          <<":", after_colon::binary>> ->
+            complete_map_after_colon(val, after_colon, next_remaining)
+
+          _ ->
+            :error
         end
     end
   end
 
-  defp order_partial_map_key(remaining, partial_key, acc_rev) do
-    case Enum.find(remaining, fn {k, _v} -> String.starts_with?(k, partial_key) end) do
-      {key, val} ->
-        next_remaining = Map.delete(remaining, key)
-        {finalize_ordered_pairs([{key, val} | acc_rev], next_remaining), <<>>}
+  defp complete_map_after_colon(val, after_colon, next_remaining) do
+    case complete_value(val, after_colon) do
+      {:complete, after_val} ->
+        complete_map_entries(next_remaining, after_val, true)
 
-      nil ->
-        {finalize_ordered_pairs(acc_rev, remaining), <<>>}
+      {:suffix, val_suffix} ->
+        {:suffix, val_suffix <> close_remaining_map(next_remaining)}
+
+      :error ->
+        :error
     end
   end
 
-  defp order_list_entries([], rest, acc_rev) do
-    case skip_json_ws(rest) do
-      <<"]", after_close::binary>> -> {Enum.reverse(acc_rev), after_close}
-      other -> {Enum.reverse(acc_rev), other}
-    end
+  defp complete_partial_map_key(remaining, decoded_prefix, partial_escape) do
+    Enum.find_value(remaining, :error, fn {key, val} ->
+      case complete_string_tail(key, decoded_prefix, partial_escape) do
+        {:ok, key_suffix} ->
+          next_remaining = Map.delete(remaining, key)
+
+          {:suffix,
+           key_suffix <> ":" <> Jason.encode!(val) <> close_remaining_map(next_remaining)}
+
+        :error ->
+          nil
+      end
+    end)
   end
 
-  defp order_list_entries([head | tail] = remaining, rest, acc_rev) do
+  defp close_remaining_map(remaining) when map_size(remaining) == 0, do: "}"
+  defp close_remaining_map(remaining), do: "," <> encode_remaining_pairs(remaining) <> "}"
+
+  defp encode_remaining_pairs(remaining) do
+    Enum.map_join(remaining, ",", fn {k, v} -> Jason.encode!(k) <> ":" <> Jason.encode!(v) end)
+  end
+
+  defp complete_list_entries(remaining, rest, expect_comma?) do
     case skip_json_ws(rest) do
       <<>> ->
-        {Enum.reverse(acc_rev, remaining), <<>>}
+        {:suffix, finish_list_suffix(remaining, expect_comma?)}
 
       <<"]", after_close::binary>> ->
-        {Enum.reverse(acc_rev, remaining), after_close}
+        if remaining == [], do: {:complete, after_close}, else: :error
 
-      <<",", after_comma::binary>> ->
-        order_list_entries(remaining, after_comma, acc_rev)
+      <<",", after_comma::binary>> when expect_comma? ->
+        complete_list_after_comma(remaining, after_comma)
 
-      val_start ->
-        {ordered_head, after_head} = order_value_for_prefix(head, val_start)
-        order_list_entries(tail, after_head, [ordered_head | acc_rev])
+      val_start when not expect_comma? ->
+        complete_list_head(remaining, val_start)
+
+      _ ->
+        :error
     end
   end
 
-  defp scan_json_string(<<"\"", rest::binary>>) do
-    case find_string_end(rest, 0, false) do
-      {:ok, len} ->
-        raw = binary_part(rest, 0, len)
-        after_str = binary_part(rest, len + 1, byte_size(rest) - len - 1)
+  defp finish_list_suffix([], _expect_comma?), do: "]"
 
-        case Jason.decode(<<?", raw::binary, ?">>) do
-          {:ok, decoded} when is_binary(decoded) -> {:ok, decoded, after_str}
+  defp finish_list_suffix(remaining, true),
+    do: "," <> Enum.map_join(remaining, ",", &Jason.encode!/1) <> "]"
+
+  defp finish_list_suffix(remaining, false),
+    do: Enum.map_join(remaining, ",", &Jason.encode!/1) <> "]"
+
+  defp complete_list_after_comma([], _after_comma), do: :error
+
+  defp complete_list_after_comma(remaining, after_comma) do
+    case skip_json_ws(after_comma) do
+      <<>> -> {:suffix, Enum.map_join(remaining, ",", &Jason.encode!/1) <> "]"}
+      val_start -> complete_list_head(remaining, val_start)
+    end
+  end
+
+  defp complete_list_head([], _val_start), do: :error
+
+  defp complete_list_head([head | tail], val_start) do
+    case complete_value(head, val_start) do
+      {:complete, after_head} ->
+        complete_list_entries(tail, after_head, true)
+
+      {:suffix, head_suffix} ->
+        rest_tail =
+          if tail == [],
+            do: "]",
+            else: "," <> Enum.map_join(tail, ",", &Jason.encode!/1) <> "]"
+
+        {:suffix, head_suffix <> rest_tail}
+
+      :error ->
+        :error
+    end
+  end
+
+  defp complete_number_value(expected, rest) do
+    {token, after_token} = take_number_token(rest, 0)
+
+    cond do
+      token == "" ->
+        :error
+
+      after_token != "" ->
+        case Jason.decode(token) do
+          {:ok, num} when is_number(num) and num == expected -> {:complete, after_token}
           _ -> :error
         end
 
-      :unterminated ->
-        case Jason.decode(<<?", rest::binary, ?">>) do
-          {:ok, partial} when is_binary(partial) -> {:partial, partial}
-          _ -> :error
+      true ->
+        complete_number_token(token, expected)
+    end
+  end
+
+  defp complete_number_token(token, expected) do
+    encoded = Jason.encode!(expected)
+
+    cond do
+      match?({:ok, num} when is_number(num) and num == expected, Jason.decode(token)) ->
+        {:suffix, ""}
+
+      String.starts_with?(encoded, token) ->
+        {:suffix, binary_part(encoded, byte_size(token), byte_size(encoded) - byte_size(token))}
+
+      String.ends_with?(token, ".") and
+          match?({:ok, num} when is_number(num) and num == expected, Jason.decode(token <> "0")) ->
+        {:suffix, "0"}
+
+      String.contains?(token, ["e", "E"]) ->
+        complete_exponent_number(token, expected)
+
+      true ->
+        :error
+    end
+  end
+
+  defp complete_exponent_number(token, expected) do
+    case String.split(token, ["e", "E"], parts: 2) do
+      [mantissa_str, exp_prefix] ->
+        case Jason.decode(mantissa_str) do
+          {:ok, mantissa} when is_number(mantissa) ->
+            match_exponent_suffix(token, mantissa, exp_prefix, expected)
+
+          _ ->
+            :error
         end
+
+      _ ->
+        :error
     end
   end
 
-  defp find_string_end(<<>>, _idx, _escaped), do: :unterminated
-  defp find_string_end(<<_, rest::binary>>, idx, true), do: find_string_end(rest, idx + 1, false)
+  defp match_exponent_suffix(_token, mantissa, exp_prefix, expected)
+       when mantissa == 0 and expected == 0 do
+    if exp_prefix in ["", "+", "-"], do: {:suffix, "0"}, else: :error
+  end
 
-  defp find_string_end(<<?\\, rest::binary>>, idx, false),
-    do: find_string_end(rest, idx + 1, true)
+  defp match_exponent_suffix(token, mantissa, exp_prefix, expected)
+       when mantissa != 0 and expected != 0 do
+    if mantissa > 0 == expected > 0 do
+      exp = round(:math.log10(abs(expected / mantissa)))
+      candidates = exponent_candidates(exp)
 
-  defp find_string_end(<<?", _rest::binary>>, idx, false), do: {:ok, idx}
-  defp find_string_end(<<_, rest::binary>>, idx, false), do: find_string_end(rest, idx + 1, false)
-
-  defp skip_json_scalar(<<"\"", _::binary>> = str) do
-    case scan_json_string(str) do
-      {:ok, _decoded, after_str} -> after_str
-      _ -> <<>>
+      Enum.find_value(candidates, :error, fn full_exp ->
+        try_exponent_candidate(token, exp_prefix, full_exp, expected)
+      end)
+    else
+      :error
     end
   end
 
-  defp skip_json_scalar(<<c, rest::binary>>) when c not in [?,, ?}, ?], ?\s, ?\t, ?\r, ?\n],
-    do: skip_json_scalar(rest)
+  defp match_exponent_suffix(_token, _mantissa, _exp_prefix, _expected), do: :error
 
-  defp skip_json_scalar(rest), do: rest
+  defp try_exponent_candidate(token, exp_prefix, full_exp, expected) do
+    if String.starts_with?(full_exp, exp_prefix) do
+      tail =
+        binary_part(full_exp, byte_size(exp_prefix), byte_size(full_exp) - byte_size(exp_prefix))
+
+      case Jason.decode(token <> tail) do
+        {:ok, num} when is_number(num) and num == expected -> {:suffix, tail}
+        _ -> nil
+      end
+    end
+  end
+
+  defp exponent_candidates(exp) when exp > 0 do
+    s = Integer.to_string(exp)
+    [s, "+" <> s]
+  end
+
+  defp exponent_candidates(0), do: ["0", "+0", "-0"]
+  defp exponent_candidates(exp) when exp < 0, do: [Integer.to_string(exp)]
+
+  defp take_number_token(bin, len) do
+    case bin do
+      <<_::binary-size(^len), c, _::binary>>
+      when c in ?0..?9 or c in [?-, ?+, ?., ?e, ?E] ->
+        take_number_token(bin, len + 1)
+
+      _ ->
+        {binary_part(bin, 0, len), binary_part(bin, len, byte_size(bin) - len)}
+    end
+  end
+
+  defp complete_literal_value(val, rest) do
+    encoded = Jason.encode!(val)
+    {token, after_token} = take_alpha_token(rest, 0)
+
+    cond do
+      token == "" ->
+        :error
+
+      after_token != "" ->
+        if token == encoded, do: {:complete, after_token}, else: :error
+
+      String.starts_with?(encoded, token) ->
+        {:suffix, binary_part(encoded, byte_size(token), byte_size(encoded) - byte_size(token))}
+
+      true ->
+        :error
+    end
+  end
+
+  defp take_alpha_token(bin, len) do
+    case bin do
+      <<_::binary-size(^len), c, _::binary>> when c in ?a..?z ->
+        take_alpha_token(bin, len + 1)
+
+      _ ->
+        {binary_part(bin, 0, len), binary_part(bin, len, byte_size(bin) - len)}
+    end
+  end
+
+  defp parse_json_string_prefix(<<"\"", rest::binary>>), do: scan_string_prefix(rest, [])
+
+  defp scan_string_prefix(<<>>, acc), do: {:partial, IO.iodata_to_binary(acc), ""}
+
+  defp scan_string_prefix(<<"\"", after_str::binary>>, acc),
+    do: {:complete, IO.iodata_to_binary(acc), after_str}
+
+  defp scan_string_prefix(<<"\\", after_bs::binary>>, acc),
+    do: scan_string_escape(after_bs, acc)
+
+  defp scan_string_prefix(<<c::utf8, tail::binary>>, acc) when c >= 0x20,
+    do: scan_string_prefix(tail, [acc, <<c::utf8>>])
+
+  defp scan_string_prefix(_invalid, _acc), do: :error
+
+  defp scan_string_escape(<<>>, acc), do: {:partial, IO.iodata_to_binary(acc), "\\"}
+  defp scan_string_escape(<<"\"", tail::binary>>, acc), do: scan_string_prefix(tail, [acc, "\""])
+  defp scan_string_escape(<<"\\", tail::binary>>, acc), do: scan_string_prefix(tail, [acc, "\\"])
+  defp scan_string_escape(<<"/", tail::binary>>, acc), do: scan_string_prefix(tail, [acc, "/"])
+  defp scan_string_escape(<<"b", tail::binary>>, acc), do: scan_string_prefix(tail, [acc, "\b"])
+  defp scan_string_escape(<<"f", tail::binary>>, acc), do: scan_string_prefix(tail, [acc, "\f"])
+  defp scan_string_escape(<<"n", tail::binary>>, acc), do: scan_string_prefix(tail, [acc, "\n"])
+  defp scan_string_escape(<<"r", tail::binary>>, acc), do: scan_string_prefix(tail, [acc, "\r"])
+  defp scan_string_escape(<<"t", tail::binary>>, acc), do: scan_string_prefix(tail, [acc, "\t"])
+
+  defp scan_string_escape(<<"u", hex_rest::binary>>, acc),
+    do: scan_unicode_escape(hex_rest, acc)
+
+  defp scan_string_escape(_invalid, _acc), do: :error
+
+  defp scan_unicode_escape(hex_rest, acc) when byte_size(hex_rest) < 4 do
+    if all_hex?(hex_rest),
+      do: {:partial, IO.iodata_to_binary(acc), "\\u" <> hex_rest},
+      else: :error
+  end
+
+  defp scan_unicode_escape(<<hex::binary-size(4), tail::binary>>, acc) do
+    case parse_hex4(hex) do
+      {:ok, hi} when hi in 0xD800..0xDBFF ->
+        scan_surrogate_low(hex, hi, tail, acc)
+
+      {:ok, lo} when lo in 0xDC00..0xDFFF ->
+        :error
+
+      {:ok, cp} ->
+        scan_string_prefix(tail, [acc, <<cp::utf8>>])
+
+      :error ->
+        :error
+    end
+  end
+
+  defp scan_surrogate_low(hi_hex, _hi, <<>>, acc),
+    do: {:partial, IO.iodata_to_binary(acc), "\\u" <> hi_hex}
+
+  defp scan_surrogate_low(hi_hex, _hi, <<"\\">>, acc),
+    do: {:partial, IO.iodata_to_binary(acc), "\\u" <> hi_hex <> "\\"}
+
+  defp scan_surrogate_low(hi_hex, _hi, <<"\\u", low_partial::binary>>, acc)
+       when byte_size(low_partial) < 4 do
+    if all_hex?(low_partial),
+      do: {:partial, IO.iodata_to_binary(acc), "\\u" <> hi_hex <> "\\u" <> low_partial},
+      else: :error
+  end
+
+  defp scan_surrogate_low(_hi_hex, hi, <<"\\u", lo_hex::binary-size(4), tail::binary>>, acc) do
+    case parse_hex4(lo_hex) do
+      {:ok, lo} when lo in 0xDC00..0xDFFF ->
+        cp = 0x10000 + Bitwise.bsl(hi - 0xD800, 10) + (lo - 0xDC00)
+        scan_string_prefix(tail, [acc, <<cp::utf8>>])
+
+      _ ->
+        :error
+    end
+  end
+
+  defp scan_surrogate_low(_hi_hex, _hi, _tail, _acc), do: :error
+
+  defp complete_string_tail(expected, decoded_prefix, partial_escape) do
+    if String.starts_with?(expected, decoded_prefix) do
+      prefix_len = byte_size(decoded_prefix)
+      rem_str = binary_part(expected, prefix_len, byte_size(expected) - prefix_len)
+      complete_remaining_string(rem_str, partial_escape)
+    else
+      :error
+    end
+  end
+
+  defp complete_remaining_string(rem_str, ""),
+    do: {:ok, encode_json_string_inner(rem_str) <> "\""}
+
+  defp complete_remaining_string(<<>>, _partial_escape), do: :error
+
+  defp complete_remaining_string(<<cp::utf8, rest_str::binary>>, "\\") do
+    esc_tail =
+      case cp do
+        ?" ->
+          "\""
+
+        ?\\ ->
+          "\\"
+
+        ?/ ->
+          "/"
+
+        ?\b ->
+          "b"
+
+        ?\f ->
+          "f"
+
+        ?\n ->
+          "n"
+
+        ?\r ->
+          "r"
+
+        ?\t ->
+          "t"
+
+        _ ->
+          esc = unicode_escape_for(cp)
+          binary_part(esc, 1, byte_size(esc) - 1)
+      end
+
+    {:ok, esc_tail <> encode_json_string_inner(rest_str) <> "\""}
+  end
+
+  defp complete_remaining_string(<<cp::utf8, rest_str::binary>>, partial_escape) do
+    full_esc = unicode_escape_for(cp)
+    down = String.downcase(partial_escape)
+
+    if String.starts_with?(full_esc, down) do
+      esc_tail = binary_part(full_esc, byte_size(down), byte_size(full_esc) - byte_size(down))
+      {:ok, esc_tail <> encode_json_string_inner(rest_str) <> "\""}
+    else
+      :error
+    end
+  end
+
+  defp unicode_escape_for(cp) when cp <= 0xFFFF do
+    "\\u" <> hex4(cp)
+  end
+
+  defp unicode_escape_for(cp) do
+    offset = cp - 0x10000
+    hi = 0xD800 + Bitwise.bsr(offset, 10)
+    lo = 0xDC00 + Bitwise.band(offset, 0x3FF)
+    "\\u" <> hex4(hi) <> "\\u" <> hex4(lo)
+  end
+
+  defp hex4(n) do
+    n
+    |> Integer.to_string(16)
+    |> String.downcase()
+    |> String.pad_leading(4, "0")
+  end
+
+  defp all_hex?(<<>>), do: true
+
+  defp all_hex?(<<c, rest::binary>>) when c in ?0..?9 or c in ?a..?f or c in ?A..?F,
+    do: all_hex?(rest)
+
+  defp all_hex?(_), do: false
+
+  defp parse_hex4(hex) do
+    if all_hex?(hex), do: {:ok, String.to_integer(hex, 16)}, else: :error
+  end
+
+  defp encode_json_string_inner(str) do
+    encoded = Jason.encode!(str)
+    binary_part(encoded, 1, byte_size(encoded) - 2)
+  end
 
   defp skip_json_ws(<<ws, rest::binary>>) when ws in [?\s, ?\t, ?\r, ?\n],
     do: skip_json_ws(rest)
 
   defp skip_json_ws(rest), do: rest
-
-  defp finalize_ordered_pairs(acc_rev, remaining) do
-    Enum.reverse(acc_rev) ++ Map.to_list(remaining)
-  end
-
-  # Matches a JSON prefix against a valid JSON document ignoring insignificant
-  # whitespace outside string literals, returning the unemitted tail of `full`.
-  defp json_ws_suffix(full, prefix), do: do_json_ws_suffix(full, prefix, false, false)
-
-  defp do_json_ws_suffix(<<c, full_rest::binary>>, <<c, prefix_rest::binary>>, true, true),
-    do: do_json_ws_suffix(full_rest, prefix_rest, true, false)
-
-  defp do_json_ws_suffix(<<?\\, full_rest::binary>>, <<?\\, prefix_rest::binary>>, true, false),
-    do: do_json_ws_suffix(full_rest, prefix_rest, true, true)
-
-  defp do_json_ws_suffix(<<?", full_rest::binary>>, <<?", prefix_rest::binary>>, true, false),
-    do: do_json_ws_suffix(full_rest, prefix_rest, false, false)
-
-  defp do_json_ws_suffix(<<c, full_rest::binary>>, <<c, prefix_rest::binary>>, true, false),
-    do: do_json_ws_suffix(full_rest, prefix_rest, true, false)
-
-  defp do_json_ws_suffix(full_rest, <<>>, true, _escaped), do: {:ok, full_rest}
-
-  defp do_json_ws_suffix(full, <<ws, prefix_rest::binary>>, false, false)
-       when ws in [?\s, ?\t, ?\r, ?\n],
-       do: do_json_ws_suffix(full, prefix_rest, false, false)
-
-  defp do_json_ws_suffix(full_rest, <<>>, false, false), do: {:ok, full_rest}
-
-  defp do_json_ws_suffix(<<ws, full_rest::binary>>, prefix, false, false)
-       when ws in [?\s, ?\t, ?\r, ?\n],
-       do: do_json_ws_suffix(full_rest, prefix, false, false)
-
-  defp do_json_ws_suffix(<<?", full_rest::binary>>, <<?", prefix_rest::binary>>, false, false),
-    do: do_json_ws_suffix(full_rest, prefix_rest, true, false)
-
-  defp do_json_ws_suffix(<<c, full_rest::binary>>, <<c, prefix_rest::binary>>, false, false),
-    do: do_json_ws_suffix(full_rest, prefix_rest, false, false)
-
-  defp do_json_ws_suffix(_full, _prefix, _in_string, _escaped), do: :error
 
   defp item_args_delta(item, event_type) do
     case Map.get(item, "arguments") do

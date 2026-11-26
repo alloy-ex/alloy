@@ -137,9 +137,26 @@ defmodule Alloy.Agent.Turn do
       %{state | status: :max_turns}
     else
       case run_turn(state, opts) do
-        {:continue, state} -> loop(state, opts)
-        {:halt, state} -> state
+        {:continue, state} ->
+          loop(state, opts)
+
+        {:halt, %State{status: :max_turns, turn: t} = state} when t > 0 ->
+          maybe_finalize_expired_max_turns(state, opts)
+
+        {:halt, state} ->
+          state
       end
+    end
+  end
+
+  defp maybe_finalize_expired_max_turns(state, opts) do
+    if deadline_expired?(state) do
+      case run_turn(state, opts) do
+        {:halt, timed_out} -> timed_out
+        {:continue, next} -> loop(next, opts)
+      end
+    else
+      state
     end
   end
 

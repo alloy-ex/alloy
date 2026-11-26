@@ -4914,6 +4914,252 @@ defmodule Alloy.ReasoningAndEventsTest do
                )
 
       _ = drain_tagged(:mb_ev)
+
+      # 22. OpenAI/xAI: JSON token-level prefix reconciliation preserves Unicode escapes (\u00),
+      #     escaped slashes (\/), surrogate pairs, and exponent-form numbers (1e, 1e+, 1.5E-)
+      #     through both .done and .completed, with and without subscribers — while rejecting
+      #     conflicting exponent/escape values with :malformed_reply.
+      for {prefix, final_map} <- [
+            {~S({"x":"\u00), %{"x" => "é"}},
+            {~S({"x":"a\/), %{"x" => "a/b"}},
+            {~S({"x":"\uD83D\uDE), %{"x" => "😀"}},
+            {~S({"x":1e), %{"x" => 100}},
+            {~S({"x":1e+), %{"x" => 100}},
+            {~S({"x":1.5E-), %{"x" => 0.015}},
+            {~S({"x":0e+), %{"x" => 0}},
+            {~S({"x":1.), %{"x" => 1}},
+            {~S({"x":10), %{"x" => 100}},
+            {~S({"a":tr), %{"a" => true, "b" => false, "c" => nil}},
+            {~S({"a":true,"b":fa), %{"a" => true, "b" => false, "c" => nil}},
+            {~S({"a":true,"b":false,"c":nu), %{"a" => true, "b" => false, "c" => nil}},
+            {~S({"arr":[1,), %{"arr" => [1, 2]}},
+            {~S({"arr":[1,2), %{"arr" => [1, 2]}},
+            {~S({"arr":[), %{"arr" => [1, 2]}},
+            {~S({"arr":[]), %{"arr" => [], "b" => 1}},
+            {~S({"a":"line1\n\t\r\b\f\"\\\/), %{"a" => "line1\n\t\r\b\f\"\\/end"}},
+            {"{\"a\":\"hi\\", %{"a" => "hi\n"}},
+            {"{\"a\":\"hi\\", %{"a" => "hi\"x"}},
+            {"{\"a\":\"hi\\", %{"a" => "hi\\x"}},
+            {"{\"a\":\"hi\\", %{"a" => "hi/x"}},
+            {"{\"a\":\"hi\\", %{"a" => "hi\tx"}},
+            {"{\"a\":\"hi\\", %{"a" => "hi\rx"}},
+            {"{\"a\":\"hi\\", %{"a" => "hi\bx"}},
+            {"{\"a\":\"hi\\", %{"a" => "hi\fx"}},
+            {"{\"a\":\"hi\\", %{"a" => "hié"}},
+            {~S({"a":"\uD83D\uDE00), %{"a" => "😀!"}},
+            {~S({"a":"\uD83D), %{"a" => "😀"}},
+            {"{\"a\":\"\\uD83D\\", %{"a" => "😀"}},
+            {~S({"a"), %{"a" => 1, "b" => 2}},
+            {~S({"a":1,), %{"a" => 1, "b" => 2}},
+            {~S({"a":1e2,"b":), %{"a" => 100, "b" => 2}}
+          ],
+          include_done? <- [false, true],
+          subscribed? <- [false, true] do
+        tok_item = %{
+          "type" => "function_call",
+          "id" => "fc_tok",
+          "call_id" => "call_tok",
+          "name" => "echo",
+          "arguments" => final_map
+        }
+
+        done_chunk =
+          if include_done? do
+            sse_oai("response.output_item.done", %{
+              "type" => "response.output_item.done",
+              "output_index" => 0,
+              "item" => tok_item
+            })
+          else
+            ""
+          end
+
+        tok_plug =
+          sse_plug(
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_tok",
+                "call_id" => "call_tok",
+                "name" => "echo",
+                "arguments" => ""
+              }
+            }) <>
+              sse_oai("response.function_call_arguments.delta", %{
+                "type" => "response.function_call_arguments.delta",
+                "item_id" => "fc_tok",
+                "output_index" => 0,
+                "delta" => prefix
+              }) <>
+              done_chunk <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_tok",
+                  "status" => "completed",
+                  "output" => [tok_item],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        cfg =
+          %{api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: tok_plug]}
+          |> then(fn base ->
+            if subscribed?, do: Map.put(base, :on_event, &send(parent, {:tok_ev, &1})), else: base
+          end)
+
+        {:ok, %{messages: [tok_msg]}} =
+          OpenAI.stream([Message.user("hi")], [], cfg, fn _ -> :ok end)
+
+        assert [%{type: "tool_use", id: "call_tok", name: "echo", input: ^final_map}] =
+                 tok_msg.content
+
+        if subscribed? do
+          tok_deltas =
+            drain_tagged(:tok_ev)
+            |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+            |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+          assert Jason.decode!(Enum.map_join(tok_deltas, & &1.arguments_delta)) == final_map
+        end
+      end
+
+      for {bad_prefix, bad_map} <- [
+            {~S({"x":1e), %{"x" => 42}},
+            {~S({"x":-1e), %{"x" => 100}},
+            {~S({"x":1e2 ), %{"x" => 42}},
+            {~S({"x":0e9), %{"x" => 1}},
+            {~S({"x":true ), %{"x" => false}},
+            {~S({"x":tr), %{"x" => false}},
+            {~S({"arr":[1]), %{"arr" => [1, 2]}},
+            {~S({"arr":[1,]), %{"arr" => [1]}},
+            {~S({"arr":[1,2,3]), %{"arr" => [1, 2]}},
+            {~S({"x":1}), %{"x" => 1, "y" => 2}},
+            {~S({"x":1,), %{"x" => 1}},
+            {~S({"unknown":1), %{"x" => 1}},
+            {~S({"x":"\q), %{"x" => "q"}},
+            {~S({"x":"\uZZZZ), %{"x" => "a"}},
+            {~S({"x":"\uDC00), %{"x" => "a"}},
+            {~S({"x":"\uD83D\u0041), %{"x" => "a"}},
+            {~S({"x":"\u0041), %{"x" => "B"}},
+            {"{\"x\":\"a\\", %{"x" => "a"}}
+          ] do
+        bad_exp_plug =
+          sse_plug(
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_bad_exp",
+                "call_id" => "call_bad_exp",
+                "name" => "echo",
+                "arguments" => bad_prefix
+              }
+            }) <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_bad_exp",
+                  "status" => "completed",
+                  "output" => [
+                    %{
+                      "type" => "function_call",
+                      "id" => "fc_bad_exp",
+                      "call_id" => "call_bad_exp",
+                      "name" => "echo",
+                      "arguments" => bad_map
+                    }
+                  ],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAI.stream(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_key: "sk-oai",
+                     model: "gpt-5.4",
+                     req_options: [plug: bad_exp_plug],
+                     on_event: &send(parent, {:bexp_ev, &1})
+                   },
+                   fn _ -> :ok end
+                 )
+
+        _ = drain_tagged(:bexp_ev)
+      end
+
+      # 23. Deadline expiry during [:alloy, :turn, :stop] telemetry OR :turn_end callback when
+      #     turn 1 was finalized as :max_turns still enforces the run deadline (returning :error
+      #     and publishing a terminal :turn_end with status: :error).
+      max_turns_tel_id = "slice2-max-turns-slow-stop-#{inspect(make_ref())}"
+
+      :ok =
+        :telemetry.attach(
+          max_turns_tel_id,
+          [:alloy, :turn, :stop],
+          fn _ev, _meas, meta, _cfg ->
+            if self() == parent and meta.turn == 1, do: Process.sleep(160)
+          end,
+          nil
+        )
+
+      try do
+        {:ok, mt_tel_pid} =
+          TestProvider.start_link([
+            TestProvider.tool_use_response([
+              %{id: "t_mt_tel", name: "echo", input: %{"text" => "hi"}}
+            ])
+          ])
+
+        assert {:error, %Alloy.Result{status: :error, turns: 1}} =
+                 Alloy.run("go",
+                   provider: {TestProvider, agent_pid: mt_tel_pid},
+                   tools: [EchoTool],
+                   max_turns: 1,
+                   timeout_ms: 120,
+                   on_event: &send(parent, {:mt_tel_ev, &1})
+                 )
+      after
+        :telemetry.detach(max_turns_tel_id)
+      end
+
+      mt_tel_ends =
+        drain_tagged(:mt_tel_ev)
+        |> Enum.filter(&(&1.event == :turn_end))
+
+      assert List.last(mt_tel_ends).payload.status == :error
+
+      {:ok, mt_cb_pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t_mt_cb", name: "echo", input: %{"text" => "hi"}}
+          ])
+        ])
+
+      assert {:error, %Alloy.Result{status: :error, turns: 1}} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: mt_cb_pid},
+                 tools: [EchoTool],
+                 max_turns: 1,
+                 timeout_ms: 120,
+                 on_event: fn ev ->
+                   send(parent, {:mt_cb_ev, ev})
+                   if ev.event == :turn_end and ev.turn == 1, do: Process.sleep(160)
+                 end
+               )
+
+      mt_cb_ends =
+        drain_tagged(:mt_cb_ev)
+        |> Enum.filter(&(&1.event == :turn_end))
+
+      assert List.last(mt_cb_ends).payload.status == :error
     end
   end
 
