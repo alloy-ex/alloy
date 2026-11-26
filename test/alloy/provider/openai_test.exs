@@ -1253,7 +1253,7 @@ defmodule Alloy.Provider.OpenAITest do
                OpenAI.complete([Message.user("Hi")], [], config)
     end
 
-    test "preserves explicitly empty map response metadata while omitting empty citation lists" do
+    test "preserves explicitly empty map metadata and omits empty list metadata and request fields" do
       body = %{
         "id" => "resp_empty_meta",
         "object" => "response",
@@ -1271,6 +1271,32 @@ defmodule Alloy.Provider.OpenAITest do
                OpenAI.complete([Message.user("Hi")], [], config)
 
       assert metadata == %{server_side_tool_usage: %{}, stop_details: %{}}
+
+      # Confirm the symmetric case: empty map citations survives while empty list usage is omitted.
+      symmetric_body =
+        body
+        |> Map.put("citations", %{})
+        |> Map.put("server_side_tool_usage", [])
+
+      symmetric_config = config_with_response(%{status: 200, body: Jason.encode!(symmetric_body)})
+
+      assert {:ok, %{response_metadata: symmetric_metadata}} =
+               OpenAI.complete([Message.user("Hi")], [], symmetric_config)
+
+      assert symmetric_metadata == %{citations: %{}, stop_details: %{}}
+
+      # Optional request fields follow the same nil/[]-only omission rule.
+      capture_config =
+        config_that_captures_request()
+        |> Map.put(:store, true)
+        |> Map.put(:tool_choice, [])
+        |> Map.put(:include, [])
+
+      OpenAI.complete([Message.user("Hi")], [], capture_config)
+      assert_received {:request_body, req_body}
+      decoded = Jason.decode!(req_body)
+      refute Map.has_key?(decoded, "tool_choice")
+      refute Map.has_key?(decoded, "include")
     end
   end
 

@@ -156,7 +156,7 @@ defmodule Alloy.Provider.OpenAICompat do
     body =
       %{"model" => config.model, "messages" => openai_messages}
       |> HTTP.maybe_put("max_tokens", Map.get(config, :max_tokens))
-      |> HTTP.maybe_put_non_empty("tools", Enum.map(tool_defs, &format_tool_def/1))
+      |> HTTP.maybe_put_unless_empty_list("tools", Enum.map(tool_defs, &format_tool_def/1))
       |> maybe_put_output_schema(config)
 
     # Merge extra_body LAST so caller can override any field. Keys are
@@ -231,7 +231,7 @@ defmodule Alloy.Provider.OpenAICompat do
 
     msg =
       %{"role" => "assistant", "content" => if(text_parts == "", do: nil, else: text_parts)}
-      |> HTTP.maybe_put_non_empty("tool_calls", tool_calls)
+      |> HTTP.maybe_put_unless_empty_list("tool_calls", tool_calls)
 
     # Thinking modes (DeepSeek, Kimi, GLM) need earlier reasoning back to
     # keep continuity; DeepSeek rejects a tool loop without it (HTTP 400).

@@ -625,7 +625,7 @@ defmodule Alloy.Provider.Anthropic do
 
     body =
       body
-      |> HTTP.maybe_put_non_empty("tools", tools)
+      |> HTTP.maybe_put_unless_empty_list("tools", tools)
       |> maybe_put_container(config)
       |> maybe_put_output_schema(config)
 

@@ -167,19 +167,25 @@ defmodule Alloy.Provider.OpenAI do
 
     body =
       %{"model" => config.model, "input" => input_items}
-      |> HTTP.maybe_put("max_output_tokens", Map.get(config, :max_tokens))
-      |> HTTP.maybe_put("previous_response_id", Map.get(config, :previous_response_id))
-      |> HTTP.maybe_put("store", Map.get(config, :store))
-      |> HTTP.maybe_put_non_empty("include", Map.get(config, :include))
+      |> HTTP.maybe_put_unless_empty_list("max_output_tokens", Map.get(config, :max_tokens))
+      |> HTTP.maybe_put_unless_empty_list(
+        "previous_response_id",
+        Map.get(config, :previous_response_id)
+      )
+      |> HTTP.maybe_put_unless_empty_list("store", Map.get(config, :store))
+      |> HTTP.maybe_put_unless_empty_list("include", Map.get(config, :include))
       |> maybe_put_reasoning_include(config)
-      |> HTTP.maybe_put("tool_choice", Map.get(config, :tool_choice))
-      |> HTTP.maybe_put("parallel_tool_calls", Map.get(config, :parallel_tool_calls))
+      |> HTTP.maybe_put_unless_empty_list("tool_choice", Map.get(config, :tool_choice))
+      |> HTTP.maybe_put_unless_empty_list(
+        "parallel_tool_calls",
+        Map.get(config, :parallel_tool_calls)
+      )
 
     tools = Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
 
     body =
       body
-      |> HTTP.maybe_put_non_empty("tools", tools)
+      |> HTTP.maybe_put_unless_empty_list("tools", tools)
       |> maybe_put_output_schema(config)
 
     # Merge extra_body LAST so caller can override any field (#18), preserving
@@ -749,9 +755,12 @@ defmodule Alloy.Provider.OpenAI do
 
   defp response_metadata_from_response(resp) do
     %{}
-    |> HTTP.maybe_put_non_empty(:citations, Map.get(resp, "citations"))
-    |> HTTP.maybe_put(:server_side_tool_usage, Map.get(resp, "server_side_tool_usage"))
-    |> HTTP.maybe_put(:stop_details, stop_details(resp))
+    |> HTTP.maybe_put_unless_empty_list(:citations, Map.get(resp, "citations"))
+    |> HTTP.maybe_put_unless_empty_list(
+      :server_side_tool_usage,
+      Map.get(resp, "server_side_tool_usage")
+    )
+    |> HTTP.maybe_put_unless_empty_list(:stop_details, stop_details(resp))
   end
 
   defp stop_details(%{"status" => "incomplete"} = resp), do: resp["incomplete_details"]

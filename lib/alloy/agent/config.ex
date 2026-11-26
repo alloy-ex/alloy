@@ -310,7 +310,7 @@ defmodule Alloy.Agent.Config do
       )
 
   defp validate_middleware!(value) do
-    require_opt!(
+    require_opt_shape!(
       is_list(value) and Enum.all?(value, &valid_module_atom?/1),
       value,
       "middleware must be a list of module atoms"

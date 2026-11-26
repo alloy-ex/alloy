@@ -80,9 +80,14 @@ defmodule Alloy.Provider.HTTP do
   def maybe_put(map, key, value), do: Map.put(map, key, value)
 
   @doc false
-  @spec maybe_put_non_empty(map(), term(), term()) :: map()
-  def maybe_put_non_empty(map, _key, value) when value in [nil, [], %{}], do: map
-  def maybe_put_non_empty(map, key, value), do: Map.put(map, key, value)
+  @spec maybe_put_unless_empty_list(map(), term(), term()) :: map()
+  def maybe_put_unless_empty_list(map, _key, value) when value in [nil, []], do: map
+  def maybe_put_unless_empty_list(map, key, value), do: Map.put(map, key, value)
+
+  @doc false
+  @spec maybe_put_unless_empty_map(map(), term(), term()) :: map()
+  def maybe_put_unless_empty_map(map, _key, value) when value in [nil, %{}], do: map
+  def maybe_put_unless_empty_map(map, key, value), do: Map.put(map, key, value)
 
   @doc false
   @spec maybe_put_new(map(), term(), term()) :: map()

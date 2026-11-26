@@ -253,6 +253,17 @@ defmodule Alloy.Agent.ConfigTest do
         end
 
       refute Exception.message(prompt_err) =~ secret
+
+      mw_err =
+        assert_raise ArgumentError, ~r/middleware must be a list of module atoms/, fn ->
+          Config.from_opts(
+            provider: Alloy.Provider.Test,
+            middleware: [{Alloy.Provider.Test, api_key: secret}]
+          )
+        end
+
+      refute Exception.message(mw_err) =~ secret
+      assert Exception.message(mw_err) =~ "got: list"
       assert Exception.message(prompt_err) =~ "got: map"
     end
   end

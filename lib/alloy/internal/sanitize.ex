@@ -190,9 +190,11 @@ defmodule Alloy.Internal.Sanitize do
   @doc """
   Returns a bounded, value-safe outer shape summary for error messages on
   untrusted or potentially secret-bearing terms (provider tuples, config
-  options, middleware return values). Only atoms and bounded numbers are
-  printed verbatim; strings and compound structures are reduced to type labels
-  while preserving atom tags on 2/3-tuples up to a fixed depth cap.
+  options, middleware return values). Only atoms, floats, and integers with
+  `abs(n) <= 10^15` are printed verbatim; strings and compound structures are
+  reduced to type labels while preserving atom tags on 2/3-tuples and the first
+  element's shape on non-atom 2-tuples (`{first_shape, ...}`) up to a fixed
+  depth cap.
   """
   @spec shape_summary(term()) :: String.t()
   def shape_summary(term) do

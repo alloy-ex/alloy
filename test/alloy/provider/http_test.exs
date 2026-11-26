@@ -992,6 +992,33 @@ defmodule Alloy.Provider.HTTPTest do
                {:timeout, {GenServer, :call, [self(), {:secret, "sk-123"}, 100]}}
              ) == ":timeout"
     end
+
+    test "shared map, integer, and sticky-error helpers enforce exact contracts" do
+      assert HTTP.maybe_put_unless_empty_list(%{}, :a, nil) == %{}
+      assert HTTP.maybe_put_unless_empty_list(%{}, :a, []) == %{}
+      assert HTTP.maybe_put_unless_empty_list(%{}, :a, %{}) == %{a: %{}}
+      assert HTTP.maybe_put_unless_empty_list(%{}, :a, [1]) == %{a: [1]}
+
+      assert HTTP.maybe_put_unless_empty_map(%{}, :a, nil) == %{}
+      assert HTTP.maybe_put_unless_empty_map(%{}, :a, %{}) == %{}
+      assert HTTP.maybe_put_unless_empty_map(%{}, :a, []) == %{a: []}
+      assert HTTP.maybe_put_unless_empty_map(%{}, :a, %{k: 1}) == %{a: %{k: 1}}
+
+      assert HTTP.maybe_put_new(%{a: 1}, :a, 2) == %{a: 1}
+      assert HTTP.maybe_put_new(%{}, :a, nil) == %{}
+      assert HTTP.maybe_put_new(%{}, :a, 2) == %{a: 2}
+
+      assert HTTP.non_neg_int(0) == 0
+      assert HTTP.non_neg_int(42) == 42
+      assert HTTP.non_neg_int(-1) == 0
+      assert HTTP.non_neg_int("42") == 0
+      assert HTTP.non_neg_int(nil) == 0
+
+      acc = %{sticky_error: nil}
+      acc1 = HTTP.record_sticky_error(acc, :protocol_error, "first")
+      acc2 = HTTP.record_sticky_error(acc1, :server_error, "second")
+      assert %Error{kind: :protocol_error, message: "first"} = acc2.sticky_error
+    end
   end
 
   defp start_tcp_http_server(handler) do

@@ -408,6 +408,7 @@ defmodule Alloy.Tool.Validation do
     end)
   end
 
+  # Mirrors advance_scope_only/2: a sibling $ref takes precedence over $id/id.
   defp has_nested_id?(%{"$ref" => ref}) when is_binary(ref) or is_struct(ref), do: false
   defp has_nested_id?(%{"$id" => id}) when is_binary(id), do: true
   defp has_nested_id?(%{"id" => id}) when is_binary(id), do: true

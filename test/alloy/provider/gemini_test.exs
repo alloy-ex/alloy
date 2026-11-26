@@ -378,6 +378,21 @@ defmodule Alloy.Provider.GeminiTest do
 
       assert [%{"thoughtSignature" => "skip_thought_signature_validator"}] = first_step["parts"]
       assert [%{"thoughtSignature" => "skip_thought_signature_validator"}] = second_step["parts"]
+
+      # Empty list signatures are preserved (only nil and %{} are omitted, matching baseline).
+      list_sig_config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(
+              gemini_response([
+                %{"text" => "With list sig", "thoughtSignature" => []}
+              ])
+            )
+        })
+
+      assert {:ok, %{messages: [%Message{content: [%{type: "text", signature: []}]}]}} =
+               Gemini.complete([Message.user("Hi")], [], list_sig_config)
     end
   end
 

@@ -189,7 +189,7 @@ defmodule Alloy.Provider.Gemini do
         |> HTTP.maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
         |> maybe_put_output_schema(output_schema)
 
-      body = HTTP.maybe_put_non_empty(body, "generationConfig", generation_config)
+      body = HTTP.maybe_put_unless_empty_map(body, "generationConfig", generation_config)
 
       body =
         case tool_defs do
@@ -295,12 +295,12 @@ defmodule Alloy.Provider.Gemini do
 
   defp format_content_block(%{type: "thinking", thinking: thinking} = block, _messages) do
     %{"text" => thinking, "thought" => true}
-    |> HTTP.maybe_put_non_empty("thoughtSignature", block[:signature])
+    |> HTTP.maybe_put_unless_empty_map("thoughtSignature", block[:signature])
   end
 
   defp format_content_block(%{type: "text", text: text} = block, _messages) do
     %{"text" => text}
-    |> HTTP.maybe_put_non_empty("thoughtSignature", block[:signature])
+    |> HTTP.maybe_put_unless_empty_map("thoughtSignature", block[:signature])
   end
 
   defp format_content_block(
@@ -314,7 +314,7 @@ defmodule Alloy.Provider.Gemini do
         "args" => Alloy.Provider.stringify_keys(input)
       }
     }
-    |> HTTP.maybe_put_non_empty("thoughtSignature", block[:signature])
+    |> HTTP.maybe_put_unless_empty_map("thoughtSignature", block[:signature])
   end
 
   defp format_content_block(
@@ -523,13 +523,13 @@ defmodule Alloy.Provider.Gemini do
   defp parse_content_part(%{"text" => text, "thought" => true} = part) when is_binary(text) do
     {:ok,
      %{type: "thinking", thinking: text}
-     |> HTTP.maybe_put_non_empty(:signature, part["thoughtSignature"])}
+     |> HTTP.maybe_put_unless_empty_map(:signature, part["thoughtSignature"])}
   end
 
   defp parse_content_part(%{"text" => text} = part) when is_binary(text) do
     {:ok,
      %{type: "text", text: text}
-     |> HTTP.maybe_put_non_empty(:signature, part["thoughtSignature"])}
+     |> HTTP.maybe_put_unless_empty_map(:signature, part["thoughtSignature"])}
   end
 
   defp parse_content_part(%{"functionCall" => %{"name" => name} = call} = part)
@@ -544,12 +544,12 @@ defmodule Alloy.Provider.Gemini do
       nil ->
         {:ok,
          %{type: "tool_use", id: id, name: name, input: %{}}
-         |> HTTP.maybe_put_non_empty(:signature, part["thoughtSignature"])}
+         |> HTTP.maybe_put_unless_empty_map(:signature, part["thoughtSignature"])}
 
       args when is_map(args) ->
         {:ok,
          %{type: "tool_use", id: id, name: name, input: args}
-         |> HTTP.maybe_put_non_empty(:signature, part["thoughtSignature"])}
+         |> HTTP.maybe_put_unless_empty_map(:signature, part["thoughtSignature"])}
 
       _invalid ->
         {:error,
@@ -589,14 +589,14 @@ defmodule Alloy.Provider.Gemini do
 
   defp build_response_metadata(resp, candidate) do
     %{}
-    |> HTTP.maybe_put_non_empty(:finish_reason, candidate["finishReason"])
-    |> HTTP.maybe_put_non_empty(:finish_message, candidate["finishMessage"])
-    |> HTTP.maybe_put_non_empty(:prompt_feedback, resp["promptFeedback"])
-    |> HTTP.maybe_put_non_empty(
+    |> HTTP.maybe_put_unless_empty_map(:finish_reason, candidate["finishReason"])
+    |> HTTP.maybe_put_unless_empty_map(:finish_message, candidate["finishMessage"])
+    |> HTTP.maybe_put_unless_empty_map(:prompt_feedback, resp["promptFeedback"])
+    |> HTTP.maybe_put_unless_empty_map(
       :grounding_metadata,
       candidate["groundingMetadata"] || resp["groundingMetadata"]
     )
-    |> HTTP.maybe_put_non_empty(:stop_details, refusal_details(candidate))
+    |> HTTP.maybe_put_unless_empty_map(:stop_details, refusal_details(candidate))
   end
 
   # Like every provider, the API's own fields with its own (string) keys.
