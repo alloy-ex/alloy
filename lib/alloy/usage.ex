@@ -48,6 +48,23 @@ defmodule Alloy.Usage do
   end
 
   @doc """
+  Computes the non-negative delta between two cumulative usage snapshots
+  (`current - previous`), useful for reporting per-turn usage.
+  """
+  @spec diff(t(), t()) :: t()
+  def diff(%__MODULE__{} = current, %__MODULE__{} = previous) do
+    %__MODULE__{
+      input_tokens: max(current.input_tokens - previous.input_tokens, 0),
+      output_tokens: max(current.output_tokens - previous.output_tokens, 0),
+      cache_creation_input_tokens:
+        max(current.cache_creation_input_tokens - previous.cache_creation_input_tokens, 0),
+      cache_read_input_tokens:
+        max(current.cache_read_input_tokens - previous.cache_read_input_tokens, 0),
+      estimated_cost_cents: current.estimated_cost_cents - previous.estimated_cost_cents
+    }
+  end
+
+  @doc """
   Estimates cost in cents given per-million token prices in dollars.
   Replaces (does not accumulate) the existing `estimated_cost_cents`.
 

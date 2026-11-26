@@ -26,6 +26,11 @@ defmodule Alloy.Tool.Core.Bash do
   - `:bash_max_timeout` - ceiling in milliseconds for the `timeout` the
     model asks for (default 10 minutes). The agent's `:tool_timeout`
     still applies on top of it.
+  - `:bash_on_output` - optional 1-arity callback `(binary() -> any())` invoked
+    for each raw output chunk as it arrives from the shell port (before head/tail
+    truncation), allowing hosts to spill full output to disk or inspect raw bytes.
+    Raising callbacks are rescued and logged once per command so execution
+    continues.
   - `:bash_executor` - an `t:executor/0` that runs the command instead of
     the local shell, for a container, VM or remote runner. The options
     above, except the timeout, do not apply to it. Custom executors run inside
@@ -71,6 +76,8 @@ defmodule Alloy.Tool.Core.Bash do
 
   alias Alloy.Internal.Sanitize
   alias Alloy.{OSProcess, OwnedWorker}
+
+  require Logger
 
   @typedoc """
   A custom command executor. Receives the shell command string and the working
@@ -153,13 +160,14 @@ defmodule Alloy.Tool.Core.Bash do
         |> maybe_add_cd(working_dir)
 
       caller = self()
+      callbacks = extract_output_callbacks(context)
 
       # The port lives in its own process so the shell is killed even when
       # the caller is: the executor brutally kills a tool's task on
       # :tool_timeout, and closing a port does not stop the shell.
       task =
         Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-          run_port(bash, opts, timeout, caller)
+          run_port(bash, opts, timeout, caller, callbacks)
         end)
 
       result = Task.yield(task, timeout + @kill_grace_ms) || Task.shutdown(task, :brutal_kill)
@@ -233,7 +241,27 @@ defmodule Alloy.Tool.Core.Bash do
     Enum.any?(@secret_name_parts, &String.contains?(name, &1))
   end
 
-  defp run_port(bash, opts, timeout, caller) do
+  defp extract_output_callbacks(context) do
+    on_tool_update =
+      case Map.get(context, :on_tool_update) do
+        fun when is_function(fun, 1) -> fun
+        _ -> nil
+      end
+
+    bash_on_output =
+      case Map.get(context, :bash_on_output) do
+        fun when is_function(fun, 1) -> fun
+        _ -> nil
+      end
+
+    %{
+      on_tool_update: on_tool_update,
+      bash_on_output: bash_on_output,
+      bash_cb_logged?: false
+    }
+  end
+
+  defp run_port(bash, opts, timeout, caller, callbacks) do
     # Trapping exits lets a supervisor shutdown stop the shell process group too.
     Process.flag(:trap_exit, true)
     caller_ref = Process.monitor(caller)
@@ -253,7 +281,10 @@ defmodule Alloy.Tool.Core.Bash do
           port: port,
           os_pid: OSProcess.os_pid(port),
           caller_ref: caller_ref,
-          deadline: System.monotonic_time(:millisecond) + timeout
+          deadline: System.monotonic_time(:millisecond) + timeout,
+          on_tool_update: callbacks.on_tool_update,
+          bash_on_output: callbacks.bash_on_output,
+          bash_cb_logged?: callbacks.bash_cb_logged?
         }
 
         send(caller, {:bash_os_pid, self(), run.os_pid})
@@ -285,6 +316,8 @@ defmodule Alloy.Tool.Core.Bash do
   defp receive_output(%{port: port, caller_ref: caller_ref} = run, output, remaining) do
     receive do
       {^port, {:data, data}} ->
+        notify_tool_update(run.on_tool_update, data)
+        run = notify_bash_on_output(run, data)
         collect(run, append(output, data))
 
       {^port, {:exit_status, status}} ->
@@ -301,6 +334,33 @@ defmodule Alloy.Tool.Core.Bash do
     after
       remaining -> time_out(run, output)
     end
+  end
+
+  defp notify_tool_update(nil, _data), do: :ok
+  defp notify_tool_update(_fun, <<>>), do: :ok
+
+  defp notify_tool_update(fun, data) do
+    fun.(String.replace_invalid(data))
+    :ok
+  end
+
+  defp notify_bash_on_output(%{bash_on_output: nil} = run, _data), do: run
+
+  defp notify_bash_on_output(%{bash_on_output: fun} = run, data) do
+    fun.(data)
+    run
+  rescue
+    exception ->
+      if not run.bash_cb_logged? do
+        sanitized_trace = Sanitize.stacktrace(__STACKTRACE__)
+
+        Logger.warning(
+          "[Alloy.Tool.Core.Bash] :bash_on_output callback failed (#{Sanitize.exception_summary(exception, 500)}); command continues (further failures suppressed).\n" <>
+            Exception.format_stacktrace(sanitized_trace)
+        )
+      end
+
+      %{run | bash_cb_logged?: true}
   end
 
   defp time_out(run, output) do

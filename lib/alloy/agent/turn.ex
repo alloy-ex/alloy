@@ -11,7 +11,7 @@ defmodule Alloy.Agent.Turn do
   alias Alloy.Agent.State
   alias Alloy.Events
   alias Alloy.Internal.Sanitize
-  alias Alloy.{Message, Middleware, OutputSchema}
+  alias Alloy.{Message, Middleware, OutputSchema, Provider, Usage}
   alias Alloy.Provider.{Error, Retry}
   alias Alloy.Tool.{Executor, Validation}
 
@@ -67,7 +67,8 @@ defmodule Alloy.Agent.Turn do
 
     normalized_config = %{
       state.config
-      | output_schema: OutputSchema.normalize!(state.config.output_schema)
+      | output_schema: OutputSchema.normalize!(state.config.output_schema),
+        reasoning: Provider.normalize_reasoning!(state.config.reasoning)
     }
 
     state = %{
@@ -152,7 +153,26 @@ defmodule Alloy.Agent.Turn do
   # with the final status set.
   defp run_turn(%State{} = state, opts) do
     turn = state.turn + 1
-    turn_span(turn, fn -> complete(state, opts, false) end)
+    usage_before = state.usage
+    Events.emit(opts, turn, {:turn_start, %{turn: turn}})
+
+    step = turn_span(turn, fn -> complete(state, opts, false) end)
+    {_, step_state} = step
+    turn_stop_reason = if step_state.turn == turn, do: step_state.stop_reason, else: nil
+
+    Events.emit(
+      opts,
+      turn,
+      {:turn_end,
+       %{
+         turn: turn,
+         status: step_status(step),
+         stop_reason: turn_stop_reason,
+         usage: Usage.diff(step_state.usage, usage_before)
+       }}
+    )
+
+    step
   end
 
   defp turn_span(turn, fun) do
@@ -553,6 +573,13 @@ defmodule Alloy.Agent.Turn do
     |> Map.put(:provider_state, provider_state)
     |> maybe_enable_code_execution(config.provider, config.code_execution)
     |> maybe_put_output_schema(config.output_schema)
+    |> maybe_put_reasoning(config.reasoning)
+  end
+
+  defp maybe_put_reasoning(provider_config, nil), do: provider_config
+
+  defp maybe_put_reasoning(provider_config, reasoning) do
+    Map.put_new(provider_config, :reasoning, reasoning)
   end
 
   # Top-level :code_execution enables Anthropic-compatible server code execution

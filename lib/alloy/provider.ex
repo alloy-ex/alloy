@@ -18,6 +18,7 @@ defmodule Alloy.Provider do
     layer (for example, citations or server-side tool usage)
   """
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.Provider.Error
 
   @typedoc """
@@ -51,6 +52,40 @@ defmodule Alloy.Provider do
   Static API key string or 0-arity callback invoked per HTTP request attempt.
   """
   @type api_key :: String.t() | (-> String.t() | {:ok, String.t()} | {:error, term()})
+
+  @typedoc """
+  Portable reasoning effort level.
+  """
+  @type reasoning_effort :: :off | :low | :medium | :high | :xhigh
+
+  @typedoc """
+  Portable reasoning visibility hint (`:summarized` requests visible reasoning
+  summaries where supported; `:omitted` suppresses them where supported).
+  """
+  @type reasoning_display :: :summarized | :omitted
+
+  @typedoc """
+  Portable reasoning configuration accepted at the top level of `Alloy.run/2` /
+  `Alloy.stream/3` or inside a provider config map.
+  """
+  @type reasoning ::
+          nil
+          | reasoning_effort()
+          | %{
+              required(:effort) => reasoning_effort(),
+              optional(:display) => reasoning_display() | nil
+            }
+
+  @typedoc """
+  Canonical normalized reasoning configuration passed to providers.
+  """
+  @type normalized_reasoning :: %{
+          effort: reasoning_effort(),
+          display: reasoning_display() | nil
+        }
+
+  @reasoning_efforts [:off, :low, :medium, :high, :xhigh]
+  @reasoning_displays [nil, :summarized, :omitted]
 
   @doc """
   Send messages to the provider and get a completion response.
@@ -141,4 +176,64 @@ defmodule Alloy.Provider do
         {:error, %Error{kind: :malformed_reply, message: "Failed to decode response JSON"}}
     end
   end
+
+  @doc """
+  Normalizes a portable `:reasoning` option into `nil` or
+  `%{effort: effort, display: display}`.
+
+  Returns `{:ok, normalized}` or `{:error, %Alloy.Provider.Error{kind: :invalid_request}}`.
+  """
+  @spec normalize_reasoning(term()) :: {:ok, normalized_reasoning() | nil} | {:error, Error.t()}
+  def normalize_reasoning(nil), do: {:ok, nil}
+
+  def normalize_reasoning(effort) when effort in @reasoning_efforts do
+    {:ok, %{effort: effort, display: nil}}
+  end
+
+  def normalize_reasoning(map) when is_map(map) and not is_struct(map) do
+    unknown = Map.keys(map) -- [:effort, :display]
+
+    cond do
+      unknown != [] ->
+        invalid_reasoning(
+          "Invalid :reasoning keys #{Sanitize.inspect_bounded(unknown)}; expected :effort and optional :display"
+        )
+
+      not Map.has_key?(map, :effort) ->
+        invalid_reasoning("Invalid :reasoning map: missing required :effort key")
+
+      map.effort not in @reasoning_efforts ->
+        invalid_reasoning(
+          "Invalid :reasoning :effort: expected one of #{inspect(@reasoning_efforts)}, got #{Sanitize.inspect_bounded(map.effort)}"
+        )
+
+      Map.get(map, :display) not in @reasoning_displays ->
+        invalid_reasoning(
+          "Invalid :reasoning :display: expected :summarized, :omitted, or nil, got #{Sanitize.inspect_bounded(Map.get(map, :display))}"
+        )
+
+      true ->
+        display = if map.effort == :off, do: nil, else: Map.get(map, :display)
+        {:ok, %{effort: map.effort, display: display}}
+    end
+  end
+
+  def normalize_reasoning(other) do
+    invalid_reasoning(
+      "Invalid :reasoning: expected nil, one of #{inspect(@reasoning_efforts)}, or %{effort: ..., display?: ...}, got #{Sanitize.inspect_bounded(other)}"
+    )
+  end
+
+  @doc """
+  Like `normalize_reasoning/1`, raising `ArgumentError` on invalid input.
+  """
+  @spec normalize_reasoning!(term()) :: normalized_reasoning() | nil
+  def normalize_reasoning!(value) do
+    case normalize_reasoning(value) do
+      {:ok, normalized} -> normalized
+      {:error, %Error{message: msg}} -> raise ArgumentError, msg
+    end
+  end
+
+  defp invalid_reasoning(message), do: {:error, %Error{kind: :invalid_request, message: message}}
 end

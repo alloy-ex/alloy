@@ -51,9 +51,13 @@ Field guarantees:
 
 | `event` | `payload` | Emitted when |
 |---|---|---|
+| `:turn_start` | `%{turn:}` | a turn begins in `Alloy.Agent.Turn` (both `run/2` and `stream/3`) |
+| `:turn_end` | `%{turn:, status:, stop_reason:, usage:}` | a turn finishes; `status` is `:running` if the loop continues or the final status otherwise; `stop_reason` is `nil` if the turn ended before a provider response; `usage` is the per-turn `%Alloy.Usage{}` delta |
 | `:text_delta` | `String.t()` — text fragment | streaming providers emit assistant text |
-| `:thinking_delta` | `String.t()` — reasoning fragment | providers with reasoning/thinking blocks stream them |
+| `:thinking_delta` | `String.t()` — reasoning fragment | streaming providers emit reasoning/thinking deltas (Anthropic, OpenAI/xAI Responses, Gemini, OpenAICompat) |
+| `:tool_call_delta` | `%{id:, index:, name:, arguments_delta:}` | streaming providers emit tool-call headers or partial argument JSON deltas |
 | `:tool_start` | `%{id:, name:, input:}` | a tool call begins executing |
+| `:tool_update` | `%{id:, name:, chunk:, start_event_seq:}` | a running tool emits incremental output (for example `Alloy.Tool.Core.Bash`); marshalled to the caller process strictly between `:tool_start` and `:tool_end` |
 | `:tool_end` | `%{id:, name:, input:, duration_ms:, error:, start_event_seq:}` | a tool call finishes; `error` is `nil` on success, a string otherwise; `start_event_seq` links back to the matching `:tool_start` envelope |
 | `:runtime_event` | `term()` — the raw event | anything emitted that isn't a recognized tuple; a forward-compatibility escape hatch |
 

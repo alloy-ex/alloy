@@ -98,6 +98,8 @@ defmodule Alloy.Provider.OpenAICompat do
           optional(:chat_path) => String.t(),
           optional(:extra_headers) => [{String.t(), String.t()}],
           optional(:extra_body) => map(),
+          optional(:reasoning) => Alloy.Provider.reasoning(),
+          optional(:on_event) => (term() -> :ok),
           optional(:stream_options) => false,
           optional(:req_options) => keyword()
         }
@@ -106,9 +108,8 @@ defmodule Alloy.Provider.OpenAICompat do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    body = build_request_body(messages, tool_defs, config)
-
-    with {:ok, api_key} <- HTTP.resolve_optional_api_key(config),
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- HTTP.resolve_optional_api_key(config),
          {:ok, resp_body} <-
            HTTP.post_json(
              chat_url(config),
@@ -125,19 +126,21 @@ defmodule Alloy.Provider.OpenAICompat do
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
-    body = build_request_body(messages, tool_defs, config)
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- HTTP.resolve_optional_api_key(config) do
+      body =
+        if config[:stream_options] == false,
+          do: Map.put(body, "stream_options", false),
+          else: body
 
-    body =
-      if config[:stream_options] == false, do: Map.put(body, "stream_options", false), else: body
-
-    with {:ok, api_key} <- HTTP.resolve_optional_api_key(config) do
       OpenAIStream.stream(
         chat_url(config),
         build_headers(config, api_key),
         body,
         on_chunk,
         Map.get(config, :req_options, []),
-        deadline: Map.get(config, :alloy_request_deadline)
+        deadline: Map.get(config, :alloy_request_deadline),
+        on_event: Map.get(config, :on_event, fn _ -> :ok end)
       )
     end
   end
@@ -160,18 +163,36 @@ defmodule Alloy.Provider.OpenAICompat do
   # --- Request Building ---
 
   defp build_request_body(messages, tool_defs, config) do
-    openai_messages = build_messages(messages, config)
+    with {:ok, reasoning} <- Alloy.Provider.normalize_reasoning(Map.get(config, :reasoning)) do
+      openai_messages = build_messages(messages, config)
 
-    body =
-      %{"model" => config.model, "messages" => openai_messages}
-      |> HTTP.maybe_put("max_tokens", Map.get(config, :max_tokens))
-      |> HTTP.maybe_put_unless_empty_list("tools", Enum.map(tool_defs, &format_tool_def/1))
-      |> maybe_put_output_schema(config)
+      body =
+        %{"model" => config.model, "messages" => openai_messages}
+        |> HTTP.maybe_put("max_tokens", Map.get(config, :max_tokens))
+        |> HTTP.maybe_put_unless_empty_list("tools", Enum.map(tool_defs, &format_tool_def/1))
+        |> maybe_put_output_schema(config)
+        |> maybe_put_reasoning(reasoning)
 
-    # Merge extra_body LAST so caller can override any field. Keys are
-    # stringified first: an atom key would sit beside the string key it
-    # meant to replace and be encoded as a duplicate JSON key.
-    Map.merge(body, HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})))
+      # Merge extra_body LAST so caller can override any field. Keys are
+      # stringified first: an atom key would sit beside the string key it
+      # meant to replace and be encoded as a duplicate JSON key.
+      {:ok, Map.merge(body, HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})))}
+    end
+  end
+
+  defp maybe_put_reasoning(body, nil), do: body
+
+  defp maybe_put_reasoning(body, %{effort: effort}) do
+    effort_str =
+      case effort do
+        :off -> "none"
+        :low -> "low"
+        :medium -> "medium"
+        :high -> "high"
+        :xhigh -> "xhigh"
+      end
+
+    Map.put(body, "reasoning_effort", effort_str)
   end
 
   defp maybe_put_output_schema(body, config) do

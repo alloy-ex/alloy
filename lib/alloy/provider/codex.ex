@@ -157,6 +157,7 @@ defmodule Alloy.Provider.Codex do
           optional(:profile) => String.t(),
           optional(:codex_home) => String.t(),
           optional(:config_overrides) => [String.t()],
+          optional(:reasoning) => Alloy.Provider.reasoning(),
           optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
           optional(:receive_timeout) => pos_integer(),
@@ -177,7 +178,9 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp run_completion(messages, tool_defs, config) do
-    with {:ok, codex_home} <- codex_home(config),
+    with {:ok, reasoning} <- Alloy.Provider.normalize_reasoning(Map.get(config, :reasoning)),
+         config = Map.put(config, :reasoning, reasoning),
+         {:ok, codex_home} <- codex_home(config),
          :ok <- validate_session_workdir(config, codex_home) do
       scope = session_scope(config, codex_home, tool_defs)
       plan = session_plan(config, codex_home, messages, scope)
@@ -228,7 +231,7 @@ defmodule Alloy.Provider.Codex do
       workdir: Map.get(config, :workdir),
       model: Map.get(config, :model),
       system_prompt: Map.get(config, :system_prompt),
-      overrides: Map.get(config, :config_overrides, []),
+      overrides: effective_config_overrides(config),
       executable: CodexRunner.codex_bin(config),
       generation: Map.get(config, :session_generation),
       tools: tools
@@ -718,10 +721,40 @@ defmodule Alloy.Provider.Codex do
     session_args(config.alloy_codex_plan) ++
       ["--output-schema", paths.schema_path, "--output-last-message", paths.last_message_path] ++
       user_config_args(config) ++
-      Enum.flat_map(Map.get(config, :config_overrides, []), &["-c", &1]) ++
+      Enum.flat_map(effective_config_overrides(config), &["-c", &1]) ++
       sandbox_args(config.alloy_codex_plan) ++
       model_args(config) ++ session_id_args(config.alloy_codex_plan)
   end
+
+  defp effective_config_overrides(config) do
+    overrides = Map.get(config, :config_overrides, [])
+
+    case Map.get(config, :reasoning) do
+      %{effort: effort} ->
+        if Enum.any?(overrides, &reasoning_effort_override?/1) do
+          overrides
+        else
+          overrides ++ [~s(model_reasoning_effort="#{codex_reasoning_effort(effort)}")]
+        end
+
+      _nil ->
+        overrides
+    end
+  end
+
+  defp reasoning_effort_override?(entry) when is_binary(entry) do
+    entry
+    |> String.trim_leading()
+    |> String.starts_with?("model_reasoning_effort")
+  end
+
+  defp reasoning_effort_override?(_other), do: false
+
+  defp codex_reasoning_effort(:off), do: "none"
+  defp codex_reasoning_effort(:low), do: "low"
+  defp codex_reasoning_effort(:medium), do: "medium"
+  defp codex_reasoning_effort(:high), do: "high"
+  defp codex_reasoning_effort(:xhigh), do: "xhigh"
 
   defp session_args({:fresh, :ephemeral}),
     do: ~w(exec --json --skip-git-repo-check --ephemeral --ignore-rules --sandbox read-only)

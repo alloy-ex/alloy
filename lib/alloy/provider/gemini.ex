@@ -120,6 +120,8 @@ defmodule Alloy.Provider.Gemini do
           optional(:url_context) => boolean() | map(),
           optional(:code_execution) => boolean() | map(),
           optional(:generation_config) => map() | keyword() | nil,
+          optional(:reasoning) => Alloy.Provider.reasoning(),
+          optional(:on_event) => (term() -> :ok),
           optional(:tool_config) => map(),
           optional(:safety_settings) => [map()],
           optional(:extra_headers) => [{String.t(), String.t()}],
@@ -158,7 +160,9 @@ defmodule Alloy.Provider.Gemini do
       response: %{},
       candidate: %{},
       stream_error: nil,
-      on_chunk: on_chunk
+      tool_call_count: 0,
+      on_chunk: on_chunk,
+      on_event: Map.get(config, :on_event, fn _ -> :ok end)
     }
 
     with {:ok, auth_scheme} <- HTTP.resolve_auth_scheme(config),
@@ -223,12 +227,14 @@ defmodule Alloy.Provider.Gemini do
     output_schema = Map.get(config, :output_schema)
 
     with {:ok, raw_generation_config} <- normalize_generation_config(config),
+         {:ok, reasoning} <- Provider.normalize_reasoning(Map.get(config, :reasoning)),
          :ok <- validate_cached_content_config(cached_content, config) do
       # No default maxOutputTokens: the budget includes thinking, so a fixed
       # default truncates thinking models; each model's own limit is larger.
       generation_config =
         raw_generation_config
         |> HTTP.maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
+        |> maybe_put_reasoning(reasoning)
         |> maybe_put_output_schema(output_schema)
 
       body = HTTP.maybe_put_unless_empty_map(body, "generationConfig", generation_config)
@@ -376,6 +382,40 @@ defmodule Alloy.Provider.Gemini do
     do: tools ++ [%{key => Provider.stringify_keys(cfg)}]
 
   defp maybe_append_native_tool(tools, _key, _other), do: tools
+
+  defp maybe_put_reasoning(generation_config, nil), do: generation_config
+
+  defp maybe_put_reasoning(generation_config, reasoning) do
+    has_explicit_thinking? =
+      Map.has_key?(generation_config, "thinkingConfig") or
+        Map.has_key?(generation_config, "thinking_config")
+
+    if has_explicit_thinking? do
+      generation_config
+    else
+      Map.put(generation_config, "thinkingConfig", gemini_thinking_config(reasoning))
+    end
+  end
+
+  defp gemini_thinking_config(%{effort: :off}), do: %{"thinkingBudget" => 0}
+
+  defp gemini_thinking_config(%{effort: effort, display: display}) do
+    level =
+      case effort do
+        :low -> "LOW"
+        :medium -> "MEDIUM"
+        :high -> "HIGH"
+        :xhigh -> "HIGH"
+      end
+
+    base = %{"thinkingLevel" => level}
+
+    case display do
+      :summarized -> Map.put(base, "includeThoughts", true)
+      :omitted -> Map.put(base, "includeThoughts", false)
+      nil -> base
+    end
+  end
 
   defp normalize_generation_config(config) do
     case Map.get(config, :generation_config) do
@@ -902,7 +942,10 @@ defmodule Alloy.Provider.Gemini do
        when is_map(candidate) do
     case extract_candidate_blocks(candidate) do
       {:ok, blocks} ->
-        Enum.each(blocks, &emit_text_delta(&1, acc.on_chunk))
+        tool_call_count =
+          Enum.reduce(blocks, acc.tool_call_count, fn block, tc_idx ->
+            emit_stream_block_event(block, tc_idx, acc.on_chunk, acc.on_event)
+          end)
 
         candidate_updates =
           candidate
@@ -912,7 +955,8 @@ defmodule Alloy.Provider.Gemini do
         %{
           merge_response_fields(acc, chunk)
           | content_blocks: Enum.reduce(blocks, acc.content_blocks, &merge_stream_block/2),
-            candidate: Map.merge(acc.candidate, candidate_updates)
+            candidate: Map.merge(acc.candidate, candidate_updates),
+            tool_call_count: tool_call_count
         }
 
       {:error, %Error{} = error} ->
@@ -976,8 +1020,43 @@ defmodule Alloy.Provider.Gemini do
     %{acc | response: response}
   end
 
-  defp emit_text_delta(%{type: "text", text: text}, on_chunk) when text != "", do: on_chunk.(text)
-  defp emit_text_delta(_block, _on_chunk), do: :ok
+  defp emit_stream_block_event(%{type: "text", text: text}, tc_idx, on_chunk, _on_event)
+       when is_binary(text) and text != "" do
+    on_chunk.(text)
+    tc_idx
+  end
+
+  defp emit_stream_block_event(
+         %{type: "thinking", thinking: thinking},
+         tc_idx,
+         _on_chunk,
+         on_event
+       )
+       when is_binary(thinking) and thinking != "" do
+    on_event.({:thinking_delta, thinking})
+    tc_idx
+  end
+
+  defp emit_stream_block_event(
+         %{type: "tool_use", id: id, name: name, input: input},
+         tc_idx,
+         _on_chunk,
+         on_event
+       ) do
+    on_event.(
+      {:tool_call_delta,
+       %{
+         id: id,
+         index: tc_idx,
+         name: name,
+         arguments_delta: Jason.encode!(input)
+       }}
+    )
+
+    tc_idx + 1
+  end
+
+  defp emit_stream_block_event(_block, tc_idx, _on_chunk, _on_event), do: tc_idx
 
   # Gemini streams one logical part as many pieces. Kept apart, they become
   # separate blocks that Message.text/1 joins with newlines, so consecutive

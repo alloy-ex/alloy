@@ -147,6 +147,7 @@ defmodule Alloy.Provider.Anthropic do
           optional(:req_options) => keyword(),
           optional(:on_event) => (term() -> :ok),
           optional(:cache) => boolean() | String.t() | map(),
+          optional(:reasoning) => Alloy.Provider.reasoning(),
           optional(:code_execution) => boolean(),
           optional(:provider_state) => map()
         }
@@ -290,6 +291,18 @@ defmodule Alloy.Provider.Anthropic do
           |> Map.update!(:open_tool_blocks, &Map.delete(&1, index))
 
         if tool_use_block?(normalized) do
+          if normalized["type"] == "tool_use" do
+            acc.on_event.(
+              {:tool_call_delta,
+               %{
+                 id: normalized["id"],
+                 index: index,
+                 name: normalized["name"],
+                 arguments_delta: ""
+               }}
+            )
+          end
+
           %{acc | open_tool_blocks: Map.put(acc.open_tool_blocks, index, true)}
         else
           acc
@@ -370,6 +383,18 @@ defmodule Alloy.Provider.Anthropic do
 
     cond do
       tool_use_block?(current) and Map.has_key?(acc.open_tool_blocks, index) ->
+        if current["type"] == "tool_use" and json != "" do
+          acc.on_event.(
+            {:tool_call_delta,
+             %{
+               id: current["id"],
+               index: index,
+               name: current["name"],
+               arguments_delta: json
+             }}
+          )
+        end
+
         current_buffer = Map.get(acc.input_json_buffers, index, "")
 
         %{
@@ -612,7 +637,8 @@ defmodule Alloy.Provider.Anthropic do
   defp build_request_body(messages, tool_defs, config) do
     reject_extended_thinking!(config)
 
-    with {:ok, cache_control} <- normalize_cache(config) do
+    with {:ok, cache_control} <- normalize_cache(config),
+         {:ok, reasoning} <- Alloy.Provider.normalize_reasoning(Map.get(config, :reasoning)) do
       body = %{
         "model" => config.model,
         "max_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
@@ -662,6 +688,7 @@ defmodule Alloy.Provider.Anthropic do
         |> HTTP.maybe_put_unless_empty_list("tools", tools)
         |> maybe_put_container(config)
         |> maybe_put_output_schema(config)
+        |> maybe_put_reasoning(reasoning)
 
       {:ok,
        HTTP.merge_extra_body(
@@ -671,6 +698,33 @@ defmodule Alloy.Provider.Anthropic do
        )}
     end
   end
+
+  defp maybe_put_reasoning(body, nil), do: body
+  defp maybe_put_reasoning(body, %{effort: :off}), do: body
+
+  defp maybe_put_reasoning(body, %{effort: effort, display: display}) do
+    thinking =
+      %{"type" => "adaptive"}
+      |> HTTP.maybe_put("display", anthropic_reasoning_display(display))
+
+    output_config =
+      body
+      |> Map.get("output_config", %{})
+      |> Map.put("effort", anthropic_reasoning_effort(effort))
+
+    body
+    |> Map.put("thinking", thinking)
+    |> Map.put("output_config", output_config)
+  end
+
+  defp anthropic_reasoning_effort(:low), do: "low"
+  defp anthropic_reasoning_effort(:medium), do: "medium"
+  defp anthropic_reasoning_effort(:high), do: "high"
+  defp anthropic_reasoning_effort(:xhigh), do: "max"
+
+  defp anthropic_reasoning_display(:summarized), do: "summarized"
+  defp anthropic_reasoning_display(:omitted), do: "omitted"
+  defp anthropic_reasoning_display(nil), do: nil
 
   defp normalize_cache(config) do
     case Map.get(config, :cache, false) do

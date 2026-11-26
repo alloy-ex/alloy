@@ -171,7 +171,11 @@ defmodule Alloy.Provider.Retry do
         if is_integer(deadline) and deadline - now <= 0 do
           {:halt, {acc_err, messages_acc}}
         else
-          fb_provider_config = Map.merge(fb_config, runtime_overrides)
+          fb_provider_config =
+            fb_config
+            |> Map.merge(runtime_overrides)
+            |> maybe_put_reasoning(state.config.reasoning)
+
           fb_streaming? = streaming? and supports_streaming?(fb_provider)
           fb_origin = Message.origin(fb_provider, fb_provider_config)
 
@@ -220,6 +224,12 @@ defmodule Alloy.Provider.Retry do
     if Message.origin(fb_provider, fb_config) == primary_origin,
       do: response,
       else: Map.delete(response, :provider_state)
+  end
+
+  defp maybe_put_reasoning(provider_config, nil), do: provider_config
+
+  defp maybe_put_reasoning(provider_config, reasoning) do
+    Map.put_new(provider_config, :reasoning, reasoning)
   end
 
   defp do_provider_call(

@@ -16,6 +16,7 @@ defmodule Alloy.Agent.Config do
     :tool_validation,
     :stop_after_tool,
     :output_schema,
+    :reasoning,
     :provider,
     :tools,
     :system_prompt,
@@ -95,6 +96,7 @@ defmodule Alloy.Agent.Config do
           tool_validation: :required | :schema,
           stop_after_tool: String.t() | nil,
           output_schema: OutputSchema.t() | nil,
+          reasoning: Alloy.Provider.normalized_reasoning() | nil,
           middleware: [module()],
           compaction: compaction(),
           compaction_explicit: %{
@@ -129,6 +131,7 @@ defmodule Alloy.Agent.Config do
     tool_validation: :required,
     stop_after_tool: nil,
     output_schema: nil,
+    reasoning: nil,
     middleware: [],
     compaction: %{
       reserve_tokens: 16_384,
@@ -163,6 +166,7 @@ defmodule Alloy.Agent.Config do
       |> normalize_provider_config()
       |> reject_removed!(provider_mod)
       |> validate_provider_auth!(provider_mod)
+      |> validate_provider_reasoning!()
 
     model_metadata_overrides = normalize_model_metadata_overrides(opts[:model_metadata_overrides])
 
@@ -221,6 +225,7 @@ defmodule Alloy.Agent.Config do
           "stop_after_tool must be a nonempty tool name"
         ),
       output_schema: OutputSchema.normalize!(Keyword.get(opts, :output_schema)),
+      reasoning: Alloy.Provider.normalize_reasoning!(Keyword.get(opts, :reasoning)),
       middleware:
         resolve_middleware(
           validate_middleware!(Keyword.get(opts, :middleware, [])),
@@ -427,6 +432,16 @@ defmodule Alloy.Agent.Config do
     end
   end
 
+  defp validate_provider_reasoning!(provider_config) do
+    case Map.fetch(provider_config, :reasoning) do
+      :error ->
+        provider_config
+
+      {:ok, value} ->
+        Map.put(provider_config, :reasoning, Alloy.Provider.normalize_reasoning!(value))
+    end
+  end
+
   defp require_origin_key!(provider_config, provider, detail) do
     origin_key = Map.get(provider_config, :origin_key)
 
@@ -456,6 +471,7 @@ defmodule Alloy.Agent.Config do
       |> normalize_provider_config()
       |> reject_removed!(provider_mod)
       |> validate_provider_auth!(provider_mod)
+      |> validate_provider_reasoning!()
 
     max_tokens =
       if config.max_tokens_explicit? do
@@ -510,7 +526,11 @@ defmodule Alloy.Agent.Config do
     {mod, cfg} = parse_provider_entry(entry, "fallback provider", %{})
 
     {mod,
-     cfg |> normalize_provider_config() |> reject_removed!(mod) |> validate_provider_auth!(mod)}
+     cfg
+     |> normalize_provider_config()
+     |> reject_removed!(mod)
+     |> validate_provider_auth!(mod)
+     |> validate_provider_reasoning!()}
   end
 
   defp parse_provider_entry({mod, cfg}, _label, _default)

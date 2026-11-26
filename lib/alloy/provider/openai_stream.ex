@@ -57,7 +57,8 @@ defmodule Alloy.Provider.OpenAIStream do
       stream_error: nil,
       sticky_error: nil,
       usage: %{},
-      on_chunk: on_chunk
+      on_chunk: on_chunk,
+      on_event: Keyword.get(opts, :on_event, fn _ -> :ok end)
     }
 
     with {:ok, acc} <-
@@ -265,12 +266,15 @@ defmodule Alloy.Provider.OpenAIStream do
              Map.get(delta, "refusal"),
              "Invalid delta refusal in Chat Completions SSE chunk"
            ) do
-      acc = accumulate_tool_calls(acc, Map.get(delta, "tool_calls", []))
+      {acc, tool_events} = accumulate_tool_calls(acc, Map.get(delta, "tool_calls", []))
       combined_refusal = content_refusal <> refusal
 
       if acc.sticky_error do
         acc
       else
+        if reasoning != "", do: acc.on_event.({:thinking_delta, reasoning})
+        if content_thinking != "", do: acc.on_event.({:thinking_delta, content_thinking})
+
         acc =
           if text != "" do
             acc.on_chunk.(text)
@@ -278,6 +282,8 @@ defmodule Alloy.Provider.OpenAIStream do
           else
             acc
           end
+
+        Enum.each(tool_events, fn ev -> acc.on_event.({:tool_call_delta, ev}) end)
 
         acc =
           if reasoning != "",
@@ -318,15 +324,18 @@ defmodule Alloy.Provider.OpenAIStream do
   # ── Tool Call Accumulation ───────────────────────────────────────────
 
   # DeepInfra sends "tool_calls": null on chunks without a call.
-  defp accumulate_tool_calls(acc, nil), do: acc
-  defp accumulate_tool_calls(acc, []), do: acc
+  defp accumulate_tool_calls(acc, nil), do: {acc, []}
+  defp accumulate_tool_calls(acc, []), do: {acc, []}
 
   defp accumulate_tool_calls(acc, tool_call_deltas) when is_list(tool_call_deltas) do
-    Enum.reduce(tool_call_deltas, acc, &accumulate_tool_call_delta/2)
+    {acc, events_rev} =
+      Enum.reduce(tool_call_deltas, {acc, []}, &accumulate_tool_call_delta/2)
+
+    {acc, Enum.reverse(events_rev)}
   end
 
   defp accumulate_tool_calls(acc, _invalid) do
-    record_protocol_error(acc, "Invalid tool_calls delta in Chat Completions SSE chunk")
+    {record_protocol_error(acc, "Invalid tool_calls delta in Chat Completions SSE chunk"), []}
   end
 
   @doc false
@@ -367,7 +376,7 @@ defmodule Alloy.Provider.OpenAIStream do
     end
   end
 
-  defp accumulate_tool_call_delta(tc_delta, acc) when is_map(tc_delta) do
+  defp accumulate_tool_call_delta(tc_delta, {acc, events}) when is_map(tc_delta) do
     case resolve_tool_call_index(tc_delta, acc) do
       {:ok, index} ->
         existing =
@@ -388,23 +397,53 @@ defmodule Alloy.Provider.OpenAIStream do
 
         with {:ok, sig} <- extract_thought_signature(tc_delta),
              with_sig = if(sig, do: %{existing | thought_signature: sig}, else: existing),
-             {:ok, updated} <- merge_function_delta(with_sig, Map.fetch(tc_delta, "function")) do
-          %{
+             {:ok, updated, args_delta} <-
+               merge_function_delta(with_sig, Map.fetch(tc_delta, "function")) do
+          next_acc = %{
             acc
             | tool_calls: Map.put(acc.tool_calls, index, updated),
               last_tool_call_index: index
           }
+
+          next_events =
+            if should_emit_tool_call_delta?(tc_delta, args_delta) do
+              [
+                %{
+                  id: updated.id,
+                  index: index,
+                  name: updated.name,
+                  arguments_delta: args_delta
+                }
+                | events
+              ]
+            else
+              events
+            end
+
+          {next_acc, next_events}
         else
-          {:error, message} -> record_protocol_error(acc, message)
+          {:error, message} -> {record_protocol_error(acc, message), events}
         end
 
       {:error, message} ->
-        record_protocol_error(acc, message)
+        {record_protocol_error(acc, message), events}
     end
   end
 
-  defp accumulate_tool_call_delta(_invalid, acc) do
-    record_protocol_error(acc, "Invalid tool call delta in Chat Completions SSE chunk")
+  defp accumulate_tool_call_delta(_invalid, {acc, events}) do
+    {record_protocol_error(acc, "Invalid tool call delta in Chat Completions SSE chunk"), events}
+  end
+
+  defp should_emit_tool_call_delta?(_tc_delta, args_delta) when args_delta != "", do: true
+
+  defp should_emit_tool_call_delta?(tc_delta, "") do
+    has_id? = is_binary(tc_delta["id"]) and tc_delta["id"] != ""
+
+    has_name? =
+      is_map(tc_delta["function"]) and is_binary(tc_delta["function"]["name"]) and
+        tc_delta["function"]["name"] != ""
+
+    has_id? or has_name?
   end
 
   # Some Chat Completions-compatible servers (notably Gemini's OpenAI-compat
@@ -441,8 +480,8 @@ defmodule Alloy.Provider.OpenAIStream do
   defp next_unused_index(tool_calls) when map_size(tool_calls) == 0, do: 0
   defp next_unused_index(tool_calls), do: (tool_calls |> Map.keys() |> Enum.max()) + 1
 
-  defp merge_function_delta(existing, :error), do: {:ok, existing}
-  defp merge_function_delta(existing, {:ok, nil}), do: {:ok, existing}
+  defp merge_function_delta(existing, :error), do: {:ok, existing, ""}
+  defp merge_function_delta(existing, {:ok, nil}), do: {:ok, existing, ""}
 
   defp merge_function_delta(existing, {:ok, func}) when is_map(func) do
     with {:ok, with_name} <- merge_function_name(existing, Map.fetch(func, "name")) do
@@ -462,10 +501,10 @@ defmodule Alloy.Provider.OpenAIStream do
   defp merge_function_name(_existing, {:ok, _invalid}),
     do: {:error, "Invalid function name in Chat Completions tool call delta"}
 
-  defp merge_function_args(existing, :error), do: {:ok, existing}
+  defp merge_function_args(existing, :error), do: {:ok, existing, ""}
 
   defp merge_function_args(existing, {:ok, args}) when is_binary(args),
-    do: {:ok, %{existing | arguments_buffer: existing.arguments_buffer <> args}}
+    do: {:ok, %{existing | arguments_buffer: existing.arguments_buffer <> args}, args}
 
   defp merge_function_args(existing, {:ok, _invalid}) do
     name = existing.name || "unknown"

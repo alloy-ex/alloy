@@ -137,7 +137,7 @@ defmodule Alloy.Events do
   end
 
   defp normalize_event_fields(event, payload, seq_ref, correlation_id)
-       when event in [:tool_start, :tool_end] and is_map(payload) do
+       when event in [:tool_start, :tool_update, :tool_end] and is_map(payload) do
     seq = Map.get(payload, :event_seq) || next_event_seq(seq_ref)
     effective_correlation_id = Map.get(payload, :correlation_id) || correlation_id
     normalized_payload = Map.drop(payload, [:event_seq, :correlation_id])

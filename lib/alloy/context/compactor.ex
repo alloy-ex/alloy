@@ -89,7 +89,11 @@ defmodule Alloy.Context.Compactor do
     :prompt_cache_key,
     "prompt_cache_key",
     :prompt_cache_retention,
-    "prompt_cache_retention"
+    "prompt_cache_retention",
+    :reasoning,
+    "reasoning",
+    :reasoning_effort,
+    "reasoning_effort"
   ]
 
   # extra_body keys that alter thinking, tools, context editing, or output
@@ -100,6 +104,8 @@ defmodule Alloy.Context.Compactor do
     "thinking",
     :reasoning,
     "reasoning",
+    :reasoning_effort,
+    "reasoning_effort",
     :tools,
     "tools",
     :tool_choice,
@@ -840,7 +846,7 @@ defmodule Alloy.Context.Compactor do
     # by the caller's deadline.
     summary_state = %{
       state
-      | config: %{state.config | fallback_providers: sanitized_fallbacks},
+      | config: %{state.config | fallback_providers: sanitized_fallbacks, reasoning: nil},
         messages: [Message.user(prompt)],
         tool_defs: []
     }

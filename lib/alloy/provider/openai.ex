@@ -107,6 +107,8 @@ defmodule Alloy.Provider.OpenAI do
           optional(:previous_response_id) => String.t(),
           optional(:prompt_cache_key) => String.t(),
           optional(:prompt_cache_retention) => String.t(),
+          optional(:reasoning) => Alloy.Provider.reasoning(),
+          optional(:on_event) => (term() -> :ok),
           optional(:built_in_tools) => [map()],
           optional(:web_search) => boolean() | map(),
           optional(:x_search) => boolean() | map(),
@@ -119,9 +121,8 @@ defmodule Alloy.Provider.OpenAI do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    body = build_request_body(messages, tool_defs, config)
-
-    with {:ok, api_key} <- HTTP.resolve_api_key(config),
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- HTTP.resolve_api_key(config),
          {:ok, resp_body} <-
            HTTP.post_json(
              responses_url(config),
@@ -138,20 +139,19 @@ defmodule Alloy.Provider.OpenAI do
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
-    body =
-      messages
-      |> build_request_body(tool_defs, config)
-      |> Map.put("stream", true)
-
     initial_acc = %{
       buffer: "",
       response: nil,
       stream_error: nil,
       sticky_error: nil,
-      on_chunk: on_chunk
+      function_calls: %{},
+      on_chunk: on_chunk,
+      on_event: Map.get(config, :on_event, fn _ -> :ok end)
     }
 
-    with {:ok, api_key} <- HTTP.resolve_api_key(config),
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- HTTP.resolve_api_key(config),
+         body = Map.put(body, "stream", true),
          {:ok, acc} <-
            HTTP.stream_sse(
              responses_url(config),
@@ -177,44 +177,68 @@ defmodule Alloy.Provider.OpenAI do
   # --- Request Building ---
 
   defp build_request_body(messages, tool_defs, config) do
-    input_items = build_input_items(messages, config)
+    with {:ok, reasoning} <- Alloy.Provider.normalize_reasoning(Map.get(config, :reasoning)) do
+      input_items = build_input_items(messages, config)
 
-    body =
-      %{"model" => config.model, "input" => input_items}
-      |> HTTP.maybe_put_unless_empty_list("max_output_tokens", Map.get(config, :max_tokens))
-      |> HTTP.maybe_put_unless_empty_list(
-        "previous_response_id",
-        Map.get(config, :previous_response_id)
-      )
-      |> HTTP.maybe_put_unless_empty_list("store", Map.get(config, :store))
-      |> HTTP.maybe_put_unless_empty_list("include", Map.get(config, :include))
-      |> maybe_put_reasoning_include(config)
-      |> HTTP.maybe_put_unless_empty_list("tool_choice", Map.get(config, :tool_choice))
-      |> HTTP.maybe_put_unless_empty_list(
-        "parallel_tool_calls",
-        Map.get(config, :parallel_tool_calls)
-      )
-      |> maybe_put_non_empty_string("prompt_cache_key", Map.get(config, :prompt_cache_key))
-      |> maybe_put_non_empty_string(
-        "prompt_cache_retention",
-        Map.get(config, :prompt_cache_retention)
-      )
+      body =
+        %{"model" => config.model, "input" => input_items}
+        |> HTTP.maybe_put_unless_empty_list("max_output_tokens", Map.get(config, :max_tokens))
+        |> HTTP.maybe_put_unless_empty_list(
+          "previous_response_id",
+          Map.get(config, :previous_response_id)
+        )
+        |> HTTP.maybe_put_unless_empty_list("store", Map.get(config, :store))
+        |> HTTP.maybe_put_unless_empty_list("include", Map.get(config, :include))
+        |> maybe_put_reasoning_include(config)
+        |> HTTP.maybe_put_unless_empty_list("tool_choice", Map.get(config, :tool_choice))
+        |> HTTP.maybe_put_unless_empty_list(
+          "parallel_tool_calls",
+          Map.get(config, :parallel_tool_calls)
+        )
+        |> maybe_put_non_empty_string("prompt_cache_key", Map.get(config, :prompt_cache_key))
+        |> maybe_put_non_empty_string(
+          "prompt_cache_retention",
+          Map.get(config, :prompt_cache_retention)
+        )
 
-    tools = Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
+      tools = Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
 
-    body =
-      body
-      |> HTTP.maybe_put_unless_empty_list("tools", tools)
-      |> maybe_put_output_schema(config)
+      body =
+        body
+        |> HTTP.maybe_put_unless_empty_list("tools", tools)
+        |> maybe_put_output_schema(config)
+        |> maybe_put_reasoning(reasoning)
 
-    # Merge extra_body LAST so caller can override any field (#18), preserving
-    # sibling keys inside "text" (e.g. verbosity alongside format).
-    HTTP.merge_extra_body(
-      body,
-      HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
-      "text"
-    )
+      # Merge extra_body LAST so caller can override any field (#18), preserving
+      # sibling keys inside "text" (e.g. verbosity alongside format).
+      {:ok,
+       HTTP.merge_extra_body(
+         body,
+         HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
+         "text"
+       )}
+    end
   end
+
+  defp maybe_put_reasoning(body, nil), do: body
+
+  defp maybe_put_reasoning(body, %{effort: effort, display: display}) do
+    reasoning =
+      %{"effort" => openai_reasoning_effort(effort)}
+      |> then(fn map ->
+        if effort != :off and display == :summarized,
+          do: Map.put(map, "summary", "auto"),
+          else: map
+      end)
+
+    Map.put(body, "reasoning", reasoning)
+  end
+
+  defp openai_reasoning_effort(:off), do: "none"
+  defp openai_reasoning_effort(:low), do: "low"
+  defp openai_reasoning_effort(:medium), do: "medium"
+  defp openai_reasoning_effort(:high), do: "high"
+  defp openai_reasoning_effort(:xhigh), do: "xhigh"
 
   defp maybe_put_non_empty_string(body, key, value) when is_binary(value) and value != "",
     do: Map.put(body, key, value)
@@ -502,6 +526,65 @@ defmodule Alloy.Provider.OpenAI do
     acc
   end
 
+  defp process_stream_event(acc, event_type, %{"delta" => delta})
+       when event_type in [
+              "response.reasoning_summary_text.delta",
+              "response.reasoning_text.delta"
+            ] and
+              is_binary(delta) and delta != "" do
+    acc.on_event.({:thinking_delta, delta})
+    acc
+  end
+
+  defp process_stream_event(
+         acc,
+         "response.output_item.added",
+         %{"item" => %{"type" => "function_call"} = item} = payload
+       ) do
+    index = if is_integer(payload["output_index"]), do: payload["output_index"], else: 0
+    call_id = item["call_id"] || item["id"]
+    name = item["name"]
+    meta = %{id: call_id, index: index, name: name}
+
+    delta_event = Map.put(meta, :arguments_delta, "")
+    acc.on_event.({:tool_call_delta, delta_event})
+
+    function_calls =
+      acc.function_calls
+      |> maybe_put_call_meta(item["id"], meta)
+      |> Map.put({:index, index}, meta)
+
+    %{acc | function_calls: function_calls}
+  end
+
+  defp process_stream_event(
+         acc,
+         "response.function_call_arguments.delta",
+         %{"delta" => delta} = payload
+       )
+       when is_binary(delta) and delta != "" do
+    index = if is_integer(payload["output_index"]), do: payload["output_index"], else: nil
+
+    meta =
+      Map.get(acc.function_calls, payload["item_id"]) ||
+        lookup_call_by_index(acc.function_calls, index) ||
+        %{id: payload["call_id"] || payload["item_id"], index: index || 0, name: nil}
+
+    effective_index = index || meta.index || 0
+
+    acc.on_event.(
+      {:tool_call_delta,
+       %{
+         id: meta.id,
+         index: effective_index,
+         name: meta.name,
+         arguments_delta: delta
+       }}
+    )
+
+    acc
+  end
+
   # Every terminal event carries the whole response, and parse_response/1
   # reads its status, so completed, incomplete and failed share one path.
   defp process_stream_event(acc, event_type, %{"response" => response})
@@ -520,6 +603,16 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp process_stream_event(acc, _event_type, _payload), do: acc
+
+  defp maybe_put_call_meta(map, id, meta) when is_binary(id) and id != "",
+    do: Map.put(map, id, meta)
+
+  defp maybe_put_call_meta(map, _id, _meta), do: map
+
+  defp lookup_call_by_index(calls, index) when is_integer(index),
+    do: Map.get(calls, {:index, index})
+
+  defp lookup_call_by_index(_calls, _index), do: nil
 
   defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
   defp build_stream_response(%{sticky_error: %Error{} = error}), do: {:error, error}

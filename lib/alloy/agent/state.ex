@@ -97,8 +97,8 @@ defmodule Alloy.Agent.State do
   Prepares request inputs from `:before_completion` middleware.
 
   Accepts `:messages`, `:tools`, `:system_prompt`, `:provider` (the same
-  provider tuple accepted by `Alloy.run/2`), and `:output_schema`. Changes
-  persist for later turns.
+  provider tuple accepted by `Alloy.run/2`), `:output_schema`, and
+  `:reasoning`. Changes persist for later turns.
   Tools and their wire definitions are rebuilt together. Provider changes
   re-derive model limits and discard previous opaque provider state; pass an
   explicit `provider_state` in the new provider config to restore it.
@@ -106,7 +106,16 @@ defmodule Alloy.Agent.State do
   """
   @spec prepare(t(), keyword()) :: t()
   def prepare(%__MODULE__{} = state, opts) when is_list(opts) do
-    opts = Keyword.validate!(opts, [:messages, :tools, :system_prompt, :provider, :output_schema])
+    opts =
+      Keyword.validate!(opts, [
+        :messages,
+        :tools,
+        :system_prompt,
+        :provider,
+        :output_schema,
+        :reasoning
+      ])
+
     config = prepare_config(state.config, opts)
     {tool_defs, tool_fns} = Registry.build(config.tools)
     messages = Keyword.get(opts, :messages, state.messages)
@@ -149,7 +158,33 @@ defmodule Alloy.Agent.State do
         :error -> config.output_schema
       end
 
-    %{config | system_prompt: prompt, output_schema: output_schema}
+    {reasoning, provider_config} =
+      case Keyword.fetch(opts, :reasoning) do
+        {:ok, spec} ->
+          normalized = Alloy.Provider.normalize_reasoning!(spec)
+
+          # When middleware explicitly updates :reasoning without setting a
+          # provider-specific :reasoning in the same call, clear any earlier
+          # provider-level :reasoning so the new setting takes effect.
+          updated_provider_config =
+            if Keyword.has_key?(opts, :provider) and
+                 Map.has_key?(config.provider_config, :reasoning),
+               do: config.provider_config,
+               else: Map.delete(config.provider_config, :reasoning)
+
+          {normalized, updated_provider_config}
+
+        :error ->
+          {config.reasoning, config.provider_config}
+      end
+
+    %{
+      config
+      | system_prompt: prompt,
+        output_schema: output_schema,
+        reasoning: reasoning,
+        provider_config: provider_config
+    }
   end
 
   defp prepared_provider_state(state, config) do
