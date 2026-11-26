@@ -288,7 +288,7 @@ defmodule Alloy.Provider.HTTP do
              do: err.kind,
              else: :auth
 
-        safe_status = if is_integer(err.status), do: err.status, else: nil
+        safe_status = if is_integer(err.status) and err.status > 0, do: err.status, else: nil
 
         safe_retry_after =
           if is_integer(err.retry_after_ms) and err.retry_after_ms >= 0,

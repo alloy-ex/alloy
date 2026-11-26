@@ -134,54 +134,64 @@ defmodule Alloy.Provider.Retry do
 
     primary_origin = Message.origin(state.config.provider, provider_config)
 
-    Enum.reduce_while(state.config.fallback_providers, last_error, fn
-      {fb_provider, fb_config}, acc ->
-        now = System.monotonic_time(:millisecond)
+    base_messages =
+      Message.attribute_file_blocks(state.messages, primary_origin, state.config.provider)
 
-        if is_integer(deadline) and deadline - now <= 0 do
-          {:halt, acc}
-        else
-          fb_provider_config = Map.merge(fb_config, runtime_overrides)
-          fb_streaming? = streaming? and supports_streaming?(fb_provider)
+    {final_result, _messages} =
+      Enum.reduce_while(
+        state.config.fallback_providers,
+        {last_error, base_messages},
+        fn {fb_provider, fb_config}, {acc_err, messages_acc} ->
+          now = System.monotonic_time(:millisecond)
 
-          attributed_state = %{
-            state
-            | messages:
-                Message.attribute_file_blocks(
-                  state.messages,
-                  primary_origin,
-                  state.config.provider
-                )
-          }
+          if is_integer(deadline) and deadline - now <= 0 do
+            {:halt, {acc_err, messages_acc}}
+          else
+            fb_provider_config = Map.merge(fb_config, runtime_overrides)
+            fb_streaming? = streaming? and supports_streaming?(fb_provider)
+            fb_origin = Message.origin(fb_provider, fb_provider_config)
 
-          {result, chunks_emitted?} =
-            do_provider_call(
-              normalize_for(attributed_state, fb_provider, fb_provider_config),
-              fb_provider,
-              fb_provider_config,
-              fb_streaming?,
-              on_chunk,
-              state.config.max_retries,
-              deadline
-            )
+            attempt_messages =
+              Message.attribute_file_blocks(messages_acc, fb_origin, fb_provider)
 
-          case result do
-            {:ok, response} ->
-              {:halt,
-               {:ok,
-                isolate_fallback_state(response, fb_provider, fb_provider_config, primary_origin)}}
+            attributed_state = %{state | messages: attempt_messages}
 
-            {:error, _} = error when chunks_emitted? ->
-              {:halt, error}
+            {result, chunks_emitted?} =
+              do_provider_call(
+                normalize_for(attributed_state, fb_provider, fb_provider_config),
+                fb_provider,
+                fb_provider_config,
+                fb_streaming?,
+                on_chunk,
+                state.config.max_retries,
+                deadline
+              )
 
-            {:error, %Error{kind: :shutdown}} = error ->
-              {:halt, error}
+            case result do
+              {:ok, response} ->
+                {:halt,
+                 {{:ok,
+                   isolate_fallback_state(
+                     response,
+                     fb_provider,
+                     fb_provider_config,
+                     primary_origin
+                   )}, attempt_messages}}
 
-            {:error, _} = error ->
-              {:cont, error}
+              {:error, _} = error when chunks_emitted? ->
+                {:halt, {error, attempt_messages}}
+
+              {:error, %Error{kind: :shutdown}} = error ->
+                {:halt, {error, attempt_messages}}
+
+              {:error, _} = error ->
+                {:cont, {error, attempt_messages}}
+            end
           end
         end
-    end)
+      )
+
+    final_result
   end
 
   defp isolate_fallback_state(response, fb_provider, fb_config, primary_origin) do

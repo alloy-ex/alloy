@@ -770,6 +770,127 @@ defmodule Alloy.Provider.GeminiTest do
       assert_received {:request_body, top_body}
       refute Map.has_key?(Jason.decode!(top_body), "tools")
     end
+
+    test "binds unattributed Gemini File API URI to the Gemini fallback account that handled it" do
+      test_pid = self()
+      gem_uri = "https://generativelanguage.googleapis.com/v1beta/files/acct-a-doc"
+
+      gem_a_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:gem_a_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(gemini_response([%{"text" => "from gem A"}])))
+      end
+
+      gem_b_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:gem_b_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(gemini_response([%{"text" => "from gem B"}])))
+      end
+
+      user_msg = %Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Summarize"},
+          Message.document("application/pdf", gem_uri)
+        ]
+      }
+
+      gem_a_cfg = %{
+        api_key: "gem-acct-a",
+        model: "gemini-2.5-flash",
+        req_options: [plug: gem_a_plug]
+      }
+
+      # 1. Anthropic primary fails -> Gemini Account A fallback handles the URI and binds its origin.
+      assert {:ok, res_a} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: fn -> {:error, :auth_failed} end,
+                    origin_key: "ant-primary",
+                    model: "claude-sonnet-5-5"},
+                 fallback_providers: [{Gemini, gem_a_cfg}],
+                 max_retries: 0
+               )
+
+      assert res_a.text == "from gem A"
+      assert_received {:gem_a_body, body_a}
+      assert body_a =~ gem_uri
+
+      gem_a_origin = Message.origin(Gemini, gem_a_cfg)
+      [persisted_user | _] = res_a.messages
+      assert [_, %{uri: ^gem_uri, origin: ^gem_a_origin}] = persisted_user.content
+
+      # 2. Resuming on Gemini Account B omits Account A's URI instead of sending it.
+      assert {:ok, res_b} =
+               Alloy.run("Follow up",
+                 messages: res_a.messages,
+                 provider:
+                   {Gemini,
+                    api_key: "gem-acct-b",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_b_plug]},
+                 max_retries: 0
+               )
+
+      assert res_b.text == "from gem B"
+      assert_received {:gem_b_body, body_b}
+      refute body_b =~ gem_uri
+      assert body_b =~ "Omitted provider-specific file attachment"
+
+      # 3. Resuming on the same Gemini Account A preserves the URI intact.
+      assert {:ok, _} =
+               Alloy.run("Follow up on A",
+                 messages: res_a.messages,
+                 provider: {Gemini, gem_a_cfg},
+                 max_retries: 0
+               )
+
+      assert_received {:gem_a_body, body_a_resumed}
+      assert body_a_resumed =~ gem_uri
+
+      # 4. Within a single fallback chain (Anthropic fails -> Gemini A fails -> Gemini B succeeds),
+      #    Gemini B does not receive Account A's URI.
+      gem_a_fail_plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          500,
+          Jason.encode!(%{"error" => %{"status" => "INTERNAL", "message" => "boom"}})
+        )
+      end
+
+      assert {:ok, %{text: "from gem B"}} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: fn -> {:error, :auth_failed} end,
+                    origin_key: "ant-primary",
+                    model: "claude-sonnet-5-5"},
+                 fallback_providers: [
+                   {Gemini,
+                    api_key: "gem-acct-a",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_a_fail_plug]},
+                   {Gemini,
+                    api_key: "gem-acct-b",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_b_plug]}
+                 ],
+                 max_retries: 0
+               )
+
+      assert_received {:gem_b_body, body_b_chain}
+      refute body_b_chain =~ gem_uri
+    end
   end
 
   describe "stream/4" do

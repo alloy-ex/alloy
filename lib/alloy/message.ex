@@ -294,16 +294,18 @@ defmodule Alloy.Message do
 
   @doc """
   The origin fingerprint for a provider and its config: a hash of the
-  module, `:api_url` and `:origin_key` (falling back to `:api_key`). Two
-  configs share an origin exactly when they reach the same endpoint with the
-  same credentials.
+  module, `:api_url`, and `:origin_key` (falling back to `:api_key`).
+  `:origin_key` defines the account identity: two configs targeting the same
+  provider module and endpoint share an origin when they use the same
+  `:origin_key` (even across rotated credentials or multiple keys in the same
+  project/workspace, such as a same-project Gemini fallback).
 
   Function-valued `:api_key` callbacks are never invoked during origin hashing.
   Because closure inspection does not capture runtime values and changes across
   recompiles, `Alloy.Agent.Config` requires a stable `:origin_key` string
-  whenever `:api_key` is a function; direct `origin/2` calls without
-  `:origin_key` include `:erlang.fun_info(fun, :env)` so distinct captured
-  accounts do not collide.
+  whenever `:api_key` is a function (or `auth_scheme: :bearer`); direct
+  `origin/2` calls without `:origin_key` include `:erlang.fun_info(fun, :env)`
+  so distinct captured accounts do not collide.
   """
   @spec origin(module(), map()) :: String.t()
   def origin(provider, config) when is_atom(provider) and is_map(config) do
@@ -344,24 +346,40 @@ defmodule Alloy.Message do
   @spec attribute_file_blocks([t()], String.t(), module() | nil) :: [t()]
   def attribute_file_blocks(messages, origin_id, provider \\ nil)
       when is_list(messages) and is_binary(origin_id) and is_atom(provider) do
-    Enum.map(messages, fn
-      %__MODULE__{role: :user, content: blocks} = msg when is_list(blocks) ->
-        updated =
-          Enum.map(blocks, fn block ->
-            if attributable_file_block?(block, provider) and
-                 is_nil(Map.get(block, :origin) || msg.origin) do
-              Map.put(block, :origin, origin_id)
-            else
-              block
-            end
-          end)
+    if Enum.any?(messages, &needs_file_attribution?(&1, provider)) do
+      Enum.map(messages, &attribute_message_file_blocks(&1, origin_id, provider))
+    else
+      messages
+    end
+  end
 
-        %{msg | content: updated}
+  defp attribute_message_file_blocks(
+         %__MODULE__{role: :user, origin: nil, content: blocks} = msg,
+         origin_id,
+         provider
+       )
+       when is_list(blocks) do
+    %{msg | content: Enum.map(blocks, &attribute_file_block(&1, origin_id, provider))}
+  end
 
-      other ->
-        other
+  defp attribute_message_file_blocks(other, _origin_id, _provider), do: other
+
+  defp attribute_file_block(block, origin_id, provider) do
+    if attributable_file_block?(block, provider) and is_nil(Map.get(block, :origin)) do
+      Map.put(block, :origin, origin_id)
+    else
+      block
+    end
+  end
+
+  defp needs_file_attribution?(%__MODULE__{role: :user, origin: nil, content: blocks}, provider)
+       when is_list(blocks) do
+    Enum.any?(blocks, fn block ->
+      attributable_file_block?(block, provider) and is_nil(Map.get(block, :origin))
     end)
   end
+
+  defp needs_file_attribution?(_msg, _provider), do: false
 
   defp attributable_file_block?(%{type: "document", file_id: _}, _provider), do: true
 
