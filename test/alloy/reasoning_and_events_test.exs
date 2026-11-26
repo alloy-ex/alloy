@@ -3321,6 +3321,190 @@ defmodule Alloy.ReasoningAndEventsTest do
                )
 
       refute Enum.any?(drain_tagged(:gem_fb_ev), &(&1.event == :tool_call_delta))
+
+      # 3. Gemini MISSING_THOUGHT_SIGNATURE suppresses :tool_call_delta and preserves fallback.
+      gem_sig_plug =
+        sse_plug(
+          "data: " <>
+            Jason.encode!(%{
+              "candidates" => [
+                %{
+                  "content" => %{
+                    "role" => "model",
+                    "parts" => [%{"functionCall" => %{"name" => "echo", "args" => %{"x" => 1}}}]
+                  },
+                  "finishReason" => "MISSING_THOUGHT_SIGNATURE"
+                }
+              ],
+              "usageMetadata" => %{"promptTokenCount" => 1, "candidatesTokenCount" => 1}
+            }) <> "\n\n"
+        )
+
+      {:ok, gem_sig_fb_pid} =
+        TestProvider.start_link([TestProvider.text_response("sig fallback ok")])
+
+      assert {:ok, %{text: "sig fallback ok"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {Gemini,
+                    api_key: "sk-gem",
+                    model: "gemini-3.8-flash",
+                    req_options: [plug: gem_sig_plug]},
+                 fallback_providers: [{TestProvider, agent_pid: gem_sig_fb_pid}],
+                 max_retries: 0,
+                 on_event: &send(parent, {:gem_sig_ev, &1})
+               )
+
+      refute Enum.any?(drain_tagged(:gem_sig_ev), &(&1.event == :tool_call_delta))
+
+      # 4. Anthropic negative tool-call index suppresses :tool_call_delta and preserves retry + fallback.
+      ant_neg_attempts = :atomics.new(1, signed: false)
+
+      ant_neg_plug = fn conn ->
+        n = :atomics.add_get(ant_neg_attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            sse_ant("message_start", %{
+              "type" => "message_start",
+              "message" => %{
+                "id" => "m_neg",
+                "role" => "assistant",
+                "usage" => %{"input_tokens" => 1}
+              }
+            }) <>
+              sse_ant("content_block_start", %{
+                "type" => "content_block_start",
+                "index" => -1,
+                "content_block" => %{
+                  "type" => "tool_use",
+                  "id" => "toolu_neg",
+                  "name" => "echo",
+                  "input" => %{}
+                }
+              }) <>
+              sse_ant("error", %{
+                "type" => "error",
+                "error" => %{"type" => "overloaded_error", "message" => "busy"}
+              })
+          else
+            sse_ant("message_start", %{
+              "type" => "message_start",
+              "message" => %{
+                "id" => "m_neg2",
+                "role" => "assistant",
+                "usage" => %{"input_tokens" => 1}
+              }
+            }) <>
+              sse_ant("content_block_start", %{
+                "type" => "content_block_start",
+                "index" => 0,
+                "content_block" => %{"type" => "text", "text" => ""}
+              }) <>
+              sse_ant("content_block_delta", %{
+                "type" => "content_block_delta",
+                "index" => 0,
+                "delta" => %{"type" => "text_delta", "text" => "ant neg recovered"}
+              }) <>
+              sse_ant("content_block_stop", %{"type" => "content_block_stop", "index" => 0}) <>
+              sse_ant("message_delta", %{
+                "type" => "message_delta",
+                "delta" => %{"stop_reason" => "end_turn"},
+                "usage" => %{"output_tokens" => 1}
+              }) <>
+              sse_ant("message_stop", %{"type" => "message_stop"})
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "ant neg recovered"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {Anthropic,
+                    api_key: "sk-ant",
+                    model: "claude-sonnet-4-6",
+                    req_options: [plug: ant_neg_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0,
+                 on_event: &send(parent, {:ant_neg_ev, &1})
+               )
+
+      assert :atomics.get(ant_neg_attempts, 1) == 2
+      refute Enum.any?(drain_tagged(:ant_neg_ev), &(&1.event == :tool_call_delta))
+
+      # 5. OpenAICompat (OpenAIStream) negative tool-call index suppresses :tool_call_delta
+      #    and preserves both retry and fallback eligibility.
+      compat_neg_attempts = :atomics.new(1, signed: false)
+
+      compat_neg_plug = fn conn ->
+        n = :atomics.add_get(compat_neg_attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            "data: " <>
+              Jason.encode!(%{
+                "choices" => [
+                  %{
+                    "index" => 0,
+                    "delta" => %{
+                      "tool_calls" => [
+                        %{
+                          "index" => -1,
+                          "id" => "call_neg",
+                          "function" => %{"name" => "echo", "arguments" => "{}"}
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }) <>
+              "\n\n" <>
+              "data: " <>
+              Jason.encode!(%{
+                "error" => %{"type" => "server_error", "message" => "transient"}
+              }) <> "\n\n"
+          else
+            "data: " <>
+              Jason.encode!(%{
+                "choices" => [
+                  %{
+                    "index" => 0,
+                    "delta" => %{"content" => "compat neg ok"},
+                    "finish_reason" => nil
+                  }
+                ]
+              }) <>
+              "\n\n" <>
+              "data: " <>
+              Jason.encode!(%{
+                "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => "stop"}],
+                "usage" => %{"prompt_tokens" => 1, "completion_tokens" => 1}
+              }) <> "\n\ndata: [DONE]\n\n"
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "compat neg ok"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAICompat,
+                    api_url: "https://compat.example/v1",
+                    api_key: "sk-compat",
+                    model: "qwen3",
+                    req_options: [plug: compat_neg_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0,
+                 on_event: &send(parent, {:compat_neg_ev, &1})
+               )
+
+      assert :atomics.get(compat_neg_attempts, 1) == 2
+      refute Enum.any?(drain_tagged(:compat_neg_ev), &(&1.event == :tool_call_delta))
     end
   end
 

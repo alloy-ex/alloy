@@ -288,7 +288,7 @@ defmodule Alloy.Provider.Anthropic do
          "index" => index,
          "content_block" => block
        })
-       when is_integer(index) and is_map(block) do
+       when is_integer(index) and index >= 0 and is_map(block) do
     case validate_start_block(block) do
       {:ok, normalized} ->
         acc =
@@ -331,7 +331,7 @@ defmodule Alloy.Provider.Anthropic do
          "index" => index,
          "delta" => %{"type" => "thinking_delta", "thinking" => text}
        })
-       when is_integer(index) and is_binary(text) do
+       when is_integer(index) and index >= 0 and is_binary(text) do
     case Map.get(acc.content_blocks, index) do
       %{"type" => "thinking", "thinking" => existing} = current when is_binary(existing) ->
         acc.on_event.({:thinking_delta, text})
@@ -346,7 +346,7 @@ defmodule Alloy.Provider.Anthropic do
          "index" => index,
          "delta" => %{"type" => "signature_delta", "signature" => sig}
        })
-       when is_integer(index) and is_binary(sig) do
+       when is_integer(index) and index >= 0 and is_binary(sig) do
     case Map.get(acc.content_blocks, index) do
       %{"type" => "thinking"} = current ->
         case Map.get(current, "signature") do
@@ -369,7 +369,7 @@ defmodule Alloy.Provider.Anthropic do
          "index" => index,
          "delta" => %{"type" => "text_delta", "text" => text}
        })
-       when is_integer(index) and is_binary(text) do
+       when is_integer(index) and index >= 0 and is_binary(text) do
     case Map.get(acc.content_blocks, index) do
       %{"type" => "text", "text" => existing} = current when is_binary(existing) ->
         # :text_delta on_event is emitted by Turn.wrapped_chunk universally.
@@ -385,7 +385,7 @@ defmodule Alloy.Provider.Anthropic do
          "index" => index,
          "delta" => %{"type" => "input_json_delta", "partial_json" => json}
        })
-       when is_integer(index) and is_binary(json) do
+       when is_integer(index) and index >= 0 and is_binary(json) do
     current = Map.get(acc.content_blocks, index)
 
     cond do
@@ -424,7 +424,7 @@ defmodule Alloy.Provider.Anthropic do
          "index" => index,
          "delta" => %{"type" => delta_type}
        })
-       when is_integer(index) and is_binary(delta_type) and
+       when is_integer(index) and index >= 0 and is_binary(delta_type) and
               delta_type not in [
                 "input_json_delta",
                 "text_delta",
@@ -447,7 +447,7 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp handle_sse_event(acc, "content_block_stop", %{"index" => index})
-       when is_integer(index) do
+       when is_integer(index) and index >= 0 do
     acc = %{acc | open_tool_blocks: Map.delete(acc.open_tool_blocks, index)}
 
     case Map.get(acc.input_json_buffers, index) do

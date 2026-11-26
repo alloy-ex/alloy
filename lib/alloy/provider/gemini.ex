@@ -104,6 +104,7 @@ defmodule Alloy.Provider.Gemini do
   # succeeds, so these are retried like a server error.
   @generation_errors ~w(MALFORMED_FUNCTION_CALL MALFORMED_RESPONSE UNEXPECTED_TOOL_CALL
                         TOO_MANY_TOOL_CALLS NO_IMAGE)
+  @error_finish_reasons @generation_errors ++ ["MISSING_THOUGHT_SIGNATURE"]
 
   @typedoc """
   Configuration for the Gemini provider. See the module doc for field
@@ -955,7 +956,7 @@ defmodule Alloy.Provider.Gemini do
     case extract_candidate_blocks(candidate) do
       {:ok, blocks} ->
         tool_call_count =
-          if Map.get(candidate, "finishReason") in @generation_errors do
+          if Map.get(candidate, "finishReason") in @error_finish_reasons do
             acc.tool_call_count
           else
             Enum.reduce(blocks, acc.tool_call_count, fn block, tc_idx ->

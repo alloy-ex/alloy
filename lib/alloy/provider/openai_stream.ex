@@ -470,7 +470,7 @@ defmodule Alloy.Provider.OpenAIStream do
   # deltas, while rejecting explicit non-integer indices.
   defp resolve_tool_call_index(tc_delta, acc) do
     case Map.fetch(tc_delta, "index") do
-      {:ok, index} when is_integer(index) ->
+      {:ok, index} when is_integer(index) and index >= 0 ->
         {:ok, index}
 
       missing when missing in [:error, {:ok, nil}] ->
