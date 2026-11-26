@@ -278,9 +278,11 @@ defmodule Alloy.Provider.OpenAICompat do
     do: %{"type" => "image_url", "image_url" => %{"url" => "data:#{mime};base64,#{data}"}}
 
   defp format_user_content_block(%{type: "image", url: url}) when is_binary(url) do
-    if HTTP.http_url?(url),
-      do: %{"type" => "image_url", "image_url" => %{"url" => url}},
-      else: nil
+    if HTTP.http_url?(url) do
+      %{"type" => "image_url", "image_url" => %{"url" => url}}
+    else
+      %{"type" => "text", "text" => "[Unsupported image URL scheme for OpenAICompat provider]"}
+    end
   end
 
   defp format_user_content_block(_), do: nil

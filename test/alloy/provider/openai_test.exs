@@ -1367,6 +1367,108 @@ defmodule Alloy.Provider.OpenAITest do
 
       assert doc_url == %{"type" => "input_file", "file_url" => "https://example.com/remote.pdf"}
       assert doc_file == %{"type" => "input_file", "file_id" => "file_oai_1"}
+
+      # Non-HTTP image URL falls back to unsupported notice.
+      non_http_msg = [%Alloy.Message{role: :user, content: [Message.image_url("gs://b/a.png")]}]
+      assert {:ok, _} = OpenAI.complete(non_http_msg, [], config)
+      assert_received {:request_body, nh_body}
+
+      [%{"content" => [%{"type" => "input_text", "text" => nh_text}]}] =
+        Jason.decode!(nh_body)["input"]
+
+      assert nh_text =~ "Unsupported"
+    end
+
+    test "dynamic api_key re-invokes on retry, skips retry on :auth error, and strips foreign user file_id on fallback" do
+      test_pid = self()
+      attempts = :atomics.new(1, signed: false)
+
+      retry_plug = fn conn ->
+        send(test_pid, {:attempt_headers, conn.req_headers})
+        n = :atomics.add_get(attempts, 1, 1)
+
+        if n == 1 do
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(500, Jason.encode!(%{"error" => %{"message" => "transient"}}))
+        else
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(
+            200,
+            Jason.encode!(response_payload([assistant_text_item("ok")]))
+          )
+        end
+      end
+
+      key_calls = :atomics.new(1, signed: false)
+
+      assert {:ok, %{text: "ok"}} =
+               Alloy.run("Hi",
+                 provider:
+                   {OpenAI,
+                    api_key: fn ->
+                      n = :atomics.add_get(key_calls, 1, 1)
+                      {:ok, "rot-key-#{n}"}
+                    end,
+                    origin_key: "oai-acct-1",
+                    model: "gpt-5.4",
+                    req_options: [plug: retry_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0
+               )
+
+      assert_received {:attempt_headers, h1}
+      assert_received {:attempt_headers, h2}
+      assert {"authorization", "Bearer rot-key-1"} in h1
+      assert {"authorization", "Bearer rot-key-2"} in h2
+
+      # Primary auth callback failure skips retries and falls back to OpenAI with
+      # user-attached Anthropic file_id automatically stripped.
+      primary_calls = :atomics.new(1, signed: false)
+
+      fb_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:fallback_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(response_payload([assistant_text_item("from fallback")]))
+        )
+      end
+
+      user_msg = %Alloy.Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Summarize"},
+          Message.document_file("application/pdf", "file_ant_only")
+        ]
+      }
+
+      assert {:ok, %{text: "from fallback"}} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: fn ->
+                      :atomics.add_get(primary_calls, 1, 1)
+                      {:error, :token_expired}
+                    end,
+                    origin_key: "ant-acct-1",
+                    model: "claude-sonnet-5-5"},
+                 fallback_providers: [
+                   {OpenAI, api_key: "oai-fb-key", model: "gpt-5.4", req_options: [plug: fb_plug]}
+                 ],
+                 max_retries: 2,
+                 retry_backoff_ms: 0
+               )
+
+      assert :atomics.get(primary_calls, 1) == 1
+      assert_received {:fallback_body, fb_body}
+      refute fb_body =~ "file_ant_only"
+      assert fb_body =~ "Summarize"
     end
   end
 

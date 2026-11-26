@@ -541,16 +541,16 @@ defmodule Alloy.Agent.Turn do
     config.provider_config
     |> Map.put(:system_prompt, config.system_prompt)
     |> Map.put(:provider_state, provider_state)
-    |> maybe_enable_code_execution(config.code_execution)
+    |> maybe_enable_code_execution(config.provider, config.code_execution)
     |> maybe_put_output_schema(config.output_schema)
   end
 
-  # The top-level option only turns code execution on, so a provider config
-  # that already sets :code_execution itself is left alone when it is false.
-  defp maybe_enable_code_execution(provider_config, true),
+  # Top-level :code_execution enables Anthropic's programmatic code execution
+  # tool; other providers configure native code execution in their own config.
+  defp maybe_enable_code_execution(provider_config, Alloy.Provider.Anthropic, true),
     do: Map.put(provider_config, :code_execution, true)
 
-  defp maybe_enable_code_execution(provider_config, false), do: provider_config
+  defp maybe_enable_code_execution(provider_config, _provider, _flag), do: provider_config
 
   defp maybe_put_output_schema(provider_config, nil),
     do: Map.delete(provider_config, :output_schema)

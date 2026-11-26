@@ -159,7 +159,7 @@ defmodule Alloy.Provider.HTTP do
         {:ok, key}
 
       fun when is_function(fun, 0) ->
-        invoke_api_key_callback(fun)
+        resolve_api_key_callback(fun, Map.get(config, :alloy_request_deadline))
 
       nil ->
         {:error, %Error{kind: :auth, message: "Missing :api_key in provider config"}}
@@ -182,6 +182,39 @@ defmodule Alloy.Provider.HTTP do
     end
   end
 
+  defp resolve_api_key_callback(fun, deadline) when is_integer(deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error,
+       %Error{kind: :timeout, message: "Request exceeded deadline while resolving :api_key"}}
+    else
+      owner = OwnedWorker.start(deadline, fn -> invoke_api_key_callback(fun) end)
+
+      case await_monitored_post(owner, deadline) do
+        {:ok, result} ->
+          result
+
+        {:shutdown, _reason} ->
+          shutdown_error()
+
+        {:worker_exit, reason} ->
+          {:error,
+           %Error{
+             kind: :auth,
+             message:
+               "Dynamic :api_key callback exited: #{OwnedWorker.format_exit_reason(reason)}"
+           }}
+
+        :timeout ->
+          {:error,
+           %Error{kind: :timeout, message: "Dynamic :api_key callback exceeded request deadline"}}
+      end
+    end
+  end
+
+  defp resolve_api_key_callback(fun, _no_deadline), do: invoke_api_key_callback(fun)
+
   defp invoke_api_key_callback(fun) do
     case fun.() do
       {:ok, key} when is_binary(key) and byte_size(key) > 0 ->
@@ -194,7 +227,7 @@ defmodule Alloy.Provider.HTTP do
         {:error,
          %Error{
            kind: :auth,
-           message: "Dynamic :api_key callback failed: #{format_auth_callback_error(reason)}"
+           message: "Dynamic :api_key callback failed: #{Sanitize.shape_summary(reason)}"
          }}
 
       other ->
@@ -210,8 +243,7 @@ defmodule Alloy.Provider.HTTP do
       {:error,
        %Error{
          kind: :auth,
-         message:
-           "Dynamic :api_key callback raised: #{Sanitize.exception_summary(exception, 200)}"
+         message: "Dynamic :api_key callback raised: #{inspect(exception.__struct__)}"
        }}
   catch
     kind, reason ->
@@ -221,16 +253,6 @@ defmodule Alloy.Provider.HTTP do
          message: "Dynamic :api_key callback #{kind}: #{Sanitize.exit_summary(reason, :redact)}"
        }}
   end
-
-  defp format_auth_callback_error(reason) when is_binary(reason),
-    do: Sanitize.cap_bytes(reason, 200)
-
-  defp format_auth_callback_error(reason) when is_atom(reason), do: inspect(reason)
-
-  defp format_auth_callback_error(reason) when is_exception(reason),
-    do: Sanitize.exception_summary(reason, 200)
-
-  defp format_auth_callback_error(reason), do: Sanitize.shape_summary(reason)
 
   @doc false
   @spec cache_adjusted_usage(

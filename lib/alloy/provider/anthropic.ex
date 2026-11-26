@@ -28,6 +28,11 @@ defmodule Alloy.Provider.Anthropic do
   - `:extra_body` - Additional request body fields, merged last. A `"tools"`
     key here replaces every tool Alloy generates; use `:server_tools` to add
     tools instead.
+  - `:web_search` - `true` or config map to append Anthropic's web search tool
+    (defaults to `type: "web_search_20260209"`, `name: "web_search"`; override
+    with `web_search: %{type: "web_search_20250305"}` on older models)
+  - `:cache` - `true` / `"5m"` / `%{ttl: "5m"}` for 5-minute ephemeral prompt
+    caching, `"1h"` / `%{ttl: "1h"}` for 1-hour TTL, or `false` (default)
   - `:server_tools` - Raw tool maps sent after Alloy's own tools, for
     Anthropic-run tools such as web search, web fetch, tool search or an
     `mcp_toolset` (default: `[]`). For example
@@ -867,7 +872,7 @@ defmodule Alloy.Provider.Anthropic do
   # server tools client-side; "reasoning" and "output_item" are opaque
   # OpenAI Responses items in a transcript that switched provider.
   defp unsendable_block?(%{type: type})
-       when type in ["server_tool_result", "reasoning", "output_item"],
+       when type in ["server_tool_result", "reasoning", "output_item", "gemini_part"],
        do: true
 
   defp unsendable_block?(%{type: "thinking", thinking: thinking} = block),
@@ -931,17 +936,45 @@ defmodule Alloy.Provider.Anthropic do
     %{"type" => "text", "text" => "[Unsupported media type for Anthropic provider: #{type}]"}
   end
 
-  defp format_content_block(%{type: "document", mime_type: mime_type, data: data} = block)
-       when is_binary(mime_type) and is_binary(data) do
+  defp format_content_block(%{type: "document", mime_type: "application/pdf", data: data} = block)
+       when is_binary(data) do
     %{
       "type" => "document",
       "source" => %{
         "type" => "base64",
-        "media_type" => mime_type,
+        "media_type" => "application/pdf",
         "data" => data
       }
     }
     |> HTTP.maybe_put("title", block[:title] || block[:filename])
+  end
+
+  defp format_content_block(%{type: "document", mime_type: "text/plain", data: data} = block)
+       when is_binary(data) do
+    case Base.decode64(data) do
+      {:ok, decoded} ->
+        if String.valid?(decoded) do
+          %{
+            "type" => "document",
+            "source" => %{
+              "type" => "text",
+              "media_type" => "text/plain",
+              "data" => decoded
+            }
+          }
+          |> HTTP.maybe_put("title", block[:title] || block[:filename])
+        else
+          unsupported_inline_document_notice("text/plain")
+        end
+
+      :error ->
+        unsupported_inline_document_notice("text/plain")
+    end
+  end
+
+  defp format_content_block(%{type: "document", mime_type: mime_type, data: data})
+       when is_binary(mime_type) and is_binary(data) do
+    unsupported_inline_document_notice(mime_type)
   end
 
   defp format_content_block(%{type: "document", file_id: file_id} = block)
@@ -978,16 +1011,20 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp format_content_block(%{type: "document", mime_type: mime_type}) do
-    %{
-      "type" => "text",
-      "text" =>
-        "[Unsupported inline document (#{mime_type}) for Anthropic provider: use the Files API]"
-    }
+    unsupported_inline_document_notice(mime_type)
   end
 
   defp format_content_block(block) when is_map(block) do
     # Pass through any other block types as-is, converting atom keys to strings
     Map.new(block, fn {k, v} -> {to_string(k), v} end)
+  end
+
+  defp unsupported_inline_document_notice(mime_type) do
+    %{
+      "type" => "text",
+      "text" =>
+        "[Unsupported inline document (#{mime_type}) for Anthropic provider: base64 documents require application/pdf, or use text/plain or the Files API]"
+    }
   end
 
   defp maybe_add_cache_to_last_tool(tools, nil), do: tools

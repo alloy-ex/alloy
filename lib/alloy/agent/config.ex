@@ -159,7 +159,10 @@ defmodule Alloy.Agent.Config do
     {provider_mod, provider_config} = parse_provider(opts[:provider])
 
     provider_config =
-      provider_config |> normalize_provider_config() |> reject_removed!(provider_mod)
+      provider_config
+      |> normalize_provider_config()
+      |> reject_removed!(provider_mod)
+      |> validate_provider_auth!(provider_mod)
 
     model_metadata_overrides = normalize_model_metadata_overrides(opts[:model_metadata_overrides])
 
@@ -381,6 +384,27 @@ defmodule Alloy.Agent.Config do
     end
   end
 
+  defp validate_provider_auth!(provider_config, provider) do
+    case Map.get(provider_config, :api_key) do
+      fun when is_function(fun, 0) ->
+        origin_key = Map.get(provider_config, :origin_key)
+
+        unless is_binary(origin_key) and byte_size(origin_key) > 0 do
+          raise ArgumentError,
+                "provider #{inspect(provider)} uses a function :api_key and must also set a non-empty string :origin_key for account isolation"
+        end
+
+        provider_config
+
+      fun when is_function(fun) ->
+        raise ArgumentError,
+              "provider #{inspect(provider)} :api_key callback must be a 0-arity function"
+
+      _other ->
+        provider_config
+    end
+  end
+
   # `memory: binding` is shorthand for `tools: [Alloy.Memory.tool(binding)]`.
   defp memory_tools(nil), do: []
   defp memory_tools(binding), do: [Alloy.Memory.tool(binding)]
@@ -396,7 +420,10 @@ defmodule Alloy.Agent.Config do
     {provider_mod, provider_config} = parse_provider(provider)
 
     provider_config =
-      provider_config |> normalize_provider_config() |> reject_removed!(provider_mod)
+      provider_config
+      |> normalize_provider_config()
+      |> reject_removed!(provider_mod)
+      |> validate_provider_auth!(provider_mod)
 
     max_tokens =
       if config.max_tokens_explicit? do
@@ -449,7 +476,9 @@ defmodule Alloy.Agent.Config do
 
   defp parse_fallback_provider(entry) do
     {mod, cfg} = parse_provider_entry(entry, "fallback provider", %{})
-    {mod, cfg |> normalize_provider_config() |> reject_removed!(mod)}
+
+    {mod,
+     cfg |> normalize_provider_config() |> reject_removed!(mod) |> validate_provider_auth!(mod)}
   end
 
   defp parse_provider_entry({mod, cfg}, _label, _default)

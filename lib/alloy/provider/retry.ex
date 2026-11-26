@@ -144,9 +144,14 @@ defmodule Alloy.Provider.Retry do
           fb_provider_config = Map.merge(fb_config, runtime_overrides)
           fb_streaming? = streaming? and supports_streaming?(fb_provider)
 
+          attributed_state = %{
+            state
+            | messages: Message.attribute_file_blocks(state.messages, primary_origin)
+          }
+
           {result, chunks_emitted?} =
             do_provider_call(
-              normalize_for(state, fb_provider, fb_provider_config),
+              normalize_for(attributed_state, fb_provider, fb_provider_config),
               fb_provider,
               fb_provider_config,
               fb_streaming?,

@@ -233,14 +233,18 @@ defmodule Alloy.Message do
   Creates a provider Files API document content block.
 
   `file_id` is origin-scoped to the provider account that uploaded the file
-  (Anthropic Files API, OpenAI Files API, or Gemini File URI). Cross-origin
-  `normalize_for/3` drops `file_id` document blocks automatically.
+  (Anthropic Files API, OpenAI Files API, or Gemini File URI). Pass
+  `origin: Message.origin(provider, config)` (or `origin: {provider, config}`)
+  to bind the attachment explicitly; during fallback runs Alloy also attributes
+  unattributed user `file_id` attachments to the primary provider's origin so
+  `normalize_for/3` omits them before calling a different provider or account.
   """
   @spec document_file(String.t(), String.t(), keyword()) :: content_block()
   def document_file(mime_type, file_id, opts \\ [])
       when is_binary(mime_type) and is_binary(file_id) and is_list(opts) do
     %{type: "document", mime_type: mime_type, file_id: file_id}
     |> put_document_opts(opts)
+    |> put_document_origin(opts)
   end
 
   defp put_document_opts(block, opts) do
@@ -252,20 +256,41 @@ defmodule Alloy.Message do
     end)
   end
 
+  defp put_document_origin(block, opts) do
+    case Keyword.get(opts, :origin) do
+      origin_str when is_binary(origin_str) and origin_str != "" ->
+        Map.put(block, :origin, origin_str)
+
+      {provider, cfg} when is_atom(provider) and is_map(cfg) ->
+        Map.put(block, :origin, origin(provider, cfg))
+
+      {provider, cfg} when is_atom(provider) and is_list(cfg) ->
+        Map.put(block, :origin, origin(provider, Map.new(cfg)))
+
+      _ ->
+        block
+    end
+  end
+
   @doc """
   The origin fingerprint for a provider and its config: a hash of the
   module, `:api_url` and `:origin_key` (falling back to `:api_key`). Two
   configs share an origin exactly when they reach the same endpoint with the
-  same credentials. Function-valued `:api_key` callbacks are never invoked
-  during origin hashing; pass `:origin_key` if you construct a fresh closure
-  per call for the same account.
+  same credentials.
+
+  Function-valued `:api_key` callbacks are never invoked during origin hashing.
+  Because closure inspection does not capture runtime values and changes across
+  recompiles, `Alloy.Agent.Config` requires a stable `:origin_key` string
+  whenever `:api_key` is a function; direct `origin/2` calls without
+  `:origin_key` include `:erlang.fun_info(fun, :env)` so distinct captured
+  accounts do not collide.
   """
   @spec origin(module(), map()) :: String.t()
   def origin(provider, config) when is_atom(provider) and is_map(config) do
     credential =
       case Map.get(config, :origin_key) do
-        nil -> Map.get(config, :api_key)
-        key -> key
+        key when is_binary(key) and key != "" -> key
+        _ -> Map.get(config, :api_key)
       end
 
     input =
@@ -280,7 +305,44 @@ defmodule Alloy.Message do
 
   defp origin_part(nil), do: ""
   defp origin_part(value) when is_binary(value), do: value
+
+  defp origin_part(fun) when is_function(fun) do
+    info = {
+      :erlang.fun_info(fun, :module),
+      :erlang.fun_info(fun, :name),
+      :erlang.fun_info(fun, :uniq),
+      :erlang.fun_info(fun, :env)
+    }
+
+    "fun:" <>
+      (:sha256 |> :crypto.hash(:erlang.term_to_binary(info)) |> Base.encode16(case: :lower))
+  end
+
   defp origin_part(value), do: inspect(value)
+
+  @doc false
+  @spec attribute_file_blocks([t()], String.t()) :: [t()]
+  def attribute_file_blocks(messages, origin_id)
+      when is_list(messages) and is_binary(origin_id) do
+    Enum.map(messages, fn
+      %__MODULE__{role: :user, content: blocks} = msg when is_list(blocks) ->
+        updated =
+          Enum.map(blocks, fn
+            %{type: "document", file_id: _} = block ->
+              if Map.get(block, :origin) || msg.origin,
+                do: block,
+                else: Map.put(block, :origin, origin_id)
+
+            other ->
+              other
+          end)
+
+        %{msg | content: updated}
+
+      other ->
+        other
+    end)
+  end
 
   @doc """
   Prepares a conversation for `provider` configured with `config`.
@@ -334,18 +396,46 @@ defmodule Alloy.Message do
     end
   end
 
-  defp normalize(%__MODULE__{role: :user, content: blocks} = message, ids, _target)
-       when is_list(blocks) and map_size(ids) > 0 do
-    if Enum.any?(blocks, &(is_map(&1) and &1[:type] == "tool_result")) do
-      {[%{message | content: Enum.map(blocks, &rename_result(&1, ids))}], ids}
-    else
-      {[message], %{}}
-    end
+  defp normalize(%__MODULE__{role: :user, content: blocks} = message, ids, target)
+       when is_list(blocks) do
+    has_tool_results? = Enum.any?(blocks, &(is_map(&1) and &1[:type] == "tool_result"))
+
+    {blocks, next_ids} =
+      if map_size(ids) > 0 and has_tool_results? do
+        {Enum.map(blocks, &rename_result(&1, ids)), ids}
+      else
+        {blocks, %{}}
+      end
+
+    blocks = strip_foreign_user_file_blocks(blocks, message.origin, target)
+    {[%{message | content: blocks}], next_ids}
   end
 
   defp normalize(%__MODULE__{role: :user} = message, _ids, _target), do: {[message], %{}}
 
   defp normalize(message, ids, _target), do: {[message], ids}
+
+  defp strip_foreign_user_file_blocks(blocks, msg_origin, target) do
+    {kept, dropped?} =
+      Enum.reduce(blocks, {[], false}, fn
+        %{type: "document", file_id: _} = block, {acc, dropped?} ->
+          eff_origin = Map.get(block, :origin) || msg_origin
+
+          if eff_origin != nil and eff_origin != target do
+            {acc, true}
+          else
+            {[block | acc], dropped?}
+          end
+
+        block, {acc, dropped?} ->
+          {[block | acc], dropped?}
+      end)
+
+    case {Enum.reverse(kept), dropped?} do
+      {[], true} -> [%{type: "text", text: "[Omitted provider-specific file attachment]"}]
+      {list, _} -> list
+    end
+  end
 
   defp foreign_block(%{type: "thinking", thinking: thinking}, ids) when is_binary(thinking) do
     case String.trim(thinking) do

@@ -1197,6 +1197,8 @@ defmodule Alloy.Provider.AnthropicTest do
           content: [
             Message.image_url("https://example.com/pic.png"),
             Message.document_data("application/pdf", "JVBERi0=", title: "Report"),
+            Message.document_data("text/plain", Base.encode64("hello plain"), title: "Notes"),
+            Message.document_data("application/octet-stream", "AAAA"),
             Message.document("application/pdf", "https://example.com/doc.pdf",
               filename: "doc.pdf"
             ),
@@ -1206,15 +1208,16 @@ defmodule Alloy.Provider.AnthropicTest do
         }
       ]
 
+      config =
+        Map.put(config, :extra_headers, [{"anthropic-beta", "files-api-2025-04-14, custom-beta"}])
+
       assert {:ok, _} = Anthropic.complete(messages, [], config)
       assert_received {:request_body, body}
       assert_received {:request_headers, headers}
 
       assert {"x-api-key", "dyn-ant-key-1"} in headers
-
-      assert Enum.any?(headers, fn {k, v} ->
-               k == "anthropic-beta" and v =~ "files-api-2025-04-14"
-             end)
+      beta_val = Enum.find_value(headers, fn {k, v} -> if k == "anthropic-beta", do: v end)
+      assert beta_val == "files-api-2025-04-14,custom-beta"
 
       decoded = Jason.decode!(body)
 
@@ -1224,7 +1227,8 @@ defmodule Alloy.Provider.AnthropicTest do
                %{"type" => "web_search_20260209", "name" => "web_search", "max_uses" => 3}
              ] = decoded["tools"]
 
-      [img, doc_b64, doc_url, doc_file, doc_gcs] = hd(decoded["messages"])["content"]
+      [img, doc_b64, doc_txt, doc_bin, doc_url, doc_file, doc_gcs] =
+        hd(decoded["messages"])["content"]
 
       assert img == %{
                "type" => "image",
@@ -1240,6 +1244,19 @@ defmodule Alloy.Provider.AnthropicTest do
                  "data" => "JVBERi0="
                }
              }
+
+      assert doc_txt == %{
+               "type" => "document",
+               "title" => "Notes",
+               "source" => %{
+                 "type" => "text",
+                 "media_type" => "text/plain",
+                 "data" => "hello plain"
+               }
+             }
+
+      assert doc_bin["type"] == "text"
+      assert doc_bin["text"] =~ "Unsupported inline document (application/octet-stream)"
 
       assert doc_url == %{
                "type" => "document",
@@ -1257,9 +1274,61 @@ defmodule Alloy.Provider.AnthropicTest do
       assert doc_gcs["text"] =~ "Unsupported document URI"
       assert doc_gcs["cache_control"] == %{"type" => "ephemeral", "ttl" => "1h"}
 
-      # Invalid :cache returns non-retryable :invalid_request
+      # Verify web_search: true and map-based cache TTL configs.
+      map_cache_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{cache: %{ttl: "1h"}, web_search: true, system_prompt: "Sys"})
+
+      assert {:ok, _} = Anthropic.complete([Message.user("Hi")], [], map_cache_cfg)
+      assert_received {:request_body, map_cache_body}
+      decoded2 = Jason.decode!(map_cache_body)
+      assert [%{"type" => "web_search_20260209", "name" => "web_search"}] = decoded2["tools"]
+      assert [%{"cache_control" => %{"type" => "ephemeral", "ttl" => "1h"}}] = decoded2["system"]
+
+      # Invalid :cache returns non-retryable :invalid_request on both complete/3 and stream/4.
       assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
                Anthropic.complete([Message.user("Hi")], [], Map.put(config, :cache, "2h"))
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Anthropic.stream(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(config, :cache, "2h"),
+                 fn _ -> :ok end
+               )
+
+      # Stream path resolves dynamic :api_key and surfaces callback :auth errors.
+      stream_cfg =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 0}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "ok"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{"output_tokens" => 1}
+          }),
+          ant_event("message_stop", %{})
+        ])
+        |> Map.put(:api_key, fn -> {:ok, "dyn-stream-key"} end)
+
+      assert {:ok, _} = Anthropic.stream([Message.user("Hi")], [], stream_cfg, fn _ -> :ok end)
+
+      assert {:error, %Alloy.Provider.Error{kind: :auth}} =
+               Anthropic.stream(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(stream_cfg, :api_key, fn -> {:error, :expired} end),
+                 fn _ -> :ok end
+               )
     end
   end
 

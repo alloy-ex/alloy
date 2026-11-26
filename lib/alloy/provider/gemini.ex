@@ -200,14 +200,11 @@ defmodule Alloy.Provider.Gemini do
 
       body = HTTP.maybe_put_unless_empty_map(body, "generationConfig", generation_config)
 
-      tools = build_tools(tool_defs, config)
+      {tools, has_native_tools?} = build_tools(tool_defs, config)
       body = HTTP.maybe_put_unless_empty_list(body, "tools", tools)
 
-      body =
-        case Map.get(config, :tool_config) do
-          nil -> body
-          tool_config -> Map.put(body, "toolConfig", Alloy.Provider.stringify_keys(tool_config))
-        end
+      tool_config = build_tool_config(config, tool_defs != [] and has_native_tools?)
+      body = HTTP.maybe_put_unless_empty_map(body, "toolConfig", tool_config)
 
       body =
         case Map.get(config, :safety_settings) do
@@ -222,7 +219,9 @@ defmodule Alloy.Provider.Gemini do
           "generationConfig"
         )
 
-      validate_output_schema_conflicts(body, raw_generation_config, output_schema)
+      with :ok <- validate_cached_content_conflicts(body) do
+        validate_output_schema_conflicts(body, raw_generation_config, output_schema)
+      end
     end
   end
 
@@ -233,11 +232,45 @@ defmodule Alloy.Provider.Gemini do
         defs -> [%{"functionDeclarations" => Enum.map(defs, &format_tool_def/1)}]
       end
 
-    fn_tools
-    |> maybe_append_native_tool("googleSearch", Map.get(config, :google_search))
-    |> maybe_append_native_tool("urlContext", Map.get(config, :url_context))
-    |> maybe_append_native_tool("codeExecution", Map.get(config, :code_execution))
+    native_tools =
+      []
+      |> maybe_append_native_tool("googleSearch", Map.get(config, :google_search))
+      |> maybe_append_native_tool("urlContext", Map.get(config, :url_context))
+      |> maybe_append_native_tool("codeExecution", Map.get(config, :code_execution))
+
+    {fn_tools ++ native_tools, native_tools != []}
   end
+
+  defp build_tool_config(config, combine_server_and_custom?) do
+    base =
+      case Map.get(config, :tool_config) do
+        nil -> %{}
+        tool_config -> Alloy.Provider.stringify_keys(tool_config)
+      end
+
+    if combine_server_and_custom? do
+      Map.put_new(base, "includeServerSideToolInvocations", true)
+    else
+      base
+    end
+  end
+
+  # Gemini rejects generateContent requests that pass cachedContent together
+  # with systemInstruction, tools, or toolConfig (they belong in the cache).
+  defp validate_cached_content_conflicts(%{"cachedContent" => _} = body) do
+    if Enum.any?(["systemInstruction", "tools", "toolConfig"], &Map.has_key?(body, &1)) do
+      {:error,
+       %Error{
+         kind: :invalid_request,
+         message:
+           "Gemini :cached_content cannot be combined with :system_prompt, tools, or :tool_config; include them in the cached content resource instead"
+       }}
+    else
+      :ok
+    end
+  end
+
+  defp validate_cached_content_conflicts(_body), do: :ok
 
   defp maybe_append_native_tool(tools, key, true), do: tools ++ [%{key => %{}}]
 
@@ -381,6 +414,10 @@ defmodule Alloy.Provider.Gemini do
        when is_binary(mime_type) and is_binary(file_id) do
     %{"fileData" => %{"mimeType" => mime_type, "fileUri" => file_id}}
   end
+
+  # Server-side tool / code-execution parts replayed verbatim with signatures.
+  defp format_content_block(%{type: "gemini_part", raw: raw}, _messages) when is_map(raw),
+    do: raw
 
   # Opaque OpenAI Responses items in a transcript that switched provider;
   # they mean nothing to Gemini, so they are dropped rather than turned
@@ -615,6 +652,13 @@ defmodule Alloy.Provider.Gemini do
   defp parse_content_part(%{"fileData" => %{"mimeType" => mime_type, "fileUri" => uri}})
        when is_binary(mime_type) and is_binary(uri) do
     {:ok, %{type: "document", mime_type: mime_type, uri: uri}}
+  end
+
+  defp parse_content_part(part)
+       when is_map(part) and
+              (is_map_key(part, "executableCode") or is_map_key(part, "codeExecutionResult") or
+                 is_map_key(part, "toolCall") or is_map_key(part, "toolResponse")) do
+    {:ok, %{type: "gemini_part", raw: part}}
   end
 
   defp parse_content_part(part) when is_map(part) do

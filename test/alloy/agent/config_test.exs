@@ -266,6 +266,35 @@ defmodule Alloy.Agent.ConfigTest do
       refute Exception.message(mw_err) =~ secret
       assert Exception.message(mw_err) =~ "got: list"
     end
+
+    test "requires :origin_key when provider or fallback uses a function :api_key" do
+      auth_fun = fn -> {:ok, "tok"} end
+
+      assert_raise ArgumentError, ~r/:origin_key/, fn ->
+        Config.from_opts(provider: {Alloy.Provider.Anthropic, api_key: auth_fun, model: "m"})
+      end
+
+      assert_raise ArgumentError, ~r/:origin_key/, fn ->
+        Config.from_opts(
+          provider: Alloy.Provider.Test,
+          fallback_providers: [{Alloy.Provider.OpenAI, api_key: auth_fun, model: "m"}]
+        )
+      end
+
+      assert_raise ArgumentError, ~r/0-arity/, fn ->
+        Config.from_opts(
+          provider: {Alloy.Provider.Anthropic, api_key: fn _x -> "tok" end, model: "m"}
+        )
+      end
+
+      cfg =
+        Config.from_opts(
+          provider:
+            {Alloy.Provider.Anthropic, api_key: auth_fun, origin_key: "acct-1", model: "m"}
+        )
+
+      assert cfg.provider_config.origin_key == "acct-1"
+    end
   end
 
   describe "compaction middleware" do

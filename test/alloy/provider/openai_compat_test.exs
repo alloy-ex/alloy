@@ -1150,8 +1150,38 @@ defmodule Alloy.Provider.OpenAICompatTest do
                %{
                  "type" => "image_url",
                  "image_url" => %{"url" => "https://example.com/photo.jpg"}
+               },
+               %{
+                 "type" => "text",
+                 "text" => "[Unsupported image URL scheme for OpenAICompat provider]"
                }
              ]
+
+      # Stream path also resolves dynamic :api_key callback.
+      stream_plug = fn conn ->
+        send(test_pid, {:stream_headers, conn.req_headers})
+
+        sse =
+          "data: " <>
+            Jason.encode!(%{
+              "choices" => [%{"delta" => %{"content" => "hi"}, "finish_reason" => "stop"}]
+            }) <> "\n\ndata: [DONE]\n\n"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, _} =
+               OpenAICompat.stream(
+                 [Message.user("Hi")],
+                 [],
+                 %{config | req_options: [plug: stream_plug]},
+                 fn _ -> :ok end
+               )
+
+      assert_received {:stream_headers, sh}
+      assert {"authorization", "Bearer dyn-compat-key"} in sh
     end
   end
 end

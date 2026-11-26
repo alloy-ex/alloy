@@ -1032,18 +1032,51 @@ defmodule Alloy.Provider.HTTPTest do
       refute msg1 =~ "sk-secret"
       assert msg1 =~ "{:token_err, string}"
 
-      assert {:error, %Error{kind: :auth, message: msg2}} =
-               HTTP.resolve_api_key(%{api_key: fn -> raise ArgumentError, "sk-secret" end})
+      for bad_cb <- [
+            fn -> {:error, "sk-secret"} end,
+            fn -> raise "sk-secret" end,
+            fn -> {:error, RuntimeError.exception("sk-secret")} end,
+            fn -> raise ArgumentError, "sk-secret" end,
+            fn -> throw("sk-secret") end,
+            fn -> exit({:boom, "sk-secret"}) end
+          ] do
+        assert {:error, %Error{kind: :auth, message: msg}} =
+                 HTTP.resolve_api_key(%{api_key: bad_cb})
 
-      refute msg2 =~ "sk-secret"
-      assert msg2 =~ "ArgumentError"
+        refute msg =~ "sk-secret"
+      end
 
-      assert {:error, %Error{kind: :auth, message: msg3}} =
-               HTTP.resolve_api_key(%{api_key: fn -> "" end})
+      for bad_ret <- ["", {:ok, ""}, {:ok, 123}, nil] do
+        assert {:error, %Error{kind: :auth, message: msg}} =
+                 HTTP.resolve_api_key(%{api_key: fn -> bad_ret end})
 
-      assert msg3 =~ "invalid value: string"
+        assert msg =~ "invalid value"
+      end
 
       assert {:error, %Error{kind: :auth}} = HTTP.resolve_api_key(%{})
+
+      # Stalled dynamic :api_key callback is bounded by :alloy_request_deadline.
+      parent = self()
+
+      stalled_cb = fn ->
+        send(parent, {:auth_worker_pid, self()})
+        Process.sleep(5_000)
+        {:ok, "late"}
+      end
+
+      deadline = System.monotonic_time(:millisecond) + 30
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, %Error{kind: :timeout}} =
+               HTTP.resolve_api_key(%{api_key: stalled_cb, alloy_request_deadline: deadline})
+
+      elapsed = System.monotonic_time(:millisecond) - started
+      assert elapsed < 500
+
+      assert_receive {:auth_worker_pid, worker_pid}, 100
+      ref = Process.monitor(worker_pid)
+      assert_receive {:DOWN, ^ref, :process, ^worker_pid, _reason}, 500
+
       assert HTTP.http_url?("https://example.com/a.pdf")
       assert HTTP.http_url?("http://localhost/a.pdf")
       refute HTTP.http_url?("gs://bucket/a.pdf")

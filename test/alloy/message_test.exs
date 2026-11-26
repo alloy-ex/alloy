@@ -74,12 +74,18 @@ defmodule Alloy.MessageTest do
              }
     end
 
-    test "origin/2 never invokes function api_key and respects :origin_key" do
-      auth_fun = fn -> raise "should never be invoked during origin hashing" end
+    test "origin/2 never invokes function api_key, distinguishes captured accounts, and respects :origin_key" do
+      make_auth = fn acct ->
+        fn -> raise "should never be invoked: #{acct}" end
+      end
 
-      o1 = Message.origin(Alloy.Provider.Anthropic, %{api_key: auth_fun})
-      o2 = Message.origin(Alloy.Provider.Anthropic, %{api_key: auth_fun})
-      assert o1 == o2
+      f_a = make_auth.("account-a")
+      f_b = make_auth.("account-b")
+
+      o_a = Message.origin(Alloy.Provider.Anthropic, %{api_key: f_a})
+      o_b = Message.origin(Alloy.Provider.Anthropic, %{api_key: f_b})
+      assert o_a == Message.origin(Alloy.Provider.Anthropic, %{api_key: f_a})
+      refute o_a == o_b
 
       ok1 =
         Message.origin(Alloy.Provider.Anthropic, %{
@@ -96,10 +102,27 @@ defmodule Alloy.MessageTest do
       assert ok1 == ok2
     end
 
-    test "normalize_for/3 drops cross-origin file_id documents while keeping data/uri documents" do
-      msg = %Message{
+    test "normalize_for/3 drops cross-origin file_id documents on both user and assistant messages" do
+      ant_origin = Message.origin(Alloy.Provider.Anthropic, %{api_key: "k1"})
+
+      user_mixed = %Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Check this PDF"},
+          Message.document_file("application/pdf", "file_ant_1", origin: ant_origin),
+          Message.document_data("application/pdf", "JVBERi0=")
+        ]
+      }
+
+      user_only_file = %Message{
+        role: :user,
+        origin: ant_origin,
+        content: [Message.document_file("application/pdf", "file_ant_2")]
+      }
+
+      assistant_msg = %Message{
         role: :assistant,
-        origin: Message.origin(Alloy.Provider.Anthropic, %{api_key: "k1"}),
+        origin: ant_origin,
         content: [
           %{type: "text", text: "See attached"},
           Message.document_file("application/pdf", "file_secret"),
@@ -107,9 +130,35 @@ defmodule Alloy.MessageTest do
         ]
       }
 
-      [normalized] = Message.normalize_for([msg], Alloy.Provider.OpenAI, %{api_key: "k2"})
+      # Same origin keeps user file_id attachments intact.
+      [same_mixed, same_only, _] =
+        Message.normalize_for(
+          [user_mixed, user_only_file, assistant_msg],
+          Alloy.Provider.Anthropic,
+          %{api_key: "k1"}
+        )
 
-      assert normalized.content == [
+      assert Enum.any?(same_mixed.content, &match?(%{file_id: "file_ant_1"}, &1))
+      assert Enum.any?(same_only.content, &match?(%{file_id: "file_ant_2"}, &1))
+
+      # Different origin drops foreign file_id blocks on both user and assistant messages.
+      [norm_mixed, norm_only, norm_asst] =
+        Message.normalize_for(
+          [user_mixed, user_only_file, assistant_msg],
+          Alloy.Provider.OpenAI,
+          %{api_key: "k2"}
+        )
+
+      assert norm_mixed.content == [
+               %{type: "text", text: "Check this PDF"},
+               %{type: "document", mime_type: "application/pdf", data: "JVBERi0="}
+             ]
+
+      assert norm_only.content == [
+               %{type: "text", text: "[Omitted provider-specific file attachment]"}
+             ]
+
+      assert norm_asst.content == [
                %{type: "text", text: "See attached"},
                %{type: "document", mime_type: "application/pdf", data: "JVBERi0="}
              ]

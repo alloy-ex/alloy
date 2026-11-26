@@ -395,12 +395,52 @@ defmodule Alloy.Provider.GeminiTest do
                Gemini.complete([Message.user("Hi")], [], list_sig_config)
     end
 
-    test "formats inline/file_id documents, image URLs, cached_content, native tools, and dynamic api_key" do
-      config =
+    test "formats inline/file_id documents, image URLs, cached_content conflicts, native tools, and server-tool replay" do
+      # 1. Valid :cached_content without system_prompt/tools/tool_config succeeds.
+      cache_only =
         config_that_captures_request()
         |> Map.merge(%{
           api_key: fn -> {:ok, "dyn-gem-key"} end,
-          cached_content: "cachedContents/abc123",
+          cached_content: "cachedContents/abc123"
+        })
+
+      assert {:ok, _} = Gemini.complete([Message.user("Hi")], [], cache_only)
+      assert_received {:request_body, cache_body}
+      assert_received {:request_headers, headers}
+      assert {"x-goog-api-key", "dyn-gem-key"} in headers
+      assert Jason.decode!(cache_body)["cachedContent"] == "cachedContents/abc123"
+
+      # 2. :cached_content combined with system_prompt, tools, or tool_config fails fast.
+      tool_defs = [
+        %{
+          name: "read",
+          description: "Read a file",
+          input_schema: %{type: "object", properties: %{}}
+        }
+      ]
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(cache_only, :system_prompt, "Sys")
+               )
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.complete([Message.user("Hi")], tool_defs, cache_only)
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(cache_only, :tool_config, %{functionCallingConfig: %{mode: "AUTO"}})
+               )
+
+      # 3. Combining native tools + custom functionDeclarations sets includeServerSideToolInvocations
+      #    and formats multimodal document/image blocks.
+      combined_config =
+        config_that_captures_request()
+        |> Map.merge(%{
           google_search: true,
           url_context: true,
           code_execution: true
@@ -417,21 +457,9 @@ defmodule Alloy.Provider.GeminiTest do
         }
       ]
 
-      tool_defs = [
-        %{
-          name: "read",
-          description: "Read a file",
-          input_schema: %{type: "object", properties: %{}}
-        }
-      ]
-
-      assert {:ok, _} = Gemini.complete(messages, tool_defs, config)
+      assert {:ok, _} = Gemini.complete(messages, tool_defs, combined_config)
       assert_received {:request_body, body}
-      assert_received {:request_headers, headers}
-
-      assert {"x-goog-api-key", "dyn-gem-key"} in headers
       decoded = Jason.decode!(body)
-      assert decoded["cachedContent"] == "cachedContents/abc123"
 
       assert [
                %{"functionDeclarations" => [%{"name" => "read"}]},
@@ -439,6 +467,8 @@ defmodule Alloy.Provider.GeminiTest do
                %{"urlContext" => %{}},
                %{"codeExecution" => %{}}
              ] = decoded["tools"]
+
+      assert decoded["toolConfig"] == %{"includeServerSideToolInvocations" => true}
 
       [%{"parts" => [img, doc_data, doc_file]}] = decoded["contents"]
 
@@ -456,6 +486,82 @@ defmodule Alloy.Provider.GeminiTest do
       assert doc_file == %{
                "fileData" => %{"mimeType" => "application/pdf", "fileUri" => "files/gem-file-1"}
              }
+
+      # 4. Multi-turn round-trip of executableCode, codeExecutionResult, toolCall, and toolResponse
+      #    with thoughtSignature preserved verbatim across both complete/3 and stream/4.
+      exec_part = %{
+        "executableCode" => %{"language" => "PYTHON", "code" => "print(2 + 2)"},
+        "thoughtSignature" => "sig_exec_1"
+      }
+
+      exec_result = %{
+        "codeExecutionResult" => %{"outcome" => "OUTCOME_OK", "output" => "4\n"}
+      }
+
+      server_call = %{
+        "toolCall" => %{"toolType" => "GOOGLE_SEARCH", "args" => %{"q" => "elixir"}},
+        "thoughtSignature" => "sig_srv_1"
+      }
+
+      server_resp = %{
+        "toolResponse" => %{"toolType" => "GOOGLE_SEARCH", "response" => %{"hits" => 1}}
+      }
+
+      resp_cfg =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(
+              gemini_response([
+                exec_part,
+                exec_result,
+                server_call,
+                server_resp,
+                %{"text" => "4"}
+              ])
+            )
+        })
+
+      assert {:ok, %{messages: [asst_msg]}} =
+               Gemini.complete([Message.user("2+2?")], [], resp_cfg)
+
+      assert [
+               %{type: "gemini_part", raw: ^exec_part},
+               %{type: "gemini_part", raw: ^exec_result},
+               %{type: "gemini_part", raw: ^server_call},
+               %{type: "gemini_part", raw: ^server_resp},
+               %{type: "text", text: "4"}
+             ] = asst_msg.content
+
+      # Replay on the next turn preserves all 4 raw parts and their signatures verbatim.
+      assert {:ok, _} =
+               Gemini.complete(
+                 [Message.user("2+2?"), asst_msg, Message.user("Again")],
+                 [],
+                 config_that_captures_request()
+               )
+
+      assert_received {:request_body, replay_body}
+      [_u1, model_turn, _u2] = Jason.decode!(replay_body)["contents"]
+
+      assert [^exec_part, ^exec_result, ^server_call, ^server_resp, %{"text" => "4"}] =
+               model_turn["parts"]
+
+      # Streaming path also preserves gemini_part blocks verbatim.
+      stream_cfg =
+        config_with_sse_stream([
+          sse_chunk(gemini_response([exec_part, exec_result], nil)),
+          sse_chunk(gemini_response([%{"text" => "4"}]))
+        ])
+
+      assert {:ok, %{messages: [streamed_asst]}} =
+               Gemini.stream([Message.user("2+2?")], [], stream_cfg, fn _ -> :ok end)
+
+      assert [
+               %{type: "gemini_part", raw: ^exec_part},
+               %{type: "gemini_part", raw: ^exec_result},
+               %{type: "text", text: "4"}
+             ] = streamed_asst.content
     end
   end
 
