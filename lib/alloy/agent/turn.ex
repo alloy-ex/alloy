@@ -137,26 +137,9 @@ defmodule Alloy.Agent.Turn do
       %{state | status: :max_turns}
     else
       case run_turn(state, opts) do
-        {:continue, state} ->
-          loop(state, opts)
-
-        {:halt, %State{status: :max_turns, turn: t} = state} when t > 0 ->
-          maybe_finalize_expired_max_turns(state, opts)
-
-        {:halt, state} ->
-          state
+        {:continue, state} -> loop(state, opts)
+        {:halt, state} -> state
       end
-    end
-  end
-
-  defp maybe_finalize_expired_max_turns(state, opts) do
-    if deadline_expired?(state) do
-      case run_turn(state, opts) do
-        {:halt, timed_out} -> timed_out
-        {:continue, next} -> loop(next, opts)
-      end
-    else
-      state
     end
   end
 
@@ -181,6 +164,7 @@ defmodule Alloy.Agent.Turn do
             |> finalize_turn_limits()
           end
         end)
+        |> recheck_post_span_deadline()
       catch
         kind, reason ->
           stacktrace = __STACKTRACE__
@@ -245,6 +229,24 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp finalize_turn_limits({:halt, _state} = step), do: step
+
+  # Recheck the run deadline after [:alloy, :turn, :stop] telemetry finishes
+  # and before :turn_end is published so a slow stop handler flips the single
+  # turn verdict to :error instead of synthesizing a phantom follow-up turn.
+  defp recheck_post_span_deadline({:continue, %State{turn: t} = next_state}) when t > 0 do
+    if deadline_expired?(next_state),
+      do: {:halt, fail(next_state, timeout_error(next_state))},
+      else: {:continue, next_state}
+  end
+
+  defp recheck_post_span_deadline({:halt, %State{status: :max_turns, turn: t} = next_state})
+       when t > 0 do
+    if deadline_expired?(next_state),
+      do: {:halt, fail(next_state, timeout_error(next_state))},
+      else: {:halt, next_state}
+  end
+
+  defp recheck_post_span_deadline(step), do: step
 
   defp turn_span(turn, fun) do
     start_mono = System.monotonic_time()

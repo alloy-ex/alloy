@@ -4773,12 +4773,12 @@ defmodule Alloy.ReasoningAndEventsTest do
         :telemetry.detach(tel_handler_id)
       end
 
-      slow_tel_ends =
-        drain_tagged(:slow_tel_ev)
-        |> Enum.filter(&(&1.event == :turn_end))
+      slow_tel_events = drain_tagged(:slow_tel_ev)
+      slow_tel_starts = Enum.filter(slow_tel_events, &(&1.event == :turn_start))
+      slow_tel_ends = Enum.filter(slow_tel_events, &(&1.event == :turn_end))
 
-      assert length(slow_tel_ends) == 2
-      assert List.last(slow_tel_ends).payload.status == :error
+      assert [%{turn: 1}] = slow_tel_starts
+      assert [%{turn: 1, payload: %{status: :error}}] = slow_tel_ends
 
       {:ok, slow_cb_pid} =
         TestProvider.start_link([
@@ -4803,8 +4803,8 @@ defmodule Alloy.ReasoningAndEventsTest do
         drain_tagged(:slow_cb_ev)
         |> Enum.filter(&(&1.event == :turn_end))
 
-      assert length(slow_cb_ends) == 2
-      assert List.last(slow_cb_ends).payload.status == :error
+      assert [%{turn: 1, payload: %{status: :running}}, %{turn: 2, payload: %{status: :error}}] =
+               slow_cb_ends
 
       # 21. OpenAI/xAI: multi-key map arguments (including nested maps and partial key prefixes)
       #     reconcile cleanly against already-emitted prefixes whose key order differs from
@@ -5120,9 +5120,10 @@ defmodule Alloy.ReasoningAndEventsTest do
         _ = drain_tagged(:bexp_ev)
       end
 
-      # 23. Deadline expiry during [:alloy, :turn, :stop] telemetry OR :turn_end callback when
-      #     turn 1 was finalized as :max_turns still enforces the run deadline (returning :error
-      #     and publishing a terminal :turn_end with status: :error).
+      # 23. Deadline expiry during [:alloy, :turn, :stop] telemetry when turn 1 was finalized
+      #     as :max_turns rechecks before :turn_end so the single turn verdict is :error (no
+      #     phantom turn 2); time spent inside the user's own final :turn_end callback does not
+      #     overturn an already-published :max_turns verdict or synthesize a turn past max_turns.
       max_turns_tel_id = "slice2-max-turns-slow-stop-#{inspect(make_ref())}"
 
       :ok =
@@ -5155,11 +5156,11 @@ defmodule Alloy.ReasoningAndEventsTest do
         :telemetry.detach(max_turns_tel_id)
       end
 
-      mt_tel_ends =
-        drain_tagged(:mt_tel_ev)
-        |> Enum.filter(&(&1.event == :turn_end))
+      mt_tel_events = drain_tagged(:mt_tel_ev)
+      assert [%{turn: 1}] = Enum.filter(mt_tel_events, &(&1.event == :turn_start))
 
-      assert List.last(mt_tel_ends).payload.status == :error
+      assert [%{turn: 1, payload: %{status: :error}}] =
+               Enum.filter(mt_tel_events, &(&1.event == :turn_end))
 
       {:ok, mt_cb_pid} =
         TestProvider.start_link([
@@ -5168,7 +5169,7 @@ defmodule Alloy.ReasoningAndEventsTest do
           ])
         ])
 
-      assert {:error, %Alloy.Result{status: :error, turns: 1}} =
+      assert {:ok, %Alloy.Result{status: :max_turns, turns: 1}} =
                Alloy.run("go",
                  provider: {TestProvider, agent_pid: mt_cb_pid},
                  tools: [EchoTool],
@@ -5180,11 +5181,11 @@ defmodule Alloy.ReasoningAndEventsTest do
                  end
                )
 
-      mt_cb_ends =
-        drain_tagged(:mt_cb_ev)
-        |> Enum.filter(&(&1.event == :turn_end))
+      mt_cb_events = drain_tagged(:mt_cb_ev)
+      assert [%{turn: 1}] = Enum.filter(mt_cb_events, &(&1.event == :turn_start))
 
-      assert List.last(mt_cb_ends).payload.status == :error
+      assert [%{turn: 1, payload: %{status: :max_turns}}] =
+               Enum.filter(mt_cb_events, &(&1.event == :turn_end))
     end
   end
 

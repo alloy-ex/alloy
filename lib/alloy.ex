@@ -119,7 +119,8 @@ defmodule Alloy do
   or ignored if `:messages` option provides conversation history.
 
   Accepts `:on_event` like `stream/3`. Without streaming, the callback
-  receives the tool events (`:tool_start`, `:tool_end`) but no text deltas.
+  receives lifecycle and tool events (`:turn_start`, `:turn_end`, `:tool_start`,
+  `:tool_update`, `:tool_end`) but no streaming model deltas.
 
   Built-in HTTP/SSE providers (when `:timeout_ms` is finite), Codex, and tool
   execution require the `:alloy` application (and its `Alloy.TaskSupervisor`)
