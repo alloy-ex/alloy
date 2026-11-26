@@ -1114,9 +1114,20 @@ defmodule Alloy.Provider.HTTPTest do
       assert_receive {:DOWN, ^ref, :process, ^worker_pid, _reason}, 500
 
       assert HTTP.http_url?("https://example.com/a.pdf")
+      assert HTTP.http_url?("HTTPS://example.com/a.pdf")
       assert HTTP.http_url?("http://localhost/a.pdf")
       refute HTTP.http_url?("gs://bucket/a.pdf")
       refute HTTP.http_url?("https://")
+      refute HTTP.http_url?("HTTPS://")
+
+      assert HTTP.provider_file_uri?(
+               "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+             )
+
+      assert HTTP.provider_file_uri?("HTTPS://GENERATIVELANGUAGE.GOOGLEAPIS.COM/v1/files/xyz")
+
+      refute HTTP.provider_file_uri?("https://example.com/v1beta/files/abc123")
+      refute HTTP.provider_file_uri?("https://generativelanguage.googleapis.com/v1beta/models")
     end
   end
 

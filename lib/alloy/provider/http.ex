@@ -147,9 +147,38 @@ defmodule Alloy.Provider.HTTP do
 
   @doc false
   @spec http_url?(term()) :: boolean()
-  def http_url?("https://" <> rest) when byte_size(rest) > 0, do: true
-  def http_url?("http://" <> rest) when byte_size(rest) > 0, do: true
+  def http_url?(uri) when is_binary(uri) do
+    case URI.parse(uri) do
+      %URI{scheme: scheme, host: host}
+      when is_binary(scheme) and is_binary(host) and host != "" ->
+        String.downcase(scheme) in ["http", "https"]
+
+      _ ->
+        false
+    end
+  end
+
   def http_url?(_other), do: false
+
+  # Account-scoped provider File API URIs look like ordinary HTTPS URLs but
+  # require the uploading provider's credentials and fail if another provider
+  # attempts to fetch them as public URLs.
+  @doc false
+  @spec provider_file_uri?(term()) :: boolean()
+  def provider_file_uri?(uri) when is_binary(uri) do
+    case URI.parse(uri) do
+      %URI{scheme: scheme, host: host, path: path}
+      when is_binary(scheme) and is_binary(host) and is_binary(path) ->
+        String.downcase(scheme) in ["http", "https"] and
+          String.downcase(host) == "generativelanguage.googleapis.com" and
+          String.contains?(path, "/files/")
+
+      _ ->
+        false
+    end
+  end
+
+  def provider_file_uri?(_other), do: false
 
   @doc false
   @spec resolve_api_key(map()) :: {:ok, String.t()} | {:error, Error.t()}

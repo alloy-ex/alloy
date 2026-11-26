@@ -1359,16 +1359,28 @@ defmodule Alloy.Provider.AnthropicTest do
 
       msg = %Alloy.Message{
         role: :user,
-        content: [Message.document("text/plain", "https://example.com/notes.txt")]
+        content: [
+          Message.document("text/plain", "https://example.com/notes.txt"),
+          Message.document(
+            "application/pdf",
+            "https://generativelanguage.googleapis.com/v1beta/files/gem123"
+          )
+        ]
       }
 
       assert {:ok, _} = Anthropic.complete([msg], [], dedupe_cfg)
       assert_received {:request_body, body}
+      assert_received {:request_headers, _headers}
       decoded = Jason.decode!(body)
 
       assert [%{"type" => "web_search_20250305", "name" => "web_search"}] = decoded["tools"]
-      [%{"type" => "text", "text" => notice}] = hd(decoded["messages"])["content"]
+
+      [%{"type" => "text", "text" => notice}, %{"type" => "text", "text" => gem_notice}] =
+        hd(decoded["messages"])["content"]
+
       assert notice =~ "URL documents require application/pdf"
+      assert gem_notice =~ "Unsupported document URI (application/pdf)"
+      refute body =~ "generativelanguage.googleapis.com"
     end
 
     test "supports auth_scheme: :bearer for OAuth tokens and rejects invalid auth_scheme" do

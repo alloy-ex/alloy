@@ -151,6 +151,7 @@ defmodule Alloy.MessageTest do
 
       assert norm_mixed.content == [
                %{type: "text", text: "Check this PDF"},
+               %{type: "text", text: "[Omitted provider-specific file attachment]"},
                %{type: "document", mime_type: "application/pdf", data: "JVBERi0="}
              ]
 
@@ -162,6 +163,41 @@ defmodule Alloy.MessageTest do
                %{type: "text", text: "See attached"},
                %{type: "document", mime_type: "application/pdf", data: "JVBERi0="}
              ]
+
+      # Gemini File API URIs passed via document/2 are also origin-scoped:
+      # attributed to Gemini, preserved on the same Gemini origin, and replaced
+      # with an omission notice on another provider or another Gemini account.
+      gem_origin = Message.origin(Alloy.Provider.Gemini, %{api_key: "gem-k1"})
+      gem_uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+
+      gem_user = %Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Read this"},
+          Message.document("application/pdf", gem_uri)
+        ]
+      }
+
+      [attributed_gem_user] = Message.attribute_file_blocks([gem_user], gem_origin)
+      assert [_, %{uri: ^gem_uri, origin: ^gem_origin}] = attributed_gem_user.content
+
+      [same_gem] =
+        Message.normalize_for([attributed_gem_user], Alloy.Provider.Gemini, %{api_key: "gem-k1"})
+
+      assert [_, %{uri: ^gem_uri}] = same_gem.content
+
+      for {target_mod, target_cfg} <- [
+            {Alloy.Provider.Anthropic, %{api_key: "k1"}},
+            {Alloy.Provider.OpenAI, %{api_key: "k2"}},
+            {Alloy.Provider.Gemini, %{api_key: "gem-k2"}}
+          ] do
+        [cross] = Message.normalize_for([attributed_gem_user], target_mod, target_cfg)
+
+        assert cross.content == [
+                 %{type: "text", text: "Read this"},
+                 %{type: "text", text: "[Omitted provider-specific file attachment]"}
+               ]
+      end
 
       # Block-level foreign file_id on unattributed (origin: nil) and same-origin
       # assistant messages is also stripped, covering {mod, keyword} and {mod, map} origins.

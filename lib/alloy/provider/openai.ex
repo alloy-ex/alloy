@@ -377,7 +377,7 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp format_user_content_block(%{type: "document", uri: uri} = block) when is_binary(uri) do
-    if HTTP.http_url?(uri) do
+    if HTTP.http_url?(uri) and not HTTP.provider_file_uri?(uri) do
       %{"type" => "input_file", "file_url" => uri}
     else
       unsupported_media_notice(Map.get(block, :mime_type, "document"))

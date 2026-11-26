@@ -1014,7 +1014,7 @@ defmodule Alloy.Provider.Anthropic do
 
   defp format_content_block(%{type: "document", mime_type: "application/pdf", uri: uri} = block)
        when is_binary(uri) do
-    if HTTP.http_url?(uri) do
+    if HTTP.http_url?(uri) and not HTTP.provider_file_uri?(uri) do
       %{
         "type" => "document",
         "source" => %{

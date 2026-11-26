@@ -32,8 +32,10 @@ defmodule Alloy.Message do
   `source: "content_part"` (OpenAI-compatible array-of-parts thinking, which
   is withheld from top-level `reasoning_content` echo on subsequent turns),
   `"redacted_thinking"`, `"reasoning"` and `"output_item"` (OpenAI and xAI raw
-  items), `"server_tool_use"` and server tool results (Anthropic), and
-  `:signature` or `:thought_signature` on text and tool-call blocks (Gemini).
+  items), `"server_tool_use"` and server tool results (Anthropic),
+  `"gemini_part"` (Gemini native `executableCode`, `codeExecutionResult`,
+  `toolCall`, and `toolResponse` parts), and `:signature` or
+  `:thought_signature` on text and tool-call blocks (Gemini).
 
   ## Provenance
 
@@ -50,6 +52,8 @@ defmodule Alloy.Message do
   foreign `file_id` document attachments; see its docs. Persist these fields
   with your transcripts: without them a reloaded message is sent as it is.
   """
+
+  alias Alloy.Provider.HTTP
 
   @type role :: :user | :assistant
   @type content_block :: map()
@@ -207,10 +211,14 @@ defmodule Alloy.Message do
   @doc """
   Creates a URL- or URI-referenced document content block.
 
-  Accepts HTTP(S) URLs (supported by Anthropic, OpenAI/xAI, and Gemini) as well
-  as provider-specific URIs such as Google File API / GCS URIs (`gs://...`,
-  used with Gemini). Optional `:filename` and `:title` keys may be passed in
-  `opts`.
+  Accepts public HTTP(S) URLs (supported by Anthropic for PDFs, OpenAI/xAI, and
+  Gemini) as well as GCS URIs (`gs://...`, used with Gemini). Prefer
+  `document_file/3` for account-scoped provider Files API references (including
+  Gemini File API URIs); Gemini File API URIs
+  (`https://generativelanguage.googleapis.com/.../files/...`) passed here are
+  still treated as origin-scoped and degraded safely if a run switches or falls
+  back to another provider. Optional `:filename` and `:title` keys may be
+  passed in `opts`.
   """
   @spec document(String.t(), String.t(), keyword()) :: content_block()
   def document(mime_type, uri, opts \\ [])
@@ -330,14 +338,12 @@ defmodule Alloy.Message do
     Enum.map(messages, fn
       %__MODULE__{role: :user, content: blocks} = msg when is_list(blocks) ->
         updated =
-          Enum.map(blocks, fn
-            %{type: "document", file_id: _} = block ->
-              if Map.get(block, :origin) || msg.origin,
-                do: block,
-                else: Map.put(block, :origin, origin_id)
-
-            other ->
-              other
+          Enum.map(blocks, fn block ->
+            if origin_scoped_file_block?(block) and is_nil(Map.get(block, :origin) || msg.origin) do
+              Map.put(block, :origin, origin_id)
+            else
+              block
+            end
           end)
 
         %{msg | content: updated}
@@ -435,39 +441,42 @@ defmodule Alloy.Message do
 
   defp strip_foreign_assistant_file_blocks(blocks, target) do
     {kept, dropped?} =
-      Enum.reduce(blocks, {[], false}, fn
-        %{type: "document", file_id: _, origin: block_origin}, {acc, _dropped?}
-        when is_binary(block_origin) and block_origin != target ->
-          {acc, true}
+      Enum.reduce(blocks, {[], false}, fn block, {acc, dropped?} ->
+        block_origin = if is_map(block), do: Map.get(block, :origin), else: nil
 
-        block, {acc, dropped?} ->
+        if origin_scoped_file_block?(block) and is_binary(block_origin) and
+             block_origin != target do
+          {acc, true}
+        else
           {[block | acc], dropped?}
+        end
       end)
 
     {Enum.reverse(kept), dropped?}
   end
 
   defp strip_foreign_user_file_blocks(blocks, msg_origin, target) do
-    {kept, dropped?} =
-      Enum.reduce(blocks, {[], false}, fn
-        %{type: "document", file_id: _} = block, {acc, dropped?} ->
-          eff_origin = Map.get(block, :origin) || msg_origin
+    Enum.map(blocks, fn block ->
+      if origin_scoped_file_block?(block) do
+        eff_origin = Map.get(block, :origin) || msg_origin
 
-          if eff_origin != nil and eff_origin != target do
-            {acc, true}
-          else
-            {[block | acc], dropped?}
-          end
-
-        block, {acc, dropped?} ->
-          {[block | acc], dropped?}
-      end)
-
-    case {Enum.reverse(kept), dropped?} do
-      {[], true} -> [%{type: "text", text: "[Omitted provider-specific file attachment]"}]
-      {list, _} -> list
-    end
+        if eff_origin != nil and eff_origin != target do
+          %{type: "text", text: "[Omitted provider-specific file attachment]"}
+        else
+          block
+        end
+      else
+        block
+      end
+    end)
   end
+
+  defp origin_scoped_file_block?(%{type: "document", file_id: _}), do: true
+
+  defp origin_scoped_file_block?(%{type: "document", uri: uri}),
+    do: HTTP.provider_file_uri?(uri)
+
+  defp origin_scoped_file_block?(_block), do: false
 
   defp foreign_block(%{type: "thinking", thinking: thinking}, ids) when is_binary(thinking) do
     case String.trim(thinking) do
@@ -492,8 +501,17 @@ defmodule Alloy.Message do
     end
   end
 
-  # Files API IDs belong strictly to the provider account that uploaded them.
+  # Files API IDs and account-scoped provider file URIs belong strictly to the
+  # provider account that uploaded them.
   defp foreign_block(%{type: "document", file_id: _}, ids), do: {[], ids}
+
+  defp foreign_block(%{type: "document", uri: uri} = block, ids) do
+    if HTTP.provider_file_uri?(uri) do
+      {[], ids}
+    else
+      {[Map.drop(block, @signature_keys)], ids}
+    end
+  end
 
   defp foreign_block(%{type: type} = block, ids) when type in @portable_blocks,
     do: {[Map.drop(block, @signature_keys)], ids}

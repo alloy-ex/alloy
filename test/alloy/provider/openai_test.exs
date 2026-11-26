@@ -1368,15 +1368,31 @@ defmodule Alloy.Provider.OpenAITest do
       assert doc_url == %{"type" => "input_file", "file_url" => "https://example.com/remote.pdf"}
       assert doc_file == %{"type" => "input_file", "file_id" => "file_oai_1"}
 
-      # Non-HTTP image URL falls back to unsupported notice.
-      non_http_msg = [%Alloy.Message{role: :user, content: [Message.image_url("gs://b/a.png")]}]
+      # Non-HTTP image URL and Gemini File API URIs fall back to unsupported notices
+      # rather than sending unfetchable URLs to OpenAI.
+      non_http_msg = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            Message.image_url("gs://b/a.png"),
+            Message.document(
+              "application/pdf",
+              "https://generativelanguage.googleapis.com/v1beta/files/gem123"
+            )
+          ]
+        }
+      ]
+
       assert {:ok, _} = OpenAI.complete(non_http_msg, [], config)
       assert_received {:request_body, nh_body}
 
-      [%{"content" => [%{"type" => "input_text", "text" => nh_text}]}] =
+      [%{"content" => [%{"type" => "input_text", "text" => nh_text}, gem_uri_block]}] =
         Jason.decode!(nh_body)["input"]
 
       assert nh_text =~ "Unsupported"
+      assert gem_uri_block["type"] == "input_text"
+      assert gem_uri_block["text"] =~ "Unsupported"
+      refute nh_body =~ "generativelanguage.googleapis.com"
     end
 
     test "dynamic api_key re-invokes on retry, skips retry on :auth error, and strips foreign user file_id on fallback" do

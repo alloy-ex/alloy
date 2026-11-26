@@ -512,7 +512,10 @@ defmodule Alloy.Provider.GeminiTest do
           content: [
             Message.image_url("https://example.com/pic.png", mime_type: "image/png"),
             Message.document_data("application/pdf", "JVBERi0="),
-            Message.document_file("application/pdf", "files/gem-file-1")
+            Message.document_file(
+              "application/pdf",
+              "https://generativelanguage.googleapis.com/v1beta/files/gem-file-1"
+            )
           ]
         }
       ]
@@ -544,7 +547,10 @@ defmodule Alloy.Provider.GeminiTest do
              }
 
       assert doc_file == %{
-               "fileData" => %{"mimeType" => "application/pdf", "fileUri" => "files/gem-file-1"}
+               "fileData" => %{
+                 "mimeType" => "application/pdf",
+                 "fileUri" => "https://generativelanguage.googleapis.com/v1beta/files/gem-file-1"
+               }
              }
 
       # 4. Multi-turn round-trip of executableCode, codeExecutionResult, toolCall, and toolResponse
