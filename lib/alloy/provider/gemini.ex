@@ -402,8 +402,9 @@ defmodule Alloy.Provider.Gemini do
     end
   end
 
-  defp has_thinking_config?(map) when is_map(map) do
-    Map.has_key?(map, "thinkingConfig") or Map.has_key?(map, "thinking_config")
+  defp has_thinking_config?(map) when is_map(map) and not is_struct(map) do
+    normalized = Provider.stringify_keys(map)
+    Map.has_key?(normalized, "thinkingConfig") or Map.has_key?(normalized, "thinking_config")
   end
 
   defp has_thinking_config?(_other), do: false

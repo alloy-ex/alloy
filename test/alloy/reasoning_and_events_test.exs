@@ -2517,6 +2517,230 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert log =~ "callback worker exited"
       refute log =~ "backpressure queue limit reached"
+
+      # 4. Bash: callback worker exiting during post-exit flush also logs abnormal exit while
+      #    preserving exit code 0.
+      flush_log =
+        capture_log(fn ->
+          assert {:ok, flush_out} =
+                   Bash.execute(
+                     %{"command" => "printf x", "timeout" => 5_000},
+                     %{
+                       bash_restricted: false,
+                       bash_on_output: fn _chunk ->
+                         Process.sleep(30)
+                         throw(:flush_boom)
+                       end
+                     }
+                   )
+
+          assert flush_out =~ "x"
+          assert flush_out =~ "exit code: 0"
+        end)
+
+      assert flush_log =~ "callback worker exited"
+    end
+
+    test "whole-item Responses tool call args, sticky rejected header, provider-level on_event telemetry, and atom-key Gemini extra_body" do
+      parent = self()
+
+      # 1. Whole-item Responses function_call (xAI style, zero function_call_arguments.delta events)
+      #    still delivers full arguments via :tool_call_delta.
+      whole_item_plug =
+        sse_plug(
+          sse_oai("response.output_item.done", %{
+            "type" => "response.output_item.done",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_xai",
+              "call_id" => "call_xai",
+              "name" => "echo",
+              "arguments" => "{\"text\":\"whole\"}"
+            }
+          }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_xai",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_xai",
+                    "call_id" => "call_xai",
+                    "name" => "echo",
+                    "arguments" => "{\"text\":\"whole\"}"
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      {:ok, %{messages: [xai_msg]}} =
+        XAI.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "sk-xai",
+            model: "grok-3",
+            req_options: [plug: whole_item_plug],
+            on_event: &send(parent, {:xai_whole_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      assert [%{type: "tool_use", id: "call_xai", name: "echo", input: %{"text" => "whole"}}] =
+               xai_msg.content
+
+      xai_deltas =
+        drain_tagged(:xai_whole_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.all?(xai_deltas, &(&1.id == "call_xai" and &1.name == "echo"))
+      assert Enum.map_join(xai_deltas, & &1.arguments_delta) == "{\"text\":\"whole\"}"
+
+      # 2. Rejected interim header stays sticky and is NOT revived by later output_item.done.
+      sticky_rej_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_stick",
+              "call_id" => "c_s",
+              "name" => ""
+            }
+          }) <>
+            sse_oai("response.output_item.done", %{
+              "type" => "response.output_item.done",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_stick",
+                "call_id" => "c_s",
+                "name" => "echo",
+                "arguments" => "{\"text\":\"ok\"}"
+              }
+            }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_stick",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "message",
+                    "role" => "assistant",
+                    "content" => [%{"type" => "output_text", "text" => "done"}]
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      assert {:ok, _} =
+               OpenAI.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "sk-oai",
+                   model: "gpt-5.4",
+                   req_options: [plug: sticky_rej_plug],
+                   on_event: &send(parent, {:stick_ev, &1})
+                 },
+                 fn _ -> :ok end
+               )
+
+      refute Enum.any?(drain_tagged(:stick_ev), &match?({:tool_call_delta, _}, &1))
+
+      # 3. Provider-level :on_event without top-level :on_event still emits [:alloy, :event] :text_delta telemetry.
+      tel_id = "slice2-provider-on-event-tel-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        tel_id,
+        [:alloy, :event],
+        fn _ev, _m, meta, _ ->
+          if meta.event == :text_delta, do: send(parent, {:prov_tel_text, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(tel_id) end)
+
+      text_plug =
+        sse_plug(
+          sse_oai("response.output_text.delta", %{
+            "type" => "response.output_text.delta",
+            "delta" => "hello"
+          }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_ptel",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "message",
+                    "role" => "assistant",
+                    "content" => [%{"type" => "output_text", "text" => "hello"}]
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      assert {:ok, %{text: "hello"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai",
+                    model: "gpt-5.4",
+                    on_event: fn _ev -> :ok end,
+                    req_options: [plug: text_plug]}
+               )
+
+      assert_received {:prov_tel_text, %{event: :text_delta, turn: 1}}
+
+      # 4. Gemini atom-key extra_body %{generationConfig: %{thinking_config: ...}} prevents duplicate thinkingConfig.
+      gem_atom_plug = fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:gem_atom_body, Jason.decode!(raw)})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "candidates" => [
+              %{"content" => %{"parts" => [%{"text" => "ok"}]}, "finishReason" => "STOP"}
+            ],
+            "usageMetadata" => %{"promptTokenCount" => 1, "candidatesTokenCount" => 1}
+          })
+        )
+      end
+
+      assert {:ok, _} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "sk-gem",
+                   model: "gemini-2.5-flash",
+                   reasoning: :high,
+                   extra_body: %{generationConfig: %{thinking_config: %{thinkingBudget: 256}}},
+                   req_options: [plug: gem_atom_plug]
+                 }
+               )
+
+      assert_received {:gem_atom_body, %{"generationConfig" => atom_gen_cfg}}
+      refute Map.has_key?(atom_gen_cfg, "thinkingConfig")
+      assert atom_gen_cfg["thinking_config"] == %{"thinkingBudget" => 256}
     end
   end
 

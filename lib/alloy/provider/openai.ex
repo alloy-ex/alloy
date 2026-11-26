@@ -544,7 +544,7 @@ defmodule Alloy.Provider.OpenAI do
          %{"item" => %{"type" => "function_call"} = item} = payload
        )
        when event_type in ["response.output_item.added", "response.output_item.done"] do
-    register_function_call_item(acc, item, Map.get(payload, "output_index", 0), event_type)
+    register_function_call_item(acc, item, Map.get(payload, "output_index"), event_type)
   end
 
   defp process_stream_event(
@@ -593,6 +593,7 @@ defmodule Alloy.Provider.OpenAI do
     raw_call_id = Map.get(item, "call_id")
     item_id = item["id"]
     name = item["name"]
+    existing = lookup_function_call_meta(acc.function_calls, item_id, index)
 
     # During streaming (output_item.added / output_item.done), require the true
     # call_id so consumers never receive item_id when call_id arrives later.
@@ -604,26 +605,20 @@ defmodule Alloy.Provider.OpenAI do
         else: raw_call_id
 
     cond do
+      existing == :rejected ->
+        acc
+
       valid_function_call_header?(index, call_id, name) ->
-        meta = %{id: call_id, index: index, name: name}
-        already_known? = lookup_function_call_meta(acc.function_calls, item_id, index) == meta
-
-        unless already_known? do
-          header_event = Map.put(meta, :arguments_delta, "")
-          acc.on_event.({:tool_call_delta, header_event})
-        end
-
-        {pending_deltas, next_pending} =
-          pop_pending_deltas(acc.pending_function_deltas, item_id, index)
-
-        emit_buffered_args(acc.on_event, meta, pending_deltas)
-
-        function_calls =
-          acc.function_calls
-          |> maybe_put_call_meta(item_id, meta)
-          |> Map.put({:index, index}, meta)
-
-        %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
+        emit_and_store_function_call(
+          acc,
+          existing,
+          item,
+          item_id,
+          call_id,
+          index,
+          name,
+          event_type
+        )
 
       deferred_call_id_header?(event_type, index, raw_call_id, item_id, name) ->
         # Legitimate partial header waiting for call_id: buffer deltas until
@@ -639,6 +634,60 @@ defmodule Alloy.Provider.OpenAI do
         acc
     end
   end
+
+  defp emit_and_store_function_call(
+         acc,
+         existing,
+         item,
+         item_id,
+         call_id,
+         index,
+         name,
+         event_type
+       ) do
+    header_emitted? = match?(%{id: ^call_id, name: ^name}, existing)
+    args_emitted? = match?(%{args_emitted?: true}, existing)
+    base_meta = %{id: call_id, index: index, name: name}
+
+    unless header_emitted? do
+      header_event = Map.put(base_meta, :arguments_delta, "")
+      acc.on_event.({:tool_call_delta, header_event})
+    end
+
+    {pending_deltas, next_pending} =
+      pop_pending_deltas(acc.pending_function_deltas, item_id, index)
+
+    emit_buffered_args(acc.on_event, base_meta, pending_deltas)
+    args_emitted? = args_emitted? or pending_deltas != []
+
+    args_emitted? =
+      maybe_emit_whole_item_args(acc.on_event, base_meta, item, event_type, args_emitted?)
+
+    meta = Map.put(base_meta, :args_emitted?, args_emitted?)
+
+    function_calls =
+      acc.function_calls
+      |> maybe_put_call_meta(item_id, meta)
+      |> Map.put({:index, index}, meta)
+
+    %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
+  end
+
+  defp maybe_emit_whole_item_args(on_event, base_meta, item, event_type, false)
+       when event_type in ["response.output_item.done", "response.completed"] do
+    case item["arguments"] do
+      args when is_binary(args) and args != "" ->
+        event = Map.put(base_meta, :arguments_delta, args)
+        on_event.({:tool_call_delta, event})
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  defp maybe_emit_whole_item_args(_on_event, _base_meta, _item, _event_type, args_emitted?),
+    do: args_emitted?
 
   defp deferred_call_id_header?(event_type, index, nil, item_id, name)
        when event_type in ["response.output_item.added", "response.output_item.done"] do
@@ -698,7 +747,7 @@ defmodule Alloy.Provider.OpenAI do
       :rejected ->
         acc
 
-      %{id: id, index: idx, name: name} ->
+      %{id: id, index: idx, name: name} = meta ->
         acc.on_event.(
           {:tool_call_delta,
            %{
@@ -709,7 +758,14 @@ defmodule Alloy.Provider.OpenAI do
            }}
         )
 
-        acc
+        updated_meta = %{meta | args_emitted?: true}
+
+        function_calls =
+          acc.function_calls
+          |> maybe_put_call_meta(item_id, updated_meta)
+          |> Map.put({:index, idx}, updated_meta)
+
+        %{acc | function_calls: function_calls}
 
       nil ->
         buffer_pending_delta(acc, item_id, raw_index, delta)
@@ -767,26 +823,12 @@ defmodule Alloy.Provider.OpenAI do
     end)
   end
 
-  defp flush_pending_from_response(%{pending_function_deltas: pending} = acc, _response)
-       when map_size(pending) == 0,
-       do: acc
-
   defp flush_pending_from_response(acc, %{"output" => output}) when is_list(output) do
     output
     |> Enum.with_index()
     |> Enum.reduce(acc, fn
       {%{"type" => "function_call"} = item, idx}, current ->
-        item_id = item["id"]
-        call_id = item["call_id"] || item["id"]
-        name = item["name"]
-
-        if valid_function_call_header?(idx, call_id, name) and
-             has_pending_for?(current.pending_function_deltas, item_id, idx) and
-             lookup_function_call_meta(current.function_calls, item_id, idx) != :rejected do
-          register_function_call_item(current, item, idx, "response.completed")
-        else
-          current
-        end
+        register_function_call_item(current, item, idx, "response.completed")
 
       _other, current ->
         current
@@ -794,11 +836,6 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp flush_pending_from_response(acc, _response), do: acc
-
-  defp has_pending_for?(pending, item_id, idx) do
-    (is_binary(item_id) and item_id != "" and Map.has_key?(pending, item_id)) or
-      Map.has_key?(pending, {:index, idx})
-  end
 
   defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
   defp build_stream_response(%{sticky_error: %Error{} = error}), do: {:error, error}

@@ -348,12 +348,7 @@ defmodule Alloy.Tool.Core.Bash do
         collect(%{run | utf8_carry: utf8_carry}, append(output, data))
 
       {:DOWN, ^worker_mon_ref, :process, _pid, reason} when is_reference(worker_mon_ref) ->
-        if reason != :normal do
-          Logger.warning(
-            "[Alloy.Tool.Core.Bash] :bash_on_output callback worker exited (#{Sanitize.exit_summary(reason)}); command continues without further callback output."
-          )
-        end
-
+        log_output_worker_exit(reason)
         collect(%{run | output_worker: nil}, output)
 
       {^port, {:exit_status, status}} ->
@@ -407,10 +402,9 @@ defmodule Alloy.Tool.Core.Bash do
     ready_ref = make_ref()
 
     case Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
+           Process.flag(:trap_exit, true)
            owner_ref = Process.monitor(owner)
-
-           {worker_pid, worker_ref} =
-             spawn_monitor(fn -> output_worker_loop(fun, budget, false) end)
+           worker_pid = spawn_link(fn -> output_worker_loop(fun, budget, false) end)
 
            send(owner, {:output_worker_ready, ready_ref, worker_pid})
 
@@ -418,7 +412,11 @@ defmodule Alloy.Tool.Core.Bash do
              {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
                Process.exit(worker_pid, :kill)
 
-             {:DOWN, ^worker_ref, :process, ^worker_pid, _reason} ->
+             {:EXIT, ^worker_pid, _reason} ->
+               Process.demonitor(owner_ref, [:flush])
+
+             {:EXIT, _supervisor_or_linked, _reason} ->
+               Process.exit(worker_pid, :kill)
                Process.demonitor(owner_ref, [:flush])
            end
          end) do
@@ -502,7 +500,8 @@ defmodule Alloy.Tool.Core.Bash do
         Process.demonitor(mon_ref, [:flush])
         :ok
 
-      {:DOWN, ^mon_ref, :process, ^pid, _reason} ->
+      {:DOWN, ^mon_ref, :process, ^pid, reason} ->
+        log_output_worker_exit(reason)
         :ok
 
       {:DOWN, ^caller_ref, :process, _pid, _reason} ->
@@ -526,6 +525,16 @@ defmodule Alloy.Tool.Core.Bash do
         "[Alloy.Tool.Core.Bash] :bash_on_output dropped queued output (#{reason}); further drops for this command suppressed."
       )
     end
+
+    :ok
+  end
+
+  defp log_output_worker_exit(:normal), do: :ok
+
+  defp log_output_worker_exit(reason) do
+    Logger.warning(
+      "[Alloy.Tool.Core.Bash] :bash_on_output callback worker exited (#{Sanitize.exit_summary(reason)}); command continues without further callback output."
+    )
 
     :ok
   end

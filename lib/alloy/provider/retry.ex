@@ -388,7 +388,7 @@ defmodule Alloy.Provider.Retry do
 
     {on_text_event, provider_config} = Map.pop(provider_config, :alloy_on_text_event)
     original_on_event = Map.get(provider_config, :on_event)
-    text_event_cb = original_on_event || on_text_event
+    text_event_cb = on_text_event || original_on_event
 
     wrapped_chunk = fn chunk ->
       :atomics.put(ref, 1, 1)

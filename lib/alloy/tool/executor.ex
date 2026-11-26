@@ -398,7 +398,8 @@ defmodule Alloy.Tool.Executor do
 
   defp maybe_attach_tool_updates(run, started) do
     call_alias = Process.alias()
-    inflight = :atomics.new(1, signed: false)
+    # Slot 1: in-flight updates, Slot 2: drop warning logged?
+    inflight = :atomics.new(2, signed: false)
     call_id = started.call[:id]
     call_name = started.call[:name]
     start_seq = started.start_seq
@@ -412,6 +413,12 @@ defmodule Alloy.Tool.Executor do
           )
         else
           :atomics.sub(inflight, 1, 1)
+
+          if :atomics.compare_exchange(inflight, 2, 0, 1) == :ok do
+            Logger.warning(
+              "[Alloy.Tool.Executor] Tool #{call_name} (#{call_id}) dropped :tool_update chunks after reaching #{@max_inflight_tool_updates} in-flight updates; further drops for this call suppressed."
+            )
+          end
         end
 
         :ok
