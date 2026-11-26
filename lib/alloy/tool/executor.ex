@@ -152,14 +152,21 @@ defmodule Alloy.Tool.Executor do
          next_results_rev,
          next_metas_rev
        ) do
-    if Cancel.cancelled?(run.cancel_token) do
-      skipped = skip_batches(rest, &unexecuted_cancelled_result/1)
-      all_results = Enum.reverse(next_results_rev, skipped)
-      {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
-    else
-      skipped = skip_batches(rest, &unexecuted_steering_result/1)
-      all_results = Enum.reverse(next_results_rev, skipped)
-      {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), steering_msgs}
+    cond do
+      Cancel.cancelled?(run.cancel_token) ->
+        skipped = skip_batches(rest, &unexecuted_cancelled_result/1)
+        all_results = Enum.reverse(next_results_rev, skipped)
+        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
+
+      deadline_expired?(run.run_deadline) ->
+        skipped = skip_batches(rest, &elem(unexecuted_result(&1, run), 0))
+        all_results = Enum.reverse(next_results_rev, skipped)
+        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
+
+      true ->
+        skipped = skip_batches(rest, &unexecuted_steering_result/1)
+        all_results = Enum.reverse(next_results_rev, skipped)
+        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), steering_msgs}
     end
   end
 
@@ -171,14 +178,21 @@ defmodule Alloy.Tool.Executor do
          next_results_rev,
          next_metas_rev
        ) do
-    if Cancel.cancelled?(run.cancel_token) do
-      skipped = skip_batches(rest, &unexecuted_cancelled_result/1)
-      all_results = Enum.reverse(next_results_rev, skipped)
-      {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
-    else
-      skipped = skip_batches(rest, &unexecuted_error_result(&1, "Not executed: #{reason}"))
-      all_results = Enum.reverse(next_results_rev, skipped)
-      {:steering_error, Message.tool_results(all_results), Enum.reverse(next_metas_rev), reason}
+    cond do
+      Cancel.cancelled?(run.cancel_token) ->
+        skipped = skip_batches(rest, &unexecuted_cancelled_result/1)
+        all_results = Enum.reverse(next_results_rev, skipped)
+        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
+
+      deadline_expired?(run.run_deadline) ->
+        skipped = skip_batches(rest, &elem(unexecuted_result(&1, run), 0))
+        all_results = Enum.reverse(next_results_rev, skipped)
+        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
+
+      true ->
+        skipped = skip_batches(rest, &unexecuted_error_result(&1, "Not executed: #{reason}"))
+        all_results = Enum.reverse(next_results_rev, skipped)
+        {:steering_error, Message.tool_results(all_results), Enum.reverse(next_metas_rev), reason}
     end
   end
 
@@ -718,6 +732,7 @@ defmodule Alloy.Tool.Executor do
         else
           case Middleware.run_before_tool_call(state, call) do
             :ok -> {:cont, {:ok, [{:execute, call} | acc]}}
+            :cancelled -> {:cont, {:ok, [{:execute, call} | acc]}}
             {:edit, modified_call} -> {:cont, {:ok, [{:execute, modified_call} | acc]}}
             {:block, reason} -> {:cont, {:ok, [{:blocked, call, reason} | acc]}}
             {:halted, reason} -> {:halt, {:halted, reason}}

@@ -143,28 +143,35 @@ defmodule Alloy.Middleware do
 
   Injects the tool call into `state.config.context[:current_tool_call]`
   before running middleware. Returns `:ok`, `{:block, reason}`,
-  `{:edit, modified_call}`, or `{:halted, reason}`.
+  `{:edit, modified_call}`, `{:halted, reason}`, or `:cancelled` (fail-closed
+  when `state.config.cancel_token` is cancelled before or during the chain;
+  an explicit `{:block, reason}` already returned by a middleware is preserved).
 
   The `{:edit, modified_call}` return lets middleware rewrite tool arguments
   before execution. The modified call must keep the same `:id` and `:name`.
 
-  Edits pass the modified call to subsequent middleware. Block and halt
-  stop the chain. State returned from this hook does not alter loop state.
+  Edits pass the modified call to subsequent middleware. Block, halt, and
+  cancellation stop the chain. State returned from this hook does not alter
+  loop state.
   """
   @spec run_before_tool_call(State.t(), map()) ::
-          :ok | {:block, String.t()} | {:edit, map()} | {:halted, String.t()}
+          :ok | {:block, String.t()} | {:edit, map()} | {:halted, String.t()} | :cancelled
   def run_before_tool_call(%State{} = state, tool_call) do
-    result =
-      Enum.reduce_while(state.config.middleware, {:edit, tool_call}, fn middleware,
-                                                                        {:edit, current} ->
-        if Cancel.cancelled?(state.config.cancel_token) do
-          {:halt, {:edit, current}}
-        else
-          run_before_tool_call_step(middleware, state, tool_call, current)
-        end
-      end)
+    if Cancel.cancelled?(state.config.cancel_token) do
+      :cancelled
+    else
+      result =
+        Enum.reduce_while(state.config.middleware, {:edit, tool_call}, fn middleware,
+                                                                          {:edit, current} ->
+          if Cancel.cancelled?(state.config.cancel_token) do
+            {:halt, :cancelled}
+          else
+            run_before_tool_call_step(middleware, state, tool_call, current)
+          end
+        end)
 
-    if result == {:edit, tool_call}, do: :ok, else: result
+      if result == {:edit, tool_call}, do: :ok, else: result
+    end
   end
 
   defp run_before_tool_call_step(middleware, state, tool_call, current) do
@@ -172,30 +179,28 @@ defmodule Alloy.Middleware do
 
     case middleware.call(:before_tool_call, updated_state) do
       {:block, reason} when is_binary(reason) ->
-        if Cancel.cancelled?(state.config.cancel_token),
-          do: {:halt, {:edit, current}},
-          else: {:halt, {:block, reason}}
+        {:halt, {:block, reason}}
 
       {:halt, reason} when is_binary(reason) ->
         if Cancel.cancelled?(state.config.cancel_token),
-          do: {:halt, {:edit, current}},
+          do: {:halt, :cancelled},
           else: {:halt, {:halted, reason}}
 
       {:halt, reason, %State{}} when is_binary(reason) ->
         if Cancel.cancelled?(state.config.cancel_token),
-          do: {:halt, {:edit, current}},
+          do: {:halt, :cancelled},
           else: {:halt, {:halted, reason}}
 
       {:edit, modified_call} when is_map(modified_call) and not is_struct(modified_call) ->
         validate_edit!(tool_call, modified_call)
 
         if Cancel.cancelled?(state.config.cancel_token),
-          do: {:halt, {:edit, modified_call}},
+          do: {:halt, :cancelled},
           else: {:cont, {:edit, modified_call}}
 
       %State{} ->
         if Cancel.cancelled?(state.config.cancel_token),
-          do: {:halt, {:edit, current}},
+          do: {:halt, :cancelled},
           else: {:cont, {:edit, current}}
 
       other ->

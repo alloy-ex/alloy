@@ -97,7 +97,9 @@ defmodule Alloy.Provider do
     called from `Alloy.Agent.Turn`, Alloy may also inject `:system_prompt`,
     `:provider_state`, `:on_event` (when streaming), `:req_options` (with
     `:receive_timeout`), `:alloy_request_deadline` (monotonic ms deadline
-    that built-in providers enforce as a hard wall-clock bound), and
+    that built-in providers enforce as a hard wall-clock bound),
+    `:alloy_cancel_token` (an `Alloy.Cancel.t()` token, injected only when
+    the caller sets `:cancel_token`), and
     `:output_schema` (an `Alloy.OutputSchema.t()` struct, injected only when
     the caller sets `:output_schema`). Custom providers using strict config
     validation should tolerate or ignore these runtime keys, and custom

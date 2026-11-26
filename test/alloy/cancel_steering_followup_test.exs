@@ -2,7 +2,7 @@ defmodule Alloy.CancelSteeringFollowUpTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Agent.{Config, State}
-  alias Alloy.{Cancel, Message, Result, Tool, Transcript}
+  alias Alloy.{Cancel, Message, Middleware, Result, Tool, Transcript}
   alias Alloy.Context.Compactor
   alias Alloy.Provider.{Anthropic, Codex, Error, OpenAI, OpenAICompat}
   alias Alloy.Provider.Test, as: TestProvider
@@ -142,6 +142,97 @@ defmodule Alloy.CancelSteeringFollowUpTest do
         ) do
       send(state.config.context.test_pid, :blocked_step_b)
       {:block, "policy denied step_b"}
+    end
+
+    def call(_hook, state), do: state
+  end
+
+  defmodule UnexpectedHttpAdapter do
+    def run(req) do
+      case Req.Request.get_header(req, "x-probe-id") do
+        [probe_id] ->
+          if pid = :persistent_term.get({Alloy.CancelSteeringFollowUpTest, probe_id}, nil) do
+            send(pid, :unexpected_http_request)
+          end
+
+        _ ->
+          :ok
+      end
+
+      {req,
+       Req.Response.new(
+         status: 200,
+         body:
+           Jason.encode!(%{
+             "id" => "resp_1",
+             "status" => "completed",
+             "output" => [
+               %{
+                 "type" => "message",
+                 "role" => "assistant",
+                 "content" => [%{"type" => "output_text", "text" => "unexpected http"}]
+               }
+             ],
+             "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+           })
+       )}
+    end
+  end
+
+  defmodule FirstTurnThenUnexpectedAdapter do
+    def run(req) do
+      [probe_id] = Req.Request.get_header(req, "x-probe-id")
+      {pid, counter} = :persistent_term.get({Alloy.CancelSteeringFollowUpTest, probe_id})
+
+      if :atomics.add_get(counter, 1, 1) == 1 do
+        {req,
+         Req.Response.new(
+           status: 200,
+           body:
+             Jason.encode!(%{
+               "id" => "resp_1",
+               "status" => "completed",
+               "output" => [
+                 %{
+                   "type" => "message",
+                   "role" => "assistant",
+                   "content" => [%{"type" => "output_text", "text" => "turn 1"}]
+                 }
+               ],
+               "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+             })
+         )}
+      else
+        send(pid, :unexpected_http_request)
+        {req, Req.Response.new(status: 500, body: "{}")}
+      end
+    end
+  end
+
+  defmodule CancelDuringBeforeToolMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:before_tool_call, state) do
+      Cancel.cancel(state.config.cancel_token)
+
+      case state.config.context[:before_tool_mode] do
+        :edit -> {:edit, %{id: "tc_1", name: "t", input: %{"edited" => true}}}
+        :block -> {:block, "explicit policy block"}
+        _ -> state
+      end
+    end
+
+    def call(_hook, state), do: state
+  end
+
+  defmodule AlwaysBlockBeforeToolMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:before_tool_call, state) do
+      if pid = state.config.context[:test_pid], do: send(pid, :always_block_ran)
+      {:block, "must not bypass policy"}
     end
 
     def call(_hook, state), do: state
@@ -1363,73 +1454,6 @@ defmodule Alloy.CancelSteeringFollowUpTest do
             fn _ -> [%Message{role: :user, content: nil}] end,
             fn _ -> [%Message{role: :user, content: []}] end,
             fn _ -> [%Message{role: :user, content: [Message.user("nested")]}] end,
-            fn _ ->
-              [
-                %Message{
-                  role: :assistant,
-                  content: [%{type: "text", text: %{secret: "sk-fu-map-secret"}}]
-                }
-              ]
-            end,
-            fn _ ->
-              [
-                %Message{
-                  role: :assistant,
-                  content: [%{type: "thinking", thinking: 42}]
-                }
-              ]
-            end,
-            fn _ -> [%Message{role: :user, content: [%{type: "image"}]}] end,
-            fn _ ->
-              [
-                %Message{
-                  role: :user,
-                  content: [
-                    %{
-                      type: "image",
-                      url: "https://example.invalid/a.png",
-                      data: "AAAA",
-                      mime_type: %{secret: "sk-fu-map-secret"}
-                    }
-                  ]
-                }
-              ]
-            end,
-            fn _ ->
-              [
-                %Message{
-                  role: :user,
-                  content: [
-                    %{
-                      type: "document",
-                      mime_type: "application/pdf",
-                      uri: "https://example.invalid/a.pdf",
-                      file_id: "file_1"
-                    }
-                  ]
-                }
-              ]
-            end,
-            fn _ ->
-              [
-                %Message{
-                  role: :user,
-                  content: [
-                    %{type: "audio", mime_type: "audio/wav", data: %{secret: "sk-fu-map-secret"}}
-                  ]
-                }
-              ]
-            end,
-            fn _ ->
-              [
-                %Message{
-                  role: :user,
-                  content: [
-                    %{type: "video", mime_type: %{secret: "sk-fu-map-secret"}, data: "AAAA"}
-                  ]
-                }
-              ]
-            end,
             fn _ -> [%Message{role: :assistant, content: [%URI{}]}] end,
             fn _ ->
               [
@@ -2130,6 +2154,221 @@ defmodule Alloy.CancelSteeringFollowUpTest do
                    end
                  end
                )
+    end
+
+    test "rejects non-JSON tool_use input and invalid UTF-8 before HTTP serialization" do
+      probe_id = "json-compat-#{System.unique_integer([:positive])}"
+      :persistent_term.put({__MODULE__, probe_id}, self())
+      on_exit(fn -> :persistent_term.erase({__MODULE__, probe_id}) end)
+
+      bad_payloads = [
+        [
+          %Message{
+            role: :assistant,
+            content: [
+              %{
+                type: "tool_use",
+                id: "bad_json_1",
+                name: "t",
+                input: %{"nested" => {"sk-tuple-secret", 1}}
+              }
+            ]
+          },
+          Message.tool_results([Message.tool_result_block("bad_json_1", "ok", false)])
+        ],
+        [Message.user(<<0xFF, 0xFE>>)]
+      ]
+
+      tool =
+        Tool.inline(
+          name: "t",
+          description: "t",
+          input_schema: %{type: "object", properties: %{}, required: []},
+          execute: fn _, _ -> {:ok, "ok"} end
+        )
+
+      # 1. Rejected in :steering before advancing to real OpenAI provider
+      for msgs <- bad_payloads do
+        {:ok, pid} =
+          TestProvider.start_link([
+            TestProvider.tool_use_response([%{id: "s1", name: "t", input: %{}}])
+          ])
+
+        assert {:error, %Result{status: :error, error: err} = res} =
+                 Alloy.run("go",
+                   provider: {TestProvider, agent_pid: pid},
+                   tools: [tool],
+                   steering: fn _ -> msgs end
+                 )
+
+        assert err =~ "steering callback"
+        refute err =~ "sk-tuple-secret"
+        assert :ok == Transcript.validate(res.messages)
+      end
+
+      # 2. Rejected in :follow_up against a real OpenAI provider before any second HTTP request
+      req_count = :atomics.new(1, signed: false)
+      :persistent_term.put({__MODULE__, probe_id}, {self(), req_count})
+
+      for msgs <- bad_payloads do
+        :atomics.put(req_count, 1, 0)
+
+        assert {:error, %Result{status: :error, error: err} = res} =
+                 Alloy.run("go",
+                   provider:
+                     {OpenAI,
+                      api_key: "test-key",
+                      model: "gpt-5.4",
+                      req_options: [
+                        adapter: FirstTurnThenUnexpectedAdapter,
+                        headers: [{"x-probe-id", probe_id}]
+                      ]},
+                   follow_up: fn _ -> msgs end
+                 )
+
+        assert err =~ "follow_up callback"
+        refute err =~ "sk-tuple-secret"
+        assert :atomics.get(req_count, 1) == 1
+        refute_received :unexpected_http_request
+        assert :ok == Transcript.validate(res.messages)
+      end
+    end
+
+    test "dynamic :api_key callback returning %Error{kind: :cancelled} skips fallbacks and redacts message" do
+      probe_id = "auth-cancel-#{System.unique_integer([:positive])}"
+      :persistent_term.put({__MODULE__, probe_id}, self())
+      on_exit(fn -> :persistent_term.erase({__MODULE__, probe_id}) end)
+
+      {:ok, fallback_pid} = TestProvider.start_link([TestProvider.text_response("fallback ran")])
+
+      assert {:error, %Result{status: :cancelled, error: :cancelled} = res} =
+               Alloy.run("hi",
+                 provider:
+                   {OpenAI,
+                    api_key: fn ->
+                      {:error, %Error{kind: :cancelled, message: "sk-auth-cancel-secret"}}
+                    end,
+                    origin_key: "openai:test-auth-cancel",
+                    model: "gpt-5.4",
+                    req_options: [
+                      adapter: UnexpectedHttpAdapter,
+                      headers: [{"x-probe-id", probe_id}]
+                    ]},
+                 fallback_providers: [{TestProvider, agent_pid: fallback_pid}]
+               )
+
+      refute_received :unexpected_http_request
+      assert length(Agent.get(fallback_pid, & &1)) == 1
+      refute inspect(res) =~ "sk-auth-cancel-secret"
+      assert res.metadata.run.provider_error.kind == :cancelled
+    end
+
+    test "Middleware.run_before_tool_call/2 fails closed with :cancelled while preserving explicit :block" do
+      call = %{id: "tc_1", name: "t", input: %{}}
+
+      # 1. Pre-cancelled token returns :cancelled without invoking blocking middleware
+      token1 = Cancel.new()
+      Cancel.cancel(token1)
+
+      state1 =
+        State.init(
+          Config.from_opts(
+            provider: {TestProvider, agent_pid: self()},
+            cancel_token: token1,
+            middleware: [AlwaysBlockBeforeToolMiddleware],
+            context: %{test_pid: self(), current_tool_call: call}
+          )
+        )
+
+      assert :cancelled == Middleware.run_before_tool_call(state1, call)
+      refute_received :always_block_ran
+
+      # 2. Mid-chain cancel during :ok or {:edit, _} returns :cancelled (never fails open)
+      for mode <- [:ok, :edit] do
+        token2 = Cancel.new()
+
+        state2 =
+          State.init(
+            Config.from_opts(
+              provider: {TestProvider, agent_pid: self()},
+              cancel_token: token2,
+              middleware: [CancelDuringBeforeToolMiddleware, AlwaysBlockBeforeToolMiddleware],
+              context: %{test_pid: self(), current_tool_call: call, before_tool_mode: mode}
+            )
+          )
+
+        assert :cancelled == Middleware.run_before_tool_call(state2, call)
+        refute_received :always_block_ran
+      end
+
+      # 3. Explicit {:block, reason} returned alongside cancellation is preserved
+      token3 = Cancel.new()
+
+      state3 =
+        State.init(
+          Config.from_opts(
+            provider: {TestProvider, agent_pid: self()},
+            cancel_token: token3,
+            middleware: [CancelDuringBeforeToolMiddleware, AlwaysBlockBeforeToolMiddleware],
+            context: %{test_pid: self(), current_tool_call: call, before_tool_mode: :block}
+          )
+        )
+
+      assert {:block, "explicit policy block"} == Middleware.run_before_tool_call(state3, call)
+      refute_received :always_block_ran
+    end
+
+    test "deadline expiry takes precedence over :steering and :follow_up callback errors" do
+      tool =
+        Tool.inline(
+          name: "t",
+          description: "t",
+          input_schema: %{type: "object", properties: %{}, required: []},
+          execute: fn _, _ -> {:ok, "ok"} end
+        )
+
+      for bad_action <- [
+            fn ->
+              Process.sleep(100)
+              :not_a_list
+            end,
+            fn ->
+              Process.sleep(100)
+              raise "late failure"
+            end
+          ] do
+        {:ok, steer_pid} =
+          TestProvider.start_link([
+            TestProvider.tool_use_response([
+              %{id: "d1", name: "t", input: %{}},
+              %{id: "d2", name: "t", input: %{}}
+            ])
+          ])
+
+        assert {:error, %Result{status: :error} = steer_res} =
+                 Alloy.run("go",
+                   provider: {TestProvider, agent_pid: steer_pid},
+                   tools: [tool],
+                   tool_concurrency: 1,
+                   timeout_ms: 50,
+                   steering: fn _ -> bad_action.() end
+                 )
+
+        assert steer_res.metadata.run.provider_error.kind == :timeout
+        assert :ok == Transcript.validate(steer_res.messages)
+
+        {:ok, fu_pid} = TestProvider.start_link([TestProvider.text_response("turn 1")])
+
+        assert {:error, %Result{status: :error} = fu_res} =
+                 Alloy.run("go",
+                   provider: {TestProvider, agent_pid: fu_pid},
+                   timeout_ms: 50,
+                   follow_up: fn _ -> bad_action.() end
+                 )
+
+        assert fu_res.metadata.run.provider_error.kind == :timeout
+        assert :ok == Transcript.validate(fu_res.messages)
+      end
     end
   end
 end

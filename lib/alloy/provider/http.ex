@@ -326,6 +326,7 @@ defmodule Alloy.Provider.HTTP do
         safe_kind =
           if err.kind in [
                :auth,
+               :cancelled,
                :timeout,
                :rate_limited,
                :overloaded,

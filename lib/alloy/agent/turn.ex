@@ -903,9 +903,16 @@ defmodule Alloy.Agent.Turn do
           else: {:continue, State.append_messages(state, follow_up_msgs)}
 
       {:error, reason} ->
-        if Cancel.cancelled?(state.config.cancel_token),
-          do: {:halt, cancel_state(state)},
-          else: {:halt, fail(state, reason)}
+        cond do
+          Cancel.cancelled?(state.config.cancel_token) ->
+            {:halt, cancel_state(state)}
+
+          deadline_expired?(state) ->
+            {:halt, fail(state, timeout_error(state))}
+
+          true ->
+            {:halt, fail(state, reason)}
+        end
     end
   end
 
@@ -1062,7 +1069,7 @@ defmodule Alloy.Agent.Turn do
 
   defp valid_callback_message?(%Message{role: role, content: content})
        when role in [:user, :assistant] do
-    is_binary(content) or
+    valid_utf8?(content) or
       (is_list(content) and content != [] and Enum.all?(content, &valid_callback_block?/1))
   end
 
@@ -1072,7 +1079,7 @@ defmodule Alloy.Agent.Turn do
     case Map.get(block, :type) do
       "text" -> valid_callback_text?(block)
       "thinking" -> valid_callback_thinking?(block)
-      "redacted_thinking" -> is_binary(Map.get(block, :data))
+      "redacted_thinking" -> valid_utf8?(Map.get(block, :data))
       "tool_use" -> valid_callback_tool_use?(block)
       "tool_result" -> valid_callback_tool_result?(block)
       "image" -> valid_callback_image?(block)
@@ -1086,11 +1093,11 @@ defmodule Alloy.Agent.Turn do
   defp valid_callback_block?(_other), do: false
 
   defp valid_callback_text?(block) do
-    is_binary(Map.get(block, :text)) and optional_boolean?(block, :refusal)
+    valid_utf8?(Map.get(block, :text)) and optional_boolean?(block, :refusal)
   end
 
   defp valid_callback_thinking?(block) do
-    is_binary(Map.get(block, :thinking)) and optional_binary?(block, :signature)
+    valid_utf8?(Map.get(block, :thinking)) and optional_utf8?(block, :signature)
   end
 
   defp valid_callback_tool_use?(block) do
@@ -1098,18 +1105,15 @@ defmodule Alloy.Agent.Turn do
     name = Map.get(block, :name)
     input = Map.get(block, :input)
 
-    is_binary(id) and byte_size(id) > 0 and
-      is_binary(name) and byte_size(name) > 0 and
-      plain_map?(input)
+    non_empty_utf8?(id) and non_empty_utf8?(name) and
+      plain_map?(input) and json_compatible?(input)
   end
 
   defp valid_callback_tool_result?(block) do
     id = Map.get(block, :tool_use_id)
     content = Map.get(block, :content)
 
-    is_binary(id) and byte_size(id) > 0 and
-      is_binary(content) and
-      optional_boolean?(block, :is_error)
+    non_empty_utf8?(id) and valid_utf8?(content) and optional_boolean?(block, :is_error)
   end
 
   # Reject mixed inline (:data) and URL (:url) sources and validate every
@@ -1120,10 +1124,10 @@ defmodule Alloy.Agent.Turn do
 
     cond do
       has_data? and not has_url? ->
-        non_empty_binary?(Map.get(block, :mime_type)) and is_binary(Map.get(block, :data))
+        non_empty_utf8?(Map.get(block, :mime_type)) and valid_utf8?(Map.get(block, :data))
 
       has_url? and not has_data? ->
-        is_binary(Map.get(block, :url)) and optional_binary?(block, :mime_type)
+        valid_utf8?(Map.get(block, :url)) and optional_utf8?(block, :mime_type)
 
       true ->
         false
@@ -1133,29 +1137,46 @@ defmodule Alloy.Agent.Turn do
   defp valid_callback_media?(block) do
     not Map.has_key?(block, :url) and
       not Map.has_key?(block, :uri) and
-      non_empty_binary?(Map.get(block, :mime_type)) and
-      is_binary(Map.get(block, :data))
+      non_empty_utf8?(Map.get(block, :mime_type)) and
+      valid_utf8?(Map.get(block, :data))
   end
 
   defp valid_callback_document?(block) do
     sources = Enum.filter([:data, :uri, :file_id], &Map.has_key?(block, &1))
 
-    non_empty_binary?(Map.get(block, :mime_type)) and
+    non_empty_utf8?(Map.get(block, :mime_type)) and
       length(sources) == 1 and
-      is_binary(Map.get(block, hd(sources))) and
-      optional_binary?(block, :filename) and
-      optional_binary?(block, :title) and
-      optional_binary?(block, :origin)
+      valid_utf8?(Map.get(block, hd(sources))) and
+      optional_utf8?(block, :filename) and
+      optional_utf8?(block, :title) and
+      optional_utf8?(block, :origin)
   end
 
   defp plain_map?(value), do: is_map(value) and not is_struct(value)
-  defp non_empty_binary?(value), do: is_binary(value) and byte_size(value) > 0
+  defp valid_utf8?(value), do: is_binary(value) and String.valid?(value)
+  defp non_empty_utf8?(value), do: valid_utf8?(value) and byte_size(value) > 0
 
-  defp optional_binary?(map, key) do
+  defp json_compatible?(value) when is_nil(value) or is_boolean(value) or is_number(value),
+    do: true
+
+  defp json_compatible?(value) when is_binary(value), do: String.valid?(value)
+
+  defp json_compatible?(value) when is_list(value),
+    do: not List.improper?(value) and Enum.all?(value, &json_compatible?/1)
+
+  defp json_compatible?(value) when is_map(value) and not is_struct(value) do
+    Enum.all?(value, fn {k, v} ->
+      (valid_utf8?(k) or is_atom(k)) and json_compatible?(v)
+    end)
+  end
+
+  defp json_compatible?(_other), do: false
+
+  defp optional_utf8?(map, key) do
     case Map.fetch(map, key) do
       :error -> true
       {:ok, nil} -> true
-      {:ok, value} -> is_binary(value)
+      {:ok, value} -> valid_utf8?(value)
     end
   end
 
