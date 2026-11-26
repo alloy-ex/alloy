@@ -1029,6 +1029,37 @@ defmodule Alloy.CancelSteeringFollowUpTest do
                Compactor.maybe_compact(st)
 
       assert %State{status: :cancelled, messages: ^short_history} = Compactor.force_compact(st)
+
+      # End-to-end :on_context_overflow recovery cancelled during compaction summary
+      overflow_history =
+        for i <- 1..8 do
+          if rem(i, 2) == 1,
+            do: Message.user(String.duplicate("ov-u#{i} ", 40)),
+            else: Message.assistant(String.duplicate("ov-a#{i} ", 40))
+        end
+
+      {:ok, ov_pid} =
+        TestProvider.start_link([
+          {:error, %Error{kind: :context_overflow, message: "prompt is too long"}},
+          {:error, %Error{kind: :cancelled, message: "overflow summary cancelled"}},
+          TestProvider.text_response("should not retry")
+        ])
+
+      assert {:error,
+              %Result{
+                status: :cancelled,
+                error: :cancelled,
+                metadata: %{run: %{provider_error: %Error{kind: :cancelled}}}
+              } = ov_res} =
+               Alloy.run("trigger overflow",
+                 messages: overflow_history,
+                 provider: {TestProvider, agent_pid: ov_pid},
+                 max_tokens: 100_000,
+                 compaction: [reserve_tokens: 1_000, keep_recent_tokens: 100]
+               )
+
+      assert ov_res.messages == overflow_history ++ [Message.user("trigger overflow")]
+      assert length(Agent.get(ov_pid, & &1)) == 1
     end
 
     test "cancels CodexRunner subprocess cleanly, removes temp dir, and annotates resumed sessions" do
@@ -1349,6 +1380,56 @@ defmodule Alloy.CancelSteeringFollowUpTest do
               ]
             end,
             fn _ -> [%Message{role: :user, content: [%{type: "image"}]}] end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{
+                      type: "image",
+                      url: "https://example.invalid/a.png",
+                      data: "AAAA",
+                      mime_type: %{secret: "sk-fu-map-secret"}
+                    }
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{
+                      type: "document",
+                      mime_type: "application/pdf",
+                      uri: "https://example.invalid/a.pdf",
+                      file_id: "file_1"
+                    }
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{type: "audio", mime_type: "audio/wav", data: %{secret: "sk-fu-map-secret"}}
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{type: "video", mime_type: %{secret: "sk-fu-map-secret"}, data: "AAAA"}
+                  ]
+                }
+              ]
+            end,
             fn _ -> [%Message{role: :assistant, content: [%URI{}]}] end,
             fn _ ->
               [
@@ -1367,6 +1448,55 @@ defmodule Alloy.CancelSteeringFollowUpTest do
               ]
             end,
             fn _ -> [%Message{role: :user, content: [%{type: "unknown_block"}]}] end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{
+                      type: "image",
+                      url: "https://example.invalid/a.png",
+                      data: "AAAA",
+                      mime_type: %{secret: "sk-map-secret"}
+                    }
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{
+                      type: "document",
+                      mime_type: "application/pdf",
+                      uri: "https://example.invalid/a.pdf",
+                      data: "AAAA",
+                      filename: %{secret: "sk-map-secret"}
+                    }
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{type: "audio", mime_type: "audio/wav", data: %{secret: "sk-map-secret"}}
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [%{type: "video", mime_type: %{secret: "sk-map-secret"}, data: "AAAA"}]
+                }
+              ]
+            end,
             fn _ ->
               [
                 %Message{
@@ -1495,6 +1625,30 @@ defmodule Alloy.CancelSteeringFollowUpTest do
                )
 
       assert :ok == Transcript.validate(pair_res.messages)
+
+      # 1c. Steering accepts valid audio and video content blocks
+      {:ok, pid_av} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "av1", name: "par_t", input: %{}}]),
+          TestProvider.text_response("audio video steering ok")
+        ])
+
+      av_msg = %Message{
+        role: :user,
+        content: [
+          Message.audio("audio/wav", "AAAA"),
+          Message.video("video/mp4", "BBBB"),
+          Message.image_url("https://example.invalid/a.png"),
+          Message.document("application/pdf", "https://example.invalid/a.pdf", filename: "a.pdf")
+        ]
+      }
+
+      assert {:ok, %Result{status: :completed, text: "audio video steering ok"}} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid_av},
+                 tools: [par_tool],
+                 steering: fn _ -> [av_msg] end
+               )
 
       {:ok, pid_halt} =
         TestProvider.start_link([
@@ -1831,6 +1985,56 @@ defmodule Alloy.CancelSteeringFollowUpTest do
             fn _ ->
               [
                 %Message{
+                  role: :user,
+                  content: [
+                    %{
+                      type: "image",
+                      url: "https://example.invalid/a.png",
+                      data: "AAAA",
+                      mime_type: %{secret: "sk-fu-map-secret"}
+                    }
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{
+                      type: "document",
+                      mime_type: "application/pdf",
+                      uri: "https://example.invalid/a.pdf",
+                      file_id: "file_1"
+                    }
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{type: "audio", mime_type: "audio/wav", data: %{secret: "sk-fu-map-secret"}}
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :user,
+                  content: [
+                    %{type: "video", mime_type: %{secret: "sk-fu-map-secret"}, data: "AAAA"}
+                  ]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
                   role: :assistant,
                   content: [%{type: "tool_use", id: "fu_unanswered", name: "t", input: %{}}]
                 }
@@ -1897,6 +2101,35 @@ defmodule Alloy.CancelSteeringFollowUpTest do
                )
 
       assert :ok == Transcript.validate(fu_pair_res.messages)
+
+      # 7. Valid audio and video blocks in :follow_up succeed
+      {:ok, pid_fu_av} =
+        TestProvider.start_link([
+          TestProvider.text_response("turn 1"),
+          TestProvider.text_response("audio video follow-up ok")
+        ])
+
+      fu_av_once = :atomics.new(1, signed: false)
+
+      assert {:ok, %Result{status: :completed, text: "audio video follow-up ok", turns: 2}} =
+               Alloy.run("hi",
+                 provider: {TestProvider, agent_pid: pid_fu_av},
+                 follow_up: fn _ ->
+                   if :atomics.compare_exchange(fu_av_once, 1, 0, 1) == :ok do
+                     [
+                       %Message{
+                         role: :user,
+                         content: [
+                           Message.audio("audio/wav", "AAAA"),
+                           Message.video("video/mp4", "BBBB")
+                         ]
+                       }
+                     ]
+                   else
+                     []
+                   end
+                 end
+               )
     end
   end
 end

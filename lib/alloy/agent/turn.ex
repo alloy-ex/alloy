@@ -1070,18 +1070,28 @@ defmodule Alloy.Agent.Turn do
 
   defp valid_callback_block?(block) when is_map(block) and not is_struct(block) do
     case Map.get(block, :type) do
-      "text" -> is_binary(Map.get(block, :text))
-      "thinking" -> is_binary(Map.get(block, :thinking))
+      "text" -> valid_callback_text?(block)
+      "thinking" -> valid_callback_thinking?(block)
       "redacted_thinking" -> is_binary(Map.get(block, :data))
       "tool_use" -> valid_callback_tool_use?(block)
       "tool_result" -> valid_callback_tool_result?(block)
       "image" -> valid_callback_image?(block)
+      "audio" -> valid_callback_media?(block)
+      "video" -> valid_callback_media?(block)
       "document" -> valid_callback_document?(block)
       _other -> false
     end
   end
 
   defp valid_callback_block?(_other), do: false
+
+  defp valid_callback_text?(block) do
+    is_binary(Map.get(block, :text)) and optional_boolean?(block, :refusal)
+  end
+
+  defp valid_callback_thinking?(block) do
+    is_binary(Map.get(block, :thinking)) and optional_binary?(block, :signature)
+  end
 
   defp valid_callback_tool_use?(block) do
     id = Map.get(block, :id)
@@ -1090,24 +1100,70 @@ defmodule Alloy.Agent.Turn do
 
     is_binary(id) and byte_size(id) > 0 and
       is_binary(name) and byte_size(name) > 0 and
-      is_map(input) and not is_struct(input)
+      plain_map?(input)
   end
 
   defp valid_callback_tool_result?(block) do
     id = Map.get(block, :tool_use_id)
     content = Map.get(block, :content)
-    is_binary(id) and byte_size(id) > 0 and is_binary(content)
+
+    is_binary(id) and byte_size(id) > 0 and
+      is_binary(content) and
+      optional_boolean?(block, :is_error)
   end
 
+  # Reject mixed inline (:data) and URL (:url) sources and validate every
+  # supplied source/metadata field so providers never crash on malformed maps.
   defp valid_callback_image?(block) do
-    (is_binary(Map.get(block, :mime_type)) and is_binary(Map.get(block, :data))) or
-      is_binary(Map.get(block, :url))
+    has_data? = Map.has_key?(block, :data)
+    has_url? = Map.has_key?(block, :url)
+
+    cond do
+      has_data? and not has_url? ->
+        non_empty_binary?(Map.get(block, :mime_type)) and is_binary(Map.get(block, :data))
+
+      has_url? and not has_data? ->
+        is_binary(Map.get(block, :url)) and optional_binary?(block, :mime_type)
+
+      true ->
+        false
+    end
+  end
+
+  defp valid_callback_media?(block) do
+    not Map.has_key?(block, :url) and
+      not Map.has_key?(block, :uri) and
+      non_empty_binary?(Map.get(block, :mime_type)) and
+      is_binary(Map.get(block, :data))
   end
 
   defp valid_callback_document?(block) do
-    is_binary(Map.get(block, :mime_type)) and
-      (is_binary(Map.get(block, :data)) or is_binary(Map.get(block, :uri)) or
-         is_binary(Map.get(block, :file_id)))
+    sources = Enum.filter([:data, :uri, :file_id], &Map.has_key?(block, &1))
+
+    non_empty_binary?(Map.get(block, :mime_type)) and
+      length(sources) == 1 and
+      is_binary(Map.get(block, hd(sources))) and
+      optional_binary?(block, :filename) and
+      optional_binary?(block, :title) and
+      optional_binary?(block, :origin)
+  end
+
+  defp plain_map?(value), do: is_map(value) and not is_struct(value)
+  defp non_empty_binary?(value), do: is_binary(value) and byte_size(value) > 0
+
+  defp optional_binary?(map, key) do
+    case Map.fetch(map, key) do
+      :error -> true
+      {:ok, nil} -> true
+      {:ok, value} -> is_binary(value)
+    end
+  end
+
+  defp optional_boolean?(map, key) do
+    case Map.fetch(map, key) do
+      :error -> true
+      {:ok, value} -> is_boolean(value)
+    end
   end
 
   defp check_deadline(state) do

@@ -88,13 +88,17 @@ defmodule Alloy.Middleware do
   # stopped, so the loop can keep work earlier middleware already paid for.
   @spec run_hook(hook(), State.t()) :: State.t() | {:halted, String.t(), State.t()}
   def run_hook(hook, %State{} = state) do
-    Enum.reduce_while(state.config.middleware, state, fn middleware, acc ->
-      if acc.status == :cancelled or Cancel.cancelled?(acc.config.cancel_token) do
-        {:halt, cancel_middleware_state(acc)}
-      else
-        run_hook_step(middleware, hook, acc)
-      end
-    end)
+    if state.status == :cancelled or Cancel.cancelled?(state.config.cancel_token) do
+      cancel_middleware_state(state)
+    else
+      Enum.reduce_while(state.config.middleware, state, fn middleware, acc ->
+        if acc.status == :cancelled or Cancel.cancelled?(acc.config.cancel_token) do
+          {:halt, cancel_middleware_state(acc)}
+        else
+          run_hook_step(middleware, hook, acc)
+        end
+      end)
+    end
   end
 
   defp run_hook_step(middleware, hook, acc) do

@@ -51,7 +51,7 @@ defmodule Alloy.Tool.Executor do
   def execute_all(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
     {run, inline_tools} = build_run(tool_fns, state, opts)
 
-    with {:ok, tagged} <- tag_tool_calls(state, tool_calls) do
+    with {:ok, tagged} <- tag_tool_calls(run.state, tool_calls) do
       {results, meta} =
         tagged
         |> batches(inline_tools, state.config.tool_concurrency == 1)
@@ -71,7 +71,7 @@ defmodule Alloy.Tool.Executor do
     {run, inline_tools} = build_run(tool_fns, state, opts)
     poll_steering = Keyword.get(opts, :poll_steering)
 
-    with {:ok, tagged} <- tag_tool_calls(state, tool_calls) do
+    with {:ok, tagged} <- tag_tool_calls(run.state, tool_calls) do
       batches = batches(tagged, inline_tools, state.config.tool_concurrency == 1)
       run_batches(batches, run, poll_steering, [], [])
     end
@@ -91,15 +91,18 @@ defmodule Alloy.Tool.Executor do
     emit_tool_updates? =
       Keyword.get(opts, :event_subscriber?, Keyword.has_key?(opts, :on_event))
 
+    cancel_token = Keyword.get(opts, :cancel_token, state.config.cancel_token)
+    effective_state = %{state | config: %{state.config | cancel_token: cancel_token}}
+
     run = %{
-      state: state,
+      state: effective_state,
       schemas: schemas,
       concurrency: state.config.tool_concurrency || System.schedulers_online(),
       tool_fns: inline_tools,
-      context: build_context(state),
+      context: build_context(effective_state),
       timeout: state.config.tool_timeout,
       run_deadline: Keyword.get(opts, :run_deadline),
-      cancel_token: Keyword.get(opts, :cancel_token, state.config.cancel_token),
+      cancel_token: cancel_token,
       on_event: Keyword.get(opts, :on_event, fn _ -> :ok end),
       emit_tool_updates?: emit_tool_updates?,
       seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
