@@ -2176,6 +2176,39 @@ defmodule Alloy.CancelSteeringFollowUpTest do
           },
           Message.tool_results([Message.tool_result_block("bad_json_1", "ok", false)])
         ],
+        [
+          %Message{
+            role: :assistant,
+            content: [%{type: "text", text: "hi", phase: {"sk-phase-secret", 1}}]
+          }
+        ],
+        [
+          %Message{
+            role: :assistant,
+            content: [%{type: "text", text: "hi", signature: {"sk-sig-secret", 1}}]
+          }
+        ],
+        [
+          %Message{
+            role: :assistant,
+            content: [%{type: "text", text: "hi", phase: 123}]
+          }
+        ],
+        [
+          %Message{
+            role: :assistant,
+            content: [
+              %{
+                type: "tool_use",
+                id: "bad_caller_1",
+                name: "t",
+                input: %{},
+                caller: {"sk-caller-secret", 1}
+              }
+            ]
+          },
+          Message.tool_results([Message.tool_result_block("bad_caller_1", "ok", false)])
+        ],
         [Message.user(<<0xFF, 0xFE>>)]
       ]
 
@@ -2202,7 +2235,11 @@ defmodule Alloy.CancelSteeringFollowUpTest do
                  )
 
         assert err =~ "steering callback"
-        refute err =~ "sk-tuple-secret"
+
+        for secret <- ["sk-tuple-secret", "sk-phase-secret", "sk-sig-secret", "sk-caller-secret"] do
+          refute err =~ secret
+        end
+
         assert :ok == Transcript.validate(res.messages)
       end
 
@@ -2227,7 +2264,11 @@ defmodule Alloy.CancelSteeringFollowUpTest do
                  )
 
         assert err =~ "follow_up callback"
-        refute err =~ "sk-tuple-secret"
+
+        for secret <- ["sk-tuple-secret", "sk-phase-secret", "sk-sig-secret", "sk-caller-secret"] do
+          refute err =~ secret
+        end
+
         assert :atomics.get(req_count, 1) == 1
         refute_received :unexpected_http_request
         assert :ok == Transcript.validate(res.messages)
@@ -2368,6 +2409,39 @@ defmodule Alloy.CancelSteeringFollowUpTest do
 
         assert fu_res.metadata.run.provider_error.kind == :timeout
         assert :ok == Transcript.validate(fu_res.messages)
+      end
+
+      # Deadline expiry during steering must not be masked by stop_after_tool
+      for steering_action <- [
+            fn ->
+              Process.sleep(100)
+              [Message.user("more")]
+            end,
+            fn ->
+              Process.sleep(100)
+              :not_a_list
+            end,
+            fn ->
+              Process.sleep(100)
+              raise "late failure"
+            end
+          ] do
+        {:ok, sat_pid} =
+          TestProvider.start_link([
+            TestProvider.tool_use_response([%{id: "sat1", name: "t", input: %{}}])
+          ])
+
+        assert {:error, %Result{status: :error} = sat_res} =
+                 Alloy.run("go",
+                   provider: {TestProvider, agent_pid: sat_pid},
+                   tools: [tool],
+                   stop_after_tool: "t",
+                   timeout_ms: 50,
+                   steering: fn _ -> steering_action.() end
+                 )
+
+        assert sat_res.metadata.run.provider_error.kind == :timeout
+        assert :ok == Transcript.validate(sat_res.messages)
       end
     end
   end

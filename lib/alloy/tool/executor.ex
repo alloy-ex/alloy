@@ -65,6 +65,7 @@ defmodule Alloy.Tool.Executor do
   @doc false
   @spec execute_all_for_turn([map()], %{String.t() => Registry.tool()}, State.t(), keyword()) ::
           {:ok, Message.t(), [map()], [Message.t()]}
+          | {:deadline_expired, Message.t(), [map()]}
           | {:steering_error, Message.t(), [map()], String.t()}
           | {:halted, String.t()}
   def execute_all_for_turn(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
@@ -161,7 +162,7 @@ defmodule Alloy.Tool.Executor do
       deadline_expired?(run.run_deadline) ->
         skipped = skip_batches(rest, &elem(unexecuted_result(&1, run), 0))
         all_results = Enum.reverse(next_results_rev, skipped)
-        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
+        {:deadline_expired, Message.tool_results(all_results), Enum.reverse(next_metas_rev)}
 
       true ->
         skipped = skip_batches(rest, &unexecuted_steering_result/1)
@@ -187,7 +188,7 @@ defmodule Alloy.Tool.Executor do
       deadline_expired?(run.run_deadline) ->
         skipped = skip_batches(rest, &elem(unexecuted_result(&1, run), 0))
         all_results = Enum.reverse(next_results_rev, skipped)
-        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
+        {:deadline_expired, Message.tool_results(all_results), Enum.reverse(next_metas_rev)}
 
       true ->
         skipped = skip_batches(rest, &unexecuted_error_result(&1, "Not executed: #{reason}"))

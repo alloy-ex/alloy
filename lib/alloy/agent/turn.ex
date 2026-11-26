@@ -666,6 +666,18 @@ defmodule Alloy.Agent.Turn do
 
         {:halt, failed}
 
+      {:deadline_expired, result_blocks, tool_call_meta} ->
+        state =
+          state
+          |> answer_tool_calls(tool_calls, result_blocks)
+          |> State.append_tool_calls(tool_call_meta)
+
+        if Cancel.cancelled?(state.config.cancel_token) do
+          {:halt, cancel_state(state)}
+        else
+          finish_tool_round_deadline_expired(state)
+        end
+
       {:ok, result_blocks, tool_call_meta, steering_msgs} ->
         steered? = steering_msgs != []
 
@@ -698,6 +710,20 @@ defmodule Alloy.Agent.Turn do
 
           true ->
             maybe_finish_after_tool({:continue, next_state}, tool_call_meta)
+        end
+    end
+  end
+
+  defp finish_tool_round_deadline_expired(state) do
+    case run_middleware(:after_tool_execution, state) do
+      {:halt, _halted} = halted ->
+        halted
+
+      {:continue, next_state} ->
+        if Cancel.cancelled?(next_state.config.cancel_token) do
+          {:halt, cancel_state(next_state)}
+        else
+          {:halt, fail(next_state, timeout_error(next_state))}
         end
     end
   end
@@ -778,6 +804,9 @@ defmodule Alloy.Agent.Turn do
     case Executor.execute_all_for_turn(calls, state.tool_fns, state, executor_opts) do
       {:ok, %Message{content: blocks}, tool_call_meta, steering_msgs} ->
         {:ok, blocks, tool_call_meta, steering_msgs}
+
+      {:deadline_expired, %Message{content: blocks}, tool_call_meta} ->
+        {:deadline_expired, blocks, tool_call_meta}
 
       {:steering_error, %Message{content: blocks}, tool_call_meta, reason} ->
         {:steering_error, blocks, tool_call_meta, reason}
@@ -898,9 +927,16 @@ defmodule Alloy.Agent.Turn do
           else: complete_run(state, new_msgs)
 
       {:ok, follow_up_msgs} ->
-        if Cancel.cancelled?(state.config.cancel_token),
-          do: {:halt, cancel_state(state)},
-          else: {:continue, State.append_messages(state, follow_up_msgs)}
+        cond do
+          Cancel.cancelled?(state.config.cancel_token) ->
+            {:halt, cancel_state(state)}
+
+          deadline_expired?(state) ->
+            {:halt, fail(state, timeout_error(state))}
+
+          true ->
+            {:continue, State.append_messages(state, follow_up_msgs)}
+        end
 
       {:error, reason} ->
         cond do
@@ -1067,37 +1103,46 @@ defmodule Alloy.Agent.Turn do
     end
   end
 
-  defp valid_callback_message?(%Message{role: role, content: content})
+  defp valid_callback_message?(%Message{role: role, content: content} = msg)
        when role in [:user, :assistant] do
-    valid_utf8?(content) or
-      (is_list(content) and content != [] and Enum.all?(content, &valid_callback_block?/1))
+    (is_nil(msg.provider) or is_atom(msg.provider)) and
+      optional_utf8?(msg, :model) and
+      optional_utf8?(msg, :origin) and
+      (valid_utf8?(content) or
+         (is_list(content) and content != [] and Enum.all?(content, &valid_callback_block?/1)))
   end
 
   defp valid_callback_message?(_other), do: false
 
   defp valid_callback_block?(block) when is_map(block) and not is_struct(block) do
-    case Map.get(block, :type) do
-      "text" -> valid_callback_text?(block)
-      "thinking" -> valid_callback_thinking?(block)
-      "redacted_thinking" -> valid_utf8?(Map.get(block, :data))
-      "tool_use" -> valid_callback_tool_use?(block)
-      "tool_result" -> valid_callback_tool_result?(block)
-      "image" -> valid_callback_image?(block)
-      "audio" -> valid_callback_media?(block)
-      "video" -> valid_callback_media?(block)
-      "document" -> valid_callback_document?(block)
-      _other -> false
-    end
+    json_compatible?(block) and
+      case Map.get(block, :type) do
+        "text" -> valid_callback_text?(block)
+        "thinking" -> valid_callback_thinking?(block)
+        "redacted_thinking" -> valid_utf8?(Map.get(block, :data))
+        "tool_use" -> valid_callback_tool_use?(block)
+        "tool_result" -> valid_callback_tool_result?(block)
+        "image" -> valid_callback_image?(block)
+        "audio" -> valid_callback_media?(block)
+        "video" -> valid_callback_media?(block)
+        "document" -> valid_callback_document?(block)
+        _other -> false
+      end
   end
 
   defp valid_callback_block?(_other), do: false
 
   defp valid_callback_text?(block) do
-    valid_utf8?(Map.get(block, :text)) and optional_boolean?(block, :refusal)
+    valid_utf8?(Map.get(block, :text)) and
+      optional_boolean?(block, :refusal) and
+      optional_utf8?(block, :phase) and
+      optional_utf8?(block, :signature)
   end
 
   defp valid_callback_thinking?(block) do
-    valid_utf8?(Map.get(block, :thinking)) and optional_utf8?(block, :signature)
+    valid_utf8?(Map.get(block, :thinking)) and
+      optional_utf8?(block, :signature) and
+      optional_utf8?(block, :source)
   end
 
   defp valid_callback_tool_use?(block) do
@@ -1106,7 +1151,9 @@ defmodule Alloy.Agent.Turn do
     input = Map.get(block, :input)
 
     non_empty_utf8?(id) and non_empty_utf8?(name) and
-      plain_map?(input) and json_compatible?(input)
+      plain_map?(input) and
+      optional_utf8?(block, :signature) and
+      optional_plain_map?(block, :caller)
   end
 
   defp valid_callback_tool_result?(block) do
@@ -1184,6 +1231,14 @@ defmodule Alloy.Agent.Turn do
     case Map.fetch(map, key) do
       :error -> true
       {:ok, value} -> is_boolean(value)
+    end
+  end
+
+  defp optional_plain_map?(map, key) do
+    case Map.fetch(map, key) do
+      :error -> true
+      {:ok, nil} -> true
+      {:ok, value} -> plain_map?(value)
     end
   end
 
