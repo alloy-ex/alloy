@@ -977,7 +977,7 @@ defmodule Alloy.Provider.Anthropic do
 
   defp format_content_block(%{type: "document", mime_type: "text/plain", data: data} = block)
        when is_binary(data) do
-    case Base.decode64(data) do
+    case Base.decode64(data, ignore: :whitespace) do
       {:ok, decoded} ->
         if String.valid?(decoded) do
           %{

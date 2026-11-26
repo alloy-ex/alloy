@@ -857,7 +857,8 @@ defmodule Alloy.Provider.GeminiTest do
       assert body_a_resumed =~ gem_uri
 
       # 4. Within a single fallback chain (Anthropic fails -> Gemini A fails -> Gemini B succeeds),
-      #    Gemini B does not receive Account A's URI.
+      #    Gemini B does not receive Account A's URI, res_chain.messages retains A's origin (NOT B's),
+      #    and resuming res_chain.messages on Gemini B still omits Account A's URI.
       gem_a_fail_plug = fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
@@ -867,7 +868,7 @@ defmodule Alloy.Provider.GeminiTest do
         )
       end
 
-      assert {:ok, %{text: "from gem B"}} =
+      assert {:ok, res_chain} =
                Alloy.run(nil,
                  messages: [user_msg],
                  provider:
@@ -888,8 +889,64 @@ defmodule Alloy.Provider.GeminiTest do
                  max_retries: 0
                )
 
+      assert res_chain.text == "from gem B"
       assert_received {:gem_b_body, body_b_chain}
       refute body_b_chain =~ gem_uri
+
+      [chain_user | _] = res_chain.messages
+      assert [_, %{uri: ^gem_uri, origin: ^gem_a_origin}] = chain_user.content
+
+      assert {:ok, _} =
+               Alloy.run("Resume after chain",
+                 messages: res_chain.messages,
+                 provider:
+                   {Gemini,
+                    api_key: "gem-acct-b",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_b_plug]},
+                 max_retries: 0
+               )
+
+      assert_received {:gem_b_body, body_b_chain_resumed}
+      refute body_b_chain_resumed =~ gem_uri
+      assert body_b_chain_resumed =~ "Omitted provider-specific file attachment"
+
+      # 5. Exhausted fallback chain (Anthropic fails -> Gemini A fails) still persists
+      #    Account A's origin on failed.messages so resuming on Gemini B omits A's URI.
+      assert {:error, failed_chain} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: fn -> {:error, :auth_failed} end,
+                    origin_key: "ant-primary",
+                    model: "claude-sonnet-5-5"},
+                 fallback_providers: [
+                   {Gemini,
+                    api_key: "gem-acct-a",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_a_fail_plug]}
+                 ],
+                 max_retries: 0
+               )
+
+      [failed_user | _] = failed_chain.messages
+      assert [_, %{uri: ^gem_uri, origin: ^gem_a_origin}] = failed_user.content
+
+      assert {:ok, _} =
+               Alloy.run("Resume after failure",
+                 messages: failed_chain.messages,
+                 provider:
+                   {Gemini,
+                    api_key: "gem-acct-b",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_b_plug]},
+                 max_retries: 0
+               )
+
+      assert_received {:gem_b_body, body_b_after_fail}
+      refute body_b_after_fail =~ gem_uri
+      assert body_b_after_fail =~ "Omitted provider-specific file attachment"
     end
   end
 

@@ -480,36 +480,44 @@ defmodule Alloy.Message do
   defp normalize(message, ids, _target), do: {[message], ids}
 
   defp strip_foreign_assistant_file_blocks(blocks, target) do
-    {kept, dropped?} =
-      Enum.reduce(blocks, {[], false}, fn block, {acc, dropped?} ->
-        block_origin = if is_map(block), do: Map.get(block, :origin), else: nil
-
-        if origin_scoped_file_block?(block) and is_binary(block_origin) and
-             block_origin != target do
-          {acc, true}
-        else
-          {[block | acc], dropped?}
-        end
-      end)
-
-    {Enum.reverse(kept), dropped?}
+    if Enum.any?(blocks, &foreign_assistant_file_block?(&1, target)) do
+      {Enum.reject(blocks, &foreign_assistant_file_block?(&1, target)), true}
+    else
+      {blocks, false}
+    end
   end
 
-  defp strip_foreign_user_file_blocks(blocks, msg_origin, target) do
-    Enum.map(blocks, fn block ->
-      if origin_scoped_file_block?(block) do
-        eff_origin = Map.get(block, :origin) || msg_origin
+  defp foreign_assistant_file_block?(block, target) when is_map(block) do
+    block_origin = Map.get(block, :origin)
+    origin_scoped_file_block?(block) and is_binary(block_origin) and block_origin != target
+  end
 
-        if eff_origin != nil and eff_origin != target do
+  defp foreign_assistant_file_block?(_block, _target), do: false
+
+  defp strip_foreign_user_file_blocks(blocks, msg_origin, target) do
+    if Enum.any?(blocks, &foreign_user_file_block?(&1, msg_origin, target)) do
+      Enum.map(blocks, fn block ->
+        if foreign_user_file_block?(block, msg_origin, target) do
           %{type: "text", text: "[Omitted provider-specific file attachment]"}
         else
           block
         end
-      else
-        block
-      end
-    end)
+      end)
+    else
+      blocks
+    end
   end
+
+  defp foreign_user_file_block?(block, msg_origin, target) when is_map(block) do
+    if origin_scoped_file_block?(block) do
+      eff_origin = Map.get(block, :origin) || msg_origin
+      eff_origin != nil and eff_origin != target
+    else
+      false
+    end
+  end
+
+  defp foreign_user_file_block?(_block, _msg_origin, _target), do: false
 
   defp origin_scoped_file_block?(%{type: "document", file_id: _}), do: true
 

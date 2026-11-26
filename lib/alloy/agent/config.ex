@@ -405,8 +405,25 @@ defmodule Alloy.Agent.Config do
             "uses auth_scheme: :bearer and must also set a non-empty string :origin_key so rotating bearer tokens preserve account provenance"
           )
         else
-          provider_config
+          validate_optional_origin_key!(provider_config, provider)
         end
+    end
+  end
+
+  defp validate_optional_origin_key!(provider_config, provider) do
+    case Map.fetch(provider_config, :origin_key) do
+      :error ->
+        provider_config
+
+      {:ok, nil} ->
+        provider_config
+
+      {:ok, key} when is_binary(key) and byte_size(key) > 0 ->
+        provider_config
+
+      {:ok, _invalid} ->
+        raise ArgumentError,
+              "provider #{inspect(provider)} :origin_key must be a non-empty string when set"
     end
   end
 

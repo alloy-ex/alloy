@@ -22,7 +22,7 @@ defmodule Alloy.Provider.OpenAI do
     (required for function `:api_key` and `auth_scheme: :bearer`; recommended
     for static keys when persisting transcripts with file attachments across key rotation)
   - `:prompt_cache_key` - Optional cache routing key for Responses prompt caching
-  - `:prompt_cache_retention` - Optional cache retention policy (e.g. `"in-memory"`, `"24h"`)
+  - `:prompt_cache_retention` - Optional cache retention policy (e.g. `"in_memory"`, `"24h"`)
   - `:max_tokens` - Max output tokens, reasoning tokens included. Omitted
     unless set, so the model's own limit applies: a small cap can leave a
     reasoning model with no tokens for its answer

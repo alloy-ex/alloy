@@ -1399,8 +1399,13 @@ defmodule Alloy.Provider.OpenAITest do
         }
       ]
 
-      assert {:ok, _} = OpenAI.complete(non_http_msg, [], config)
+      assert {:ok, _} =
+               OpenAI.complete(non_http_msg, [], %{config | prompt_cache_retention: "in_memory"})
+
       assert_received {:request_body, nh_body}
+
+      decoded_nh = Jason.decode!(nh_body)
+      assert decoded_nh["prompt_cache_retention"] == "in_memory"
 
       [
         %{
@@ -1410,7 +1415,7 @@ defmodule Alloy.Provider.OpenAITest do
             gem_img_block
           ]
         }
-      ] = Jason.decode!(nh_body)["input"]
+      ] = decoded_nh["input"]
 
       assert nh_text =~ "Unsupported"
       assert gem_uri_block["type"] == "input_text"

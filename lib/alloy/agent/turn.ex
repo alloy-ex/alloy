@@ -217,25 +217,15 @@ defmodule Alloy.Agent.Turn do
       {schemas, state} = refresh_tool_schemas(state, pre_key, schemas)
       post_key = tool_schema_key(state)
 
-      # Attribute unattributed user file_id attachments before the first
-      # provider attempt so failed runs and exhausted fallbacks also retain
-      # provenance when callers resume result.messages on another provider.
-      primary_origin = Message.origin(state.config.provider, state.config.provider_config)
+      {result, attributed_messages} = request(state, opts)
+      state = %{state | messages: attributed_messages}
 
-      state = %{
-        state
-        | messages:
-            Message.attribute_file_blocks(state.messages, primary_origin, state.config.provider)
-      }
-
-      case request(state, opts) do
+      case result do
         {:ok, %{stop_reason: :refusal} = response} ->
-          state = attribute_handled_file_blocks(state, Map.get(response, :messages, []))
           {:halt, refuse(state, response)}
 
         {:ok, %{stop_reason: stop_reason, messages: new_msgs} = response} ->
           state
-          |> attribute_handled_file_blocks(new_msgs)
           |> State.append_messages(new_msgs)
           |> account_response(response)
           |> continue_after(stop_reason, new_msgs, {post_key, schemas}, opts)
@@ -268,28 +258,14 @@ defmodule Alloy.Agent.Turn do
       end)
       |> then(fn cfg -> if streaming?, do: Map.put(cfg, :on_event, on_event), else: cfg end)
 
-    Retry.call_with_retry(state, provider, provider_config, streaming?, on_chunk, state.deadline)
-  end
-
-  defp attribute_handled_file_blocks(state, new_msgs) when is_list(new_msgs) do
-    case Enum.find_value(new_msgs, fn
-           %Message{provider: provider, origin: origin}
-           when is_atom(provider) and not is_nil(provider) and is_binary(origin) ->
-             {provider, origin}
-
-           _ ->
-             nil
-         end) do
-      {handled_provider, handled_origin} ->
-        %{
-          state
-          | messages:
-              Message.attribute_file_blocks(state.messages, handled_origin, handled_provider)
-        }
-
-      nil ->
-        state
-    end
+    Retry.call_with_retry_attributed(
+      state,
+      provider,
+      provider_config,
+      streaming?,
+      on_chunk,
+      state.deadline
+    )
   end
 
   defp account_response(state, %{stop_reason: stop_reason, usage: usage} = response) do

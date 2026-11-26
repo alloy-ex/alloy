@@ -294,6 +294,13 @@ defmodule Alloy.Agent.ConfigTest do
         )
       end
 
+      assert_raise ArgumentError, ~r/:origin_key/, fn ->
+        Config.from_opts(
+          provider:
+            {Alloy.Provider.OpenAI, api_key: "sk-1", origin_key: :not_a_string, model: "m"}
+        )
+      end
+
       cfg =
         Config.from_opts(
           provider:
