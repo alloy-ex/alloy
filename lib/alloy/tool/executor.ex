@@ -26,8 +26,7 @@ defmodule Alloy.Tool.Executor do
 
   alias Alloy.Agent.State
   alias Alloy.Internal.Sanitize
-  alias Alloy.Message
-  alias Alloy.Middleware
+  alias Alloy.{Message, Middleware, OwnedWorker}
   alias Alloy.Tool.Inline
   alias Alloy.Tool.Registry
   alias Alloy.Tool.Validation
@@ -121,132 +120,196 @@ defmodule Alloy.Tool.Executor do
   # the configured cap, defaulting to schedulers_online; a queued call's duration
   # includes its wait.
   defp run_batch(batch, run) do
-    case batch_timeout(run) do
-      :expired ->
-        Enum.map(batch, &unexecuted_result(&1, run))
-
-      {timeout_ms, deadline_capped?} ->
-        started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
-        execute_batch_tasks(started, batch, run, timeout_ms, deadline_capped?)
+    if deadline_expired?(run.run_deadline) do
+      Enum.map(batch, &unexecuted_result(&1, run))
+    else
+      started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
+      execute_batch_tasks(started, batch, run)
     end
   end
 
-  defp execute_batch_tasks(started, batch, run, timeout_ms, deadline_capped?) do
-    caller = self()
-    batch_ref = make_ref()
+  # Each tool runs inside an `OwnedWorker` that independently enforces the
+  # tool's deadline (`min(now + tool_timeout, run_deadline)`), monitors the
+  # caller, and kills the worker immediately on expiry, caller death, or cancel
+  # even if the caller is busy inside a slow `:on_event` callback.
+  #
+  # Incremental `:tool_update` messages are routed through a per-batch process
+  # alias (`Process.alias/0`), which is unaliased on normal completion and abort
+  # so late updates from subprocesses (e.g. Bash's port runner) are dropped by
+  # the runtime instead of polluting the caller's mailbox.
+  defp execute_batch_tasks(started, batch, run) do
+    update_alias = Process.alias()
     max_concurrency = min(length(batch), run.concurrency)
-    deadline_hit_ref = :atomics.new(1, signed: false)
-    expected_workers = Enum.count(started, &match?({:execute, _}, &1.tag))
-    watcher = watch_caller(caller, expected_workers, run.run_deadline, deadline_hit_ref)
 
     ctx = %{
-      caller: caller,
-      batch_ref: batch_ref,
+      update_alias: update_alias,
       run: run,
-      watcher: watcher,
-      timeout_ms: timeout_ms,
-      deadline_capped?: deadline_capped?,
-      deadline_hit_ref: deadline_hit_ref,
       max_concurrency: max_concurrency
     }
 
-    try do
-      results = await_batch(%{}, started, [], ctx)
-      send(watcher, :done)
-      flush_batch_messages(batch_ref)
+    results = await_batch(%{}, started, [], ctx)
+    Process.unalias(update_alias)
+    flush_alias_updates(update_alias)
 
-      results
-      |> Enum.sort_by(fn {index, _pair} -> index end)
-      |> Enum.map(fn {_index, pair} -> pair end)
-    catch
-      kind, reason ->
-        send(watcher, :abort)
-        flush_batch_messages(batch_ref)
-        :erlang.raise(kind, reason, __STACKTRACE__)
-    end
+    results
+    |> Enum.sort_by(fn {index, _pair} -> index end)
+    |> Enum.map(fn {_index, pair} -> pair end)
   end
 
   defp await_batch(running, [], done, _ctx) when map_size(running) == 0, do: done
 
   defp await_batch(running, pending, done, ctx)
        when map_size(running) < ctx.max_concurrency and pending != [] do
-    {running, pending} = fill_slots(running, pending, ctx)
+    {running, pending, done} = fill_slots(running, pending, done, ctx)
     await_batch(running, pending, done, ctx)
   end
 
   defp await_batch(running, pending, done, ctx) do
-    %{batch_ref: batch_ref, run: run, deadline_capped?: capped?, deadline_hit_ref: hit_ref} = ctx
+    %{update_alias: update_alias, run: run} = ctx
 
     receive do
-      {:alloy_tool_update, ^batch_ref, call_id, name, start_seq, chunk} ->
-        if running_start_seq?(running, start_seq) do
-          emit_update(call_id, name, start_seq, chunk, run)
-        end
+      {:alloy_tool_update, ^update_alias, call_id, name, start_seq, chunk} ->
+        _ =
+          if running_start_seq?(running, start_seq) do
+            run_or_cleanup(running, update_alias, fn ->
+              emit_update(call_id, name, start_seq, chunk, run)
+            end)
+          end
 
         await_batch(running, pending, done, ctx)
 
-      {ref, outcome} when is_map_key(running, ref) ->
-        {%{started: started, timer_ref: timer_ref}, running} = Map.pop!(running, ref)
-        cancel_task_timer(timer_ref, batch_ref, ref)
+      {ref, {:ok, outcome}} when is_map_key(running, ref) ->
+        {%{started: started}, next_running} = Map.pop!(running, ref)
         Process.demonitor(ref, [:flush])
-        drain_call_updates(batch_ref, started.start_seq, run)
-        entry = finish(started, outcome, run)
-        await_batch(running, pending, [entry | done], ctx)
+        entry = finish_or_cleanup(started, outcome, update_alias, run, next_running)
+        await_batch(next_running, pending, [entry | done], ctx)
+
+      {ref, :timeout} when is_map_key(running, ref) ->
+        {%{started: started, deadline_capped?: capped?}, next_running} = Map.pop!(running, ref)
+        Process.demonitor(ref, [:flush])
+        outcome = exit_outcome(started.call, :timeout, run, capped?)
+        entry = finish_or_cleanup(started, outcome, update_alias, run, next_running)
+        await_batch(next_running, pending, [entry | done], ctx)
+
+      {ref, {:worker_exit, reason}} when is_map_key(running, ref) ->
+        {%{started: started, deadline_capped?: capped?}, next_running} = Map.pop!(running, ref)
+        Process.demonitor(ref, [:flush])
+        outcome = worker_exit_outcome(started.call, reason, run, capped?)
+        entry = finish_or_cleanup(started, outcome, update_alias, run, next_running)
+        await_batch(next_running, pending, [entry | done], ctx)
 
       {:DOWN, ref, :process, _pid, reason} when is_map_key(running, ref) ->
-        {%{started: started, timer_ref: timer_ref}, running} = Map.pop!(running, ref)
-        cancel_task_timer(timer_ref, batch_ref, ref)
-        drain_call_updates(batch_ref, started.start_seq, run)
-        deadline_hit? = :atomics.get(hit_ref, 1) == 1
-        outcome = exit_outcome(started.call, reason, run, capped?, deadline_hit?)
-        entry = finish(started, outcome, run)
-        await_batch(running, pending, [entry | done], ctx)
-
-      {:alloy_tool_timeout, ^batch_ref, ref} when is_map_key(running, ref) ->
-        {%{task: task, started: started}, running} = Map.pop!(running, ref)
-        Process.exit(task.pid, :kill)
-        Process.demonitor(ref, [:flush])
-        flush_task_reply(ref)
-        drain_call_updates(batch_ref, started.start_seq, run)
-        deadline_hit? = :atomics.get(hit_ref, 1) == 1
-        outcome = exit_outcome(started.call, :timeout, run, capped?, deadline_hit?)
-        entry = finish(started, outcome, run)
-        await_batch(running, pending, [entry | done], ctx)
+        {%{started: started, deadline_capped?: capped?}, next_running} = Map.pop!(running, ref)
+        outcome = exit_outcome(started.call, reason, run, capped?)
+        entry = finish_or_cleanup(started, outcome, update_alias, run, next_running)
+        await_batch(next_running, pending, [entry | done], ctx)
     end
   end
 
-  defp fill_slots(running, [], _ctx), do: {running, []}
-
-  defp fill_slots(running, pending, ctx) when map_size(running) >= ctx.max_concurrency,
-    do: {running, pending}
-
-  defp fill_slots(running, [started | rest], ctx) do
-    call_run = put_tool_update_callback(ctx.run, ctx.caller, ctx.batch_ref, started)
-
-    task =
-      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-        invoke_watched(started.tag, call_run, ctx.watcher)
-      end)
-
-    timer_ref =
-      Process.send_after(
-        ctx.caller,
-        {:alloy_tool_timeout, ctx.batch_ref, task.ref},
-        ctx.timeout_ms
-      )
-
-    entry = %{task: task, started: started, timer_ref: timer_ref}
-    fill_slots(Map.put(running, task.ref, entry), rest, ctx)
+  defp finish_or_cleanup(started, outcome, update_alias, run, remaining_running) do
+    run_or_cleanup(remaining_running, update_alias, fn ->
+      drain_call_updates(update_alias, started.start_seq, run)
+      finish(started, outcome, run)
+    end)
   end
 
-  defp put_tool_update_callback(run, caller, batch_ref, started) do
+  defp run_or_cleanup(running, update_alias, fun) do
+    fun.()
+  catch
+    kind, reason ->
+      cleanup_running(running, update_alias)
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp cleanup_running(running, update_alias) do
+    Process.unalias(update_alias)
+
+    Enum.each(running, fn {_ref, %{owner: owner}} ->
+      OwnedWorker.cancel(owner)
+    end)
+
+    flush_alias_updates(update_alias)
+  end
+
+  defp fill_slots(running, [], done, _ctx), do: {running, [], done}
+
+  defp fill_slots(running, pending, done, ctx) when map_size(running) >= ctx.max_concurrency,
+    do: {running, pending, done}
+
+  defp fill_slots(running, [%{tag: {:blocked, _call, reason}} = started | rest], done, ctx) do
+    entry =
+      run_or_cleanup(running, ctx.update_alias, fn ->
+        finish(started, {:error, "Blocked: #{reason}", nil}, ctx.run)
+      end)
+
+    fill_slots(running, rest, [entry | done], ctx)
+  end
+
+  defp fill_slots(running, [started | rest], done, ctx) do
+    case task_deadline(ctx.run) do
+      :expired ->
+        entry =
+          run_or_cleanup(running, ctx.update_alias, fn ->
+            finish(started, deadline_skipped_outcome(ctx.run), ctx.run)
+          end)
+
+        fill_slots(running, rest, [entry | done], ctx)
+
+      {deadline, deadline_capped?} ->
+        owner =
+          run_or_cleanup(running, ctx.update_alias, fn ->
+            call_run = put_tool_update_callback(ctx.run, ctx.update_alias, started)
+            OwnedWorker.start(deadline, fn -> invoke(started.tag, call_run) end)
+          end)
+
+        entry = %{owner: owner, started: started, deadline_capped?: deadline_capped?}
+        fill_slots(Map.put(running, owner.ref, entry), rest, done, ctx)
+    end
+  end
+
+  defp task_deadline(%{run_deadline: nil, timeout: timeout}) do
+    {System.monotonic_time(:millisecond) + timeout, false}
+  end
+
+  defp task_deadline(%{run_deadline: run_deadline, timeout: timeout}) do
+    now = System.monotonic_time(:millisecond)
+
+    if run_deadline <= now do
+      :expired
+    else
+      tool_deadline = now + timeout
+      {min(tool_deadline, run_deadline), run_deadline < tool_deadline}
+    end
+  end
+
+  defp worker_exit_outcome(call, {:worker_crash, :exit, reason, _trace}, run, capped?) do
+    exit_outcome(call, reason, run, capped?)
+  end
+
+  defp worker_exit_outcome(call, {:worker_crash, :throw, value, _trace}, run, capped?) do
+    exit_outcome(call, {:nocatch, value}, run, capped?)
+  end
+
+  defp worker_exit_outcome(call, {:worker_crash, :error, exception, _trace}, run, capped?) do
+    exit_outcome(call, exception, run, capped?)
+  end
+
+  defp worker_exit_outcome(call, reason, run, capped?) do
+    exit_outcome(call, reason, run, capped?)
+  end
+
+  defp put_tool_update_callback(run, update_alias, started) do
     call_id = started.call[:id]
     call_name = started.call[:name]
     start_seq = started.start_seq
 
     on_update = fn
       chunk when is_binary(chunk) and byte_size(chunk) > 0 ->
-        send(caller, {:alloy_tool_update, batch_ref, call_id, call_name, start_seq, chunk})
+        send(
+          update_alias,
+          {:alloy_tool_update, update_alias, call_id, call_name, start_seq, chunk}
+        )
+
         :ok
 
       _other ->
@@ -260,41 +323,20 @@ defmodule Alloy.Tool.Executor do
     Enum.any?(running, fn {_ref, %{started: %{start_seq: seq}}} -> seq == start_seq end)
   end
 
-  defp drain_call_updates(batch_ref, start_seq, run) do
+  defp drain_call_updates(update_alias, start_seq, run) do
     receive do
-      {:alloy_tool_update, ^batch_ref, call_id, name, ^start_seq, chunk} ->
+      {:alloy_tool_update, ^update_alias, call_id, name, ^start_seq, chunk} ->
         emit_update(call_id, name, start_seq, chunk, run)
-        drain_call_updates(batch_ref, start_seq, run)
+        drain_call_updates(update_alias, start_seq, run)
     after
       0 -> :ok
     end
   end
 
-  defp flush_batch_messages(batch_ref) do
+  defp flush_alias_updates(update_alias) do
     receive do
-      {:alloy_tool_update, ^batch_ref, _id, _name, _seq, _chunk} ->
-        flush_batch_messages(batch_ref)
-
-      {:alloy_tool_timeout, ^batch_ref, _ref} ->
-        flush_batch_messages(batch_ref)
-    after
-      0 -> :ok
-    end
-  end
-
-  defp cancel_task_timer(timer_ref, batch_ref, ref) do
-    _ = Process.cancel_timer(timer_ref)
-
-    receive do
-      {:alloy_tool_timeout, ^batch_ref, ^ref} -> :ok
-    after
-      0 -> :ok
-    end
-  end
-
-  defp flush_task_reply(ref) do
-    receive do
-      {^ref, _reply} -> :ok
+      {:alloy_tool_update, ^update_alias, _id, _name, _seq, _chunk} ->
+        flush_alias_updates(update_alias)
     after
       0 -> :ok
     end
@@ -324,26 +366,8 @@ defmodule Alloy.Tool.Executor do
     {Message.tool_result_block(call[:id], deadline_skipped_message(run), true), nil}
   end
 
-  defp batch_timeout(%{run_deadline: nil, timeout: timeout}), do: {timeout, false}
-
-  defp batch_timeout(%{run_deadline: deadline, timeout: timeout}) do
-    remaining = deadline - System.monotonic_time(:millisecond)
-
-    if remaining <= 0 do
-      :expired
-    else
-      {min(timeout, remaining), remaining < timeout}
-    end
-  end
-
   defp deadline_expired?(nil), do: false
   defp deadline_expired?(deadline), do: System.monotonic_time(:millisecond) >= deadline
-
-  defp deadline_wait_ms(nil), do: :infinity
-
-  defp deadline_wait_ms(deadline) do
-    max(deadline - System.monotonic_time(:millisecond), 0)
-  end
 
   defp deadline_skipped_message(run) do
     case run.state.config.timeout_ms do
@@ -357,94 +381,6 @@ defmodule Alloy.Tool.Executor do
 
   defp deadline_skipped_outcome(run) do
     {:error, deadline_skipped_message(run), nil}
-  end
-
-  # The tasks are unlinked, so a cancelled turn — killed outright, with no
-  # chance to clean up — would leave its tools running. This supervised
-  # watcher kills them when the caller dies OR when the run's absolute deadline
-  # arrives (bounding tasks dequeued shortly before expiry under tool_concurrency).
-  # Each task registers itself as it starts; after the caller dies the watcher
-  # still waits briefly for tasks that started but had not registered yet.
-  defp watch_caller(caller, expected, deadline, deadline_hit_ref) do
-    {:ok, watcher} =
-      Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
-        ref = Process.monitor(caller)
-        watch(ref, [], expected, deadline, deadline_hit_ref)
-      end)
-
-    watcher
-  end
-
-  defp watch(ref, pids, expected, deadline, deadline_hit_ref) do
-    receive do
-      {:watch, pid} ->
-        watch(ref, [pid | pids], expected, deadline, deadline_hit_ref)
-
-      :done ->
-        Process.demonitor(ref, [:flush])
-
-      :abort ->
-        Process.demonitor(ref, [:flush])
-        kill_watched(pids, expected - length(pids))
-
-      {:DOWN, ^ref, :process, _pid, _reason} ->
-        kill_watched(pids, expected - length(pids))
-    after
-      deadline_wait_ms(deadline) ->
-        :atomics.put(deadline_hit_ref, 1, 1)
-        Enum.each(pids, &Process.exit(&1, :kill))
-        watch_expired(ref)
-    end
-  end
-
-  defp watch_expired(ref) do
-    receive do
-      {:watch, pid} ->
-        Process.exit(pid, :kill)
-        watch_expired(ref)
-
-      :done ->
-        Process.demonitor(ref, [:flush])
-
-      :abort ->
-        Process.demonitor(ref, [:flush])
-
-      {:DOWN, ^ref, :process, _pid, _reason} ->
-        :ok
-    end
-  end
-
-  defp kill_watched(pids, unregistered) do
-    Enum.each(pids, &Process.exit(&1, :kill))
-    kill_late_registrations(unregistered)
-  end
-
-  defp kill_late_registrations(0), do: :ok
-
-  defp kill_late_registrations(unregistered) do
-    receive do
-      {:watch, pid} -> kill_watched([pid], unregistered - 1)
-    after
-      1_000 -> :ok
-    end
-  end
-
-  defp invoke_watched({:blocked, _call, reason}, _run, _watcher) do
-    {:error, "Blocked: #{reason}", nil}
-  end
-
-  defp invoke_watched(tag, run, watcher) do
-    if deadline_expired?(run.run_deadline) do
-      deadline_skipped_outcome(run)
-    else
-      send(watcher, {:watch, self()})
-
-      if deadline_expired?(run.run_deadline) do
-        deadline_skipped_outcome(run)
-      else
-        invoke(tag, run)
-      end
-    end
   end
 
   defp tag_tool_calls(state, calls) do
@@ -566,16 +502,12 @@ defmodule Alloy.Tool.Executor do
        "#{diagnostic_header}\n#{formatted_trace}"}
   end
 
-  defp exit_outcome(call, :killed, run, _deadline_capped?, true = _deadline_hit?) do
+  defp exit_outcome(call, :timeout, run, true = _deadline_capped?) do
     run_deadline_timeout_outcome(call, run)
   end
 
-  defp exit_outcome(call, :timeout, run, true = _deadline_capped?, _deadline_hit?) do
-    run_deadline_timeout_outcome(call, run)
-  end
-
-  defp exit_outcome(call, :timeout, run, false = _deadline_capped?, deadline_hit?) do
-    if deadline_hit? or deadline_expired?(run.run_deadline) do
+  defp exit_outcome(call, :timeout, run, false = _deadline_capped?) do
+    if deadline_expired?(run.run_deadline) do
       run_deadline_timeout_outcome(call, run)
     else
       {:error,
@@ -584,7 +516,7 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
-  defp exit_outcome(call, reason, _run, _deadline_capped?, _deadline_hit?) do
+  defp exit_outcome(call, reason, _run, _deadline_capped?) do
     {:error,
      "Tool #{call[:name]} crashed during execution: #{Sanitize.exit_summary(reason)}. " <>
        "Check the input and try again.", nil}

@@ -105,6 +105,10 @@ defmodule Alloy.Tool do
   - `:working_directory` - base path for file operations
   - `:config` - agent config struct
   - `:allowed_paths` - list of allowed directory prefixes for file access
+  - `:on_tool_update` - injected 1-arity callback `(String.t() -> :ok)` when
+    running inside `Alloy.Tool.Executor`; call via `Map.get(context, :on_tool_update)`
+    so tools remain callable directly outside the executor to emit incremental
+    `:tool_update` events marshalled onto the caller process
   - any custom keys added by middleware
 
   Returns `{:ok, string}` or `{:error, string}` for text-only results.

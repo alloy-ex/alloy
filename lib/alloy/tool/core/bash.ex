@@ -27,10 +27,12 @@ defmodule Alloy.Tool.Core.Bash do
     model asks for (default 10 minutes). The agent's `:tool_timeout`
     still applies on top of it.
   - `:bash_on_output` - optional 1-arity callback `(binary() -> any())` invoked
-    for each raw output chunk as it arrives from the shell port (before head/tail
-    truncation), allowing hosts to spill full output to disk or inspect raw bytes.
-    Raising callbacks are rescued and logged once per command so execution
-    continues.
+    in a dedicated supervised worker for each raw output chunk as it arrives
+    from the shell port (before head/tail truncation), allowing hosts to spill
+    full output to disk or inspect raw bytes without blocking shell timeout or
+    cancellation cleanup. Raising callbacks are rescued and logged once per
+    command; throws or exits terminate only the callback worker while command
+    execution continues.
   - `:bash_executor` - an `t:executor/0` that runs the command instead of
     the local shell, for a container, VM or remote runner. The options
     above, except the timeout, do not apply to it. Custom executors run inside
@@ -256,8 +258,7 @@ defmodule Alloy.Tool.Core.Bash do
 
     %{
       on_tool_update: on_tool_update,
-      bash_on_output: bash_on_output,
-      bash_cb_logged?: false
+      bash_on_output: bash_on_output
     }
   end
 
@@ -276,6 +277,7 @@ defmodule Alloy.Tool.Core.Bash do
     after
       0 ->
         port = Port.open({:spawn_executable, bash}, opts)
+        output_worker = start_output_worker(callbacks.bash_on_output)
 
         run = %{
           port: port,
@@ -283,8 +285,8 @@ defmodule Alloy.Tool.Core.Bash do
           caller_ref: caller_ref,
           deadline: System.monotonic_time(:millisecond) + timeout,
           on_tool_update: callbacks.on_tool_update,
-          bash_on_output: callbacks.bash_on_output,
-          bash_cb_logged?: callbacks.bash_cb_logged?
+          utf8_carry: <<>>,
+          output_worker: output_worker
         }
 
         send(caller, {:bash_os_pid, self(), run.os_pid})
@@ -316,19 +318,36 @@ defmodule Alloy.Tool.Core.Bash do
   defp receive_output(%{port: port, caller_ref: caller_ref} = run, output, remaining) do
     receive do
       {^port, {:data, data}} ->
-        notify_tool_update(run.on_tool_update, data)
-        run = notify_bash_on_output(run, data)
-        collect(run, append(output, data))
+        utf8_carry = emit_utf8_update(run.on_tool_update, run.utf8_carry, data)
+        dispatch_bash_on_output(run.output_worker, data)
+        collect(%{run | utf8_carry: utf8_carry}, append(output, data))
 
       {^port, {:exit_status, status}} ->
-        {:exited, status, render(output)}
+        flush_utf8_carry(run.on_tool_update, run.utf8_carry)
+
+        case flush_output_worker(run.output_worker, run.caller_ref, run.deadline) do
+          :ok ->
+            {:exited, status, render(output)}
+
+          :timeout ->
+            {:timeout, render(output)}
+
+          :caller_down ->
+            :caller_down
+
+          {:exit, reason} ->
+            Process.demonitor(caller_ref, [:flush])
+            exit(reason)
+        end
 
       {:DOWN, ^caller_ref, :process, _pid, _reason} ->
         OSProcess.signal_group(run.os_pid, "KILL")
+        kill_output_worker(run.output_worker)
         :caller_down
 
       {:EXIT, from, reason} when is_pid(from) ->
         OSProcess.signal_group(run.os_pid, "KILL")
+        kill_output_worker(run.output_worker)
         Process.demonitor(caller_ref, [:flush])
         exit(reason)
     after
@@ -336,22 +355,46 @@ defmodule Alloy.Tool.Core.Bash do
     end
   end
 
-  defp notify_tool_update(nil, _data), do: :ok
-  defp notify_tool_update(_fun, <<>>), do: :ok
-
-  defp notify_tool_update(fun, data) do
-    fun.(String.replace_invalid(data))
-    :ok
+  defp time_out(run, output) do
+    OSProcess.signal_group(run.os_pid, "KILL")
+    kill_output_worker(run.output_worker)
+    flush_utf8_carry(run.on_tool_update, run.utf8_carry)
+    {:timeout, render(output)}
   end
 
-  defp notify_bash_on_output(%{bash_on_output: nil} = run, _data), do: run
+  # Runs :bash_on_output in its own supervised worker so a blocking callback
+  # never prevents run_port from enforcing timeouts or killing the OS process
+  # group on caller death.
+  defp start_output_worker(nil), do: nil
 
-  defp notify_bash_on_output(%{bash_on_output: fun} = run, data) do
+  defp start_output_worker(fun) when is_function(fun, 1) do
+    {:ok, pid} =
+      Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
+        output_worker_loop(fun, false)
+      end)
+
+    ref = Process.monitor(pid)
+    {pid, ref}
+  end
+
+  defp output_worker_loop(fun, logged?) do
+    receive do
+      {:chunk, data} ->
+        next_logged? = invoke_bash_on_output(fun, data, logged?)
+        output_worker_loop(fun, next_logged?)
+
+      {:flush, from, ref} ->
+        send(from, {:output_worker_flushed, ref})
+        :ok
+    end
+  end
+
+  defp invoke_bash_on_output(fun, data, logged?) do
     fun.(data)
-    run
+    logged?
   rescue
     exception ->
-      if not run.bash_cb_logged? do
+      if not logged? do
         sanitized_trace = Sanitize.stacktrace(__STACKTRACE__)
 
         Logger.warning(
@@ -360,12 +403,76 @@ defmodule Alloy.Tool.Core.Bash do
         )
       end
 
-      %{run | bash_cb_logged?: true}
+      true
   end
 
-  defp time_out(run, output) do
-    OSProcess.signal_group(run.os_pid, "KILL")
-    {:timeout, render(output)}
+  defp dispatch_bash_on_output(nil, _data), do: :ok
+  defp dispatch_bash_on_output({pid, _ref}, data), do: send(pid, {:chunk, data})
+
+  defp flush_output_worker(nil, _caller_ref, _deadline), do: :ok
+
+  defp flush_output_worker({pid, mon_ref}, caller_ref, deadline) do
+    flush_ref = make_ref()
+    send(pid, {:flush, self(), flush_ref})
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:output_worker_flushed, ^flush_ref} ->
+        Process.demonitor(mon_ref, [:flush])
+        :ok
+
+      {:DOWN, ^mon_ref, :process, ^pid, _reason} ->
+        :ok
+
+      {:DOWN, ^caller_ref, :process, _pid, _reason} ->
+        kill_output_worker({pid, mon_ref})
+        :caller_down
+
+      {:EXIT, from, reason} when is_pid(from) ->
+        kill_output_worker({pid, mon_ref})
+        {:exit, reason}
+    after
+      remaining ->
+        kill_output_worker({pid, mon_ref})
+        :timeout
+    end
+  end
+
+  defp kill_output_worker(nil), do: :ok
+
+  defp kill_output_worker({pid, mon_ref}) do
+    Process.exit(pid, :kill)
+    Process.demonitor(mon_ref, [:flush])
+    :ok
+  end
+
+  # Carries incomplete trailing multibyte UTF-8 sequences across port chunks so
+  # split codepoints (e.g. "€" split across reads) render cleanly in :tool_update.
+  defp emit_utf8_update(nil, _carry, _data), do: <<>>
+
+  defp emit_utf8_update(fun, carry, data) do
+    {ready, next_carry} = split_complete_utf8(carry <> data, [])
+    if byte_size(ready) > 0, do: fun.(ready)
+    next_carry
+  end
+
+  defp flush_utf8_carry(nil, _carry), do: :ok
+  defp flush_utf8_carry(_fun, <<>>), do: :ok
+  defp flush_utf8_carry(fun, carry), do: fun.(String.replace_invalid(carry))
+
+  defp split_complete_utf8(<<>>, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), <<>>}
+
+  defp split_complete_utf8(bin, acc) do
+    case :unicode.characters_to_binary(bin) do
+      valid when is_binary(valid) ->
+        {IO.iodata_to_binary(Enum.reverse([valid | acc])), <<>>}
+
+      {:incomplete, valid, rest} ->
+        {IO.iodata_to_binary(Enum.reverse([valid | acc])), rest}
+
+      {:error, valid, <<_bad, rest::binary>>} ->
+        split_complete_utf8(rest, ["\uFFFD", valid | acc])
+    end
   end
 
   # Runs the custom executor inside a linked worker owned by a supervised task

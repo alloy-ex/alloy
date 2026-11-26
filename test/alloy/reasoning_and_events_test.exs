@@ -32,6 +32,25 @@ defmodule Alloy.ReasoningAndEventsTest do
     def call(_hook, state), do: state
   end
 
+  defmodule RaiseAfterToolCallMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:after_tool_call, %{config: %{context: %{current_tool_call: %{name: "fast_fail"}}}}) do
+      raise "after_tool_boom"
+    end
+
+    def call(_hook, state), do: state
+  end
+
+  defmodule RaiseBeforeCompletionMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:before_completion, _state), do: raise("turn_exploded")
+    def call(_hook, state), do: state
+  end
+
   defmodule CaptureReasoningProvider do
     @behaviour Alloy.Provider
 
@@ -113,6 +132,17 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert updated.config.reasoning == %{effort: :xhigh, display: :summarized}
       # Previous provider-level :reasoning was cleared so the prepared value takes effect.
       refute Map.has_key?(updated.config.provider_config, :reasoning)
+
+      # When both provider (with its own :reasoning) and top-level :reasoning are passed to
+      # State.prepare/2 in the same call, the new provider's explicit :reasoning is preserved.
+      both =
+        State.prepare(state,
+          provider: {TestProvider, reasoning: :low},
+          reasoning: :high
+        )
+
+      assert both.config.reasoning == %{effort: :high, display: nil}
+      assert both.config.provider_config.reasoning == %{effort: :low, display: nil}
     end
 
     test "forwards top-level :reasoning to fallbacks while allowing fallback overrides and middleware updates" do
@@ -192,13 +222,20 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert body1["output_config"]["effort"] == "max"
       assert body1["output_config"]["format"]["type"] == "json_schema"
 
-      # :off omits thinking and output_config.effort
+      # :off explicitly disables thinking on Anthropic, while nil omits thinking
       assert {:ok, _} =
                Anthropic.complete([Message.user("hi")], [], Map.put(base, :reasoning, :off))
 
       assert_received {:ant_body, body2}
-      refute Map.has_key?(body2, "thinking")
+      assert body2["thinking"] == %{"type" => "disabled"}
       refute Map.has_key?(body2, "output_config")
+
+      assert {:ok, _} =
+               Anthropic.complete([Message.user("hi")], [], Map.put(base, :reasoning, nil))
+
+      assert_received {:ant_body, body_nil}
+      refute Map.has_key?(body_nil, "thinking")
+      refute Map.has_key?(body_nil, "output_config")
 
       # extra_body overrides thinking and output_config.effort
       assert {:ok, _} =
@@ -476,6 +513,49 @@ defmodule Alloy.ReasoningAndEventsTest do
                  reasoning: :invalid,
                  command_runner: runner
                })
+
+      # Changing :reasoning on a persistent Codex session invalidates session_scope (starts fresh)
+      thread_runner = fn _bin, args, _opts ->
+        send(parent, {:codex_sess_args, args})
+        out_idx = Enum.find_index(args, &(&1 == "--output-last-message"))
+        out_path = Enum.at(args, out_idx + 1)
+
+        File.write!(
+          out_path,
+          Jason.encode!(%{stop_reason: "end_turn", text: "ok", tool_calls: []})
+        )
+
+        {Jason.encode!(%{"type" => "thread.started", "thread_id" => "thr_1"}) <> "\n", 0}
+      end
+
+      assert {:ok, r1} =
+               Codex.complete([Message.user("hi")], [], %{
+                 model: "gpt-5.4",
+                 reasoning: :high,
+                 persist_session: true,
+                 workdir: System.tmp_dir!(),
+                 command_runner: thread_runner
+               })
+
+      assert_received {:codex_sess_args, _}
+
+      assert {:ok, r2} =
+               Codex.complete(
+                 [Message.user("hi"), hd(r1.messages), Message.user("again")],
+                 [],
+                 %{
+                   model: "gpt-5.4",
+                   reasoning: :low,
+                   persist_session: true,
+                   workdir: System.tmp_dir!(),
+                   provider_state: r1.provider_state,
+                   command_runner: thread_runner
+                 }
+               )
+
+      assert_received {:codex_sess_args, sess_args2}
+      refute "resume" in sess_args2
+      assert r2.response_metadata.session.mode == :fresh
     end
 
     test "Compactor strips top-level and provider-level :reasoning on summary calls" do
@@ -955,9 +1035,9 @@ defmodule Alloy.ReasoningAndEventsTest do
       caller = self()
       raw_chunks_agent = start_supervised!({Agent, fn -> [] end})
 
-      # Print > 35KB so Core.Bash's 8KB head + 20KB tail truncation activates, while
-      # :bash_on_output still receives every raw byte pre-truncation.
-      cmd = "python3 -c 'import sys; sys.stdout.write(\"A\" * 40000); sys.stdout.flush()'"
+      # Print > 35KB using portable POSIX tools so Core.Bash's 8KB head + 20KB tail
+      # truncation activates, while :bash_on_output still receives every raw byte.
+      cmd = "head -c 40000 /dev/zero | tr '\\0' A"
 
       {:ok, pid} =
         TestProvider.start_link([
@@ -1016,6 +1096,515 @@ defmodule Alloy.ReasoningAndEventsTest do
         end)
 
       assert log =~ ":bash_on_output callback failed"
+    end
+
+    test "Core.Bash preserves multibyte UTF-8 split across port chunks in :tool_update" do
+      caller = self()
+
+      # Write the 3-byte UTF-8 sequence for "€" (E2 82 AC) across separate writes.
+      cmd = "printf '\\342\\202'; sleep 0.05; printf '\\254'"
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "bash_utf8", name: "bash", input: %{"command" => cmd}}
+          ]),
+          TestProvider.text_response("done")
+        ])
+
+      assert {:ok, result} =
+               Alloy.run("utf8",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [Bash],
+                 context: %{bash_restricted: false},
+                 on_event: fn ev -> send(caller, {:ev, ev}) end
+               )
+
+      assert result.status == :completed
+
+      updates_text =
+        collect_events()
+        |> Enum.filter(&(&1.event == :tool_update))
+        |> Enum.map_join("", & &1.payload.chunk)
+
+      assert updates_text == "€"
+    end
+
+    test "blocked :bash_on_output does not prevent shell cleanup on caller death or timeout" do
+      parent = self()
+      gate = make_ref()
+
+      # 1. Caller death while :bash_on_output is blocked kills the shell process promptly.
+      blocker =
+        spawn(fn ->
+          receive do
+            {:release, ^gate} -> :ok
+          end
+        end)
+
+      caller_pid =
+        spawn(fn ->
+          Bash.execute(
+            %{"command" => "echo $$; sleep 30", "timeout" => 30_000},
+            %{
+              bash_restricted: false,
+              bash_on_output: fn chunk ->
+                send(parent, {:bash_chunk, chunk})
+                ref = Process.monitor(blocker)
+
+                receive do
+                  {:DOWN, ^ref, :process, ^blocker, _} -> :ok
+                end
+              end
+            }
+          )
+        end)
+
+      assert_receive {:bash_chunk, pid_chunk}, 2_000
+      shell_pid = pid_chunk |> String.trim() |> String.to_integer()
+      Process.exit(caller_pid, :kill)
+
+      assert wait_until_dead(shell_pid, 1_500)
+      send(blocker, {:release, gate})
+
+      # 2. Timeout while :bash_on_output is blocked still terminates promptly.
+      blocker2 =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, msg} =
+               Bash.execute(
+                 %{"command" => "echo $$; sleep 30", "timeout" => 120},
+                 %{
+                   bash_restricted: false,
+                   bash_on_output: fn chunk ->
+                     send(parent, {:bash_timeout_chunk, chunk})
+                     ref = Process.monitor(blocker2)
+
+                     receive do
+                       {:DOWN, ^ref, :process, ^blocker2, _} -> :ok
+                     end
+                   end
+                 }
+               )
+
+      elapsed = System.monotonic_time(:millisecond) - started
+      assert msg =~ "timed out"
+      assert elapsed < 1_000
+
+      assert_receive {:bash_timeout_chunk, pid_chunk2}, 1_000
+      shell_pid2 = pid_chunk2 |> String.trim() |> String.to_integer()
+      assert wait_until_dead(shell_pid2, 1_500)
+      send(blocker2, :stop)
+    end
+
+    test "Executor enforces tool_timeout independently of slow :on_event callbacks and keeps mailbox clean on timeout/abort" do
+      parent = self()
+
+      # 1. Slow on_event (200ms) must NOT delay tool_timeout (40ms) killing the tool before
+      #    an observable side effect at 100ms.
+      side_effect_flag = :atomics.new(1, signed: false)
+
+      slow_side_effect_tool = %Inline{
+        name: "side_effect",
+        description: "Streams then performs a side effect",
+        input_schema: %{type: "object", properties: %{}},
+        execute: fn _input, context ->
+          if fun = Map.get(context, :on_tool_update), do: fun.("tick")
+          Process.sleep(100)
+          :atomics.put(side_effect_flag, 1, 1)
+          {:ok, "too late"}
+        end
+      }
+
+      {:ok, pid1} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "c_slow", name: "side_effect", input: %{}}]),
+          TestProvider.text_response("after timeout")
+        ])
+
+      assert {:ok, _} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid1},
+                 tools: [slow_side_effect_tool],
+                 tool_timeout: 40,
+                 on_event: fn
+                   %{event: :tool_update} = ev ->
+                     send(parent, {:slow_cb_ev, ev})
+                     Process.sleep(200)
+
+                   ev ->
+                     send(parent, {:slow_cb_ev, ev})
+                 end
+               )
+
+      assert :atomics.get(side_effect_flag, 1) == 0
+      # Flush expected test notifications, then verify zero leaked runtime/timer/monitor messages.
+      drain_tagged(:slow_cb_ev)
+      refute_receive _, 80
+
+      # 2. Spawning a child that emits late updates after tool_timeout must not leak into mailbox
+      #    and must never emit :tool_update after :tool_end.
+      late_update_tool = %Inline{
+        name: "late_child",
+        description: "Spawns child that keeps sending updates",
+        input_schema: %{type: "object", properties: %{}},
+        execute: fn _input, context ->
+          fun = Map.get(context, :on_tool_update)
+
+          spawn(fn ->
+            Enum.each(1..5, fn i ->
+              if fun, do: fun.("late-#{i}")
+              Process.sleep(20)
+            end)
+          end)
+
+          Process.sleep(500)
+          {:ok, "never"}
+        end
+      }
+
+      {:ok, pid2} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "c_late", name: "late_child", input: %{}}]),
+          TestProvider.text_response("done")
+        ])
+
+      assert {:ok, _} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid2},
+                 tools: [late_update_tool],
+                 tool_timeout: 35,
+                 on_event: &send(parent, {:late_ev, &1})
+               )
+
+      late_events = drain_tagged(:late_ev)
+      end_idx = Enum.find_index(late_events, &(&1.event == :tool_end))
+      assert is_integer(end_idx)
+      refute Enum.any?(Enum.drop(late_events, end_idx + 1), &(&1.event == :tool_update))
+      refute_receive _, 120
+
+      # 3. Throwing from :tool_update or raising in :after_tool_call cleans up running siblings
+      #    and leaves zero monitor/timer/update messages in the caller mailbox.
+      sibling_alive = :atomics.new(1, signed: false)
+
+      throw_tool = %Inline{
+        name: "throw_trigger",
+        description: "Emits update",
+        input_schema: %{type: "object", properties: %{}},
+        execute: fn _input, context ->
+          if fun = Map.get(context, :on_tool_update), do: fun.("boom")
+          Process.sleep(200)
+          {:ok, "ok"}
+        end
+      }
+
+      sibling_tool = %Inline{
+        name: "sibling",
+        description: "Sleeps",
+        input_schema: %{type: "object", properties: %{}},
+        execute: fn _input, _context ->
+          Process.sleep(150)
+          :atomics.put(sibling_alive, 1, 1)
+          {:ok, "ok"}
+        end
+      }
+
+      {:ok, pid3} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t_throw", name: "throw_trigger", input: %{}},
+            %{id: "t_sib", name: "sibling", input: %{}}
+          ])
+        ])
+
+      assert catch_throw(
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid3},
+                 tools: [throw_tool, sibling_tool],
+                 tool_timeout: 200,
+                 on_event: fn
+                   %{event: :tool_update} -> throw(:abort_ui)
+                   _ -> :ok
+                 end
+               )
+             ) == :abort_ui
+
+      refute_receive _, 250
+      assert :atomics.get(sibling_alive, 1) == 0
+
+      # Raising in :after_tool_call while sibling runs leaves mailbox clean too.
+      fast_fail = %Inline{
+        name: "fast_fail",
+        description: "Fast",
+        input_schema: %{type: "object", properties: %{}},
+        execute: fn _input, _ctx -> {:ok, "fast"} end
+      }
+
+      {:ok, pid4} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t_ff", name: "fast_fail", input: %{}},
+            %{id: "t_sib2", name: "sibling", input: %{}}
+          ])
+        ])
+
+      assert_raise RuntimeError, "after_tool_boom", fn ->
+        Alloy.run("go",
+          provider: {TestProvider, agent_pid: pid4},
+          tools: [fast_fail, sibling_tool],
+          middleware: [RaiseAfterToolCallMiddleware],
+          tool_timeout: 200
+        )
+      end
+
+      refute_receive _, 250
+      assert :atomics.get(sibling_alive, 1) == 0
+    end
+
+    test "parallel batch with tool_concurrency < batch size keeps :tool_update inside each call's window" do
+      caller = self()
+
+      worker_tool = %Inline{
+        name: "work",
+        description: "Work",
+        input_schema: %{type: "object", properties: %{n: %{type: "integer"}}},
+        execute: fn %{"n" => n}, context ->
+          if fun = Map.get(context, :on_tool_update), do: fun.("u-#{n}")
+          Process.sleep(10)
+          {:ok, "ok-#{n}"}
+        end
+      }
+
+      calls = for n <- 1..4, do: %{id: "c_#{n}", name: "work", input: %{"n" => n}}
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response(calls),
+          TestProvider.text_response("all done")
+        ])
+
+      assert {:ok, %{status: :completed}} =
+               Alloy.run("run 4",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [worker_tool],
+                 tool_concurrency: 2,
+                 on_event: &send(caller, {:ev, &1})
+               )
+
+      events = collect_events()
+
+      for n <- 1..4 do
+        id = "c_#{n}"
+        start_ev = Enum.find(events, &(&1.event == :tool_start and &1.payload.id == id))
+        update_ev = Enum.find(events, &(&1.event == :tool_update and &1.payload.id == id))
+        end_ev = Enum.find(events, &(&1.event == :tool_end and &1.payload.id == id))
+
+        assert start_ev.seq < update_ev.seq
+        assert update_ev.seq < end_ev.seq
+        assert update_ev.payload.start_event_seq == start_ev.seq
+        assert end_ev.payload.start_event_seq == start_ev.seq
+      end
+    end
+
+    test "subscriber-aware chunks_emitted?, OpenAI malformed tool header validation, and terminal :turn_end limits" do
+      parent = self()
+
+      # 1. Without :on_event subscriber, a transient failure after a tool_call_delta still retries.
+      attempts = :atomics.new(1, signed: false)
+
+      flaky_oai_plug = fn conn ->
+        n = :atomics.add_get(attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "id" => "fc_1",
+                "call_id" => "call_1",
+                "type" => "function_call",
+                "name" => "echo",
+                "arguments" => ""
+              }
+            }) <>
+              sse_oai("response.failed", %{
+                "type" => "response.failed",
+                "response" => %{
+                  "status" => "failed",
+                  "error" => %{"code" => "server_error", "message" => "transient"}
+                }
+              })
+          else
+            sse_oai("response.output_text.delta", %{
+              "type" => "response.output_text.delta",
+              "delta" => "recovered"
+            }) <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_ok",
+                  "status" => "completed",
+                  "output" => [
+                    %{
+                      "type" => "message",
+                      "role" => "assistant",
+                      "content" => [%{"type" => "output_text", "text" => "recovered"}]
+                    }
+                  ],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "recovered"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: flaky_oai_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0
+               )
+
+      assert :atomics.get(attempts, 1) == 2
+
+      # 2. Malformed OpenAI function_call header does NOT emit :tool_call_delta and still retries
+      #    even when :on_event IS subscribed.
+      bad_attempts = :atomics.new(1, signed: false)
+
+      malformed_oai_plug = fn conn ->
+        n = :atomics.add_get(bad_attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => -2,
+              "item" => %{
+                "id" => %{},
+                "type" => "function_call",
+                "name" => []
+              }
+            }) <>
+              sse_oai("response.failed", %{
+                "type" => "response.failed",
+                "response" => %{
+                  "status" => "failed",
+                  "error" => %{"code" => "server_error", "message" => "transient"}
+                }
+              })
+          else
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_ok2",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "message",
+                    "role" => "assistant",
+                    "content" => [%{"type" => "output_text", "text" => "clean"}]
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "clean"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: malformed_oai_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0,
+                 on_event: &send(parent, {:mal_ev, &1})
+               )
+
+      assert :atomics.get(bad_attempts, 1) == 2
+      mal_events = drain_tagged(:mal_ev)
+      refute Enum.any?(mal_events, &(&1.event == :tool_call_delta))
+      assert Enum.any?(mal_events, &(&1.event == :turn_start))
+      assert Enum.any?(mal_events, &(&1.event == :turn_end and &1.payload.status == :completed))
+
+      # 3. max_turns: 1 reports final :turn_end status :max_turns (not :running).
+      {:ok, max_pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "t1", name: "echo", input: %{"text" => "hi"}}])
+        ])
+
+      assert {:ok, max_res} =
+               Alloy.run("loop",
+                 provider: {TestProvider, agent_pid: max_pid},
+                 tools: [Alloy.Test.EchoTool],
+                 max_turns: 1,
+                 on_event: &send(parent, {:max_ev, &1})
+               )
+
+      assert max_res.status == :max_turns
+      max_events = drain_tagged(:max_ev)
+
+      assert [%{event: :turn_end, payload: %{status: :max_turns}}] =
+               Enum.filter(max_events, &(&1.event == :turn_end))
+
+      # 4. Exception during turn still emits paired :turn_end (status: :error) before re-raising.
+      {:ok, err_pid} = TestProvider.start_link([TestProvider.text_response("never")])
+
+      assert_raise RuntimeError, "turn_exploded", fn ->
+        Alloy.run("boom",
+          provider: {TestProvider, agent_pid: err_pid},
+          middleware: [RaiseBeforeCompletionMiddleware],
+          on_event: &send(parent, {:boom_ev, &1})
+        )
+      end
+
+      boom_events = drain_tagged(:boom_ev)
+      assert Enum.any?(boom_events, &(&1.event == :turn_start and &1.turn == 1))
+      assert Enum.any?(boom_events, &(&1.event == :turn_end and &1.payload.status == :error))
+    end
+  end
+
+  defp wait_until_dead(os_pid, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_until_dead(os_pid, deadline)
+  end
+
+  defp do_wait_until_dead(os_pid, deadline) do
+    case System.cmd("kill", ["-0", Integer.to_string(os_pid)], stderr_to_stdout: true) do
+      {_, 0} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          false
+        else
+          Process.sleep(25)
+          do_wait_until_dead(os_pid, deadline)
+        end
+
+      _ ->
+        true
+    end
+  end
+
+  defp drain_tagged(tag, acc \\ []) do
+    receive do
+      {^tag, val} -> drain_tagged(tag, [val | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 

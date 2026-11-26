@@ -25,10 +25,13 @@ defmodule Alloy.Events do
   """
   @spec normalize_opts(State.t(), keyword()) :: keyword()
   def normalize_opts(%State{} = state, opts) do
-    on_event = Keyword.get(opts, :on_event) || fn _event -> :ok end
+    raw_on_event = Keyword.get(opts, :on_event)
+    has_subscriber? = Keyword.get(opts, :event_subscriber?, is_function(raw_on_event, 1))
+    on_event = raw_on_event || fn _event -> :ok end
 
     opts
     |> Keyword.put(:on_event, on_event)
+    |> Keyword.put(:event_subscriber?, has_subscriber?)
     |> put_new_lazy(:event_seq_ref, fn -> :atomics.new(1, signed: false) end)
     |> put_new_lazy(:event_error_logged_ref, fn -> :atomics.new(1, signed: false) end)
     |> put_new_lazy(:event_correlation_id, fn -> build_correlation_id(state) end)

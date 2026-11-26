@@ -156,7 +156,27 @@ defmodule Alloy.Agent.Turn do
     usage_before = state.usage
     Events.emit(opts, turn, {:turn_start, %{turn: turn}})
 
-    step = turn_span(turn, fn -> complete(state, opts, false) end)
+    step =
+      try do
+        turn_span(turn, fn -> complete(state, opts, false) end)
+      catch
+        kind, reason ->
+          Events.emit(
+            opts,
+            turn,
+            {:turn_end,
+             %{
+               turn: turn,
+               status: :error,
+               stop_reason: nil,
+               usage: %Usage{}
+             }}
+          )
+
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    step = finalize_turn_limits(step)
     {_, step_state} = step
     turn_stop_reason = if step_state.turn == turn, do: step_state.stop_reason, else: nil
 
@@ -174,6 +194,23 @@ defmodule Alloy.Agent.Turn do
 
     step
   end
+
+  # Resolve run-level termination limits (deadline first, then max_turns) before
+  # publishing :turn_end so the final turn never reports status: :running.
+  defp finalize_turn_limits({:continue, %State{} = next_state}) do
+    cond do
+      next_state.turn > 0 and deadline_expired?(next_state) ->
+        {:halt, fail(next_state, timeout_error(next_state))}
+
+      next_state.turn >= next_state.config.max_turns ->
+        {:halt, %{next_state | status: :max_turns}}
+
+      true ->
+        {:continue, next_state}
+    end
+  end
+
+  defp finalize_turn_limits({:halt, _state} = step), do: step
 
   defp turn_span(turn, fun) do
     start_mono = System.monotonic_time()
@@ -269,6 +306,12 @@ defmodule Alloy.Agent.Turn do
       Events.emit(opts, provider_event_turn, raw_event)
     end
 
+    # Only attach provider-side :on_event when a caller passed :on_event.
+    # Otherwise silent provider deltas (:thinking_delta / :tool_call_delta)
+    # would flip chunks_emitted? and disable retries/fallbacks even though
+    # no caller subscribed to structured events.
+    emit_provider_events? = streaming? and Keyword.get(opts, :event_subscriber?, false)
+
     provider_config =
       provider_config
       |> then(fn cfg ->
@@ -276,7 +319,9 @@ defmodule Alloy.Agent.Turn do
           do: Map.put(cfg, :alloy_request_deadline, state.run_deadline),
           else: cfg
       end)
-      |> then(fn cfg -> if streaming?, do: Map.put(cfg, :on_event, on_event), else: cfg end)
+      |> then(fn cfg ->
+        if emit_provider_events?, do: Map.put(cfg, :on_event, on_event), else: cfg
+      end)
 
     Retry.call_with_retry_attributed(
       state,

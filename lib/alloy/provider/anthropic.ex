@@ -44,6 +44,13 @@ defmodule Alloy.Provider.Anthropic do
     with `web_search: %{type: "web_search_20250305"}` on older models)
   - `:cache` - `true` / `"5m"` / `%{ttl: "5m"}` for 5-minute ephemeral prompt
     caching, `"1h"` / `%{ttl: "1h"}` for 1-hour TTL, or `false` (default)
+  - `:reasoning` - portable reasoning config (`nil | :off | :low | :medium |
+    :high | :xhigh | %{effort: ..., display?: :summarized | :omitted}`). `:off`
+    sends `thinking: %{"type" => "disabled"}` (note: models that cannot disable
+    thinking reject `"disabled"`, so pass `reasoning: nil` or override via
+    `:extra_body`); `:low`..`:xhigh` send `thinking: %{"type" => "adaptive"}`
+    and `output_config.effort` (`:xhigh` maps to `"max"`). Explicit `:extra_body`
+    takes precedence.
   - `:server_tools` - Raw tool maps sent after Alloy's own tools, for
     Anthropic-run tools such as web search, web fetch, tool search or an
     `mcp_toolset` (default: `[]`). For example
@@ -700,7 +707,10 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp maybe_put_reasoning(body, nil), do: body
-  defp maybe_put_reasoning(body, %{effort: :off}), do: body
+
+  defp maybe_put_reasoning(body, %{effort: :off}) do
+    Map.put(body, "thinking", %{"type" => "disabled"})
+  end
 
   defp maybe_put_reasoning(body, %{effort: effort, display: display}) do
     thinking =

@@ -385,20 +385,28 @@ defmodule Alloy.Provider.Retry do
     # Slot 1: chunks_emitted?, Slot 2: on_chunk warning logged?, Slot 3: on_event warning logged?
     ref = :atomics.new(3, signed: false)
 
-    original_on_event = Map.get(provider_config, :on_event, fn _ -> :ok end)
+    original_on_event = Map.get(provider_config, :on_event)
 
     wrapped_chunk = fn chunk ->
       :atomics.put(ref, 1, 1)
       notify(:on_chunk, on_chunk, chunk, ref, 2)
-      notify(:on_event, original_on_event, {:text_delta, chunk}, ref, 3)
+
+      if is_function(original_on_event, 1) do
+        notify(:on_event, original_on_event, {:text_delta, chunk}, ref, 3)
+      end
     end
 
-    wrapped_on_event = fn event ->
-      :atomics.put(ref, 1, 1)
-      notify(:on_event, original_on_event, event, ref, 3)
-    end
+    provider_config =
+      if is_function(original_on_event, 1) do
+        wrapped_on_event = fn event ->
+          :atomics.put(ref, 1, 1)
+          notify(:on_event, original_on_event, event, ref, 3)
+        end
 
-    provider_config = Map.put(provider_config, :on_event, wrapped_on_event)
+        Map.put(provider_config, :on_event, wrapped_on_event)
+      else
+        Map.delete(provider_config, :on_event)
+      end
 
     result = provider.stream(state.messages, state.tool_defs, provider_config, wrapped_chunk)
     {result, :atomics.get(ref, 1) == 1}

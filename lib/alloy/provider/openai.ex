@@ -541,20 +541,29 @@ defmodule Alloy.Provider.OpenAI do
          "response.output_item.added",
          %{"item" => %{"type" => "function_call"} = item} = payload
        ) do
-    index = if is_integer(payload["output_index"]), do: payload["output_index"], else: 0
+    index = Map.get(payload, "output_index", 0)
     call_id = item["call_id"] || item["id"]
     name = item["name"]
-    meta = %{id: call_id, index: index, name: name}
 
-    delta_event = Map.put(meta, :arguments_delta, "")
-    acc.on_event.({:tool_call_delta, delta_event})
+    if is_integer(index) and index >= 0 and is_binary(call_id) and call_id != "" and
+         is_binary(name) and name != "" do
+      meta = %{id: call_id, index: index, name: name}
+      delta_event = Map.put(meta, :arguments_delta, "")
+      acc.on_event.({:tool_call_delta, delta_event})
 
-    function_calls =
-      acc.function_calls
-      |> maybe_put_call_meta(item["id"], meta)
-      |> Map.put({:index, index}, meta)
+      function_calls =
+        acc.function_calls
+        |> maybe_put_call_meta(item["id"], meta)
+        |> Map.put({:index, index}, meta)
 
-    %{acc | function_calls: function_calls}
+      %{acc | function_calls: function_calls}
+    else
+      HTTP.record_sticky_error(
+        acc,
+        :protocol_error,
+        "Malformed function_call item in OpenAI SSE stream"
+      )
+    end
   end
 
   defp process_stream_event(
@@ -563,26 +572,17 @@ defmodule Alloy.Provider.OpenAI do
          %{"delta" => delta} = payload
        )
        when is_binary(delta) and delta != "" do
-    index = if is_integer(payload["output_index"]), do: payload["output_index"], else: nil
+    raw_index = Map.get(payload, "output_index")
 
-    meta =
-      Map.get(acc.function_calls, payload["item_id"]) ||
-        lookup_call_by_index(acc.function_calls, index) ||
-        %{id: payload["call_id"] || payload["item_id"], index: index || 0, name: nil}
-
-    effective_index = index || meta.index || 0
-
-    acc.on_event.(
-      {:tool_call_delta,
-       %{
-         id: meta.id,
-         index: effective_index,
-         name: meta.name,
-         arguments_delta: delta
-       }}
-    )
-
-    acc
+    if valid_optional_output_index?(raw_index) do
+      emit_function_call_args_delta(acc, payload, raw_index, delta)
+    else
+      HTTP.record_sticky_error(
+        acc,
+        :protocol_error,
+        "Invalid output_index in OpenAI function_call_arguments.delta"
+      )
+    end
   end
 
   # Every terminal event carries the whole response, and parse_response/1
@@ -613,6 +613,43 @@ defmodule Alloy.Provider.OpenAI do
     do: Map.get(calls, {:index, index})
 
   defp lookup_call_by_index(_calls, _index), do: nil
+
+  defp valid_optional_output_index?(nil), do: true
+  defp valid_optional_output_index?(index) when is_integer(index) and index >= 0, do: true
+  defp valid_optional_output_index?(_other), do: false
+
+  defp emit_function_call_args_delta(acc, payload, raw_index, delta) do
+    meta =
+      Map.get(acc.function_calls, payload["item_id"]) ||
+        lookup_call_by_index(acc.function_calls, raw_index) ||
+        %{id: payload["call_id"] || payload["item_id"], index: raw_index || 0, name: nil}
+
+    effective_index = raw_index || meta.index || 0
+
+    if valid_tool_call_meta?(meta) do
+      acc.on_event.(
+        {:tool_call_delta,
+         %{
+           id: meta.id,
+           index: effective_index,
+           name: meta.name,
+           arguments_delta: delta
+         }}
+      )
+
+      acc
+    else
+      HTTP.record_sticky_error(
+        acc,
+        :protocol_error,
+        "Malformed function_call_arguments.delta metadata in OpenAI SSE stream"
+      )
+    end
+  end
+
+  defp valid_tool_call_meta?(%{id: id, name: name}) do
+    is_binary(id) and id != "" and (is_nil(name) or (is_binary(name) and name != ""))
+  end
 
   defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
   defp build_stream_response(%{sticky_error: %Error{} = error}), do: {:error, error}
