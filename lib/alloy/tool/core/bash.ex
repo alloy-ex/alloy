@@ -359,9 +359,11 @@ defmodule Alloy.Tool.Core.Bash do
             {:exited, status, render(output)}
 
           :caller_down ->
+            OSProcess.signal_group(run.os_pid, "KILL")
             :caller_down
 
           {:exit, reason} ->
+            OSProcess.signal_group(run.os_pid, "KILL")
             Process.demonitor(caller_ref, [:flush])
             exit(reason)
         end

@@ -18,7 +18,14 @@ fields) may change between minor versions.
 
 A lower-level analogue is fired for every envelope via `:telemetry` as
 `[:alloy, :event]` with measurements `%{seq: seq}` and metadata
-`%{v:, event:, correlation_id:, turn:}`.
+`%{v:, event:, correlation_id:, turn:}`. Note that `:thinking_delta`,
+`:tool_call_delta`, and `:tool_update` envelopes (and their `[:alloy, :event]`
+telemetry) are only produced when `:on_event` is subscribed, so unsubscribed
+`Alloy.stream/3` callers preserve retry/fallback resilience across non-text
+deltas (while `:text_delta`, `:turn_start`, `:turn_end`, `:tool_start`, and
+`:tool_end` always fire telemetry). When `:on_event` is subscribed, emitting
+any streaming delta marks the provider attempt as having emitted output and
+disables retries and provider fallbacks for that turn.
 
 ## Envelope shape
 

@@ -2741,6 +2741,114 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert_received {:gem_atom_body, %{"generationConfig" => atom_gen_cfg}}
       refute Map.has_key?(atom_gen_cfg, "thinkingConfig")
       assert atom_gen_cfg["thinking_config"] == %{"thinkingBudget" => 256}
+
+      # 5. OpenAI Responses: index-only argument delta after header registration must NOT
+      #    duplicate arguments when output_item.done / response.completed arrives.
+      idx_only_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_idx",
+              "call_id" => "call_idx",
+              "name" => "echo"
+            }
+          }) <>
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "output_index" => 0,
+              "delta" => "{\"x\":1}"
+            }) <>
+            sse_oai("response.output_item.done", %{
+              "type" => "response.output_item.done",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_idx",
+                "call_id" => "call_idx",
+                "name" => "echo",
+                "arguments" => "{\"x\":1}"
+              }
+            }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_idx",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_idx",
+                    "call_id" => "call_idx",
+                    "name" => "echo",
+                    "arguments" => "{\"x\":1}"
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      {:ok, %{messages: [idx_msg]}} =
+        OpenAI.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "sk-oai",
+            model: "gpt-5.4",
+            req_options: [plug: idx_only_plug],
+            on_event: &send(parent, {:idx_only_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      assert [%{type: "tool_use", id: "call_idx", name: "echo", input: %{"x" => 1}}] =
+               idx_msg.content
+
+      idx_deltas =
+        drain_tagged(:idx_only_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.map_join(idx_deltas, & &1.arguments_delta) == "{\"x\":1}"
+
+      # 6. Bash: caller cancellation during post-exit flush still kills surviving background
+      #    descendants in the shell process group.
+      flush_blocker =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      caller_pid =
+        spawn(fn ->
+          Bash.execute(
+            %{"command" => "sleep 30 </dev/null >/dev/null 2>&1 & echo $!", "timeout" => 5_000},
+            %{
+              bash_restricted: false,
+              bash_on_output: fn chunk ->
+                send(parent, {:flush_cancel_chunk, chunk})
+                bref = Process.monitor(flush_blocker)
+
+                receive do
+                  {:DOWN, ^bref, :process, ^flush_blocker, _} -> :ok
+                end
+              end
+            }
+          )
+        end)
+
+      assert_receive {:flush_cancel_chunk, bg_pid_chunk}, 1_000
+      bg_pid = bg_pid_chunk |> String.trim() |> String.to_integer()
+      # Give the top-level shell a moment to exit so run_port enters flush_output_worker/3.
+      Process.sleep(40)
+      Process.exit(caller_pid, :kill)
+
+      assert wait_until_dead(bg_pid, 1_500)
+      send(flush_blocker, :stop)
     end
   end
 

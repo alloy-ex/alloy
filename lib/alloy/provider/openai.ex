@@ -663,7 +663,7 @@ defmodule Alloy.Provider.OpenAI do
     args_emitted? =
       maybe_emit_whole_item_args(acc.on_event, base_meta, item, event_type, args_emitted?)
 
-    meta = Map.put(base_meta, :args_emitted?, args_emitted?)
+    meta = Map.merge(base_meta, %{item_id: item_id, args_emitted?: args_emitted?})
 
     function_calls =
       acc.function_calls
@@ -763,6 +763,7 @@ defmodule Alloy.Provider.OpenAI do
         function_calls =
           acc.function_calls
           |> maybe_put_call_meta(item_id, updated_meta)
+          |> maybe_put_call_meta(Map.get(meta, :item_id), updated_meta)
           |> Map.put({:index, idx}, updated_meta)
 
         %{acc | function_calls: function_calls}
