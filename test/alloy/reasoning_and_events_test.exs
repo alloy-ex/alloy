@@ -4383,6 +4383,121 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         assert Enum.map_join(cid_deltas, & &1.arguments_delta) == "{\"x\":1}"
       end
+
+      # 16. Context-overflow recovery does NOT retry after streaming deltas (:tool_call_delta)
+      #     have already been emitted to a subscriber, preventing duplicate/abandoned calls.
+      defmodule ShrinkOverflowMiddleware do
+        @behaviour Alloy.Middleware
+
+        @impl true
+        def call(:on_context_overflow, state) do
+          %{state | messages: [Alloy.Message.user("shrunk")]}
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      req_count = :atomics.new(1, signed: false)
+
+      overflow_after_delta_plug = fn conn ->
+        attempt = :atomics.add_get(req_count, 1, 1)
+
+        sse =
+          if attempt == 1 do
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_ov_1",
+                "call_id" => "call_ov_1",
+                "name" => "echo",
+                "arguments" => "{\"x\":1}"
+              }
+            }) <>
+              sse_oai("response.failed", %{
+                "type" => "response.failed",
+                "response" => %{
+                  "id" => "resp_ov_1",
+                  "status" => "failed",
+                  "error" => %{
+                    "code" => "context_length_exceeded",
+                    "message" => "Your input exceeds the context window of this model."
+                  }
+                }
+              })
+          else
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_ov_2",
+                "call_id" => "call_ov_2",
+                "name" => "echo",
+                "arguments" => "{\"x\":2}"
+              }
+            }) <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_ov_2",
+                  "status" => "completed",
+                  "output" => [
+                    %{
+                      "type" => "function_call",
+                      "id" => "fc_ov_2",
+                      "call_id" => "call_ov_2",
+                      "name" => "echo",
+                      "arguments" => "{\"x\":2}"
+                    }
+                  ],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:error, %Alloy.Result{status: :error}} =
+               Alloy.stream(
+                 "hi",
+                 fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai",
+                    model: "gpt-5.4",
+                    req_options: [plug: overflow_after_delta_plug]},
+                 max_retries: 0,
+                 middleware: [ShrinkOverflowMiddleware],
+                 on_event: &send(parent, {:ov_ev, &1})
+               )
+
+      assert :atomics.get(req_count, 1) == 1
+
+      ov_tool_ids =
+        drain_tagged(:ov_ev)
+        |> Enum.filter(&(&1.event == :tool_call_delta))
+        |> Enum.map(& &1.payload.id)
+        |> Enum.uniq()
+
+      assert ov_tool_ids == ["call_ov_1"]
+
+      # 17. OwnedWorker enforces deadline before executing the worker function so an already
+      #     expired deadline cannot run tool side effects even under dispatch/scheduling delay.
+      expired_deadline = System.monotonic_time(:millisecond) - 1
+
+      owner =
+        Alloy.OwnedWorker.start(expired_deadline, fn ->
+          send(parent, :expired_worker_ran)
+          :unexpected
+        end)
+
+      assert Task.await(owner, 1_000) == :timeout
+      refute_received :expired_worker_ran
     end
   end
 

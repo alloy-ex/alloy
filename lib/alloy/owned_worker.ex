@@ -33,18 +33,23 @@ defmodule Alloy.OwnedWorker do
           exit(reason)
       after
         0 ->
-          callers = [self() | Process.get(:"$callers", [])]
-          owner = self()
-          done_ref = make_ref()
+          if deadline <= System.monotonic_time(:millisecond) do
+            Process.demonitor(caller_ref, [:flush])
+            :timeout
+          else
+            callers = [self() | Process.get(:"$callers", [])]
+            owner = self()
+            done_ref = make_ref()
 
-          worker =
-            spawn_link(fn ->
-              Process.put(:"$callers", callers)
-              restore_caller_context(caller_ctx)
-              run_worker(owner, done_ref, fun)
-            end)
+            worker =
+              spawn_link(fn ->
+                Process.put(:"$callers", callers)
+                restore_caller_context(caller_ctx)
+                run_worker(owner, done_ref, deadline, fun)
+              end)
 
-          await_worker(caller_ref, worker, done_ref, deadline)
+            await_worker(caller_ref, worker, done_ref, deadline)
+          end
       end
     end)
   end
@@ -65,9 +70,13 @@ defmodule Alloy.OwnedWorker do
   @spec format_exit_reason(term()) :: String.t()
   def format_exit_reason(reason), do: Sanitize.exit_summary(reason, :redact)
 
-  defp run_worker(owner, done_ref, fun) do
-    result = fun.()
-    send(owner, {done_ref, {:ok, result}})
+  defp run_worker(owner, done_ref, deadline, fun) do
+    if deadline <= System.monotonic_time(:millisecond) do
+      send(owner, {done_ref, :timeout})
+    else
+      result = fun.()
+      send(owner, {done_ref, {:ok, result}})
+    end
   catch
     kind, reason ->
       send(
