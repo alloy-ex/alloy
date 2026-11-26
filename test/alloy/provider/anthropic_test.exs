@@ -739,6 +739,35 @@ defmodule Alloy.Provider.AnthropicTest do
       assert [%{"caller" => @caller}] = Enum.at(decoded["messages"], 1)["content"]
     end
 
+    # web_search_20260209 filters results in code it runs, so its searches come
+    # back as server_tool_use blocks called from that code. The API rejects a
+    # later request whose history drops their caller.
+    test "keeps a server tool's caller and sends it back with the history" do
+      search = %{
+        "type" => "server_tool_use",
+        "id" => "srvtoolu_search",
+        "name" => "web_search",
+        "input" => %{"query" => "nvidia earnings"},
+        "caller" => @caller
+      }
+
+      config =
+        config_with_response(%{
+          status: 200,
+          body: Jason.encode!(%{programmatic_call_message() | "content" => [search]})
+        })
+
+      assert {:ok, %{messages: [assistant]}} =
+               Anthropic.complete([Message.user("News?")], [], config)
+
+      assert [%{type: "server_tool_use", caller: @caller}] = assistant.content
+
+      Anthropic.complete([Message.user("News?"), assistant], [], config_that_captures_request())
+
+      assert_received {:request_body, body}
+      assert [^search] = Enum.at(Jason.decode!(body)["messages"], 1)["content"]
+    end
+
     test "sends no container before one exists" do
       config = config_that_captures_request()
 
