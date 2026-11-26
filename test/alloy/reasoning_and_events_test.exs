@@ -4091,6 +4091,222 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         _ = drain_tagged(:mm_ev)
       end
+
+      # 13. OpenAI/xAI: changed call_id or name on a resolved slot (including when terminal
+      #     item omits optional "id" or falls back from missing "call_id" to item "id") fails
+      #     with :malformed_reply and emits no bogus header for the replacement identity.
+      for terminal_item <- [
+            %{
+              "type" => "function_call",
+              "call_id" => "call_b",
+              "name" => "delete",
+              "arguments" => "{\"x\":1}"
+            },
+            %{
+              "type" => "function_call",
+              "call_id" => "call_a",
+              "name" => "delete",
+              "arguments" => "{\"x\":1}"
+            },
+            %{
+              "type" => "function_call",
+              "id" => "fc_id_check",
+              "call_id" => "call_b",
+              "name" => "read",
+              "arguments" => "{\"x\":1}"
+            },
+            %{
+              "type" => "function_call",
+              "id" => "fc_id_check",
+              "name" => "read",
+              "arguments" => "{\"x\":1}"
+            }
+          ] do
+        id_conflict_plug =
+          sse_plug(
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_id_check",
+                "call_id" => "call_a",
+                "name" => "read",
+                "arguments" => "{\"x\":1}"
+              }
+            }) <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_id_conflict",
+                  "status" => "completed",
+                  "output" => [terminal_item],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAI.stream(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_key: "sk-oai",
+                     model: "gpt-5.4",
+                     req_options: [plug: id_conflict_plug],
+                     on_event: &send(parent, {:idc_ev, &1})
+                   },
+                   fn _ -> :ok end
+                 )
+
+        idc_deltas =
+          drain_tagged(:idc_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+        assert Enum.all?(idc_deltas, &(&1.id == "call_a" and &1.name == "read"))
+      end
+
+      # 14. OpenAICompat: conflicting tool call id or function name on an existing index fails
+      #     with :protocol_error instead of splitting one argument document across two identities,
+      #     while identical repeated metadata and omitted/null/empty metadata continue to succeed.
+      for conflicting_tc <- [
+            %{"index" => 0, "id" => "call_b", "function" => %{"arguments" => "1}"}},
+            %{"index" => 0, "function" => %{"name" => "delete", "arguments" => "1}"}},
+            %{
+              "index" => 0,
+              "id" => "call_b",
+              "function" => %{"name" => "delete", "arguments" => "1}"}
+            }
+          ] do
+        oc_conflict_sse =
+          "data: " <>
+            Jason.encode!(%{
+              "choices" => [
+                %{
+                  "index" => 0,
+                  "delta" => %{
+                    "tool_calls" => [
+                      %{
+                        "index" => 0,
+                        "id" => "call_a",
+                        "function" => %{"name" => "read", "arguments" => "{\"x\":"}
+                      }
+                    ]
+                  }
+                }
+              ]
+            }) <>
+            "\n\ndata: " <>
+            Jason.encode!(%{
+              "choices" => [%{"index" => 0, "delta" => %{"tool_calls" => [conflicting_tc]}}]
+            }) <>
+            "\n\ndata: " <>
+            Jason.encode!(%{"choices" => [%{"index" => 0, "finish_reason" => "tool_calls"}]}) <>
+            "\n\ndata: [DONE]\n\n"
+
+        assert {:error, %Error{kind: :protocol_error}} =
+                 OpenAICompat.stream(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_url: "https://compat.example/v1",
+                     api_key: "sk-compat",
+                     model: "compat-model",
+                     req_options: [plug: sse_plug(oc_conflict_sse)],
+                     on_event: &send(parent, {:occ_ev, &1})
+                   },
+                   fn _ -> :ok end
+                 )
+
+        occ_deltas =
+          drain_tagged(:occ_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+        assert Enum.all?(occ_deltas, &(&1.id == "call_a" and &1.name == "read"))
+      end
+
+      oc_repeat_sse =
+        "data: " <>
+          Jason.encode!(%{
+            "choices" => [
+              %{
+                "index" => 0,
+                "delta" => %{
+                  "tool_calls" => [
+                    %{
+                      "index" => 0,
+                      "id" => "call_a",
+                      "function" => %{"name" => "read", "arguments" => "{\"x\":"}
+                    }
+                  ]
+                }
+              }
+            ]
+          }) <>
+          "\n\ndata: " <>
+          Jason.encode!(%{
+            "choices" => [
+              %{
+                "index" => 0,
+                "delta" => %{
+                  "tool_calls" => [
+                    %{
+                      "index" => 0,
+                      "id" => "call_a",
+                      "function" => %{"name" => "read", "arguments" => "1"}
+                    }
+                  ]
+                }
+              }
+            ]
+          }) <>
+          "\n\ndata: " <>
+          Jason.encode!(%{
+            "choices" => [
+              %{
+                "index" => 0,
+                "delta" => %{
+                  "tool_calls" => [
+                    %{
+                      "index" => 0,
+                      "id" => nil,
+                      "function" => %{"name" => "", "arguments" => "}"}
+                    }
+                  ]
+                }
+              }
+            ]
+          }) <>
+          "\n\ndata: " <>
+          Jason.encode!(%{"choices" => [%{"index" => 0, "finish_reason" => "tool_calls"}]}) <>
+          "\n\ndata: [DONE]\n\n"
+
+      {:ok, %{messages: [oc_repeat_msg]}} =
+        OpenAICompat.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_url: "https://compat.example/v1",
+            api_key: "sk-compat",
+            model: "compat-model",
+            req_options: [plug: sse_plug(oc_repeat_sse)],
+            on_event: &send(parent, {:ocr_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      assert [%{type: "tool_use", id: "call_a", name: "read", input: %{"x" => 1}}] =
+               oc_repeat_msg.content
+
+      ocr_deltas =
+        drain_tagged(:ocr_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.all?(ocr_deltas, &(&1.id == "call_a" and &1.name == "read"))
+      assert Jason.decode!(Enum.map_join(ocr_deltas, & &1.arguments_delta)) == %{"x" => 1}
     end
   end
 

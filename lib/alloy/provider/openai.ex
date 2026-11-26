@@ -646,7 +646,7 @@ defmodule Alloy.Provider.OpenAI do
     stable_index = if is_map(existing), do: Map.get(existing, :index, index), else: index
 
     cond do
-      conflicting_existing_header?(existing, item_id, call_id, name) ->
+      conflicting_existing_header?(existing, call_id, name) ->
         if strict? do
           {:error,
            %Error{
@@ -706,20 +706,11 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp conflicting_existing_header?(
-         %{id: id, name: existing_name, item_id: existing_item_id},
-         item_id,
-         call_id,
-         name
-       ) do
-    same_call? =
-      (is_binary(item_id) and item_id != "" and existing_item_id == item_id) or
-        (is_nil(item_id) and is_nil(existing_item_id))
-
-    same_call? and (id != call_id or existing_name != name)
+  defp conflicting_existing_header?(%{id: id, name: existing_name}, call_id, name) do
+    id != call_id or existing_name != name
   end
 
-  defp conflicting_existing_header?(_existing, _item_id, _call_id, _name), do: false
+  defp conflicting_existing_header?(_existing, _call_id, _name), do: false
 
   defp plan_call_events(base_meta, item, pending_deltas, plan_opts) do
     %{
@@ -928,8 +919,19 @@ defmodule Alloy.Provider.OpenAI do
 
   defp lookup_function_call_meta(calls, item_id, index) do
     case maybe_get_by_id(calls, item_id) do
-      nil -> lookup_call_by_index(calls, index)
-      found -> found
+      nil ->
+        case lookup_call_by_index(calls, index) do
+          %{item_id: existing_id}
+          when is_binary(item_id) and item_id != "" and is_binary(existing_id) and
+                 existing_id != "" and existing_id != item_id ->
+            nil
+
+          other ->
+            other
+        end
+
+      found ->
+        found
     end
   end
 

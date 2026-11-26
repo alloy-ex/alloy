@@ -417,10 +417,16 @@ defmodule Alloy.Provider.OpenAIStream do
   end
 
   # Some providers (DeepInfra) repeat "id": null on every later chunk of the
-  # same call; only a real id may set it, while non-string/non-nil ids fail fast.
+  # same call; only a real id may set it, while non-string/non-nil or
+  # conflicting ids fail fast.
   defp merge_tool_call_id(existing, :error), do: {:ok, existing}
   defp merge_tool_call_id(existing, {:ok, nil}), do: {:ok, existing}
   defp merge_tool_call_id(existing, {:ok, ""}), do: {:ok, existing}
+
+  defp merge_tool_call_id(%{id: existing_id}, {:ok, id})
+       when is_binary(id) and is_binary(existing_id) and existing_id != "" and id != existing_id do
+    {:error, "Conflicting tool call id in Chat Completions SSE chunk"}
+  end
 
   defp merge_tool_call_id(existing, {:ok, id}) when is_binary(id),
     do: {:ok, %{existing | id: id}}
@@ -510,6 +516,13 @@ defmodule Alloy.Provider.OpenAIStream do
 
   defp merge_function_name(existing, :error), do: {:ok, existing}
   defp merge_function_name(existing, {:ok, nil}), do: {:ok, existing}
+  defp merge_function_name(existing, {:ok, ""}), do: {:ok, existing}
+
+  defp merge_function_name(%{name: existing_name}, {:ok, name})
+       when is_binary(name) and is_binary(existing_name) and existing_name != "" and
+              name != existing_name do
+    {:error, "Conflicting function name in Chat Completions tool call delta"}
+  end
 
   defp merge_function_name(existing, {:ok, name}) when is_binary(name),
     do: {:ok, %{existing | name: name}}
