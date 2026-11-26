@@ -88,6 +88,8 @@ defmodule Alloy.Provider.OpenAI do
   @default_api_url "https://api.openai.com"
   @terminal_events ["response.completed", "response.incomplete", "response.failed"]
 
+  @json_number_prefix_re ~r/^-?(?:(?:0|[1-9][0-9]*)(?:\.(?:[0-9]+(?:[eE][+-]?[0-9]*)?)?|[eE][+-]?[0-9]*)?)?$/
+
   @typedoc """
   Configuration for the OpenAI provider. See the module doc for field
   semantics.
@@ -1078,25 +1080,180 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp complete_number_token(token, expected) do
+    if Regex.match?(@json_number_prefix_re, token) do
+      cond do
+        match?({:ok, num} when is_number(num) and num == expected, Jason.decode(token)) ->
+          {:suffix, ""}
+
+        String.contains?(token, ["e", "E"]) ->
+          complete_exponent_number(token, expected)
+
+        true ->
+          complete_mantissa_token(token, expected)
+      end
+    else
+      :error
+    end
+  end
+
+  defp complete_mantissa_token("-", expected) when expected == 0, do: {:suffix, "0"}
+
+  defp complete_mantissa_token("-", expected) when expected < 0 do
     encoded = Jason.encode!(expected)
+    {:suffix, binary_part(encoded, 1, byte_size(encoded) - 1)}
+  end
+
+  defp complete_mantissa_token("-", _expected), do: :error
+
+  defp complete_mantissa_token(token, expected) do
+    with :error <- try_decimal_prefix_completion(token, expected),
+         :error <- try_direct_exponent_completion(token, expected) do
+      try_mantissa_exponent_completion(token, expected)
+    end
+  end
+
+  defp try_decimal_prefix_completion(token, expected) do
+    Enum.find_value(decimal_candidates(expected), :error, fn full ->
+      if String.starts_with?(full, token) do
+        tail = binary_part(full, byte_size(token), byte_size(full) - byte_size(token))
+
+        case Jason.decode(token <> tail) do
+          {:ok, num} when is_number(num) and num == expected -> {:suffix, tail}
+          _ -> nil
+        end
+      end
+    end)
+  end
+
+  defp decimal_candidates(0), do: ["0", "0.0", "-0", "-0.0"]
+
+  defp decimal_candidates(n) when is_integer(n) do
+    s = Integer.to_string(n)
+    [s, s <> ".0"]
+  end
+
+  defp decimal_candidates(f) when is_float(f) do
+    base = [Jason.encode!(f) | fixed_decimal_strings(f)]
+    if f == 0.0, do: base ++ ["-0", "-0.0"], else: base
+  end
+
+  defp fixed_decimal_strings(float) when is_float(float) do
+    {neg?, sig, exp} = parse_short_float(:erlang.float_to_binary(float, [:short]))
+    sign = if neg?, do: "-", else: ""
 
     cond do
-      match?({:ok, num} when is_number(num) and num == expected, Jason.decode(token)) ->
-        {:suffix, ""}
+      exp >= 0 and exp <= 350 ->
+        whole = sign <> sig <> String.duplicate("0", exp)
+        [whole, whole <> ".0"]
 
-      String.starts_with?(encoded, token) ->
-        {:suffix, binary_part(encoded, byte_size(token), byte_size(encoded) - byte_size(token))}
+      exp < 0 and -exp <= 350 ->
+        len = byte_size(sig)
+        dot_pos = len + exp
 
-      String.ends_with?(token, ".") and
-          match?({:ok, num} when is_number(num) and num == expected, Jason.decode(token <> "0")) ->
-        {:suffix, "0"}
+        fixed =
+          if dot_pos > 0 do
+            sign <>
+              binary_part(sig, 0, dot_pos) <>
+              "." <> binary_part(sig, dot_pos, len - dot_pos)
+          else
+            sign <> "0." <> String.duplicate("0", -dot_pos) <> sig
+          end
 
-      String.contains?(token, ["e", "E"]) ->
-        complete_exponent_number(token, expected)
+        [fixed]
 
       true ->
-        :error
+        []
     end
+  end
+
+  defp parse_short_float(short) do
+    {neg?, rest} =
+      case short do
+        <<"-", tail::binary>> -> {true, tail}
+        tail -> {false, tail}
+      end
+
+    {mantissa, exp} =
+      case String.split(rest, ["e", "E"], parts: 2) do
+        [m, e] -> {m, String.to_integer(e)}
+        [m] -> {m, 0}
+      end
+
+    {digits, frac_len} =
+      case String.split(mantissa, ".", parts: 2) do
+        [i, f] -> {i <> f, byte_size(f)}
+        [i] -> {i, 0}
+      end
+
+    trimmed = String.trim_trailing(digits, "0")
+    trailing_zeros = byte_size(digits) - byte_size(trimmed)
+    sig = trimmed |> String.trim_leading("0")
+    sig = if sig == "", do: "0", else: sig
+    {neg?, sig, exp - frac_len + trailing_zeros}
+  end
+
+  defp try_direct_exponent_completion(token, expected) do
+    if String.ends_with?(token, ".") do
+      :error
+    else
+      case complete_exponent_number(token <> "e", expected) do
+        {:suffix, exp_tail} -> {:suffix, "e" <> exp_tail}
+        :error -> :error
+      end
+    end
+  end
+
+  defp try_mantissa_exponent_completion(_token, expected) when expected == 0, do: :error
+
+  defp try_mantissa_exponent_completion(token, expected) do
+    neg_token? = String.starts_with?(token, "-")
+
+    if neg_token? == expected < 0 do
+      expected_sig = expected_sig_digits(expected)
+      token_sig = token |> String.replace(["-", "."], "") |> String.trim_leading("0")
+
+      if String.starts_with?(expected_sig, token_sig) do
+        rem_digits =
+          binary_part(
+            expected_sig,
+            byte_size(token_sig),
+            byte_size(expected_sig) - byte_size(token_sig)
+          )
+
+        complete_remaining_mantissa(token, rem_digits, expected)
+      else
+        :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp complete_remaining_mantissa(_token, "", _expected), do: :error
+
+  defp complete_remaining_mantissa(token, rem_digits, expected) do
+    mantissa_tail = if token in ["0", "-0"], do: "." <> rem_digits, else: rem_digits
+    full_mantissa = token <> mantissa_tail
+
+    case Jason.decode(full_mantissa) do
+      {:ok, num} when is_number(num) and num == expected ->
+        {:suffix, mantissa_tail}
+
+      _ ->
+        case complete_exponent_number(full_mantissa <> "e", expected) do
+          {:suffix, exp_tail} -> {:suffix, mantissa_tail <> "e" <> exp_tail}
+          :error -> :error
+        end
+    end
+  end
+
+  defp expected_sig_digits(n) when is_integer(n) do
+    n |> abs() |> Integer.to_string() |> String.trim_trailing("0")
+  end
+
+  defp expected_sig_digits(f) when is_float(f) do
+    {_neg?, sig, _exp} = parse_short_float(:erlang.float_to_binary(f, [:short]))
+    sig
   end
 
   defp complete_exponent_number(token, expected) do

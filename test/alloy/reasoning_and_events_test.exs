@@ -4950,6 +4950,15 @@ defmodule Alloy.ReasoningAndEventsTest do
             {~S({"x":1e00), %{"x" => 100}},
             {~S({"x":1e-0), %{"x" => 0.01}},
             {~S({"x":0.1e), %{"x" => 1.0e308}},
+            {~S({"x":1.2), %{"x" => 1200}},
+            {~S({"x":1.2), %{"x" => 1.2e10}},
+            {~S({"x":1.2), %{"x" => 12_345}},
+            {~S({"x":1.), %{"x" => 1200}},
+            {~S({"x":0), %{"x" => 123}},
+            {~S({"x":0.00), %{"x" => 0.00001}},
+            {~S({"x":0.00000), %{"x" => 1.0e-10}},
+            {~S({"x":-), %{"x" => 0}},
+            {~S({"x":-), %{"x" => -42}},
             {~S({"x":1.5E-), %{"x" => 0.015}},
             {~S({"x":0e+), %{"x" => 0}},
             {~S({"x":1.), %{"x" => 1}},
@@ -5186,6 +5195,81 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert [%{turn: 1, payload: %{status: :max_turns}}] =
                Enum.filter(mt_cb_events, &(&1.event == :turn_end))
+
+      # 24. Exhaustive split-point fuzz: every valid UTF-8 prefix of diverse RFC 8259 JSON
+      #     spellings (plain decimals, scientific notation, zero-padded exponents, escaped
+      #     strings, reordered keys, nested structures) reconciles cleanly against map-typed
+      #     terminal arguments without ever returning a spurious :malformed_reply.
+      fuzz_spellings = [
+        ~S({"z": 0.0000000001, "a": 1.2e3}),
+        ~S({"n": 1.2345E+04, "neg": -0.015, "zero": -0.0}),
+        ~S({"s": "a\/\u00e9\n\t\uD83D\uDE00", "b": true, "c": null}),
+        ~S({"arr": [0.00001, 1200, {"y": 1.5e-2, "x": false}]})
+      ]
+
+      for raw_json <- fuzz_spellings do
+        expected = Jason.decode!(raw_json)
+        graphemes = String.graphemes(raw_json)
+
+        for cut <- 1..(length(graphemes) - 1) do
+          prefix = graphemes |> Enum.take(cut) |> Enum.join()
+
+          fuzz_plug =
+            sse_plug(
+              sse_oai("response.output_item.added", %{
+                "type" => "response.output_item.added",
+                "output_index" => 0,
+                "item" => %{
+                  "type" => "function_call",
+                  "id" => "fc_fuzz",
+                  "call_id" => "call_fuzz",
+                  "name" => "echo",
+                  "arguments" => prefix
+                }
+              }) <>
+                sse_oai("response.completed", %{
+                  "type" => "response.completed",
+                  "response" => %{
+                    "id" => "resp_fuzz",
+                    "status" => "completed",
+                    "output" => [
+                      %{
+                        "type" => "function_call",
+                        "id" => "fc_fuzz",
+                        "call_id" => "call_fuzz",
+                        "name" => "echo",
+                        "arguments" => expected
+                      }
+                    ],
+                    "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                  }
+                })
+            )
+
+          {:ok, %{messages: [fuzz_msg]}} =
+            OpenAI.stream(
+              [Message.user("hi")],
+              [],
+              %{
+                api_key: "sk-oai",
+                model: "gpt-5.4",
+                req_options: [plug: fuzz_plug],
+                on_event: &send(parent, {:fz_ev, &1})
+              },
+              fn _ -> :ok end
+            )
+
+          assert [%{type: "tool_use", id: "call_fuzz", name: "echo", input: ^expected}] =
+                   fuzz_msg.content
+
+          fz_deltas =
+            drain_tagged(:fz_ev)
+            |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+            |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+          assert Jason.decode!(Enum.map_join(fz_deltas, & &1.arguments_delta)) == expected
+        end
+      end
     end
   end
 
