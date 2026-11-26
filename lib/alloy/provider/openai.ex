@@ -589,12 +589,9 @@ defmodule Alloy.Provider.OpenAI do
 
     # During streaming (output_item.added / output_item.done), require the true
     # call_id so consumers never receive item_id when call_id arrives later.
-    # Only the terminal response.completed payload may fall back to item["id"]
-    # (matching parse_output_to_blocks/2).
-    call_id =
-      if event_type == "response.completed",
-        do: raw_call_id || item_id,
-        else: raw_call_id
+    # Terminal response.completed fallback to item["id"] happens in
+    # plan_completed_function_call/4 (matching parse_output_to_blocks/2).
+    call_id = raw_call_id
 
     cond do
       existing == :rejected ->
@@ -604,16 +601,20 @@ defmodule Alloy.Provider.OpenAI do
         mark_rejected_function_call(acc, item_id, index)
 
       valid_function_call_header?(index, call_id, name) ->
-        emit_and_store_function_call(
-          acc,
-          existing,
-          item,
-          item_id,
-          call_id,
-          index,
-          name,
-          event_type
-        )
+        call_info = %{
+          existing: existing,
+          item: item,
+          item_id: item_id,
+          call_id: call_id,
+          index: index,
+          name: name
+        }
+
+        {:ok, updated, events} =
+          plan_and_store_function_call(acc, call_info, event_type, false)
+
+        Enum.each(events, acc.on_event)
+        updated
 
       deferred_call_id_header?(event_type, index, raw_call_id, item_id, name) ->
         # Legitimate partial header waiting for call_id: preserve any initial
@@ -630,58 +631,122 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp emit_and_store_function_call(
-         acc,
-         existing,
-         item,
-         item_id,
-         call_id,
-         index,
-         name,
-         event_type
-       ) do
+  defp plan_and_store_function_call(acc, call_info, event_type, strict?) do
+    %{
+      existing: existing,
+      item: item,
+      item_id: item_id,
+      call_id: call_id,
+      index: index,
+      name: name
+    } = call_info
+
     header_emitted? = match?(%{id: ^call_id, name: ^name}, existing)
     emitted_args = if is_map(existing), do: Map.get(existing, :emitted_args, ""), else: ""
     stable_index = if is_map(existing), do: Map.get(existing, :index, index), else: index
 
-    if event_type == "response.output_item.done" and not header_emitted? and
-         invalid_whole_item_args?(item) do
-      # Defer malformed whole-item calls so response.completed / parse_response
-      # can fail with :malformed_reply before chunks_emitted? is flipped.
-      acc
-    else
-      base_meta = %{id: call_id, index: stable_index, name: name}
+    cond do
+      conflicting_existing_header?(existing, item_id, call_id, name) ->
+        if strict? do
+          {:error,
+           %Error{
+             kind: :malformed_reply,
+             message: "Streamed tool call header for #{name} does not match completed call"
+           }}
+        else
+          {:ok, acc, []}
+        end
 
-      unless header_emitted? do
-        header_event = Map.put(base_meta, :arguments_delta, "")
-        acc.on_event.({:tool_call_delta, header_event})
-      end
+      event_type == "response.output_item.done" and not header_emitted? and
+          invalid_whole_item_args?(item) ->
+        # Defer malformed whole-item calls so response.completed / parse_response
+        # can fail with :malformed_reply before chunks_emitted? is flipped.
+        {:ok, acc, []}
 
-      {pending_deltas, next_pending} =
-        pop_pending_deltas(acc.pending_function_deltas, item_id, stable_index)
+      true ->
+        base_meta = %{id: call_id, index: stable_index, name: name}
 
-      emitted_args =
-        emit_reconciled_pending_args(
-          acc.on_event,
-          base_meta,
-          pending_deltas,
-          item,
-          event_type,
-          emitted_args
-        )
+        {pending_deltas, next_pending} =
+          pop_pending_deltas(acc.pending_function_deltas, item_id, stable_index)
 
-      emitted_args =
-        maybe_emit_whole_item_args(acc.on_event, base_meta, item, event_type, emitted_args)
+        plan_opts = %{
+          header_emitted?: header_emitted?,
+          event_type: event_type,
+          emitted_args: emitted_args,
+          strict?: strict?
+        }
 
-      effective_item_id = item_id || (is_map(existing) && Map.get(existing, :item_id)) || nil
-      meta = Map.merge(base_meta, %{item_id: effective_item_id, emitted_args: emitted_args})
+        case plan_call_events(base_meta, item, pending_deltas, plan_opts) do
+          {:ok, events, next_emitted_args} ->
+            effective_item_id =
+              item_id || (is_map(existing) && Map.get(existing, :item_id)) || nil
 
-      function_calls =
-        acc.function_calls
-        |> maybe_put_call_meta(effective_item_id, meta)
-        |> Map.put({:index, stable_index}, meta)
+            meta =
+              Map.merge(base_meta, %{
+                item_id: effective_item_id,
+                emitted_args: next_emitted_args
+              })
 
-      %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
+            function_calls =
+              acc.function_calls
+              |> maybe_put_call_meta(effective_item_id, meta)
+              |> Map.put({:index, stable_index}, meta)
+
+            {:ok, %{acc | function_calls: function_calls, pending_function_deltas: next_pending},
+             events}
+
+          :conflict ->
+            {:error,
+             %Error{
+               kind: :malformed_reply,
+               message:
+                 "Streamed tool call arguments for #{name} do not match completed arguments"
+             }}
+        end
+    end
+  end
+
+  defp conflicting_existing_header?(
+         %{id: id, name: existing_name, item_id: existing_item_id},
+         item_id,
+         call_id,
+         name
+       ) do
+    same_call? =
+      (is_binary(item_id) and item_id != "" and existing_item_id == item_id) or
+        (is_nil(item_id) and is_nil(existing_item_id))
+
+    same_call? and (id != call_id or existing_name != name)
+  end
+
+  defp conflicting_existing_header?(_existing, _item_id, _call_id, _name), do: false
+
+  defp plan_call_events(base_meta, item, pending_deltas, plan_opts) do
+    %{
+      header_emitted?: header_emitted?,
+      event_type: event_type,
+      emitted_args: emitted_args,
+      strict?: strict?
+    } = plan_opts
+
+    header_events =
+      if header_emitted?,
+        do: [],
+        else: [{:tool_call_delta, Map.put(base_meta, :arguments_delta, "")}]
+
+    {pending_events, emitted_after_pending} =
+      plan_reconciled_pending_args(base_meta, pending_deltas, item, event_type, emitted_args)
+
+    case reconcile_whole_item_args(item, event_type, emitted_after_pending, strict?) do
+      {:ok, "", next_emitted} ->
+        {:ok, header_events ++ pending_events, next_emitted}
+
+      {:ok, suffix, next_emitted} ->
+        suffix_event = {:tool_call_delta, Map.put(base_meta, :arguments_delta, suffix)}
+        {:ok, header_events ++ pending_events ++ [suffix_event], next_emitted}
+
+      :conflict ->
+        :conflict
     end
   end
 
@@ -706,32 +771,117 @@ defmodule Alloy.Provider.OpenAI do
 
   defp maybe_buffer_added_args(acc, _event_type, _item, _item_id, _index), do: acc
 
-  defp maybe_emit_whole_item_args(on_event, base_meta, item, event_type, emitted_args)
-       when event_type in [
-              "response.output_item.added",
-              "response.output_item.done",
-              "response.completed"
-            ] do
-    args = item_args_delta(item, event_type)
+  defp reconcile_whole_item_args(item, "response.output_item.added", emitted_args, _strict?) do
+    reconcile_prefix_only(item_args_delta(item, "response.output_item.added"), emitted_args)
+  end
 
+  defp reconcile_whole_item_args(item, event_type, emitted_args, strict?)
+       when event_type in ["response.output_item.done", "response.completed"] do
+    case decode_function_call_arguments(item) do
+      {:ok, expected_input} ->
+        args = item_args_delta(item, event_type)
+        canonical_args = if args == "", do: "{}", else: args
+
+        case reconcile_decoded_args(emitted_args, args, canonical_args, expected_input) do
+          {:ok, suffix, next_emitted} ->
+            {:ok, suffix, next_emitted}
+
+          :conflict when strict? ->
+            :conflict
+
+          :conflict ->
+            {:ok, "", emitted_args}
+        end
+
+      {:error, _} ->
+        reconcile_prefix_only(item_args_delta(item, event_type), emitted_args)
+    end
+  end
+
+  defp reconcile_whole_item_args(_item, _event_type, emitted_args, _strict?),
+    do: {:ok, "", emitted_args}
+
+  defp reconcile_prefix_only(args, emitted_args) do
     cond do
       args == "" or args == emitted_args ->
-        emitted_args
+        {:ok, "", emitted_args}
 
       String.starts_with?(args, emitted_args) ->
         prefix_len = byte_size(emitted_args)
         suffix = binary_part(args, prefix_len, byte_size(args) - prefix_len)
-        event = Map.put(base_meta, :arguments_delta, suffix)
-        on_event.({:tool_call_delta, event})
-        args
+        {:ok, suffix, args}
 
       true ->
-        emitted_args
+        {:ok, "", emitted_args}
     end
   end
 
-  defp maybe_emit_whole_item_args(_on_event, _base_meta, _item, _event_type, emitted_args),
-    do: emitted_args
+  defp reconcile_decoded_args("", "", _canonical_args, _expected_input), do: {:ok, "", ""}
+  defp reconcile_decoded_args("", args, _canonical_args, _expected_input), do: {:ok, args, args}
+
+  defp reconcile_decoded_args(emitted, emitted, _canonical_args, _expected_input),
+    do: {:ok, "", emitted}
+
+  defp reconcile_decoded_args(emitted, args, canonical_args, expected_input) do
+    cond do
+      args != "" and String.starts_with?(args, emitted) ->
+        prefix_len = byte_size(emitted)
+        suffix = binary_part(args, prefix_len, byte_size(args) - prefix_len)
+        {:ok, suffix, args}
+
+      Jason.decode(emitted) == {:ok, expected_input} ->
+        {:ok, "", emitted}
+
+      true ->
+        reconcile_ws_prefix(emitted, canonical_args, expected_input)
+    end
+  end
+
+  defp reconcile_ws_prefix(emitted, canonical_args, expected_input) do
+    with {:ok, suffix} when suffix != "" <- json_ws_suffix(canonical_args, emitted),
+         combined = emitted <> suffix,
+         {:ok, ^expected_input} <- Jason.decode(combined) do
+      {:ok, suffix, combined}
+    else
+      _ -> :conflict
+    end
+  end
+
+  # Matches a JSON prefix against a valid JSON document ignoring insignificant
+  # whitespace outside string literals, returning the unemitted tail of `full`.
+  defp json_ws_suffix(full, prefix), do: do_json_ws_suffix(full, prefix, false, false)
+
+  defp do_json_ws_suffix(<<c, full_rest::binary>>, <<c, prefix_rest::binary>>, true, true),
+    do: do_json_ws_suffix(full_rest, prefix_rest, true, false)
+
+  defp do_json_ws_suffix(<<?\\, full_rest::binary>>, <<?\\, prefix_rest::binary>>, true, false),
+    do: do_json_ws_suffix(full_rest, prefix_rest, true, true)
+
+  defp do_json_ws_suffix(<<?", full_rest::binary>>, <<?", prefix_rest::binary>>, true, false),
+    do: do_json_ws_suffix(full_rest, prefix_rest, false, false)
+
+  defp do_json_ws_suffix(<<c, full_rest::binary>>, <<c, prefix_rest::binary>>, true, false),
+    do: do_json_ws_suffix(full_rest, prefix_rest, true, false)
+
+  defp do_json_ws_suffix(full_rest, <<>>, true, _escaped), do: {:ok, full_rest}
+
+  defp do_json_ws_suffix(full, <<ws, prefix_rest::binary>>, false, false)
+       when ws in [?\s, ?\t, ?\r, ?\n],
+       do: do_json_ws_suffix(full, prefix_rest, false, false)
+
+  defp do_json_ws_suffix(full_rest, <<>>, false, false), do: {:ok, full_rest}
+
+  defp do_json_ws_suffix(<<ws, full_rest::binary>>, prefix, false, false)
+       when ws in [?\s, ?\t, ?\r, ?\n],
+       do: do_json_ws_suffix(full_rest, prefix, false, false)
+
+  defp do_json_ws_suffix(<<?", full_rest::binary>>, <<?", prefix_rest::binary>>, false, false),
+    do: do_json_ws_suffix(full_rest, prefix_rest, true, false)
+
+  defp do_json_ws_suffix(<<c, full_rest::binary>>, <<c, prefix_rest::binary>>, false, false),
+    do: do_json_ws_suffix(full_rest, prefix_rest, false, false)
+
+  defp do_json_ws_suffix(_full, _prefix, _in_string, _escaped), do: :error
 
   defp item_args_delta(item, event_type) do
     case Map.get(item, "arguments") do
@@ -877,9 +1027,9 @@ defmodule Alloy.Provider.OpenAI do
   # When nothing has been emitted yet and a terminal/done item carries the
   # authoritative complete arguments, only emit buffered fragments if they are
   # a byte-exact prefix of the authoritative arguments; otherwise discard the
-  # inconsistent buffered data so maybe_emit_whole_item_args emits the exact
+  # inconsistent buffered data so reconcile_whole_item_args emits the exact
   # validated arguments matching the final tool input.
-  defp emit_reconciled_pending_args(on_event, meta, pending_deltas, item, event_type, "")
+  defp plan_reconciled_pending_args(meta, pending_deltas, item, event_type, "")
        when event_type in ["response.output_item.done", "response.completed"] do
     matching =
       Enum.filter(pending_deltas, fn {raw_index, _delta} ->
@@ -890,49 +1040,98 @@ defmodule Alloy.Provider.OpenAI do
     buffered = Enum.map_join(matching, fn {_raw_index, delta} -> delta end)
 
     if whole_args != "" and not String.starts_with?(whole_args, buffered) do
-      ""
+      {[], ""}
     else
-      emit_buffered_args(on_event, meta, matching, "")
+      {to_delta_events(meta, matching), buffered}
     end
   end
 
-  defp emit_reconciled_pending_args(on_event, meta, pending_deltas, _item, _event_type, emitted) do
-    emit_buffered_args(on_event, meta, pending_deltas, emitted)
+  defp plan_reconciled_pending_args(meta, pending_deltas, _item, _event_type, emitted) do
+    matching =
+      Enum.filter(pending_deltas, fn {raw_index, _delta} ->
+        is_nil(raw_index) or raw_index == meta.index
+      end)
+
+    joined = Enum.map_join(matching, fn {_raw_index, delta} -> delta end)
+    {to_delta_events(meta, matching), emitted <> joined}
   end
 
-  defp emit_buffered_args(on_event, meta, deltas, emitted_args) do
-    Enum.reduce(deltas, emitted_args, fn {raw_index, delta}, acc_args ->
-      if is_nil(raw_index) or raw_index == meta.index do
-        on_event.(
-          {:tool_call_delta,
-           %{
-             id: meta.id,
-             index: meta.index,
-             name: meta.name,
-             arguments_delta: delta
-           }}
-        )
-
-        acc_args <> delta
-      else
-        acc_args
-      end
+  defp to_delta_events(meta, deltas) do
+    Enum.map(deltas, fn {_raw_index, delta} ->
+      {:tool_call_delta,
+       %{
+         id: meta.id,
+         index: meta.index,
+         name: meta.name,
+         arguments_delta: delta
+       }}
     end)
   end
 
-  defp flush_pending_from_response(acc, %{"output" => output}) when is_list(output) do
-    output
-    |> Enum.with_index()
-    |> Enum.reduce(acc, fn
-      {%{"type" => "function_call"} = item, idx}, current ->
-        register_function_call_item(current, item, idx, "response.completed")
+  defp flush_pending_from_response(acc, %{"output" => output} = response) when is_list(output) do
+    case parse_output_mode(response) do
+      :refusal ->
+        :ok
 
-      _other, current ->
-        current
-    end)
+      mode ->
+        strict? = mode == :normal
+
+        result =
+          output
+          |> Enum.with_index()
+          |> Enum.reduce_while({:ok, acc, []}, fn
+            {%{"type" => "function_call"} = item, idx}, {:ok, current, rev_events} ->
+              case plan_completed_function_call(current, item, idx, strict?) do
+                {:ok, updated, events} ->
+                  {:cont, {:ok, updated, Enum.reverse(events, rev_events)}}
+
+                {:error, _} = err ->
+                  {:halt, err}
+              end
+
+            _other, state ->
+              {:cont, state}
+          end)
+
+        case result do
+          {:ok, _final_acc, rev_events} ->
+            rev_events |> Enum.reverse() |> Enum.each(acc.on_event)
+            :ok
+
+          {:error, _} = err ->
+            err
+        end
+    end
   end
 
-  defp flush_pending_from_response(acc, _response), do: acc
+  defp flush_pending_from_response(_acc, _response), do: :ok
+
+  defp plan_completed_function_call(acc, item, idx, strict?) do
+    item_id = item["id"]
+    call_id = Map.get(item, "call_id") || item_id
+    name = item["name"]
+    existing = lookup_function_call_meta(acc.function_calls, item_id, idx)
+
+    cond do
+      existing == :rejected ->
+        {:ok, acc, []}
+
+      not valid_function_call_header?(idx, call_id, name) ->
+        {:ok, acc, []}
+
+      true ->
+        call_info = %{
+          existing: existing,
+          item: item,
+          item_id: item_id,
+          call_id: call_id,
+          index: idx,
+          name: name
+        }
+
+        plan_and_store_function_call(acc, call_info, "response.completed", strict?)
+    end
+  end
 
   defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
   defp build_stream_response(%{sticky_error: %Error{} = error}), do: {:error, error}
@@ -940,8 +1139,10 @@ defmodule Alloy.Provider.OpenAI do
   defp build_stream_response(%{response: response} = acc) when is_map(response) do
     case parse_response(response) do
       {:ok, parsed} ->
-        _ = flush_pending_from_response(acc, response)
-        {:ok, parsed}
+        case flush_pending_from_response(acc, response) do
+          :ok -> {:ok, parsed}
+          {:error, _} = err -> err
+        end
 
       {:error, _} = err ->
         err

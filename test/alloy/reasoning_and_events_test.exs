@@ -3876,6 +3876,221 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         assert Jason.decode!(Enum.map_join(rec_deltas, & &1.arguments_delta)) == %{"x" => 1}
       end
+
+      # 10. OpenAI/xAI: already-emitted header + whitespace-formatted prefix reconciles cleanly
+      #     against both map-typed and compact-JSON authoritative arguments on .done and .completed.
+      for {include_done?, final_args} <- [
+            {false, %{"x" => 1}},
+            {true, %{"x" => 1}},
+            {false, "{\"x\":1}"},
+            {true, "{\"x\":1}"}
+          ] do
+        final_item = %{
+          "type" => "function_call",
+          "id" => "fc_ws_prefix",
+          "call_id" => "call_ws_prefix",
+          "name" => "echo",
+          "arguments" => final_args
+        }
+
+        done_chunk =
+          if include_done? do
+            sse_oai("response.output_item.done", %{
+              "type" => "response.output_item.done",
+              "output_index" => 0,
+              "item" => final_item
+            })
+          else
+            ""
+          end
+
+        ws_prefix_plug =
+          sse_plug(
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_ws_prefix",
+                "call_id" => "call_ws_prefix",
+                "name" => "echo",
+                "arguments" => "{\"x\": "
+              }
+            }) <>
+              done_chunk <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_ws_prefix",
+                  "status" => "completed",
+                  "output" => [final_item],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        {:ok, %{messages: [ws_msg]}} =
+          OpenAI.stream(
+            [Message.user("hi")],
+            [],
+            %{
+              api_key: "sk-oai",
+              model: "gpt-5.4",
+              req_options: [plug: ws_prefix_plug],
+              on_event: &send(parent, {:ws_ev, &1})
+            },
+            fn _ -> :ok end
+          )
+
+        assert [%{type: "tool_use", id: "call_ws_prefix", name: "echo", input: %{"x" => 1}}] =
+                 ws_msg.content
+
+        ws_deltas =
+          drain_tagged(:ws_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+        assert Jason.decode!(Enum.map_join(ws_deltas, & &1.arguments_delta)) == %{"x" => 1}
+      end
+
+      # 11. OpenAI/xAI: already-emitted complete JSON with extra whitespace reconciles as equal
+      #     against map-typed completed arguments without emitting duplicate deltas.
+      ws_complete_item = %{
+        "type" => "function_call",
+        "id" => "fc_ws_complete",
+        "call_id" => "call_ws_complete",
+        "name" => "echo",
+        "arguments" => %{"x" => 1}
+      }
+
+      ws_complete_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_ws_complete",
+              "call_id" => "call_ws_complete",
+              "name" => "echo",
+              "arguments" => "{\"x\": 1}"
+            }
+          }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_ws_complete",
+                "status" => "completed",
+                "output" => [ws_complete_item],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      {:ok, %{messages: [ws_complete_msg]}} =
+        OpenAI.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "sk-oai",
+            model: "gpt-5.4",
+            req_options: [plug: ws_complete_plug],
+            on_event: &send(parent, {:wsc_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      assert [%{type: "tool_use", id: "call_ws_complete", name: "echo", input: %{"x" => 1}}] =
+               ws_complete_msg.content
+
+      wsc_deltas =
+        drain_tagged(:wsc_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.map_join(wsc_deltas, & &1.arguments_delta) == "{\"x\": 1}"
+
+      # 12. OpenAI/xAI: irreconcilable mismatch between already-emitted arguments and completed
+      #     arguments fails with :malformed_reply instead of silently returning mismatched inputs
+      #     (covering .done + .completed, direct .completed, live delta, and empty-string args).
+      for {added_args, live_delta, include_done?, final_args} <- [
+            {"{\"x\":2}", nil, false, "{\"x\":1}"},
+            {"{\"x\":2}", nil, true, %{"x" => 1}},
+            {"{\"x\": ", "2}", false, "{\"x\":1}"},
+            {"{\"x\": ", nil, false, ""}
+          ] do
+        mismatch_item = %{
+          "type" => "function_call",
+          "id" => "fc_mismatch",
+          "call_id" => "call_mismatch",
+          "name" => "echo",
+          "arguments" => final_args
+        }
+
+        delta_chunk =
+          if is_binary(live_delta) do
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "item_id" => "fc_mismatch",
+              "output_index" => 0,
+              "delta" => live_delta
+            })
+          else
+            ""
+          end
+
+        done_chunk =
+          if include_done? do
+            sse_oai("response.output_item.done", %{
+              "type" => "response.output_item.done",
+              "output_index" => 0,
+              "item" => mismatch_item
+            })
+          else
+            ""
+          end
+
+        mismatch_plug =
+          sse_plug(
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_mismatch",
+                "call_id" => "call_mismatch",
+                "name" => "echo",
+                "arguments" => added_args
+              }
+            }) <>
+              delta_chunk <>
+              done_chunk <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_mismatch",
+                  "status" => "completed",
+                  "output" => [mismatch_item],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAI.stream(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_key: "sk-oai",
+                     model: "gpt-5.4",
+                     req_options: [plug: mismatch_plug],
+                     on_event: &send(parent, {:mm_ev, &1})
+                   },
+                   fn _ -> :ok end
+                 )
+
+        _ = drain_tagged(:mm_ev)
+      end
     end
   end
 
