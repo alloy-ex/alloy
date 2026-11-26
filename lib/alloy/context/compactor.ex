@@ -285,10 +285,19 @@ defmodule Alloy.Context.Compactor do
   """
   @spec force_compact(State.t(), keyword()) :: State.t()
   def force_compact(%State{} = state, opts \\ []) do
-    original = State.messages(state)
-    {_fits_estimate, messages} = maybe_clear_tool_results(original, state, opts)
-    {state, compacted} = summarize_or_fallback(state, messages, opts)
-    finalize(state, compacted, force_shrink?: compacted == original)
+    if Cancel.cancelled?(state.config.cancel_token) do
+      state
+    else
+      original = State.messages(state)
+      {_fits_estimate, messages} = maybe_clear_tool_results(original, state, opts)
+      {state, compacted} = summarize_or_fallback(state, messages, opts)
+
+      if Cancel.cancelled?(state.config.cancel_token) do
+        %{state | messages: original}
+      else
+        finalize(state, compacted, force_shrink?: compacted == original)
+      end
+    end
   end
 
   @doc """
@@ -317,10 +326,19 @@ defmodule Alloy.Context.Compactor do
   def maybe_compact(%State{} = state, opts \\ []) do
     messages = State.messages(state)
 
-    if Estimator.within_reserve?(messages, state) do
-      {:unchanged, state}
-    else
-      {:compacted, compact_messages_in_state(state, messages, opts)}
+    cond do
+      Cancel.cancelled?(state.config.cancel_token) ->
+        {:unchanged, state}
+
+      Estimator.within_reserve?(messages, state) ->
+        {:unchanged, state}
+
+      true ->
+        compacted = compact_messages_in_state(state, messages, opts)
+
+        if Cancel.cancelled?(compacted.config.cancel_token),
+          do: {:unchanged, compacted},
+          else: {:compacted, compacted}
     end
   end
 
@@ -346,13 +364,19 @@ defmodule Alloy.Context.Compactor do
   defp extend_to_round_start(middle, recent), do: {middle, recent}
 
   defp compact_messages_in_state(%State{} = state, messages, opts) do
+    original = messages
+
     {state, compacted} =
       case maybe_clear_tool_results(messages, state, opts) do
         {:done, cleared_messages} -> {state, cleared_messages}
-        {:continue, messages} -> summarize_or_fallback(state, messages, opts)
+        {:continue, cleared_or_orig} -> summarize_or_fallback(state, cleared_or_orig, opts)
       end
 
-    finalize(state, compacted)
+    if Cancel.cancelled?(state.config.cancel_token) do
+      %{state | messages: original}
+    else
+      finalize(state, compacted)
+    end
   end
 
   # Every compaction path edits earlier history, so signed thinking kept
@@ -573,24 +597,32 @@ defmodule Alloy.Context.Compactor do
           {result, usage} = summarize_compaction(prepared, state, opts)
           state = State.merge_usage(state, usage)
 
-          case result do
-            {:ok, summary_text} ->
-              {state, [prepared.first, build_summary_message(summary_text) | prepared.recent]}
-
-            {:error, %Error{kind: :cancelled}} ->
-              {state, messages}
-
-            {:error, reason} ->
-              Logger.warning(
-                "summary compaction failed, falling back to truncation: #{Sanitize.inspect_bounded(reason)}"
-              )
-
-              {state, fallback_compact(state, messages)}
-          end
+          handle_summary_result(result, state, prepared, messages)
         end
 
       :noop ->
         {state, fallback_compact(state, messages)}
+    end
+  end
+
+  defp handle_summary_result(result, state, prepared, messages) do
+    if Cancel.cancelled?(state.config.cancel_token) do
+      {state, messages}
+    else
+      case result do
+        {:ok, summary_text} ->
+          {state, [prepared.first, build_summary_message(summary_text) | prepared.recent]}
+
+        {:error, %Error{kind: :cancelled}} ->
+          {state, messages}
+
+        {:error, reason} ->
+          Logger.warning(
+            "summary compaction failed, falling back to truncation: #{Sanitize.inspect_bounded(reason)}"
+          )
+
+          {state, fallback_compact(state, messages)}
+      end
     end
   end
 

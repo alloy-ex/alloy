@@ -858,6 +858,16 @@ defmodule Alloy.Agent.Turn do
          new_msgs
        )
        when is_function(follow_up, 1) and not is_map_key(state.run_metadata, :final_tool) do
+    if refusal_response?(new_msgs) do
+      complete_run(state, new_msgs)
+    else
+      poll_follow_up(state, follow_up, new_msgs)
+    end
+  end
+
+  defp maybe_follow_up_or_complete(state, new_msgs), do: complete_run(state, new_msgs)
+
+  defp poll_follow_up(state, follow_up, new_msgs) do
     case poll_messages_callback(:follow_up, follow_up, state) do
       {:ok, []} ->
         if Cancel.cancelled?(state.config.cancel_token),
@@ -870,11 +880,15 @@ defmodule Alloy.Agent.Turn do
           else: {:continue, State.append_messages(state, follow_up_msgs)}
 
       {:error, reason} ->
-        {:halt, fail(state, reason)}
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:halt, cancel_state(state)},
+          else: {:halt, fail(state, reason)}
     end
   end
 
-  defp maybe_follow_up_or_complete(state, new_msgs), do: complete_run(state, new_msgs)
+  defp refusal_response?(new_msgs) do
+    new_msgs |> last_assistant_message() |> refusal_message?()
+  end
 
   defp complete_run(state, new_msgs) do
     case decode_structured_output(state, new_msgs) do
@@ -995,7 +1009,7 @@ defmodule Alloy.Agent.Turn do
   defp poll_messages_callback(name, callback, state) do
     case callback.(state) do
       msgs when is_list(msgs) ->
-        if Enum.all?(msgs, &is_struct(&1, Message)) do
+        if Enum.all?(msgs, &valid_callback_message?/1) do
           {:ok, msgs}
         else
           {:error,
@@ -1008,11 +1022,18 @@ defmodule Alloy.Agent.Turn do
     end
   rescue
     e ->
-      {:error, "#{name} callback failed (#{Sanitize.exception_summary(e, 500)})"}
+      {:error, "#{name} callback failed (#{Sanitize.exception_summary(e, :redact)})"}
   catch
     kind, reason ->
       {:error, "#{name} callback #{kind}: #{Sanitize.exit_summary(reason, :redact)}"}
   end
+
+  defp valid_callback_message?(%Message{role: role, content: content})
+       when role in [:user, :assistant] do
+    is_binary(content) or (is_list(content) and Enum.all?(content, &is_map/1))
+  end
+
+  defp valid_callback_message?(_other), do: false
 
   defp check_deadline(state) do
     if deadline_expired?(state),

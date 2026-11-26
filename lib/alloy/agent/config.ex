@@ -241,18 +241,18 @@ defmodule Alloy.Agent.Config do
       reasoning: Alloy.Provider.normalize_reasoning!(Keyword.get(opts, :reasoning)),
       cancel_token:
         require_opt_shape!(
-          is_nil(cancel_token) or match?(%Cancel{}, cancel_token),
+          is_nil(cancel_token) or match?(%Cancel{ref: ref} when is_reference(ref), cancel_token),
           cancel_token,
           "cancel_token must be an Alloy.Cancel struct or nil"
         ),
       steering:
-        require_opt!(
+        require_opt_shape!(
           is_nil(steering) or is_function(steering, 1),
           steering,
           "steering must be a 1-arity function or nil"
         ),
       follow_up:
-        require_opt!(
+        require_opt_shape!(
           is_nil(follow_up) or is_function(follow_up, 1),
           follow_up,
           "follow_up must be a 1-arity function or nil"
