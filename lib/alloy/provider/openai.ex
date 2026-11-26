@@ -564,14 +564,6 @@ defmodule Alloy.Provider.OpenAI do
 
   # Every terminal event carries the whole response, and parse_response/1
   # reads its status, so completed, incomplete and failed share one path.
-  # On response.completed, resolve any headerless argument deltas buffered
-  # before a function_call item arrived so consumers still correlate via call_id.
-  defp process_stream_event(acc, "response.completed", %{"response" => response})
-       when is_map(response) do
-    acc = flush_pending_from_response(acc, response)
-    %{acc | response: response}
-  end
-
   defp process_stream_event(acc, event_type, %{"response" => response})
        when event_type in @terminal_events and is_map(response) do
     %{acc | response: response}
@@ -647,31 +639,48 @@ defmodule Alloy.Provider.OpenAI do
        ) do
     header_emitted? = match?(%{id: ^call_id, name: ^name}, existing)
     args_emitted? = match?(%{args_emitted?: true}, existing)
-    base_meta = %{id: call_id, index: index, name: name}
 
-    unless header_emitted? do
-      header_event = Map.put(base_meta, :arguments_delta, "")
-      acc.on_event.({:tool_call_delta, header_event})
+    if event_type == "response.output_item.done" and not header_emitted? and
+         invalid_whole_item_args?(item) do
+      # Defer malformed whole-item calls so response.completed / parse_response
+      # can fail with :malformed_reply before chunks_emitted? is flipped.
+      acc
+    else
+      base_meta = %{id: call_id, index: index, name: name}
+
+      unless header_emitted? do
+        header_event = Map.put(base_meta, :arguments_delta, "")
+        acc.on_event.({:tool_call_delta, header_event})
+      end
+
+      {pending_deltas, next_pending} =
+        pop_pending_deltas(acc.pending_function_deltas, item_id, index)
+
+      emit_buffered_args(acc.on_event, base_meta, pending_deltas)
+      args_emitted? = args_emitted? or pending_deltas != []
+
+      args_emitted? =
+        maybe_emit_whole_item_args(acc.on_event, base_meta, item, event_type, args_emitted?)
+
+      meta = Map.merge(base_meta, %{item_id: item_id, args_emitted?: args_emitted?})
+
+      function_calls =
+        acc.function_calls
+        |> maybe_put_call_meta(item_id, meta)
+        |> Map.put({:index, index}, meta)
+
+      %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
     end
-
-    {pending_deltas, next_pending} =
-      pop_pending_deltas(acc.pending_function_deltas, item_id, index)
-
-    emit_buffered_args(acc.on_event, base_meta, pending_deltas)
-    args_emitted? = args_emitted? or pending_deltas != []
-
-    args_emitted? =
-      maybe_emit_whole_item_args(acc.on_event, base_meta, item, event_type, args_emitted?)
-
-    meta = Map.merge(base_meta, %{item_id: item_id, args_emitted?: args_emitted?})
-
-    function_calls =
-      acc.function_calls
-      |> maybe_put_call_meta(item_id, meta)
-      |> Map.put({:index, index}, meta)
-
-    %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
   end
+
+  defp invalid_whole_item_args?(%{"arguments" => args}) when is_binary(args) and args != "" do
+    case Jason.decode(args) do
+      {:ok, map} when is_map(map) -> false
+      _ -> true
+    end
+  end
+
+  defp invalid_whole_item_args?(_item), do: false
 
   defp maybe_emit_whole_item_args(on_event, base_meta, item, event_type, false)
        when event_type in ["response.output_item.done", "response.completed"] do
@@ -841,8 +850,16 @@ defmodule Alloy.Provider.OpenAI do
   defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
   defp build_stream_response(%{sticky_error: %Error{} = error}), do: {:error, error}
 
-  defp build_stream_response(%{response: response}) when is_map(response),
-    do: parse_response(response)
+  defp build_stream_response(%{response: response} = acc) when is_map(response) do
+    case parse_response(response) do
+      {:ok, parsed} ->
+        _ = flush_pending_from_response(acc, response)
+        {:ok, parsed}
+
+      {:error, _} = err ->
+        err
+    end
+  end
 
   # Without a terminal event the connection was cut mid-response; returning
   # the text received so far would pass off a fragment as a complete answer.

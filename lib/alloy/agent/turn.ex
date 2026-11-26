@@ -297,9 +297,7 @@ defmodule Alloy.Agent.Turn do
 
       case result do
         {:ok, %{stop_reason: :refusal} = response} ->
-          refused = refuse(state, response)
-          record_turn_progress(opts, refused.stop_reason, refused.usage)
-          {:halt, refused}
+          {:halt, refuse(state, response, opts)}
 
         {:ok, %{stop_reason: stop_reason, messages: new_msgs} = response} ->
           next_state =
@@ -408,7 +406,7 @@ defmodule Alloy.Agent.Turn do
   end
 
   # Refused output must be discarded, so the response's messages are not kept.
-  defp refuse(state, response) do
+  defp refuse(state, response, opts) do
     details = get_in(response, [:response_metadata, :stop_details])
 
     reason =
@@ -420,10 +418,13 @@ defmodule Alloy.Agent.Turn do
           "The model refused to continue (stop_reason: refusal): #{Sanitize.inspect_bounded(details)}"
       end
 
-    state
-    |> account_response(response)
-    |> maybe_record_refusal_output_error(reason)
-    |> fail(reason)
+    accounted =
+      state
+      |> account_response(response)
+      |> maybe_record_refusal_output_error(reason)
+
+    record_turn_progress(opts, accounted.stop_reason, accounted.usage)
+    fail(accounted, reason)
   end
 
   defp maybe_record_refusal_output_error(%State{config: %{output_schema: nil}} = state, _reason),

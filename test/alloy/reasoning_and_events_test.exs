@@ -59,6 +59,14 @@ defmodule Alloy.ReasoningAndEventsTest do
     def call(_hook, state), do: state
   end
 
+  defmodule RaiseOnErrorMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:on_error, _state), do: raise("on_error_boom")
+    def call(_hook, state), do: state
+  end
+
   defmodule CaptureReasoningProvider do
     @behaviour Alloy.Provider
 
@@ -2849,6 +2857,113 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert wait_until_dead(bg_pid, 1_500)
       send(flush_blocker, :stop)
+
+      # 7. OpenAI/xAI malformed terminal response.completed whole-item function_call arguments
+      #    must NOT emit :tool_call_delta and must still retry on :malformed_reply.
+      mal_term_attempts = :atomics.new(1, signed: false)
+
+      mal_term_plug = fn conn ->
+        n = :atomics.add_get(mal_term_attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            sse_oai("response.output_item.done", %{
+              "type" => "response.output_item.done",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_bad_term",
+                "call_id" => "call_bad_term",
+                "name" => "echo",
+                "arguments" => "{bad"
+              }
+            }) <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_bad_term",
+                  "status" => "completed",
+                  "output" => [
+                    %{
+                      "type" => "function_call",
+                      "id" => "fc_bad_term",
+                      "call_id" => "call_bad_term",
+                      "name" => "echo",
+                      "arguments" => "{bad"
+                    }
+                  ],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          else
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_ok_term",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "message",
+                    "role" => "assistant",
+                    "content" => [%{"type" => "output_text", "text" => "recovered term"}]
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "recovered term"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: mal_term_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0,
+                 on_event: &send(parent, {:mal_term_ev, &1})
+               )
+
+      assert :atomics.get(mal_term_attempts, 1) == 2
+      refute Enum.any?(drain_tagged(:mal_term_ev), &(&1.event == :tool_call_delta))
+
+      # 8. Refusal when :on_error middleware raises still preserves accounted stop_reason and usage in :turn_end.
+      {:ok, ref_pid} =
+        TestProvider.start_link([
+          {:ok,
+           %{
+             stop_reason: :refusal,
+             messages: [],
+             usage: %{input_tokens: 7, output_tokens: 3}
+           }}
+        ])
+
+      assert_raise RuntimeError, "on_error_boom", fn ->
+        Alloy.run("go",
+          provider: {TestProvider, agent_pid: ref_pid},
+          middleware: [RaiseOnErrorMiddleware],
+          on_event: &send(parent, {:ref_err_ev, &1})
+        )
+      end
+
+      ref_turn_ends =
+        drain_tagged(:ref_err_ev)
+        |> Enum.filter(&(&1.event == :turn_end))
+
+      assert [
+               %{
+                 payload: %{
+                   turn: 1,
+                   status: :error,
+                   stop_reason: :refusal,
+                   usage: %Usage{input_tokens: 7, output_tokens: 3}
+                 }
+               }
+             ] = ref_turn_ends
     end
   end
 
