@@ -21,7 +21,7 @@ defmodule Alloy.Provider.OpenAI do
   - `:origin_key` - Account identifier used for cross-origin provenance hashing
     (required when `:api_key` is a function)
   - `:prompt_cache_key` - Optional cache routing key for Responses prompt caching
-  - `:prompt_cache_retention` - Optional cache retention policy (e.g. `"in_memory"`, `"24h"`)
+  - `:prompt_cache_retention` - Optional cache retention policy (e.g. `"in-memory"`, `"24h"`)
   - `:max_tokens` - Max output tokens, reasoning tokens included. Omitted
     unless set, so the model's own limit applies: a small cap can leave a
     reasoning model with no tokens for its answer
@@ -347,7 +347,7 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp format_user_content_block(%{type: "image", url: url}) when is_binary(url) do
-    if HTTP.http_url?(url) do
+    if HTTP.http_url?(url) and not HTTP.provider_file_uri?(url) do
       %{"type" => "input_image", "image_url" => url}
     else
       unsupported_media_notice("image")

@@ -164,39 +164,60 @@ defmodule Alloy.MessageTest do
                %{type: "document", mime_type: "application/pdf", data: "JVBERi0="}
              ]
 
-      # Gemini File API URIs passed via document/2 are also origin-scoped:
-      # attributed to Gemini, preserved on the same Gemini origin, and replaced
-      # with an omission notice on another provider or another Gemini account.
+      # Gemini File API URIs passed via document/2 or image_url/2 are also
+      # origin-scoped: attributed to Gemini, preserved on the same Gemini origin,
+      # and replaced/dropped on another provider or another Gemini account.
       gem_origin = Message.origin(Alloy.Provider.Gemini, %{api_key: "gem-k1"})
       gem_uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+      gem_img_uri = "https://generativelanguage.googleapis.com/v1beta/files/img456"
 
       gem_user = %Message{
         role: :user,
         content: [
           %{type: "text", text: "Read this"},
-          Message.document("application/pdf", gem_uri)
+          Message.document("application/pdf", gem_uri),
+          Message.image_url(gem_img_uri, mime_type: "image/png")
+        ]
+      }
+
+      gem_asst = %Message{
+        role: :assistant,
+        origin: gem_origin,
+        content: [
+          %{type: "text", text: "Generated"},
+          Message.image_url(gem_img_uri, mime_type: "image/png")
         ]
       }
 
       [attributed_gem_user] = Message.attribute_file_blocks([gem_user], gem_origin)
-      assert [_, %{uri: ^gem_uri, origin: ^gem_origin}] = attributed_gem_user.content
 
-      [same_gem] =
-        Message.normalize_for([attributed_gem_user], Alloy.Provider.Gemini, %{api_key: "gem-k1"})
+      assert [_, %{uri: ^gem_uri, origin: ^gem_origin}, %{url: ^gem_img_uri, origin: ^gem_origin}] =
+               attributed_gem_user.content
 
-      assert [_, %{uri: ^gem_uri}] = same_gem.content
+      [same_gem, same_gem_asst] =
+        Message.normalize_for([attributed_gem_user, gem_asst], Alloy.Provider.Gemini, %{
+          api_key: "gem-k1"
+        })
+
+      assert [_, %{uri: ^gem_uri}, %{url: ^gem_img_uri}] = same_gem.content
+      assert [_, %{url: ^gem_img_uri}] = same_gem_asst.content
 
       for {target_mod, target_cfg} <- [
             {Alloy.Provider.Anthropic, %{api_key: "k1"}},
             {Alloy.Provider.OpenAI, %{api_key: "k2"}},
+            {Alloy.Provider.OpenAICompat, %{api_key: "k3", api_url: "http://localhost"}},
             {Alloy.Provider.Gemini, %{api_key: "gem-k2"}}
           ] do
-        [cross] = Message.normalize_for([attributed_gem_user], target_mod, target_cfg)
+        [cross, cross_asst] =
+          Message.normalize_for([attributed_gem_user, gem_asst], target_mod, target_cfg)
 
         assert cross.content == [
                  %{type: "text", text: "Read this"},
+                 %{type: "text", text: "[Omitted provider-specific file attachment]"},
                  %{type: "text", text: "[Omitted provider-specific file attachment]"}
                ]
+
+        assert cross_asst.content == [%{type: "text", text: "Generated"}]
       end
 
       # Block-level foreign file_id on unattributed (origin: nil) and same-origin

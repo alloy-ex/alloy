@@ -1364,6 +1364,10 @@ defmodule Alloy.Provider.AnthropicTest do
           Message.document(
             "application/pdf",
             "https://generativelanguage.googleapis.com/v1beta/files/gem123"
+          ),
+          Message.image_url(
+            "https://generativelanguage.googleapis.com/v1beta/files/gemimg1",
+            mime_type: "image/png"
           )
         ]
       }
@@ -1375,15 +1379,19 @@ defmodule Alloy.Provider.AnthropicTest do
 
       assert [%{"type" => "web_search_20250305", "name" => "web_search"}] = decoded["tools"]
 
-      [%{"type" => "text", "text" => notice}, %{"type" => "text", "text" => gem_notice}] =
-        hd(decoded["messages"])["content"]
+      [
+        %{"type" => "text", "text" => notice},
+        %{"type" => "text", "text" => gem_notice},
+        %{"type" => "text", "text" => gem_img_notice}
+      ] = hd(decoded["messages"])["content"]
 
       assert notice =~ "URL documents require application/pdf"
       assert gem_notice =~ "Unsupported document URI (application/pdf)"
+      assert gem_img_notice =~ "Unsupported image URL"
       refute body =~ "generativelanguage.googleapis.com"
     end
 
-    test "supports auth_scheme: :bearer for OAuth tokens and rejects invalid auth_scheme" do
+    test "supports auth_scheme: :bearer on complete/3 and stream/4 and rejects invalid auth_scheme" do
       bearer_cfg =
         config_that_captures_request()
         |> Map.merge(%{api_key: fn -> {:ok, "oauth-tok"} end, auth_scheme: :bearer})
@@ -1392,6 +1400,48 @@ defmodule Alloy.Provider.AnthropicTest do
       assert_received {:request_headers, b_headers}
       assert {"authorization", "Bearer oauth-tok"} in b_headers
       refute Enum.any?(b_headers, fn {k, _} -> k == "x-api-key" end)
+
+      # Stream path also sends Authorization: Bearer without x-api-key.
+      test_pid = self()
+
+      stream_plug = fn conn ->
+        send(test_pid, {:ant_bearer_stream_headers, conn.req_headers})
+
+        sse =
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 0}}
+          }) <>
+            ant_event("content_block_start", %{
+              "index" => 0,
+              "content_block" => %{"type" => "text", "text" => ""}
+            }) <>
+            ant_event("content_block_delta", %{
+              "index" => 0,
+              "delta" => %{"type" => "text_delta", "text" => "ok"}
+            }) <>
+            ant_event("content_block_stop", %{"index" => 0}) <>
+            ant_event("message_delta", %{
+              "delta" => %{"stop_reason" => "end_turn"},
+              "usage" => %{"output_tokens" => 1}
+            }) <>
+            ant_event("message_stop", %{})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, _} =
+               Anthropic.stream(
+                 [Message.user("Hi")],
+                 [],
+                 %{bearer_cfg | req_options: [plug: stream_plug]},
+                 fn _ -> :ok end
+               )
+
+      assert_received {:ant_bearer_stream_headers, s_headers}
+      assert {"authorization", "Bearer oauth-tok"} in s_headers
+      refute Enum.any?(s_headers, fn {k, _} -> k == "x-api-key" end)
 
       assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
                Anthropic.complete(

@@ -657,6 +657,54 @@ defmodule Alloy.Provider.GeminiTest do
       assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
                Gemini.stream([Message.user("Hi")], tool_defs, conflict_cfg, fn _ -> :ok end)
 
+      # Snake_case function_calling_config AUTO mode is also rejected.
+      snake_conflict_cfg =
+        Map.put(conflict_cfg, :tool_config, %{function_calling_config: %{mode: "AUTO"}})
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request, message: snake_msg}} =
+               Gemini.complete([Message.user("Hi")], tool_defs, snake_conflict_cfg)
+
+      assert snake_msg =~ "AUTO"
+
+      # Gemini.stream/4 resolves dynamic :api_key on the success path.
+      test_pid = self()
+
+      dyn_stream_plug = fn conn ->
+        send(test_pid, {:gem_stream_headers, conn.req_headers})
+
+        sse =
+          "data: " <>
+            Jason.encode!(%{
+              "candidates" => [
+                %{
+                  "content" => %{"role" => "model", "parts" => [%{"text" => "streamed"}]},
+                  "finishReason" => "STOP"
+                }
+              ],
+              "usageMetadata" => %{"promptTokenCount" => 1, "candidatesTokenCount" => 1}
+            }) <> "\n\n"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{messages: [stream_msg]}} =
+               Gemini.stream(
+                 [Message.user("Hi")],
+                 [],
+                 %{
+                   api_key: fn -> {:ok, "dyn-gem-stream-key"} end,
+                   model: "gemini-2.5-flash",
+                   req_options: [plug: dyn_stream_plug]
+                 },
+                 fn _ -> :ok end
+               )
+
+      assert Message.text(stream_msg) == "streamed"
+      assert_received {:gem_stream_headers, gsh}
+      assert {"x-goog-api-key", "dyn-gem-stream-key"} in gsh
+
       # VALIDATED mode succeeds alongside native + custom tools.
       valid_cfg =
         config_that_captures_request()

@@ -340,18 +340,26 @@ defmodule Alloy.Provider.Gemini do
 
   # Google excludes functionCallingConfig.mode "AUTO" when server-side and
   # custom tools are combined via includeServerSideToolInvocations: true.
-  defp validate_tool_config_conflicts(%{
-         "toolConfig" => %{
-           "includeServerSideToolInvocations" => true,
-           "functionCallingConfig" => %{"mode" => "AUTO"}
-         }
-       }) do
-    {:error,
-     %Error{
-       kind: :invalid_request,
-       message:
-         "Gemini tool combination (includeServerSideToolInvocations: true) is incompatible with functionCallingConfig mode \"AUTO\"; use \"VALIDATED\" or omit mode instead"
-     }}
+  defp validate_tool_config_conflicts(%{"toolConfig" => tool_config})
+       when is_map(tool_config) do
+    include_server? =
+      Map.get(tool_config, "includeServerSideToolInvocations") == true or
+        Map.get(tool_config, "include_server_side_tool_invocations") == true
+
+    fc_config =
+      Map.get(tool_config, "functionCallingConfig") ||
+        Map.get(tool_config, "function_calling_config")
+
+    if include_server? and is_map(fc_config) and Map.get(fc_config, "mode") == "AUTO" do
+      {:error,
+       %Error{
+         kind: :invalid_request,
+         message:
+           "Gemini tool combination (includeServerSideToolInvocations: true) is incompatible with functionCallingConfig mode \"AUTO\"; use \"VALIDATED\" or omit mode instead"
+       }}
+    else
+      :ok
+    end
   end
 
   defp validate_tool_config_conflicts(_body), do: :ok

@@ -1072,11 +1072,59 @@ defmodule Alloy.Provider.HTTPTest do
         refute m_cb =~ "sk-secret"
       end
 
-      # Explicit %Error{} from callback passes through (allowing callers to signal retryable :timeout).
-      transient = %Error{kind: :timeout, message: "token endpoint timed out"}
+      # Explicit %Error{} from callback preserves retry classification/timing while
+      # stripping diagnostic fields (message/type/code) so secrets never leak.
+      transient = %Error{
+        kind: :timeout,
+        status: 503,
+        retry_after_ms: 250,
+        type: "sk-secret-type",
+        code: "sk-secret-code",
+        message: "upstream failed with sk-secret-msg"
+      }
 
-      assert {:error, ^transient} =
-               HTTP.resolve_api_key(%{api_key: fn -> {:error, transient} end})
+      assert {:error,
+              %Error{
+                kind: :timeout,
+                status: 503,
+                retry_after_ms: 250,
+                type: nil,
+                code: nil,
+                message: redacted_msg
+              }} = HTTP.resolve_api_key(%{api_key: fn -> {:error, transient} end})
+
+      assert redacted_msg == "Dynamic :api_key callback failed (timeout)"
+      refute redacted_msg =~ "sk-secret"
+
+      # Verify end-to-end through Alloy.run/2 with both finite and :infinity timeouts.
+      for timeout <- [:infinity, 1_000] do
+        assert {:error, result} =
+                 Alloy.run("Hi",
+                   provider:
+                     {OpenAI,
+                      %{
+                        api_key: fn ->
+                          {:error,
+                           %Error{
+                             kind: :auth,
+                             type: "sk-secret-type",
+                             code: "sk-secret-code",
+                             message: "token sk-secret-msg rejected"
+                           }}
+                        end,
+                        origin_key: "acct-redact",
+                        model: "gpt-5.4"
+                      }},
+                   timeout_ms: timeout,
+                   max_retries: 0
+                 )
+
+        refute result.error =~ "sk-secret"
+        assert result.metadata.run.provider_error.kind == :auth
+        assert result.metadata.run.provider_error.type == nil
+        assert result.metadata.run.provider_error.code == nil
+        refute result.metadata.run.provider_error.message =~ "sk-secret"
+      end
 
       # Transport-layer invalid_header_value errors redact header values as defense in depth.
       err_t = Error.from_transport({:invalid_header_value, "authorization", "Bearer sk-secret"})

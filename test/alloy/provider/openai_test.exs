@@ -3,9 +3,21 @@ defmodule Alloy.Provider.OpenAITest do
 
   import Alloy.StreamTestHelpers
 
+  alias Alloy.Agent.State
   alias Alloy.Message
   alias Alloy.Provider.Error
   alias Alloy.Provider.OpenAI
+
+  defmodule SwitchToOpenAIMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:before_completion, %{turn: 1} = state) do
+      State.prepare(state, provider: state.config.context.next_provider)
+    end
+
+    def call(_hook, state), do: state
+  end
 
   describe "complete/3 with text response" do
     test "returns normalized end_turn response" do
@@ -1368,8 +1380,8 @@ defmodule Alloy.Provider.OpenAITest do
       assert doc_url == %{"type" => "input_file", "file_url" => "https://example.com/remote.pdf"}
       assert doc_file == %{"type" => "input_file", "file_id" => "file_oai_1"}
 
-      # Non-HTTP image URL and Gemini File API URIs fall back to unsupported notices
-      # rather than sending unfetchable URLs to OpenAI.
+      # Non-HTTP image URL and Gemini File API URIs (document or image) fall back to
+      # unsupported notices rather than sending unfetchable URLs to OpenAI.
       non_http_msg = [
         %Alloy.Message{
           role: :user,
@@ -1378,6 +1390,10 @@ defmodule Alloy.Provider.OpenAITest do
             Message.document(
               "application/pdf",
               "https://generativelanguage.googleapis.com/v1beta/files/gem123"
+            ),
+            Message.image_url(
+              "https://generativelanguage.googleapis.com/v1beta/files/gemimg1",
+              mime_type: "image/png"
             )
           ]
         }
@@ -1386,12 +1402,21 @@ defmodule Alloy.Provider.OpenAITest do
       assert {:ok, _} = OpenAI.complete(non_http_msg, [], config)
       assert_received {:request_body, nh_body}
 
-      [%{"content" => [%{"type" => "input_text", "text" => nh_text}, gem_uri_block]}] =
-        Jason.decode!(nh_body)["input"]
+      [
+        %{
+          "content" => [
+            %{"type" => "input_text", "text" => nh_text},
+            gem_uri_block,
+            gem_img_block
+          ]
+        }
+      ] = Jason.decode!(nh_body)["input"]
 
       assert nh_text =~ "Unsupported"
       assert gem_uri_block["type"] == "input_text"
       assert gem_uri_block["text"] =~ "Unsupported"
+      assert gem_img_block["type"] == "input_text"
+      assert gem_img_block["text"] =~ "Unsupported"
       refute nh_body =~ "generativelanguage.googleapis.com"
     end
 
@@ -1524,17 +1549,6 @@ defmodule Alloy.Provider.OpenAITest do
 
       # 2. Turn 1 succeeds on Anthropic (tool call), middleware switches to OpenAI on turn 2:
       #    the user's unattributed file_id is stamped on turn 1 and stripped before turn 2 hits OpenAI.
-      defmodule SwitchToOpenAIMiddleware do
-        @behaviour Alloy.Middleware
-        alias Alloy.Agent.State
-        @impl true
-        def call(:before_completion, %{turn: 1} = state) do
-          State.prepare(state, provider: state.config.context.next_provider)
-        end
-
-        def call(_hook, state), do: state
-      end
-
       ant_plug = fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type("application/json")

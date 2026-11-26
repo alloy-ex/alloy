@@ -18,7 +18,8 @@ defmodule Alloy.Provider.Anthropic do
 
   Optional:
   - `:auth_scheme` - `:api_key` (default, sends `x-api-key`) or `:bearer`
-    (sends `Authorization: Bearer` for OAuth tokens)
+    (sends `Authorization: Bearer` for bearer-auth gateways/proxies or OAuth;
+    Anthropic OAuth may also require an `anthropic-beta` header via `:extra_headers`)
   - `:origin_key` - Account identifier used for cross-origin provenance hashing
     (required when `:api_key` is a function)
   - `:max_tokens` - Max output tokens, thinking included (default: 16_000).
@@ -946,7 +947,7 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp format_content_block(%{type: "image", url: url}) when is_binary(url) do
-    if HTTP.http_url?(url) do
+    if HTTP.http_url?(url) and not HTTP.provider_file_uri?(url) do
       %{"type" => "image", "source" => %{"type" => "url", "url" => url}}
     else
       %{"type" => "text", "text" => "[Unsupported image URL scheme for Anthropic provider]"}

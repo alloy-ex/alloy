@@ -179,6 +179,10 @@ defmodule Alloy.Message do
 
   Supported by Anthropic, OpenAI/xAI Responses, OpenAICompat, and Gemini
   (pass `mime_type: "image/png"` in `opts` when sending URL images to Gemini).
+  Account-scoped Gemini File API URIs
+  (`https://generativelanguage.googleapis.com/.../files/...`) are treated as
+  origin-scoped and degraded safely if a run switches or falls back to another
+  provider or account.
   """
   @spec image_url(String.t(), keyword()) :: content_block()
   def image_url(url, opts \\ []) when is_binary(url) and is_list(opts) do
@@ -243,8 +247,10 @@ defmodule Alloy.Message do
   @doc """
   Creates a provider Files API document content block.
 
-  `file_id` is origin-scoped to the provider account that uploaded the file
-  (Anthropic Files API, OpenAI Files API, or Gemini File URI). Pass
+  Produces a document attachment (`document` / `input_file` / `fileData`, for
+  PDF and document files rather than uploaded image file IDs). `file_id` is
+  origin-scoped to the provider account that uploaded the file (Anthropic
+  Files API, OpenAI Files API, or Gemini File URI). Pass
   `origin: Message.origin(provider, config)` (or `origin: {provider, config}`)
   to bind the attachment explicitly; during fallback runs Alloy also attributes
   unattributed user `file_id` attachments to the primary provider's origin so
@@ -476,6 +482,9 @@ defmodule Alloy.Message do
   defp origin_scoped_file_block?(%{type: "document", uri: uri}),
     do: HTTP.provider_file_uri?(uri)
 
+  defp origin_scoped_file_block?(%{type: "image", url: url}),
+    do: HTTP.provider_file_uri?(url)
+
   defp origin_scoped_file_block?(_block), do: false
 
   defp foreign_block(%{type: "thinking", thinking: thinking}, ids) when is_binary(thinking) do
@@ -507,6 +516,14 @@ defmodule Alloy.Message do
 
   defp foreign_block(%{type: "document", uri: uri} = block, ids) do
     if HTTP.provider_file_uri?(uri) do
+      {[], ids}
+    else
+      {[Map.drop(block, @signature_keys)], ids}
+    end
+  end
+
+  defp foreign_block(%{type: "image", url: url} = block, ids) do
+    if HTTP.provider_file_uri?(url) do
       {[], ids}
     else
       {[Map.drop(block, @signature_keys)], ids}

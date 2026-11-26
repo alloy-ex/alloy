@@ -1133,7 +1133,11 @@ defmodule Alloy.Provider.OpenAICompatTest do
           content: [
             %{type: "text", text: "Describe"},
             Message.image_url("https://example.com/photo.jpg"),
-            Message.image_url("gs://ignored/not-http.jpg")
+            Message.image_url("gs://ignored/not-http.jpg"),
+            Message.image_url(
+              "https://generativelanguage.googleapis.com/v1beta/files/gemimg1",
+              mime_type: "image/png"
+            )
           ]
         }
       ]
@@ -1143,6 +1147,7 @@ defmodule Alloy.Provider.OpenAICompatTest do
       assert_received {:request_headers, headers}
 
       assert {"authorization", "Bearer dyn-compat-key"} in headers
+      refute body =~ "generativelanguage.googleapis.com"
       [%{"role" => "user", "content" => parts}] = Jason.decode!(body)["messages"]
 
       assert parts == [
@@ -1150,6 +1155,10 @@ defmodule Alloy.Provider.OpenAICompatTest do
                %{
                  "type" => "image_url",
                  "image_url" => %{"url" => "https://example.com/photo.jpg"}
+               },
+               %{
+                 "type" => "text",
+                 "text" => "[Unsupported image URL scheme for OpenAICompat provider]"
                },
                %{
                  "type" => "text",

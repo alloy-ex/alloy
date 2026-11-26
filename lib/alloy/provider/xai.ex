@@ -12,17 +12,20 @@ defmodule Alloy.Provider.XAI do
   ## Config
 
   Required:
-  - `:api_key` - xAI API key
+  - `:api_key` - xAI API key string, or a 0-arity callback returning
+    `String.t() | {:ok, String.t()} | {:error, term()}` (pair with `:origin_key`
+    when passing a callback via `Alloy.run/2`)
   - `:model` - Model name (e.g., `"grok-4.7"`, `"grok-4.3"`,
     `"grok-build-0.1"`)
 
   Optional:
   - `:web_search` - `true` or config map to enable Grok's web search tool
   - `:x_search` - `true` or config map to enable search across X posts
-  - All options from `Alloy.Provider.OpenAI` (`:max_tokens`, `:tool_choice`,
-    `:previous_response_id`, etc.). Conversation state works the same way:
-    the full history by default, or `:previous_response_id` plus only the
-    new messages.
+  - All options from `Alloy.Provider.OpenAI` (`:origin_key`,
+    `:prompt_cache_key`, `:prompt_cache_retention`, `:max_tokens`,
+    `:tool_choice`, `:previous_response_id`, etc.). Conversation state works
+    the same way: the full history by default, or `:previous_response_id` plus
+    only the new messages.
 
   ## Example
 

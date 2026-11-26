@@ -274,7 +274,21 @@ defmodule Alloy.Provider.HTTP do
         validate_api_key_bytes(key)
 
       {:error, %Error{} = err} ->
-        {:error, err}
+        safe_kind = if is_atom(err.kind), do: err.kind, else: :auth
+        safe_status = if is_integer(err.status), do: err.status, else: nil
+
+        safe_retry_after =
+          if is_integer(err.retry_after_ms) and err.retry_after_ms >= 0,
+            do: err.retry_after_ms,
+            else: nil
+
+        {:error,
+         %Error{
+           kind: safe_kind,
+           status: safe_status,
+           retry_after_ms: safe_retry_after,
+           message: "Dynamic :api_key callback failed (#{safe_kind})"
+         }}
 
       {:error, reason} ->
         {:error,
