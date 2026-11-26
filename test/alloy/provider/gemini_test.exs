@@ -328,6 +328,57 @@ defmodule Alloy.Provider.GeminiTest do
       refute Enum.any?(results["parts"], &Map.has_key?(&1, "thoughtSignature"))
       assert [%{"thoughtSignature" => "sig_real"}] = second_step["parts"]
     end
+
+    test "omits empty-map thoughtSignature on parse and falls back to placeholder on replay" do
+      parse_config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(
+              gemini_response([
+                %{
+                  "functionCall" => %{
+                    "id" => "call_empty_sig",
+                    "name" => "read",
+                    "args" => %{"path" => "a.ex"}
+                  },
+                  "thoughtSignature" => %{}
+                }
+              ])
+            )
+        })
+
+      assert {:ok, %{messages: [assistant_msg]}} =
+               Gemini.complete([Message.user("Read")], [], parse_config)
+
+      assert [%{type: "tool_use", id: "call_empty_sig", name: "read"} = parsed_block] =
+               assistant_msg.content
+
+      refute Map.has_key?(parsed_block, :signature)
+
+      replay_config = config_that_captures_request()
+
+      hand_built =
+        Message.assistant_blocks([
+          %{type: "tool_use", id: "call_hand", name: "read", input: %{}, signature: %{}}
+        ])
+
+      messages = [
+        Message.user("Read"),
+        assistant_msg,
+        Message.tool_results([Message.tool_result_block("call_empty_sig", "ok")]),
+        hand_built,
+        Message.tool_results([Message.tool_result_block("call_hand", "ok")])
+      ]
+
+      Gemini.complete(messages, [], replay_config)
+
+      assert_received {:request_body, body}
+      [_user, first_step, _r1, second_step, _r2] = Jason.decode!(body)["contents"]
+
+      assert [%{"thoughtSignature" => "skip_thought_signature_validator"}] = first_step["parts"]
+      assert [%{"thoughtSignature" => "skip_thought_signature_validator"}] = second_step["parts"]
+    end
   end
 
   describe "stream/4" do

@@ -184,31 +184,30 @@ defmodule Alloy.Tool.Validation do
       end
   end
 
-  defp rescue_schema_error(error, target) do
-    prefix =
-      case target do
-        :output -> "Invalid output_schema"
-        {:tool, name} -> "Invalid schema for #{name}"
-      end
+  defp rescue_schema_error(%{__struct__: mod} = error, :output)
+       when mod in [
+              ExJsonSchema.Schema.InvalidReferenceError,
+              ExJsonSchema.Schema.InvalidSchemaError
+            ],
+       do: {:ok, "Invalid output_schema: #{Exception.message(error)}"}
 
-    cond do
-      error.__struct__ in [
-        ExJsonSchema.Schema.InvalidReferenceError,
-        ExJsonSchema.Schema.InvalidSchemaError
-      ] ->
-        {:ok, "#{prefix}: #{Exception.message(error)}"}
+  defp rescue_schema_error(%{__struct__: mod} = error, {:tool, name})
+       when mod in [
+              ExJsonSchema.Schema.InvalidReferenceError,
+              ExJsonSchema.Schema.InvalidSchemaError
+            ],
+       do: {:ok, "Invalid schema for #{name}: #{Exception.message(error)}"}
 
-      error.__struct__ == ExJsonSchema.Schema.MissingJsonDecoderError ->
-        {:ok,
-         if(target == :output,
-           do: missing_json_decoder_message(),
-           else: "#{prefix}: #{missing_json_decoder_message()}"
-         )}
+  defp rescue_schema_error(%{__struct__: ExJsonSchema.Schema.MissingJsonDecoderError}, :output),
+    do: {:ok, missing_json_decoder_message()}
 
-      true ->
-        :reraise
-    end
-  end
+  defp rescue_schema_error(
+         %{__struct__: ExJsonSchema.Schema.MissingJsonDecoderError},
+         {:tool, name}
+       ),
+       do: {:ok, "Invalid schema for #{name}: #{missing_json_decoder_message()}"}
+
+  defp rescue_schema_error(_error, _target), do: :reraise
 
   defp missing_json_decoder_message do
     "Schema uses contentMediaType \"application/json\", which requires " <>

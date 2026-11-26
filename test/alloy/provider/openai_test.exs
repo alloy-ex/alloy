@@ -1252,6 +1252,26 @@ defmodule Alloy.Provider.OpenAITest do
       assert {:ok, %{stop_reason: :refusal, messages: [%Message{content: []}]}} =
                OpenAI.complete([Message.user("Hi")], [], config)
     end
+
+    test "preserves explicitly empty map response metadata while omitting empty citation lists" do
+      body = %{
+        "id" => "resp_empty_meta",
+        "object" => "response",
+        "status" => "incomplete",
+        "incomplete_details" => %{},
+        "citations" => [],
+        "server_side_tool_usage" => %{},
+        "output" => [assistant_text_item("partial")],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 2}
+      }
+
+      config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+      assert {:ok, %{response_metadata: metadata}} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert metadata == %{server_side_tool_usage: %{}, stop_details: %{}}
+    end
   end
 
   # --- Test Helpers ---

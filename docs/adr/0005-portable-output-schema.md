@@ -61,10 +61,10 @@ decoded into `Alloy.Result.output`:
    including sibling keys such as `output_config.effort` and `text.verbosity` —
    plus Gemini `generationConfig` schema/thinking fields on summary requests,
    and the Compactor test acts as a structural regression guard).
-4. **Decoding, validation tiers, and terminal failure:** In `Turn.finish/1`
+4. **Decoding, validation tiers, and terminal failure:** In `Turn.finish/2`
    (before `:after_completion`, skipped when `:stop_after_tool` finishes a run),
-   Alloy concatenates the final assistant message's text blocks with `""` (not
-   `"\n"`), decodes JSON, and validates it:
+   Alloy concatenates the text blocks of the final turn's last assistant message
+   with `""` (not `"\n"`), decodes JSON, and validates it:
    - Remote (non-`#`) `$ref`s are always rejected at startup — with full `$id`
      scope validation when `:ex_json_schema` is loaded and a dependency-free
      local-only `$ref` scan when it is absent.

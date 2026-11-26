@@ -295,12 +295,12 @@ defmodule Alloy.Provider.Gemini do
 
   defp format_content_block(%{type: "thinking", thinking: thinking} = block, _messages) do
     %{"text" => thinking, "thought" => true}
-    |> HTTP.maybe_put("thoughtSignature", block[:signature])
+    |> HTTP.maybe_put_non_empty("thoughtSignature", block[:signature])
   end
 
   defp format_content_block(%{type: "text", text: text} = block, _messages) do
     %{"text" => text}
-    |> HTTP.maybe_put("thoughtSignature", block[:signature])
+    |> HTTP.maybe_put_non_empty("thoughtSignature", block[:signature])
   end
 
   defp format_content_block(
@@ -314,7 +314,7 @@ defmodule Alloy.Provider.Gemini do
         "args" => Alloy.Provider.stringify_keys(input)
       }
     }
-    |> HTTP.maybe_put("thoughtSignature", block[:signature])
+    |> HTTP.maybe_put_non_empty("thoughtSignature", block[:signature])
   end
 
   defp format_content_block(
@@ -522,11 +522,14 @@ defmodule Alloy.Provider.Gemini do
 
   defp parse_content_part(%{"text" => text, "thought" => true} = part) when is_binary(text) do
     {:ok,
-     %{type: "thinking", thinking: text} |> HTTP.maybe_put(:signature, part["thoughtSignature"])}
+     %{type: "thinking", thinking: text}
+     |> HTTP.maybe_put_non_empty(:signature, part["thoughtSignature"])}
   end
 
   defp parse_content_part(%{"text" => text} = part) when is_binary(text) do
-    {:ok, %{type: "text", text: text} |> HTTP.maybe_put(:signature, part["thoughtSignature"])}
+    {:ok,
+     %{type: "text", text: text}
+     |> HTTP.maybe_put_non_empty(:signature, part["thoughtSignature"])}
   end
 
   defp parse_content_part(%{"functionCall" => %{"name" => name} = call} = part)
@@ -541,12 +544,12 @@ defmodule Alloy.Provider.Gemini do
       nil ->
         {:ok,
          %{type: "tool_use", id: id, name: name, input: %{}}
-         |> HTTP.maybe_put(:signature, part["thoughtSignature"])}
+         |> HTTP.maybe_put_non_empty(:signature, part["thoughtSignature"])}
 
       args when is_map(args) ->
         {:ok,
          %{type: "tool_use", id: id, name: name, input: args}
-         |> HTTP.maybe_put(:signature, part["thoughtSignature"])}
+         |> HTTP.maybe_put_non_empty(:signature, part["thoughtSignature"])}
 
       _invalid ->
         {:error,
