@@ -532,7 +532,7 @@ defmodule Alloy.Provider.Anthropic do
   defp validate_start_block(%{"type" => "thinking"}), do: :error
 
   defp validate_start_block(%{"type" => type, "id" => id, "name" => name} = block)
-       when is_binary(type) and is_binary(id) and is_binary(name) do
+       when is_binary(type) and is_binary(id) and id != "" and is_binary(name) and name != "" do
     if tool_use_block?(block) do
       case Map.fetch(block, "input") do
         :error -> {:ok, Map.put(block, "input", %{})}

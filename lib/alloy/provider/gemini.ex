@@ -232,12 +232,15 @@ defmodule Alloy.Provider.Gemini do
     with {:ok, raw_generation_config} <- normalize_generation_config(config),
          {:ok, reasoning} <- Provider.normalize_reasoning(Map.get(config, :reasoning)),
          :ok <- validate_cached_content_config(cached_content, config) do
+      extra_body = HTTP.stringify_extra_body(Map.get(config, :extra_body, %{}))
+      extra_gen_cfg = Map.get(extra_body, "generationConfig")
+
       # No default maxOutputTokens: the budget includes thinking, so a fixed
       # default truncates thinking models; each model's own limit is larger.
       generation_config =
         raw_generation_config
         |> HTTP.maybe_put_new("maxOutputTokens", Map.get(config, :max_tokens))
-        |> maybe_put_reasoning(reasoning)
+        |> maybe_put_reasoning(reasoning, extra_gen_cfg)
         |> maybe_put_output_schema(output_schema)
 
       body = HTTP.maybe_put_unless_empty_map(body, "generationConfig", generation_config)
@@ -266,7 +269,7 @@ defmodule Alloy.Provider.Gemini do
       body =
         HTTP.merge_extra_body(
           body,
-          HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
+          extra_body,
           "generationConfig"
         )
 
@@ -386,12 +389,11 @@ defmodule Alloy.Provider.Gemini do
 
   defp maybe_append_native_tool(tools, _key, _other), do: tools
 
-  defp maybe_put_reasoning(generation_config, nil), do: generation_config
+  defp maybe_put_reasoning(generation_config, nil, _extra_gen_cfg), do: generation_config
 
-  defp maybe_put_reasoning(generation_config, reasoning) do
+  defp maybe_put_reasoning(generation_config, reasoning, extra_gen_cfg) do
     has_explicit_thinking? =
-      Map.has_key?(generation_config, "thinkingConfig") or
-        Map.has_key?(generation_config, "thinking_config")
+      has_thinking_config?(generation_config) or has_thinking_config?(extra_gen_cfg)
 
     if has_explicit_thinking? do
       generation_config
@@ -399,6 +401,12 @@ defmodule Alloy.Provider.Gemini do
       Map.put(generation_config, "thinkingConfig", gemini_thinking_config(reasoning))
     end
   end
+
+  defp has_thinking_config?(map) when is_map(map) do
+    Map.has_key?(map, "thinkingConfig") or Map.has_key?(map, "thinking_config")
+  end
+
+  defp has_thinking_config?(_other), do: false
 
   defp gemini_thinking_config(%{effort: :off}), do: %{"thinkingBudget" => 0}
 

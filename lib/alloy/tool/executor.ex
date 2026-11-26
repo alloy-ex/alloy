@@ -166,52 +166,104 @@ defmodule Alloy.Tool.Executor do
   end
 
   defp await_batch(running, aliases, pending, done, ctx) do
-    %{run: run} = ctx
-
+    # Prioritize terminal worker messages ahead of queued :alloy_tool_update
+    # messages so a burst of updates with a slow :on_event callback cannot delay
+    # timeout or completion handling past :tool_timeout / :timeout_ms.
     receive do
-      {:alloy_tool_update, call_alias, call_id, name, start_seq, chunk}
-      when is_map_key(aliases, call_alias) ->
-        ref = Map.fetch!(aliases, call_alias)
-        %{inflight: inflight} = Map.fetch!(running, ref)
-        :atomics.sub(inflight, 1, 1)
-
-        _ =
-          run_or_cleanup(running, fn ->
-            emit_update(call_id, name, start_seq, chunk, run)
-          end)
-
-        await_batch(running, aliases, pending, done, ctx)
-
       {ref, {:ok, outcome}} when is_map_key(running, ref) ->
-        {entry, next_running} = Map.pop!(running, ref)
-        next_aliases = deactivate_update_alias(aliases, entry.update_alias)
-        Process.demonitor(ref, [:flush])
-        done_entry = finish_or_cleanup(entry, outcome, true, run, next_running)
-        await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
+        handle_worker_ok(ref, outcome, running, aliases, pending, done, ctx)
 
       {ref, :timeout} when is_map_key(running, ref) ->
-        {entry, next_running} = Map.pop!(running, ref)
-        next_aliases = deactivate_update_alias(aliases, entry.update_alias)
-        Process.demonitor(ref, [:flush])
-        outcome = exit_outcome(entry.started.call, :timeout, run, entry.deadline_capped?)
-        done_entry = finish_or_cleanup(entry, outcome, false, run, next_running)
-        await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
+        handle_worker_timeout(ref, running, aliases, pending, done, ctx)
 
       {ref, {:worker_exit, reason}} when is_map_key(running, ref) ->
-        {entry, next_running} = Map.pop!(running, ref)
-        next_aliases = deactivate_update_alias(aliases, entry.update_alias)
-        Process.demonitor(ref, [:flush])
-        outcome = worker_exit_outcome(entry.started.call, reason, run, entry.deadline_capped?)
-        done_entry = finish_or_cleanup(entry, outcome, false, run, next_running)
-        await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
+        handle_worker_exit(ref, reason, running, aliases, pending, done, ctx)
 
       {:DOWN, ref, :process, _pid, reason} when is_map_key(running, ref) ->
-        {entry, next_running} = Map.pop!(running, ref)
-        next_aliases = deactivate_update_alias(aliases, entry.update_alias)
-        outcome = exit_outcome(entry.started.call, reason, run, entry.deadline_capped?)
-        done_entry = finish_or_cleanup(entry, outcome, false, run, next_running)
-        await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
+        handle_worker_down(ref, reason, running, aliases, pending, done, ctx)
+    after
+      0 ->
+        receive do
+          {ref, {:ok, outcome}} when is_map_key(running, ref) ->
+            handle_worker_ok(ref, outcome, running, aliases, pending, done, ctx)
+
+          {ref, :timeout} when is_map_key(running, ref) ->
+            handle_worker_timeout(ref, running, aliases, pending, done, ctx)
+
+          {ref, {:worker_exit, reason}} when is_map_key(running, ref) ->
+            handle_worker_exit(ref, reason, running, aliases, pending, done, ctx)
+
+          {:DOWN, ref, :process, _pid, reason} when is_map_key(running, ref) ->
+            handle_worker_down(ref, reason, running, aliases, pending, done, ctx)
+
+          {:alloy_tool_update, call_alias, call_id, name, start_seq, chunk}
+          when is_map_key(aliases, call_alias) ->
+            handle_tool_update(
+              {call_alias, call_id, name, start_seq, chunk},
+              running,
+              aliases,
+              pending,
+              done,
+              ctx
+            )
+        end
     end
+  end
+
+  defp handle_tool_update(
+         {call_alias, call_id, name, start_seq, chunk},
+         running,
+         aliases,
+         pending,
+         done,
+         ctx
+       ) do
+    ref = Map.fetch!(aliases, call_alias)
+    %{inflight: inflight, deadline: call_deadline} = Map.fetch!(running, ref)
+    :atomics.sub(inflight, 1, 1)
+
+    _ =
+      unless deadline_expired?(ctx.run.run_deadline) or deadline_expired?(call_deadline) do
+        run_or_cleanup(running, fn ->
+          emit_update(call_id, name, start_seq, chunk, ctx.run)
+        end)
+      end
+
+    await_batch(running, aliases, pending, done, ctx)
+  end
+
+  defp handle_worker_ok(ref, outcome, running, aliases, pending, done, ctx) do
+    {entry, next_running} = Map.pop!(running, ref)
+    next_aliases = deactivate_update_alias(aliases, entry.update_alias)
+    Process.demonitor(ref, [:flush])
+    done_entry = finish_or_cleanup(entry, outcome, true, ctx.run, next_running)
+    await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
+  end
+
+  defp handle_worker_timeout(ref, running, aliases, pending, done, ctx) do
+    {entry, next_running} = Map.pop!(running, ref)
+    next_aliases = deactivate_update_alias(aliases, entry.update_alias)
+    Process.demonitor(ref, [:flush])
+    outcome = exit_outcome(entry.started.call, :timeout, ctx.run, entry.deadline_capped?)
+    done_entry = finish_or_cleanup(entry, outcome, false, ctx.run, next_running)
+    await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
+  end
+
+  defp handle_worker_exit(ref, reason, running, aliases, pending, done, ctx) do
+    {entry, next_running} = Map.pop!(running, ref)
+    next_aliases = deactivate_update_alias(aliases, entry.update_alias)
+    Process.demonitor(ref, [:flush])
+    outcome = worker_exit_outcome(entry.started.call, reason, ctx.run, entry.deadline_capped?)
+    done_entry = finish_or_cleanup(entry, outcome, false, ctx.run, next_running)
+    await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
+  end
+
+  defp handle_worker_down(ref, reason, running, aliases, pending, done, ctx) do
+    {entry, next_running} = Map.pop!(running, ref)
+    next_aliases = deactivate_update_alias(aliases, entry.update_alias)
+    outcome = exit_outcome(entry.started.call, reason, ctx.run, entry.deadline_capped?)
+    done_entry = finish_or_cleanup(entry, outcome, false, ctx.run, next_running)
+    await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
   end
 
   defp finish_or_cleanup(entry, outcome, emit_queued?, run, remaining_running) do
@@ -298,6 +350,7 @@ defmodule Alloy.Tool.Executor do
         entry = %{
           owner: owner,
           started: started,
+          deadline: deadline,
           deadline_capped?: deadline_capped?,
           update_alias: call_alias,
           inflight: inflight

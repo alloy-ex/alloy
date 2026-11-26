@@ -145,6 +145,7 @@ defmodule Alloy.Provider.OpenAI do
       stream_error: nil,
       sticky_error: nil,
       function_calls: %{},
+      pending_function_deltas: %{},
       on_chunk: on_chunk,
       on_event: Map.get(config, :on_event, fn _ -> :ok end)
     }
@@ -538,31 +539,11 @@ defmodule Alloy.Provider.OpenAI do
 
   defp process_stream_event(
          acc,
-         "response.output_item.added",
+         event_type,
          %{"item" => %{"type" => "function_call"} = item} = payload
-       ) do
-    index = Map.get(payload, "output_index", 0)
-    call_id = item["call_id"] || item["id"]
-    name = item["name"]
-
-    if is_integer(index) and index >= 0 and is_binary(call_id) and call_id != "" and
-         is_binary(name) and name != "" do
-      meta = %{id: call_id, index: index, name: name}
-      delta_event = Map.put(meta, :arguments_delta, "")
-      acc.on_event.({:tool_call_delta, delta_event})
-
-      function_calls =
-        acc.function_calls
-        |> maybe_put_call_meta(item["id"], meta)
-        |> Map.put({:index, index}, meta)
-
-      %{acc | function_calls: function_calls}
-    else
-      # Skip invalid interim headers without failing the stream: the terminal
-      # response.completed payload carries the authoritative output items, and
-      # skipping emission avoids tripping chunks_emitted? before retries.
-      acc
-    end
+       )
+       when event_type in ["response.output_item.added", "response.output_item.done"] do
+    register_function_call_item(acc, item, Map.get(payload, "output_index", 0), event_type)
   end
 
   defp process_stream_event(
@@ -574,7 +555,7 @@ defmodule Alloy.Provider.OpenAI do
     raw_index = Map.get(payload, "output_index")
 
     if valid_optional_output_index?(raw_index) do
-      emit_function_call_args_delta(acc, payload, raw_index, delta)
+      handle_function_call_args_delta(acc, payload, raw_index, delta)
     else
       acc
     end
@@ -582,6 +563,14 @@ defmodule Alloy.Provider.OpenAI do
 
   # Every terminal event carries the whole response, and parse_response/1
   # reads its status, so completed, incomplete and failed share one path.
+  # On response.completed, resolve any headerless argument deltas buffered
+  # before a function_call item arrived so consumers still correlate via call_id.
+  defp process_stream_event(acc, "response.completed", %{"response" => response})
+       when is_map(response) do
+    acc = flush_pending_from_response(acc, response)
+    %{acc | response: response}
+  end
+
   defp process_stream_event(acc, event_type, %{"response" => response})
        when event_type in @terminal_events and is_map(response) do
     %{acc | response: response}
@@ -599,6 +588,71 @@ defmodule Alloy.Provider.OpenAI do
 
   defp process_stream_event(acc, _event_type, _payload), do: acc
 
+  defp register_function_call_item(acc, item, index, event_type) do
+    call_id = item["call_id"] || item["id"]
+    name = item["name"]
+    item_id = item["id"]
+
+    if valid_function_call_header?(index, call_id, name) do
+      meta = %{id: call_id, index: index, name: name}
+      already_known? = lookup_function_call_meta(acc.function_calls, item_id, index) == meta
+
+      unless already_known? do
+        header_event = Map.put(meta, :arguments_delta, "")
+        acc.on_event.({:tool_call_delta, header_event})
+      end
+
+      {pending_deltas, next_pending} =
+        pop_pending_deltas(acc.pending_function_deltas, item_id, index)
+
+      emit_buffered_args(acc.on_event, meta, pending_deltas)
+
+      function_calls =
+        acc.function_calls
+        |> maybe_put_call_meta(item_id, meta)
+        |> Map.put({:index, index}, meta)
+
+      %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
+    else
+      # Record rejected headers so subsequent argument deltas for the same
+      # item_id or output_index cannot bypass suppression and trip chunks_emitted?.
+      if event_type == "response.output_item.added" do
+        mark_rejected_function_call(acc, item_id, index)
+      else
+        acc
+      end
+    end
+  end
+
+  defp valid_function_call_header?(index, call_id, name) do
+    is_integer(index) and index >= 0 and is_binary(call_id) and call_id != "" and
+      is_binary(name) and name != ""
+  end
+
+  defp mark_rejected_function_call(acc, item_id, index) do
+    function_calls =
+      acc.function_calls
+      |> maybe_put_call_meta(item_id, :rejected)
+      |> then(fn map ->
+        if is_integer(index) and index >= 0,
+          do: Map.put(map, {:index, index}, :rejected),
+          else: map
+      end)
+
+    {_dropped, next_pending} = pop_pending_deltas(acc.pending_function_deltas, item_id, index)
+    %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
+  end
+
+  defp lookup_function_call_meta(calls, item_id, index) do
+    case maybe_get_by_id(calls, item_id) do
+      nil -> lookup_call_by_index(calls, index)
+      found -> found
+    end
+  end
+
+  defp maybe_get_by_id(calls, id) when is_binary(id) and id != "", do: Map.get(calls, id)
+  defp maybe_get_by_id(_calls, _id), do: nil
+
   defp maybe_put_call_meta(map, id, meta) when is_binary(id) and id != "",
     do: Map.put(map, id, meta)
 
@@ -613,31 +667,113 @@ defmodule Alloy.Provider.OpenAI do
   defp valid_optional_output_index?(index) when is_integer(index) and index >= 0, do: true
   defp valid_optional_output_index?(_other), do: false
 
-  defp emit_function_call_args_delta(acc, payload, raw_index, delta) do
-    meta =
-      Map.get(acc.function_calls, payload["item_id"]) ||
-        lookup_call_by_index(acc.function_calls, raw_index) ||
-        %{id: payload["call_id"] || payload["item_id"], index: raw_index || 0, name: nil}
+  defp handle_function_call_args_delta(acc, payload, raw_index, delta) do
+    item_id = payload["item_id"]
 
-    effective_index = raw_index || meta.index || 0
+    case lookup_function_call_meta(acc.function_calls, item_id, raw_index) do
+      :rejected ->
+        acc
 
-    if valid_tool_call_meta?(meta) do
-      acc.on_event.(
+      %{id: id, index: idx, name: name} ->
+        acc.on_event.(
+          {:tool_call_delta,
+           %{
+             id: id,
+             index: raw_index || idx,
+             name: name,
+             arguments_delta: delta
+           }}
+        )
+
+        acc
+
+      nil ->
+        buffer_pending_delta(acc, item_id, raw_index, delta)
+    end
+  end
+
+  defp buffer_pending_delta(acc, item_id, raw_index, delta) do
+    key =
+      cond do
+        is_binary(item_id) and item_id != "" -> item_id
+        is_integer(raw_index) and raw_index >= 0 -> {:index, raw_index}
+        true -> nil
+      end
+
+    if is_nil(key) do
+      acc
+    else
+      updated =
+        Map.update(
+          acc.pending_function_deltas,
+          key,
+          [{raw_index, delta}],
+          &[{raw_index, delta} | &1]
+        )
+
+      %{acc | pending_function_deltas: updated}
+    end
+  end
+
+  defp pop_pending_deltas(pending, item_id, index) do
+    {by_id, pending} =
+      if is_binary(item_id) and item_id != "",
+        do: Map.pop(pending, item_id, []),
+        else: {[], pending}
+
+    {by_index, pending} =
+      if is_integer(index) and index >= 0,
+        do: Map.pop(pending, {:index, index}, []),
+        else: {[], pending}
+
+    {Enum.reverse(by_id) ++ Enum.reverse(by_index), pending}
+  end
+
+  defp emit_buffered_args(on_event, meta, deltas) do
+    Enum.each(deltas, fn {raw_index, delta} ->
+      on_event.(
         {:tool_call_delta,
          %{
            id: meta.id,
-           index: effective_index,
+           index: raw_index || meta.index,
            name: meta.name,
            arguments_delta: delta
          }}
       )
-    end
-
-    acc
+    end)
   end
 
-  defp valid_tool_call_meta?(%{id: id, name: name}) do
-    is_binary(id) and id != "" and (is_nil(name) or (is_binary(name) and name != ""))
+  defp flush_pending_from_response(%{pending_function_deltas: pending} = acc, _response)
+       when map_size(pending) == 0,
+       do: acc
+
+  defp flush_pending_from_response(acc, %{"output" => output}) when is_list(output) do
+    output
+    |> Enum.with_index()
+    |> Enum.reduce(acc, fn
+      {%{"type" => "function_call"} = item, idx}, current ->
+        item_id = item["id"]
+        call_id = item["call_id"] || item["id"]
+        name = item["name"]
+
+        if valid_function_call_header?(idx, call_id, name) and
+             has_pending_for?(current.pending_function_deltas, item_id, idx) and
+             lookup_function_call_meta(current.function_calls, item_id, idx) != :rejected do
+          register_function_call_item(current, item, idx, "response.completed")
+        else
+          current
+        end
+
+      _other, current ->
+        current
+    end)
+  end
+
+  defp flush_pending_from_response(acc, _response), do: acc
+
+  defp has_pending_for?(pending, item_id, idx) do
+    (is_binary(item_id) and item_id != "" and Map.has_key?(pending, item_id)) or
+      Map.has_key?(pending, {:index, idx})
   end
 
   defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}

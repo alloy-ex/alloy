@@ -160,33 +160,40 @@ defmodule Alloy.Agent.Turn do
     step =
       try do
         turn_span(turn, fn ->
-          complete(state, Keyword.put(opts, :turn_progress_key, progress_key), false)
+          state
+          |> complete(Keyword.put(opts, :turn_progress_key, progress_key), false)
+          |> finalize_turn_limits()
         end)
       catch
         kind, reason ->
+          stacktrace = __STACKTRACE__
+
           {stop_reason, usage} =
             case Process.delete(progress_key) do
               {sr, u} -> {sr, Usage.diff(u, usage_before)}
               nil -> {nil, %Usage{}}
             end
 
-          Events.emit(
-            opts,
-            turn,
-            {:turn_end,
-             %{
-               turn: turn,
-               status: :error,
-               stop_reason: stop_reason,
-               usage: usage
-             }}
-          )
+          try do
+            Events.emit(
+              opts,
+              turn,
+              {:turn_end,
+               %{
+                 turn: turn,
+                 status: :error,
+                 stop_reason: stop_reason,
+                 usage: usage
+               }}
+            )
+          catch
+            _, _ -> :ok
+          end
 
-          :erlang.raise(kind, reason, __STACKTRACE__)
+          :erlang.raise(kind, reason, stacktrace)
       end
 
     Process.delete(progress_key)
-    step = finalize_turn_limits(step)
     {_, step_state} = step
     turn_stop_reason = if step_state.turn == turn, do: step_state.stop_reason, else: nil
 
@@ -342,6 +349,9 @@ defmodule Alloy.Agent.Turn do
         if is_integer(state.run_deadline),
           do: Map.put(cfg, :alloy_request_deadline, state.run_deadline),
           else: cfg
+      end)
+      |> then(fn cfg ->
+        if streaming?, do: Map.put(cfg, :alloy_on_text_event, on_event), else: cfg
       end)
       |> then(fn cfg ->
         if emit_provider_events?, do: Map.put(cfg, :on_event, on_event), else: cfg

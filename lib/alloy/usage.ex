@@ -60,7 +60,7 @@ defmodule Alloy.Usage do
         max(current.cache_creation_input_tokens - previous.cache_creation_input_tokens, 0),
       cache_read_input_tokens:
         max(current.cache_read_input_tokens - previous.cache_read_input_tokens, 0),
-      estimated_cost_cents: current.estimated_cost_cents - previous.estimated_cost_cents
+      estimated_cost_cents: max(current.estimated_cost_cents - previous.estimated_cost_cents, 0)
     }
   end
 

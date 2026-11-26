@@ -439,8 +439,8 @@ defmodule Alloy.Provider.OpenAIStream do
   defp merge_tool_call_id(_existing, {:ok, _invalid}),
     do: {:error, "Invalid tool call id in Chat Completions SSE chunk"}
 
-  defp should_emit_tool_call_delta?(_tc_delta, %{id: id}, _args_delta)
-       when not is_binary(id) or id == "",
+  defp should_emit_tool_call_delta?(_tc_delta, %{id: id, name: name}, _args_delta)
+       when not is_binary(id) or id == "" or not is_binary(name) or name == "",
        do: false
 
   defp should_emit_tool_call_delta?(_tc_delta, _updated, args_delta) when args_delta != "",

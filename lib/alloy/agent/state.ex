@@ -195,8 +195,10 @@ defmodule Alloy.Agent.State do
       else: state.provider_state
   end
 
-  defp provider_changed?(old, new),
-    do: old.provider != new.provider or old.provider_config != new.provider_config
+  defp provider_changed?(old, new) do
+    old.provider != new.provider or
+      Map.delete(old.provider_config, :reasoning) != Map.delete(new.provider_config, :reasoning)
+  end
 
   @doc """
   Append messages to the conversation history.

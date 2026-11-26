@@ -1912,6 +1912,395 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert_receive {:crash_worker_pid, wpid}, 500
       wref = Process.monitor(wpid)
       assert_receive {:DOWN, ^wref, :process, ^wpid, _}, 500
+
+      # 4. Brutally killing run_port while :bash_on_output is blocked must still kill the
+      #    callback worker immediately via its owner-monitoring watcher.
+      blocker =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      bash_task =
+        Task.async(fn ->
+          Bash.execute(
+            %{"command" => "echo live; sleep 10", "timeout" => 5_000},
+            %{
+              bash_restricted: false,
+              on_tool_update: fn _chunk ->
+                send(parent, {:brutal_runner_pid, self()})
+                :ok
+              end,
+              bash_on_output: fn _chunk ->
+                send(parent, {:brutal_worker_pid, self()})
+                bref = Process.monitor(blocker)
+
+                receive do
+                  {:DOWN, ^bref, :process, ^blocker, _} -> :ok
+                end
+              end
+            }
+          )
+        end)
+
+      assert_receive {:brutal_runner_pid, runner_pid}, 1_000
+      assert_receive {:brutal_worker_pid, blocked_worker_pid}, 1_000
+      blocked_ref = Process.monitor(blocked_worker_pid)
+      Process.exit(runner_pid, :kill)
+
+      assert {:error, kill_msg} = Task.await(bash_task, 2_000)
+      assert kill_msg =~ "Executor crashed"
+      assert_receive {:DOWN, ^blocked_ref, :process, ^blocked_worker_pid, :killed}, 500
+      send(blocker, :stop)
+    end
+
+    test "State.prepare(reasoning: ...) preserves provider_state and provider_response_metadata" do
+      state =
+        State.init(Config.from_opts(provider: {Anthropic, api_key: "sk-ant", reasoning: :high}))
+
+      state = %{
+        state
+        | provider_state: %{container_id: "cntr_123"},
+          provider_response_metadata: %{model_version: "claude-sonnet-4-6"}
+      }
+
+      updated = State.prepare(state, reasoning: :off)
+      assert updated.config.reasoning == %{effort: :off, display: nil}
+      assert updated.provider_state == %{container_id: "cntr_123"}
+      assert updated.provider_response_metadata == %{model_version: "claude-sonnet-4-6"}
+    end
+
+    test "provider header correlation, retry suppression, and burst timeout priority" do
+      parent = self()
+
+      # 1. OpenAI: rejected header (empty name, valid item.id) + subsequent argument delta
+      #    must NOT bypass suppression and must still retry on response.failed.
+      rej_attempts = :atomics.new(1, signed: false)
+
+      rej_oai_plug = fn conn ->
+        n = :atomics.add_get(rej_attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "id" => "fc_bad",
+                "call_id" => "call_bad",
+                "type" => "function_call",
+                "name" => ""
+              }
+            }) <>
+              sse_oai("response.function_call_arguments.delta", %{
+                "type" => "response.function_call_arguments.delta",
+                "output_index" => 0,
+                "item_id" => "fc_bad",
+                "delta" => "{\"text\":\"hi\"}"
+              }) <>
+              sse_oai("response.failed", %{
+                "type" => "response.failed",
+                "response" => %{
+                  "status" => "failed",
+                  "error" => %{"code" => "server_error", "message" => "transient"}
+                }
+              })
+          else
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_ok3",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "message",
+                    "role" => "assistant",
+                    "content" => [%{"type" => "output_text", "text" => "retried ok"}]
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "retried ok"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: rej_oai_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0,
+                 on_event: &send(parent, {:rej_ev, &1})
+               )
+
+      assert :atomics.get(rej_attempts, 1) == 2
+      refute Enum.any?(drain_tagged(:rej_ev), &(&1.event == :tool_call_delta))
+
+      # 2. OpenAI: headerless function_call_arguments.delta with item_id "fc_1" followed by
+      #    response.completed with call_id "call_1" must correlate using "call_1" (never "fc_1").
+      headerless_plug =
+        sse_plug(
+          sse_oai("response.function_call_arguments.delta", %{
+            "type" => "response.function_call_arguments.delta",
+            "output_index" => 0,
+            "item_id" => "fc_1",
+            "delta" => "{\"text\":\"hello\"}"
+          }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_hl",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_1",
+                    "call_id" => "call_1",
+                    "name" => "echo",
+                    "arguments" => "{\"text\":\"hello\"}"
+                  }
+                ],
+                "usage" => %{"input_tokens" => 2, "output_tokens" => 2}
+              }
+            })
+        )
+
+      {:ok, %{messages: [assistant_msg]}} =
+        OpenAI.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "sk-oai",
+            model: "gpt-5.4",
+            req_options: [plug: headerless_plug],
+            on_event: &send(parent, {:hl_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      assert [%{type: "tool_use", id: "call_1", name: "echo", input: %{"text" => "hello"}}] =
+               assistant_msg.content
+
+      hl_deltas =
+        drain_tagged(:hl_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.all?(hl_deltas, &(&1.id == "call_1" and &1.name == "echo"))
+      assert Enum.any?(hl_deltas, &(&1.arguments_delta == "{\"text\":\"hello\"}"))
+
+      # 3. Anthropic: empty tool_use id suppresses :tool_call_delta and still retries on overloaded_error.
+      ant_attempts = :atomics.new(1, signed: false)
+
+      ant_empty_id_plug = fn conn ->
+        n = :atomics.add_get(ant_attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            sse_ant("message_start", %{
+              "type" => "message_start",
+              "message" => %{
+                "id" => "m1",
+                "role" => "assistant",
+                "usage" => %{"input_tokens" => 1}
+              }
+            }) <>
+              sse_ant("content_block_start", %{
+                "type" => "content_block_start",
+                "index" => 0,
+                "content_block" => %{
+                  "type" => "tool_use",
+                  "id" => "",
+                  "name" => "echo",
+                  "input" => %{}
+                }
+              }) <>
+              sse_ant("content_block_delta", %{
+                "type" => "content_block_delta",
+                "index" => 0,
+                "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"text\":\"x\"}"}
+              }) <>
+              sse_ant("error", %{
+                "type" => "error",
+                "error" => %{"type" => "overloaded_error", "message" => "busy"}
+              })
+          else
+            sse_ant("message_start", %{
+              "type" => "message_start",
+              "message" => %{
+                "id" => "m2",
+                "role" => "assistant",
+                "usage" => %{"input_tokens" => 1}
+              }
+            }) <>
+              sse_ant("content_block_start", %{
+                "type" => "content_block_start",
+                "index" => 0,
+                "content_block" => %{"type" => "text", "text" => ""}
+              }) <>
+              sse_ant("content_block_delta", %{
+                "type" => "content_block_delta",
+                "index" => 0,
+                "delta" => %{"type" => "text_delta", "text" => "recovered"}
+              }) <>
+              sse_ant("content_block_stop", %{"type" => "content_block_stop", "index" => 0}) <>
+              sse_ant("message_delta", %{
+                "type" => "message_delta",
+                "delta" => %{"stop_reason" => "end_turn"},
+                "usage" => %{"output_tokens" => 1}
+              }) <>
+              sse_ant("message_stop", %{"type" => "message_stop"})
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "recovered"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {Anthropic,
+                    api_key: "sk-ant",
+                    model: "claude-sonnet-4-6",
+                    req_options: [plug: ant_empty_id_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0,
+                 on_event: &send(parent, {:ant_bad_ev, &1})
+               )
+
+      assert :atomics.get(ant_attempts, 1) == 2
+      refute Enum.any?(drain_tagged(:ant_bad_ev), &(&1.event == :tool_call_delta))
+
+      # 4. Gemini extra_body["generationConfig"]["thinking_config"] prevents duplicate thinkingConfig.
+      gem_capture = fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:gem_body, Jason.decode!(raw)})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "candidates" => [
+              %{"content" => %{"parts" => [%{"text" => "ok"}]}, "finishReason" => "STOP"}
+            ],
+            "usageMetadata" => %{"promptTokenCount" => 1, "candidatesTokenCount" => 1}
+          })
+        )
+      end
+
+      assert {:ok, _} =
+               Gemini.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "sk-gem",
+                   model: "gemini-2.5-flash",
+                   reasoning: :high,
+                   extra_body: %{
+                     "generationConfig" => %{"thinking_config" => %{"thinkingBudget" => 512}}
+                   },
+                   req_options: [plug: gem_capture]
+                 }
+               )
+
+      assert_received {:gem_body, %{"generationConfig" => gem_gen_cfg}}
+      refute Map.has_key?(gem_gen_cfg, "thinkingConfig")
+      assert gem_gen_cfg["thinking_config"] == %{"thinkingBudget" => 512}
+
+      # 5. Executor prioritizes terminal timeout over a burst of 150 queued updates with slow :on_event.
+      burst_tool = %Inline{
+        name: "burst",
+        description: "Emits 150 updates then hangs",
+        input_schema: %{type: "object", properties: %{}},
+        execute: fn _input, context ->
+          fun = Map.fetch!(context, :on_tool_update)
+          Enum.each(1..150, fn i -> fun.("u-#{i}") end)
+          Process.sleep(5_000)
+          {:ok, "never"}
+        end
+      }
+
+      {:ok, burst_pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "c_burst", name: "burst", input: %{}}]),
+          TestProvider.text_response("done")
+        ])
+
+      burst_started = System.monotonic_time(:millisecond)
+
+      assert {:ok, _} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: burst_pid},
+                 tools: [burst_tool],
+                 tool_timeout: 40,
+                 timeout_ms: 500,
+                 on_event: fn
+                   %{event: :tool_update} = ev ->
+                     send(parent, {:burst_ev, ev})
+                     Process.sleep(10)
+
+                   ev ->
+                     send(parent, {:burst_ev, ev})
+                 end
+               )
+
+      burst_elapsed = System.monotonic_time(:millisecond) - burst_started
+      assert burst_elapsed < 350
+      burst_updates = Enum.filter(drain_tagged(:burst_ev), &(&1.event == :tool_update))
+      assert length(burst_updates) < 50
+
+      # 6. Unsubscribed Alloy.stream/3 still fires [:alloy, :event] :text_delta telemetry.
+      tel_handler = "slice2-text-delta-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        tel_handler,
+        [:alloy, :event],
+        fn _ev, _m, meta, _ ->
+          if meta.event == :text_delta, do: send(parent, {:tel_text_delta, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(tel_handler) end)
+
+      ok_oai_plug =
+        sse_plug(
+          sse_oai("response.output_text.delta", %{
+            "type" => "response.output_text.delta",
+            "delta" => "hello"
+          }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_tel",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "message",
+                    "role" => "assistant",
+                    "content" => [%{"type" => "output_text", "text" => "hello"}]
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      assert {:ok, %{text: "hello"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI, api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: ok_oai_plug]}
+               )
+
+      assert_received {:tel_text_delta, %{event: :text_delta, turn: 1}}
     end
   end
 
