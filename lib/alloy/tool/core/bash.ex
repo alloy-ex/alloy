@@ -469,6 +469,15 @@ defmodule Alloy.Tool.Core.Bash do
       end
 
       true
+  catch
+    :throw, value ->
+      exit({:shutdown, {:callback_exit, Sanitize.exit_summary({:nocatch, value}, :redact)}})
+
+    :exit, :normal ->
+      exit(:normal)
+
+    :exit, reason ->
+      exit({:shutdown, {:callback_exit, Sanitize.exit_summary(reason, :redact)}})
   end
 
   defp dispatch_bash_on_output(nil, _data), do: :ok
@@ -533,9 +542,17 @@ defmodule Alloy.Tool.Core.Bash do
 
   defp log_output_worker_exit(:normal), do: :ok
 
+  defp log_output_worker_exit({:shutdown, {:callback_exit, summary}}) when is_binary(summary) do
+    Logger.warning(
+      "[Alloy.Tool.Core.Bash] :bash_on_output callback worker exited (#{summary}); command continues without further callback output."
+    )
+
+    :ok
+  end
+
   defp log_output_worker_exit(reason) do
     Logger.warning(
-      "[Alloy.Tool.Core.Bash] :bash_on_output callback worker exited (#{Sanitize.exit_summary(reason)}); command continues without further callback output."
+      "[Alloy.Tool.Core.Bash] :bash_on_output callback worker exited (#{Sanitize.exit_summary(reason, :redact)}); command continues without further callback output."
     )
 
     :ok

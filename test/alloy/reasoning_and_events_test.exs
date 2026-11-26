@@ -272,6 +272,21 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert body3["thinking"] == %{"type" => "enabled", "budget_tokens" => 4096}
       assert body3["output_config"]["effort"] == "low"
 
+      # Thinking-only extra_body suppresses portable :reasoning completely (no leaked output_config.effort)
+      assert {:ok, _} =
+               Anthropic.complete(
+                 [Message.user("hi")],
+                 [],
+                 Map.merge(base, %{
+                   reasoning: :high,
+                   extra_body: %{"thinking" => %{"type" => "enabled", "budget_tokens" => 2048}}
+                 })
+               )
+
+      assert_received {:ant_body, body_thinking_only}
+      assert body_thinking_only["thinking"] == %{"type" => "enabled", "budget_tokens" => 2048}
+      refute Map.has_key?(body_thinking_only, "output_config")
+
       # Invalid :reasoning fails before auth callback runs
       key_calls = :atomics.new(1, signed: false)
 
@@ -2506,8 +2521,10 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert Enum.all?(pref_deltas, &(&1.id == "call_pref" and &1.name == "echo"))
       assert Enum.map_join(pref_deltas, & &1.arguments_delta) == "{\"x\":1}"
 
-      # 3. Bash: callback worker exiting via throw logs the real exit reason (not backpressure)
-      #    while the command still completes cleanly, and Port.open failure cleans up output worker.
+      # 3. Bash: callback worker exiting via throw logs a sanitized exit reason (never leaking
+      #    raw thrown payloads via BEAM crash reports) while the command completes cleanly.
+      secret_sentinel = "sk-fake-secret-for-bash-throw-test"
+
       log =
         capture_log(fn ->
           assert {:ok, out} =
@@ -2516,7 +2533,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                      %{
                        bash_restricted: false,
                        bash_on_output: fn _chunk ->
-                         throw(:abort_callback)
+                         throw({:abort_callback, secret_sentinel})
                        end
                      }
                    )
@@ -2526,9 +2543,12 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert log =~ "callback worker exited"
       refute log =~ "backpressure queue limit reached"
+      refute log =~ secret_sentinel
 
-      # 4. Bash: callback worker exiting during post-exit flush also logs abnormal exit while
-      #    preserving exit code 0.
+      # 4. Bash: callback worker exiting during post-exit flush also logs sanitized exit without
+      #    leaking raw thrown payloads while preserving exit code 0.
+      flush_secret = "sk-fake-secret-for-flush-throw-test"
+
       flush_log =
         capture_log(fn ->
           assert {:ok, flush_out} =
@@ -2538,7 +2558,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                        bash_restricted: false,
                        bash_on_output: fn _chunk ->
                          Process.sleep(30)
-                         throw(:flush_boom)
+                         throw({:flush_boom, flush_secret})
                        end
                      }
                    )
@@ -2548,6 +2568,7 @@ defmodule Alloy.ReasoningAndEventsTest do
         end)
 
       assert flush_log =~ "callback worker exited"
+      refute flush_log =~ flush_secret
     end
 
     test "whole-item Responses tool call args, sticky rejected header, provider-level on_event telemetry, and atom-key Gemini extra_body" do
@@ -4925,6 +4946,10 @@ defmodule Alloy.ReasoningAndEventsTest do
             {~S({"x":"\uD83D\uDE), %{"x" => "😀"}},
             {~S({"x":1e), %{"x" => 100}},
             {~S({"x":1e+), %{"x" => 100}},
+            {~S({"x":1e+0), %{"x" => 100}},
+            {~S({"x":1e00), %{"x" => 100}},
+            {~S({"x":1e-0), %{"x" => 0.01}},
+            {~S({"x":0.1e), %{"x" => 1.0e308}},
             {~S({"x":1.5E-), %{"x" => 0.015}},
             {~S({"x":0e+), %{"x" => 0}},
             {~S({"x":1.), %{"x" => 1}},

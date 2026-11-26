@@ -1122,39 +1122,57 @@ defmodule Alloy.Provider.OpenAI do
 
   defp match_exponent_suffix(token, mantissa, exp_prefix, expected)
        when mantissa != 0 and expected != 0 do
-    if mantissa > 0 == expected > 0 do
-      exp = round(:math.log10(abs(expected / mantissa)))
-      candidates = exponent_candidates(exp)
-
-      Enum.find_value(candidates, :error, fn full_exp ->
-        try_exponent_candidate(token, exp_prefix, full_exp, expected)
-      end)
+    with true <- mantissa > 0 == expected > 0,
+         {:ok, exp} <- safe_log10_exponent(expected, mantissa),
+         {:ok, tail} <- complete_exponent_prefix(exp_prefix, exp),
+         {:ok, num} when is_number(num) and num == expected <- Jason.decode(token <> tail) do
+      {:suffix, tail}
     else
-      :error
+      _ -> :error
     end
   end
 
   defp match_exponent_suffix(_token, _mantissa, _exp_prefix, _expected), do: :error
 
-  defp try_exponent_candidate(token, exp_prefix, full_exp, expected) do
-    if String.starts_with?(full_exp, exp_prefix) do
-      tail =
-        binary_part(full_exp, byte_size(exp_prefix), byte_size(full_exp) - byte_size(exp_prefix))
+  # Compute log10(|expected| / |mantissa|) as log10(|expected|) - log10(|mantissa|)
+  # so large values like 1.0e308 / 0.1 never overflow IEEE-754 before log10 runs.
+  defp safe_log10_exponent(expected, mantissa) do
+    {:ok, round(:math.log10(abs(expected)) - :math.log10(abs(mantissa)))}
+  rescue
+    ArithmeticError -> :error
+  end
 
-      case Jason.decode(token <> tail) do
-        {:ok, num} when is_number(num) and num == expected -> {:suffix, tail}
-        _ -> nil
+  defp complete_exponent_prefix("", exp), do: {:ok, Integer.to_string(exp)}
+
+  defp complete_exponent_prefix(<<?+, digits::binary>>, exp) when exp >= 0,
+    do: complete_exponent_digits(digits, exp)
+
+  defp complete_exponent_prefix(<<?-, digits::binary>>, exp) when exp <= 0,
+    do: complete_exponent_digits(digits, abs(exp))
+
+  defp complete_exponent_prefix(digits, exp) when exp >= 0,
+    do: complete_exponent_digits(digits, exp)
+
+  defp complete_exponent_prefix(_exp_prefix, _exp), do: :error
+
+  defp complete_exponent_digits(digits, abs_exp) do
+    if all_digits?(digits) do
+      trimmed = String.trim_leading(digits, "0")
+      abs_str = Integer.to_string(abs_exp)
+
+      if String.starts_with?(abs_str, trimmed) do
+        {:ok, binary_part(abs_str, byte_size(trimmed), byte_size(abs_str) - byte_size(trimmed))}
+      else
+        :error
       end
+    else
+      :error
     end
   end
 
-  defp exponent_candidates(exp) when exp > 0 do
-    s = Integer.to_string(exp)
-    [s, "+" <> s]
-  end
-
-  defp exponent_candidates(0), do: ["0", "+0", "-0"]
-  defp exponent_candidates(exp) when exp < 0, do: [Integer.to_string(exp)]
+  defp all_digits?(<<>>), do: true
+  defp all_digits?(<<c, rest::binary>>) when c in ?0..?9, do: all_digits?(rest)
+  defp all_digits?(_), do: false
 
   defp take_number_token(bin, len) do
     case bin do

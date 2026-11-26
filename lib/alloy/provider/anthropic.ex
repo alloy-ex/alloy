@@ -690,29 +690,34 @@ defmodule Alloy.Provider.Anthropic do
         client_tools ++
           code_execution_tools(config) ++ search_tools ++ extra_server_tools
 
+      extra_body = HTTP.stringify_extra_body(Map.get(config, :extra_body, %{}))
+
       body =
         body
         |> HTTP.maybe_put_unless_empty_list("tools", tools)
         |> maybe_put_container(config)
         |> maybe_put_output_schema(config)
-        |> maybe_put_reasoning(reasoning)
+        |> maybe_put_reasoning(reasoning, extra_body)
 
-      {:ok,
-       HTTP.merge_extra_body(
-         body,
-         HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
-         "output_config"
-       )}
+      {:ok, HTTP.merge_extra_body(body, extra_body, "output_config")}
     end
   end
 
-  defp maybe_put_reasoning(body, nil), do: body
+  defp maybe_put_reasoning(body, nil, _extra_body), do: body
 
-  defp maybe_put_reasoning(body, %{effort: :off}) do
+  defp maybe_put_reasoning(body, reasoning, extra_body) do
+    if Map.has_key?(extra_body, "thinking") do
+      body
+    else
+      put_reasoning_fields(body, reasoning)
+    end
+  end
+
+  defp put_reasoning_fields(body, %{effort: :off}) do
     Map.put(body, "thinking", %{"type" => "disabled"})
   end
 
-  defp maybe_put_reasoning(body, %{effort: effort, display: display}) do
+  defp put_reasoning_fields(body, %{effort: effort, display: display}) do
     thinking =
       %{"type" => "adaptive"}
       |> HTTP.maybe_put("display", anthropic_reasoning_display(display))
