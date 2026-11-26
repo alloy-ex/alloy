@@ -540,8 +540,9 @@ defmodule Alloy.Provider.Anthropic do
     if Map.get(block, :is_error), do: Map.put(result, "is_error", true), else: result
   end
 
-  defp format_content_block(%{type: "server_tool_use", id: id, name: name, input: input}) do
+  defp format_content_block(%{type: "server_tool_use", id: id, name: name, input: input} = block) do
     %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input}
+    |> maybe_put("caller", block[:caller])
   end
 
   defp format_content_block(%{type: "image", mime_type: mime_type, data: data}) do
@@ -704,13 +705,13 @@ defmodule Alloy.Provider.Anthropic do
     |> maybe_put(:caller, block["caller"])
   end
 
-  defp parse_content_block(%{
-         "type" => "server_tool_use",
-         "id" => id,
-         "name" => name,
-         "input" => input
-       }) do
+  # A server tool called from code execution (such as web_search_20260209
+  # filtering its results) has a `caller` that must go back with the history.
+  defp parse_content_block(
+         %{"type" => "server_tool_use", "id" => id, "name" => name, "input" => input} = block
+       ) do
     %{type: "server_tool_use", id: id, name: name, input: input}
+    |> maybe_put(:caller, block["caller"])
   end
 
   defp parse_content_block(block) do

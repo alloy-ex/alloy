@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Anthropic keeps the `caller` of a `server_tool_use` block and sends it back
+  with the history. Searches that `web_search_20260209` runs from code to
+  filter its results lost it, and the API then rejected the following request.
+
 ## [0.13.0] - 2026-10-14
 
 ### Changed
