@@ -1107,8 +1107,40 @@ defmodule Alloy.Provider.OpenAI do
 
   defp complete_mantissa_token(token, expected) do
     with :error <- try_decimal_prefix_completion(token, expected),
-         :error <- try_direct_exponent_completion(token, expected) do
-      try_mantissa_exponent_completion(token, expected)
+         :error <- try_direct_exponent_completion(token, expected),
+         :error <- try_mantissa_exponent_completion(token, expected) do
+      try_rounding_boundary_completion(token, expected)
+    end
+  end
+
+  # Handles IEEE-754 rounding-equivalent decimal prefixes whose upper/lower
+  # digit boundary rounds to `expected` (e.g. "0.29" from "0.29999999999999999"
+  # when the decoded map/normalized float is 0.3).
+  defp try_rounding_boundary_completion(token, expected) do
+    nines = String.duplicate("9", 20)
+
+    tail =
+      cond do
+        String.contains?(token, ".") -> nines
+        is_float(expected) -> "." <> nines
+        true -> nil
+      end
+
+    if is_binary(tail) do
+      candidate = token <> tail
+
+      case Jason.decode(candidate) do
+        {:ok, num} when is_number(num) and num == expected ->
+          {:suffix, tail}
+
+        _ ->
+          case complete_exponent_number(candidate <> "e", expected) do
+            {:suffix, exp_tail} -> {:suffix, tail <> "e" <> exp_tail}
+            :error -> :error
+          end
+      end
+    else
+      :error
     end
   end
 

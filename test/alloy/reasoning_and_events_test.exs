@@ -4957,6 +4957,10 @@ defmodule Alloy.ReasoningAndEventsTest do
             {~S({"x":0), %{"x" => 123}},
             {~S({"x":0.00), %{"x" => 0.00001}},
             {~S({"x":0.00000), %{"x" => 1.0e-10}},
+            {~S({"x":0.29), %{"x" => 0.3}},
+            {~S({"x":-0.29), %{"x" => -0.3}},
+            {~S({"x":0.29), %{"x" => 3.0}},
+            {~S({"x":2), %{"x" => 3.0}},
             {~S({"x":-), %{"x" => 0}},
             {~S({"x":-), %{"x" => -42}},
             {~S({"x":1.5E-), %{"x" => 0.015}},
@@ -5203,12 +5207,15 @@ defmodule Alloy.ReasoningAndEventsTest do
       fuzz_spellings = [
         ~S({"z": 0.0000000001, "a": 1.2e3}),
         ~S({"n": 1.2345E+04, "neg": -0.015, "zero": -0.0}),
+        ~S({"r": 0.29999999999999999, "nr": -0.29999999999999999, "t": 2.99999999999999999}),
         ~S({"s": "a\/\u00e9\n\t\uD83D\uDE00", "b": true, "c": null}),
         ~S({"arr": [0.00001, 1200, {"y": 1.5e-2, "x": false}]})
       ]
 
-      for raw_json <- fuzz_spellings do
+      for raw_json <- fuzz_spellings,
+          terminal_kind <- [:map, :normalized_json] do
         expected = Jason.decode!(raw_json)
+        terminal_args = if terminal_kind == :map, do: expected, else: Jason.encode!(expected)
         graphemes = String.graphemes(raw_json)
 
         for cut <- 1..(length(graphemes) - 1) do
@@ -5238,7 +5245,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                         "id" => "fc_fuzz",
                         "call_id" => "call_fuzz",
                         "name" => "echo",
-                        "arguments" => expected
+                        "arguments" => terminal_args
                       }
                     ],
                     "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
