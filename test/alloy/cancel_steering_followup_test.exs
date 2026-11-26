@@ -4,7 +4,7 @@ defmodule Alloy.CancelSteeringFollowUpTest do
   alias Alloy.Agent.{Config, State}
   alias Alloy.{Cancel, Message, Result, Tool, Transcript}
   alias Alloy.Context.Compactor
-  alias Alloy.Provider.{Anthropic, Codex, Error, OpenAI}
+  alias Alloy.Provider.{Anthropic, Codex, Error, OpenAI, OpenAICompat}
   alias Alloy.Provider.Test, as: TestProvider
 
   defmodule BlockingAdapter do
@@ -77,6 +77,43 @@ defmodule Alloy.CancelSteeringFollowUpTest do
     @impl true
     def call(:after_tool_execution, _state), do: {:halt, "stop after tool"}
     def call(_hook, state), do: state
+  end
+
+  defmodule CancelAndHaltAtHookMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(hook, state) do
+      if state.config.context[:cancel_at_hook] == hook do
+        Cancel.cancel(state.config.cancel_token)
+        {:halt, "host halted at #{hook}"}
+      else
+        state
+      end
+    end
+  end
+
+  defmodule CustomStatusCancelledMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(hook, state) do
+      if state.config.context[:status_cancel_at_hook] == hook do
+        %{state | status: :cancelled}
+      else
+        state
+      end
+    end
+  end
+
+  defmodule MustNotRunMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(hook, state) do
+      if pid = state.config.context[:test_pid], do: send(pid, {:second_middleware_ran, hook})
+      state
+    end
   end
 
   defmodule CancelEmptySummaryProvider do
@@ -383,6 +420,34 @@ defmodule Alloy.CancelSteeringFollowUpTest do
       assert_receive {:http_worker_started, _pid}, 1_000
       assert drain_tagged(:multi_chunk) == ["one"]
       assert drain_mailbox() == []
+
+      # 3. OpenAICompat.stream/4 forwards :cancel_token through OpenAIStream.stream/6 under :infinity
+      token3 = Cancel.new()
+      probe_id3 = register_probe(parent)
+
+      task3 =
+        Task.async(fn ->
+          Alloy.stream(
+            "hi",
+            fn _ -> :ok end,
+            provider:
+              {OpenAICompat,
+               api_url: "https://compat.test/v1",
+               api_key: "sk-compat",
+               model: "compat-model",
+               extra_headers: [{"x-probe-id", probe_id3}],
+               req_options: [adapter: BlockingAdapter]},
+            timeout_ms: :infinity,
+            cancel_token: token3
+          )
+        end)
+
+      assert_receive {:http_worker_started, compat_worker}, 2_000
+      compat_mon = Process.monitor(compat_worker)
+      Cancel.cancel(token3)
+
+      assert {:error, %Result{status: :cancelled, error: :cancelled}} = Task.await(task3, 2_000)
+      assert_receive {:DOWN, ^compat_mon, :process, ^compat_worker, _}, 1_000
     end
 
     test "cancels blocked dynamic :api_key callback promptly" do
@@ -812,6 +877,160 @@ defmodule Alloy.CancelSteeringFollowUpTest do
       refute_received :on_error_ran
     end
 
+    test "cancelling during a :running :turn_end callback emits terminal :turn_end :cancelled" do
+      parent = self()
+      token = Cancel.new()
+
+      tool =
+        Tool.inline(
+          name: "quick",
+          description: "quick",
+          input_schema: %{type: "object", properties: %{}, required: []},
+          execute: fn _, _ -> {:ok, "ok"} end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "q1", name: "quick", input: %{}}]),
+          TestProvider.text_response("should never run")
+        ])
+
+      assert {:error, %Result{status: :cancelled, error: :cancelled, turns: 1}} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [tool],
+                 cancel_token: token,
+                 on_event: fn ev ->
+                   send(parent, {:te_ev, ev})
+
+                   if ev.event == :turn_end and ev.turn == 1 and ev.payload.status == :running do
+                     Cancel.cancel(token)
+                   end
+                 end
+               )
+
+      turn_ends =
+        drain_tagged(:te_ev)
+        |> Enum.filter(&(&1.event == :turn_end))
+
+      assert [
+               %{turn: 1, payload: %{status: :running, stop_reason: :tool_use}},
+               %{turn: 2, payload: %{status: :cancelled, stop_reason: nil}}
+             ] = turn_ends
+
+      assert length(Agent.get(pid, & &1)) == 1
+    end
+
+    test "cancellation takes precedence over middleware halts, short-circuits later middleware, and normalizes status: :cancelled" do
+      parent = self()
+
+      tool =
+        Tool.inline(
+          name: "m_tool",
+          description: "m",
+          input_schema: %{type: "object", properties: %{}, required: []},
+          execute: fn _, _ -> {:ok, "done"} end
+        )
+
+      for hook <- [
+            :before_completion,
+            :after_tool_request,
+            :before_tool_call,
+            :after_tool_execution,
+            :after_completion
+          ] do
+        token = Cancel.new()
+
+        responses =
+          if hook in [:before_completion, :after_completion] do
+            [TestProvider.text_response("ok")]
+          else
+            [
+              TestProvider.tool_use_response([%{id: "mt1", name: "m_tool", input: %{}}]),
+              TestProvider.text_response("turn 2")
+            ]
+          end
+
+        {:ok, pid} = TestProvider.start_link(responses)
+
+        opts = [
+          provider: {TestProvider, agent_pid: pid},
+          tools: [tool],
+          middleware: [CancelAndHaltAtHookMiddleware, MustNotRunMiddleware],
+          context: %{cancel_at_hook: hook, test_pid: parent},
+          cancel_token: token
+        ]
+
+        opts =
+          if hook == :after_tool_execution,
+            do: Keyword.put(opts, :steering, fn _ -> [Message.user("steered before cancel")] end),
+            else: opts
+
+        assert {:error, %Result{status: :cancelled, error: :cancelled} = res} =
+                 Alloy.run("go", opts)
+
+        refute_received {:second_middleware_ran, ^hook}
+        _ = drain_tagged(:second_middleware_ran)
+        assert :ok == Transcript.validate(res.messages)
+
+        if hook == :after_tool_execution do
+          assert List.last(res.messages) == Message.user("steered before cancel")
+        end
+      end
+
+      # Custom middleware setting status: :cancelled without error: is normalized to error: :cancelled
+      # and :after_tool_request writes "Not executed: Cancelled" tool_result blocks.
+      {:ok, pid_custom} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "ct1", name: "m_tool", input: %{}}])
+        ])
+
+      assert {:error, %Result{status: :cancelled, error: :cancelled} = custom_res} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid_custom},
+                 tools: [tool],
+                 middleware: [CustomStatusCancelledMiddleware, MustNotRunMiddleware],
+                 context: %{status_cancel_at_hook: :after_tool_request, test_pid: parent}
+               )
+
+      refute_received {:second_middleware_ran, :after_tool_request}
+      assert :ok == Transcript.validate(custom_res.messages)
+
+      assert [%{tool_use_id: "ct1", content: "Not executed: Cancelled", is_error: true}] =
+               custom_res.messages |> List.last() |> Map.fetch!(:content)
+    end
+
+    test "pre-cancelled Compactor.maybe_compact/2 and force_compact/2 on short :noop history preserve verbatim messages" do
+      token = Cancel.new()
+      Cancel.cancel(token)
+
+      short_history = [
+        Message.user(String.duplicate("big prompt ", 200)),
+        %Message{
+          role: :assistant,
+          content: [
+            %{type: "thinking", thinking: "must stay", signature: "sig"},
+            %{type: "text", text: String.duplicate("reply ", 200)}
+          ]
+        }
+      ]
+
+      cfg =
+        Config.from_opts(
+          provider: {TestProvider, []},
+          max_tokens: 200,
+          compaction: [reserve_tokens: 50, keep_recent_tokens: 50],
+          cancel_token: token
+        )
+
+      st = State.init(cfg, short_history)
+
+      assert {:unchanged, %State{status: :cancelled, messages: ^short_history}} =
+               Compactor.maybe_compact(st)
+
+      assert %State{status: :cancelled, messages: ^short_history} = Compactor.force_compact(st)
+    end
+
     test "cancels CodexRunner subprocess cleanly, removes temp dir, and annotates resumed sessions" do
       tmp_root =
         Path.join(System.tmp_dir!(), "alloy-cancel-codex-#{System.unique_integer([:positive])}")
@@ -1113,7 +1332,41 @@ defmodule Alloy.CancelSteeringFollowUpTest do
             fn _ -> [%Message{role: :user, content: nil}] end,
             fn _ -> [%Message{role: :user, content: []}] end,
             fn _ -> [%Message{role: :user, content: [Message.user("nested")]}] end,
+            fn _ ->
+              [
+                %Message{
+                  role: :assistant,
+                  content: [%{type: "text", text: %{secret: "sk-fu-map-secret"}}]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :assistant,
+                  content: [%{type: "thinking", thinking: 42}]
+                }
+              ]
+            end,
+            fn _ -> [%Message{role: :user, content: [%{type: "image"}]}] end,
             fn _ -> [%Message{role: :assistant, content: [%URI{}]}] end,
+            fn _ ->
+              [
+                %Message{
+                  role: :assistant,
+                  content: [%{type: "text", text: %{secret: "sk-map-secret"}}]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :assistant,
+                  content: [%{type: "thinking", thinking: %{secret: "sk-map-secret"}}]
+                }
+              ]
+            end,
+            fn _ -> [%Message{role: :user, content: [%{type: "unknown_block"}]}] end,
             fn _ ->
               [
                 %Message{
@@ -1149,7 +1402,13 @@ defmodule Alloy.CancelSteeringFollowUpTest do
         assert err =~ "steering callback"
         serialized = inspect(result.messages)
 
-        for secret <- ["sk-secret-raw-string", "sk-runtime-secret", "sk-leak-999", "sk-throw-999"] do
+        for secret <- [
+              "sk-secret-raw-string",
+              "sk-runtime-secret",
+              "sk-leak-999",
+              "sk-throw-999",
+              "sk-map-secret"
+            ] do
           refute err =~ secret
           refute serialized =~ secret
         end
@@ -1556,6 +1815,23 @@ defmodule Alloy.CancelSteeringFollowUpTest do
               [
                 %Message{
                   role: :assistant,
+                  content: [%{type: "text", text: %{secret: "sk-fu-map-secret"}}]
+                }
+              ]
+            end,
+            fn _ ->
+              [
+                %Message{
+                  role: :assistant,
+                  content: [%{type: "thinking", thinking: 42}]
+                }
+              ]
+            end,
+            fn _ -> [%Message{role: :user, content: [%{type: "image"}]}] end,
+            fn _ ->
+              [
+                %Message{
+                  role: :assistant,
                   content: [%{type: "tool_use", id: "fu_unanswered", name: "t", input: %{}}]
                 }
               ]
@@ -1579,7 +1855,13 @@ defmodule Alloy.CancelSteeringFollowUpTest do
         assert err =~ "follow_up callback"
         assert :ok == Transcript.validate(bad_res.messages)
 
-        for secret <- ["sk-fu-secret", "sk-fu-runtime", "sk-fu-match", "sk-fu-exit"] do
+        for secret <- [
+              "sk-fu-secret",
+              "sk-fu-runtime",
+              "sk-fu-match",
+              "sk-fu-exit",
+              "sk-fu-map-secret"
+            ] do
           refute err =~ secret
         end
       end

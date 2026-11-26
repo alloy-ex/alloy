@@ -282,7 +282,11 @@ defmodule Alloy.Provider.HTTP do
 
         case await_monitored_post(owner, deadline, cancel_token) do
           {:ok, result} ->
-            result
+            maybe_override_cancelled(
+              result,
+              cancel_token,
+              "Request cancelled while resolving :api_key"
+            )
 
           :cancelled ->
             cancelled_error("Request cancelled while resolving :api_key")

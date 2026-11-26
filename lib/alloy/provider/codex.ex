@@ -201,10 +201,21 @@ defmodule Alloy.Provider.Codex do
            :ok <- finish_stream(result, command_result, config) do
         {:ok, remember_session(result, messages, scope, plan, command_result)}
       end
+      |> maybe_cancel_codex_error(config)
       |> session_result(plan)
     end
     |> to_provider_error()
   end
+
+  defp maybe_cancel_codex_error({:error, %Error{kind: :cancelled}} = err, _config), do: err
+
+  defp maybe_cancel_codex_error({:error, _reason} = err, config) do
+    if Alloy.Cancel.cancelled?(Map.get(config, :alloy_cancel_token)),
+      do: {:error, %Error{kind: :cancelled, message: "codex exec cancelled"}},
+      else: err
+  end
+
+  defp maybe_cancel_codex_error(ok, _config), do: ok
 
   defp session_result({:error, %Error{kind: :shutdown} = error}, {:resume, _id, _count}) do
     {:error,

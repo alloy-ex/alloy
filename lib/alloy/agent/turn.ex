@@ -135,7 +135,7 @@ defmodule Alloy.Agent.Turn do
 
   defp loop(%State{turn: turn, config: config} = state, opts) do
     cond do
-      Cancel.cancelled?(config.cancel_token) ->
+      turn == 0 and Cancel.cancelled?(config.cancel_token) ->
         cancel_state(state)
 
       turn >= config.max_turns ->
@@ -530,9 +530,16 @@ defmodule Alloy.Agent.Turn do
   # compaction whose summary request was already billed.
   defp run_middleware(hook, %State{} = state) do
     case Middleware.run_hook(hook, state) do
-      {:halted, reason, halted} -> {:halt, halt(halted, reason)}
-      %State{status: :cancelled} = cancelled -> {:halt, cancelled}
-      %State{} = state -> {:continue, state}
+      {:halted, reason, halted} ->
+        if halted.status == :cancelled or Cancel.cancelled?(halted.config.cancel_token),
+          do: {:halt, cancel_state(halted)},
+          else: {:halt, halt(halted, reason)}
+
+      %State{status: :cancelled} = cancelled ->
+        {:halt, cancel_state(cancelled)}
+
+      %State{} = state ->
+        {:continue, state}
     end
   end
 
@@ -630,6 +637,9 @@ defmodule Alloy.Agent.Turn do
               do: {:halt, cancel_tool_calls(state, tool_calls)},
               else: execute_tools(state, tool_calls, prepared_schemas, opts)
 
+          {:halt, %State{status: :cancelled} = cancelled} ->
+            {:halt, cancel_tool_calls(cancelled, tool_calls)}
+
           {:halt, state} ->
             {:halt, answer_tool_calls(state, tool_calls, [])}
         end
@@ -643,7 +653,9 @@ defmodule Alloy.Agent.Turn do
 
     case run_executor(tool_calls, state, schemas, opts) do
       {:halted, reason} ->
-        {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, [])}
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:halt, cancel_tool_calls(state, tool_calls)},
+          else: {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, [])}
 
       {:steering_error, result_blocks, tool_call_meta, reason} ->
         failed =
@@ -1051,11 +1063,52 @@ defmodule Alloy.Agent.Turn do
   defp valid_callback_message?(%Message{role: role, content: content})
        when role in [:user, :assistant] do
     is_binary(content) or
-      (is_list(content) and content != [] and
-         Enum.all?(content, &(is_map(&1) and not is_struct(&1))))
+      (is_list(content) and content != [] and Enum.all?(content, &valid_callback_block?/1))
   end
 
   defp valid_callback_message?(_other), do: false
+
+  defp valid_callback_block?(block) when is_map(block) and not is_struct(block) do
+    case Map.get(block, :type) do
+      "text" -> is_binary(Map.get(block, :text))
+      "thinking" -> is_binary(Map.get(block, :thinking))
+      "redacted_thinking" -> is_binary(Map.get(block, :data))
+      "tool_use" -> valid_callback_tool_use?(block)
+      "tool_result" -> valid_callback_tool_result?(block)
+      "image" -> valid_callback_image?(block)
+      "document" -> valid_callback_document?(block)
+      _other -> false
+    end
+  end
+
+  defp valid_callback_block?(_other), do: false
+
+  defp valid_callback_tool_use?(block) do
+    id = Map.get(block, :id)
+    name = Map.get(block, :name)
+    input = Map.get(block, :input)
+
+    is_binary(id) and byte_size(id) > 0 and
+      is_binary(name) and byte_size(name) > 0 and
+      is_map(input) and not is_struct(input)
+  end
+
+  defp valid_callback_tool_result?(block) do
+    id = Map.get(block, :tool_use_id)
+    content = Map.get(block, :content)
+    is_binary(id) and byte_size(id) > 0 and is_binary(content)
+  end
+
+  defp valid_callback_image?(block) do
+    (is_binary(Map.get(block, :mime_type)) and is_binary(Map.get(block, :data))) or
+      is_binary(Map.get(block, :url))
+  end
+
+  defp valid_callback_document?(block) do
+    is_binary(Map.get(block, :mime_type)) and
+      (is_binary(Map.get(block, :data)) or is_binary(Map.get(block, :uri)) or
+         is_binary(Map.get(block, :file_id)))
+  end
 
   defp check_deadline(state) do
     if deadline_expired?(state),

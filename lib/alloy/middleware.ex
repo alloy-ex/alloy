@@ -29,6 +29,7 @@ defmodule Alloy.Middleware do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Cancel
   alias Alloy.Internal.Sanitize
 
   @type hook ::
@@ -88,33 +89,50 @@ defmodule Alloy.Middleware do
   @spec run_hook(hook(), State.t()) :: State.t() | {:halted, String.t(), State.t()}
   def run_hook(hook, %State{} = state) do
     Enum.reduce_while(state.config.middleware, state, fn middleware, acc ->
-      case middleware.call(hook, acc) do
-        {:halt, reason} when is_binary(reason) ->
-          {:halt, {:halted, reason, acc}}
-
-        {:halt, reason, %State{} = halted} when is_binary(reason) ->
-          {:halt, {:halted, reason, halted}}
-
-        %State{status: :cancelled} = cancelled ->
-          {:halt, cancelled}
-
-        %State{} = new_state ->
-          {:cont, new_state}
-
-        {:block, reason} ->
-          raise ArgumentError,
-                "#{inspect(middleware)} returned {:block, #{Sanitize.shape_summary(reason)}} " <>
-                  "from hook #{inspect(hook)}, but {:block, reason} is only valid for " <>
-                  "the :before_tool_call hook. Use {:halt, reason} to stop the agent loop."
-
-        other ->
-          raise ArgumentError,
-                "#{inspect(middleware)} returned unsupported value #{Sanitize.shape_summary(other)} " <>
-                  "from hook #{inspect(hook)}. Expected %Alloy.Agent.State{}, {:halt, reason}, " <>
-                  "or {:halt, reason, state}."
+      if acc.status == :cancelled or Cancel.cancelled?(acc.config.cancel_token) do
+        {:halt, cancel_middleware_state(acc)}
+      else
+        run_hook_step(middleware, hook, acc)
       end
     end)
   end
+
+  defp run_hook_step(middleware, hook, acc) do
+    case middleware.call(hook, acc) do
+      {:halt, reason} when is_binary(reason) ->
+        if Cancel.cancelled?(acc.config.cancel_token),
+          do: {:halt, cancel_middleware_state(acc)},
+          else: {:halt, {:halted, reason, acc}}
+
+      {:halt, reason, %State{} = halted} when is_binary(reason) ->
+        if halted.status == :cancelled or Cancel.cancelled?(halted.config.cancel_token),
+          do: {:halt, cancel_middleware_state(halted)},
+          else: {:halt, {:halted, reason, halted}}
+
+      %State{status: :cancelled} = cancelled ->
+        {:halt, cancel_middleware_state(cancelled)}
+
+      %State{} = new_state ->
+        if Cancel.cancelled?(new_state.config.cancel_token),
+          do: {:halt, cancel_middleware_state(new_state)},
+          else: {:cont, new_state}
+
+      {:block, reason} ->
+        raise ArgumentError,
+              "#{inspect(middleware)} returned {:block, #{Sanitize.shape_summary(reason)}} " <>
+                "from hook #{inspect(hook)}, but {:block, reason} is only valid for " <>
+                "the :before_tool_call hook. Use {:halt, reason} to stop the agent loop."
+
+      other ->
+        raise ArgumentError,
+              "#{inspect(middleware)} returned unsupported value #{Sanitize.shape_summary(other)} " <>
+                "from hook #{inspect(hook)}. Expected %Alloy.Agent.State{}, {:halt, reason}, " <>
+                "or {:halt, reason, state}."
+    end
+  end
+
+  defp cancel_middleware_state(%State{} = state),
+    do: %{state | status: :cancelled, error: :cancelled}
 
   @doc """
   Runs `:before_tool_call` middleware for a single tool call.
@@ -135,34 +153,53 @@ defmodule Alloy.Middleware do
     result =
       Enum.reduce_while(state.config.middleware, {:edit, tool_call}, fn middleware,
                                                                         {:edit, current} ->
-        updated_state = tool_state(state, current)
-
-        case middleware.call(:before_tool_call, updated_state) do
-          {:block, reason} when is_binary(reason) ->
-            {:halt, {:block, reason}}
-
-          {:halt, reason} when is_binary(reason) ->
-            {:halt, {:halted, reason}}
-
-          {:halt, reason, %State{}} when is_binary(reason) ->
-            {:halt, {:halted, reason}}
-
-          {:edit, modified_call} when is_map(modified_call) and not is_struct(modified_call) ->
-            validate_edit!(tool_call, modified_call)
-            {:cont, {:edit, modified_call}}
-
-          %State{} ->
-            {:cont, {:edit, current}}
-
-          other ->
-            raise ArgumentError,
-                  "#{inspect(middleware)} returned unsupported value #{Sanitize.shape_summary(other)} " <>
-                    "from :before_tool_call. Expected %Alloy.Agent.State{}, {:edit, call}, " <>
-                    "{:block, reason}, or {:halt, reason}."
+        if Cancel.cancelled?(state.config.cancel_token) do
+          {:halt, {:edit, current}}
+        else
+          run_before_tool_call_step(middleware, state, tool_call, current)
         end
       end)
 
     if result == {:edit, tool_call}, do: :ok, else: result
+  end
+
+  defp run_before_tool_call_step(middleware, state, tool_call, current) do
+    updated_state = tool_state(state, current)
+
+    case middleware.call(:before_tool_call, updated_state) do
+      {:block, reason} when is_binary(reason) ->
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:halt, {:edit, current}},
+          else: {:halt, {:block, reason}}
+
+      {:halt, reason} when is_binary(reason) ->
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:halt, {:edit, current}},
+          else: {:halt, {:halted, reason}}
+
+      {:halt, reason, %State{}} when is_binary(reason) ->
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:halt, {:edit, current}},
+          else: {:halt, {:halted, reason}}
+
+      {:edit, modified_call} when is_map(modified_call) and not is_struct(modified_call) ->
+        validate_edit!(tool_call, modified_call)
+
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:halt, {:edit, modified_call}},
+          else: {:cont, {:edit, modified_call}}
+
+      %State{} ->
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:halt, {:edit, current}},
+          else: {:cont, {:edit, current}}
+
+      other ->
+        raise ArgumentError,
+              "#{inspect(middleware)} returned unsupported value #{Sanitize.shape_summary(other)} " <>
+                "from :before_tool_call. Expected %Alloy.Agent.State{}, {:edit, call}, " <>
+                "{:block, reason}, or {:halt, reason}."
+    end
   end
 
   @doc """

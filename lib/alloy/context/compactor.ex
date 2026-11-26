@@ -285,10 +285,11 @@ defmodule Alloy.Context.Compactor do
   """
   @spec force_compact(State.t(), keyword()) :: State.t()
   def force_compact(%State{} = state, opts \\ []) do
+    original = State.messages(state)
+
     if Cancel.cancelled?(state.config.cancel_token) do
-      state
+      cancel_compaction_state(state, original, nil)
     else
-      original = State.messages(state)
       {_fits_estimate, messages} = maybe_clear_tool_results(original, state, opts)
 
       case summarize_or_fallback(state, messages, opts) do
@@ -296,7 +297,9 @@ defmodule Alloy.Context.Compactor do
           cancel_compaction_state(next_state, original, err)
 
         {:ok, next_state, compacted} ->
-          finalize(next_state, compacted, force_shrink?: compacted == original)
+          finalize_or_cancel(next_state, compacted, original,
+            force_shrink?: compacted == original
+          )
       end
     end
   end
@@ -329,7 +332,7 @@ defmodule Alloy.Context.Compactor do
 
     cond do
       Cancel.cancelled?(state.config.cancel_token) ->
-        {:unchanged, state}
+        {:unchanged, cancel_compaction_state(state, messages, nil)}
 
       Estimator.within_reserve?(messages, state) ->
         {:unchanged, state}
@@ -337,9 +340,16 @@ defmodule Alloy.Context.Compactor do
       true ->
         compacted = compact_messages_in_state(state, messages, opts)
 
-        if compacted.status == :cancelled or Cancel.cancelled?(compacted.config.cancel_token),
-          do: {:unchanged, compacted},
-          else: {:compacted, compacted}
+        cond do
+          compacted.status == :cancelled ->
+            {:unchanged, compacted}
+
+          Cancel.cancelled?(compacted.config.cancel_token) ->
+            {:unchanged, cancel_compaction_state(compacted, messages, nil)}
+
+          true ->
+            {:compacted, compacted}
+        end
     end
   end
 
@@ -369,15 +379,25 @@ defmodule Alloy.Context.Compactor do
 
     case maybe_clear_tool_results(messages, state, opts) do
       {:done, cleared_messages} ->
-        if Cancel.cancelled?(state.config.cancel_token),
-          do: cancel_compaction_state(state, original, nil),
-          else: finalize(state, cleared_messages)
+        finalize_or_cancel(state, cleared_messages, original)
 
       {:continue, cleared_or_orig} ->
         case summarize_or_fallback(state, cleared_or_orig, opts) do
           {:cancelled, next_state, err} -> cancel_compaction_state(next_state, original, err)
-          {:ok, next_state, compacted} -> finalize(next_state, compacted)
+          {:ok, next_state, compacted} -> finalize_or_cancel(next_state, compacted, original)
         end
+    end
+  end
+
+  defp finalize_or_cancel(state, compacted, original, opts \\ []) do
+    if Cancel.cancelled?(state.config.cancel_token) do
+      cancel_compaction_state(state, original, nil)
+    else
+      finalized = finalize(state, compacted, opts)
+
+      if Cancel.cancelled?(finalized.config.cancel_token),
+        do: cancel_compaction_state(finalized, original, nil),
+        else: finalized
     end
   end
 
@@ -400,7 +420,7 @@ defmodule Alloy.Context.Compactor do
   # require it, and the models that accept manual thinking do not check the
   # history, so there the turn in progress keeps its thinking. See
   # https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
-  defp finalize(%State{} = state, messages, opts \\ []) do
+  defp finalize(%State{} = state, messages, opts) do
     force_shrink? = Keyword.get(opts, :force_shrink?, false)
 
     messages =
@@ -612,7 +632,9 @@ defmodule Alloy.Context.Compactor do
         end
 
       :noop ->
-        {:ok, state, fallback_compact(state, messages)}
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:cancelled, state, nil},
+          else: {:ok, state, fallback_compact(state, messages)}
     end
   end
 

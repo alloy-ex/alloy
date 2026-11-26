@@ -710,11 +710,15 @@ defmodule Alloy.Tool.Executor do
   defp tag_tool_calls(state, calls) do
     result =
       Enum.reduce_while(calls, {:ok, []}, fn call, {:ok, acc} ->
-        case Middleware.run_before_tool_call(state, call) do
-          :ok -> {:cont, {:ok, [{:execute, call} | acc]}}
-          {:edit, modified_call} -> {:cont, {:ok, [{:execute, modified_call} | acc]}}
-          {:block, reason} -> {:cont, {:ok, [{:blocked, call, reason} | acc]}}
-          {:halted, reason} -> {:halt, {:halted, reason}}
+        if Cancel.cancelled?(state.config.cancel_token) do
+          {:cont, {:ok, [{:execute, call} | acc]}}
+        else
+          case Middleware.run_before_tool_call(state, call) do
+            :ok -> {:cont, {:ok, [{:execute, call} | acc]}}
+            {:edit, modified_call} -> {:cont, {:ok, [{:execute, modified_call} | acc]}}
+            {:block, reason} -> {:cont, {:ok, [{:blocked, call, reason} | acc]}}
+            {:halted, reason} -> {:halt, {:halted, reason}}
+          end
         end
       end)
 
