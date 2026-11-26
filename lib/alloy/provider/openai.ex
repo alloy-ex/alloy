@@ -1113,34 +1113,37 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  # Handles IEEE-754 rounding-equivalent decimal prefixes whose upper/lower
-  # digit boundary rounds to `expected` (e.g. "0.29" from "0.29999999999999999"
-  # when the decoded map/normalized float is 0.3).
+  # Handles IEEE-754 rounding-equivalent decimal prefixes whose lower or upper
+  # digit boundary rounds to `expected` (e.g. "9007199254740993." -> 9007199254740992.0
+  # or "0.29" from "0.29999999999999999" -> 0.3).
   defp try_rounding_boundary_completion(token, expected) do
     nines = String.duplicate("9", 20)
 
-    tail =
+    tails =
       cond do
-        String.contains?(token, ".") -> nines
-        is_float(expected) -> "." <> nines
-        true -> nil
+        String.contains?(token, ".") -> ["0", nines]
+        is_float(expected) -> [".0", "." <> nines]
+        true -> []
       end
 
-    if is_binary(tail) do
-      candidate = token <> tail
+    Enum.find_value(tails, :error, &try_boundary_tail(token, &1, expected))
+  end
 
-      case Jason.decode(candidate) do
-        {:ok, num} when is_number(num) and num == expected ->
-          {:suffix, tail}
+  defp try_boundary_tail(token, tail, expected) do
+    candidate = token <> tail
 
-        _ ->
-          case complete_exponent_number(candidate <> "e", expected) do
-            {:suffix, exp_tail} -> {:suffix, tail <> "e" <> exp_tail}
-            :error -> :error
-          end
-      end
-    else
-      :error
+    case Jason.decode(candidate) do
+      {:ok, num} when is_number(num) and num == expected ->
+        {:suffix, tail}
+
+      _ when expected !== 0 ->
+        case complete_exponent_number(candidate <> "e", expected) do
+          {:suffix, exp_tail} -> {:suffix, tail <> "e" <> exp_tail}
+          :error -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 
@@ -1223,6 +1226,8 @@ defmodule Alloy.Provider.OpenAI do
     sig = if sig == "", do: "0", else: sig
     {neg?, sig, exp - frac_len + trailing_zeros}
   end
+
+  defp try_direct_exponent_completion(_token, 0), do: :error
 
   defp try_direct_exponent_completion(token, expected) do
     if String.ends_with?(token, ".") do
@@ -1310,6 +1315,16 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp match_exponent_suffix(token, mantissa, exp_prefix, expected)
+       when mantissa != 0 and expected == 0 do
+    with {:ok, tail} <- underflow_exponent_suffix(exp_prefix, byte_size(token)),
+         {:ok, num} when is_number(num) and num == expected <- Jason.decode(token <> tail) do
+      {:suffix, tail}
+    else
+      _ -> :error
+    end
+  end
+
+  defp match_exponent_suffix(token, mantissa, exp_prefix, expected)
        when mantissa != 0 and expected != 0 do
     with true <- mantissa > 0 == expected > 0,
          {:ok, exp} <- safe_log10_exponent(expected, mantissa),
@@ -1322,6 +1337,23 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   defp match_exponent_suffix(_token, _mantissa, _exp_prefix, _expected), do: :error
+
+  defp underflow_exponent_suffix("", token_len),
+    do: {:ok, "-" <> Integer.to_string(token_len + 400)}
+
+  defp underflow_exponent_suffix(<<?-, digits::binary>>, token_len) do
+    if all_digits?(digits) do
+      if String.trim_leading(digits, "0") == "" do
+        {:ok, Integer.to_string(token_len + 400)}
+      else
+        {:ok, if(token_len > 300, do: "0000", else: "000")}
+      end
+    else
+      :error
+    end
+  end
+
+  defp underflow_exponent_suffix(_exp_prefix, _token_len), do: :error
 
   # Compute log10(|expected| / |mantissa|) as log10(|expected|) - log10(|mantissa|)
   # so large values like 1.0e308 / 0.1 never overflow IEEE-754 before log10 runs.

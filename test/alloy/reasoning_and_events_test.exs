@@ -2288,7 +2288,9 @@ defmodule Alloy.ReasoningAndEventsTest do
         tel_handler,
         [:alloy, :event],
         fn _ev, _m, meta, _ ->
-          if meta.event == :text_delta, do: send(parent, {:tel_text_delta, meta})
+          if self() == parent and meta.event == :text_delta do
+            send(parent, {:tel_text_delta, meta})
+          end
         end,
         nil
       )
@@ -2695,7 +2697,9 @@ defmodule Alloy.ReasoningAndEventsTest do
         tel_id,
         [:alloy, :event],
         fn _ev, _m, meta, _ ->
-          if meta.event == :text_delta, do: send(parent, {:prov_tel_text, meta})
+          if self() == parent and meta.event == :text_delta do
+            send(parent, {:prov_tel_text, meta})
+          end
         end,
         nil
       )
@@ -4961,6 +4965,16 @@ defmodule Alloy.ReasoningAndEventsTest do
             {~S({"x":-0.29), %{"x" => -0.3}},
             {~S({"x":0.29), %{"x" => 3.0}},
             {~S({"x":2), %{"x" => 3.0}},
+            {~S({"x":9007199254740993.), %{"x" => 9_007_199_254_740_992.0}},
+            {~S({"x":9007199254740993), %{"x" => 9_007_199_254_740_992.0}},
+            {~S({"x":-9007199254740993.), %{"x" => -9_007_199_254_740_992.0}},
+            {~S({"x":1e-), %{"x" => 0.0}},
+            {~S({"x":1e), %{"x" => 0.0}},
+            {~S({"x":1e-4), %{"x" => 0.0}},
+            {~S({"x":1e-0), %{"x" => 0.0}},
+            {~S({"x":-1.5e-), %{"x" => 0.0}},
+            {~S({"x":1.), %{"x" => 0.0}},
+            {~S({"x":1), %{"x" => 0.0}},
             {~S({"x":-), %{"x" => 0}},
             {~S({"x":-), %{"x" => -42}},
             {~S({"x":1.5E-), %{"x" => 0.015}},
@@ -5067,6 +5081,9 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       for {bad_prefix, bad_map} <- [
             {~S({"x":1e), %{"x" => 42}},
+            {~S({"x":1e+), %{"x" => 0.0}},
+            {~S({"x":1), %{"x" => 0}},
+            {~S({"x":1.), %{"x" => 0}},
             {~S({"x":-1e), %{"x" => 100}},
             {~S({"x":1e2 ), %{"x" => 42}},
             {~S({"x":0e9), %{"x" => 1}},
@@ -5208,6 +5225,8 @@ defmodule Alloy.ReasoningAndEventsTest do
         ~S({"z": 0.0000000001, "a": 1.2e3}),
         ~S({"n": 1.2345E+04, "neg": -0.015, "zero": -0.0}),
         ~S({"r": 0.29999999999999999, "nr": -0.29999999999999999, "t": 2.99999999999999999}),
+        ~S({"big": 9007199254740993.0, "nbig": -9007199254740993.0, "up": 9007199254740993.5}),
+        ~S({"uf": 1e-400, "ufz": 1e-0400, "nuf": -1.5e-400}),
         ~S({"s": "a\/\u00e9\n\t\uD83D\uDE00", "b": true, "c": null}),
         ~S({"arr": [0.00001, 1200, {"y": 1.5e-2, "x": false}]})
       ]
