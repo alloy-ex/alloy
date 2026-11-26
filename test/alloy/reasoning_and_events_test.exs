@@ -3582,6 +3582,77 @@ defmodule Alloy.ReasoningAndEventsTest do
         assert Enum.all?(ap_deltas, &(&1.id == "call_pref_oai" and &1.name == "echo"))
         assert Enum.map_join(ap_deltas, & &1.arguments_delta) == "{\"x\":1}"
       end
+
+      # 7. OpenAI/xAI: non-empty arguments prefix in output_item.added followed directly by
+      #    output_item.done / response.completed (with NO intervening argument deltas) emits the
+      #    missing suffix without duplication, for both immediate and deferred call_id.
+      for include_call_id? <- [true, false] do
+        added_item =
+          %{
+            "type" => "function_call",
+            "id" => "fc_pref_nodelta",
+            "name" => "echo",
+            "arguments" => "{\"x\":"
+          }
+          |> then(fn m ->
+            if include_call_id?, do: Map.put(m, "call_id", "call_pref_nodelta"), else: m
+          end)
+
+        done_item = %{
+          "type" => "function_call",
+          "id" => "fc_pref_nodelta",
+          "call_id" => "call_pref_nodelta",
+          "name" => "echo",
+          "arguments" => "{\"x\":1}"
+        }
+
+        prefix_done_plug =
+          sse_plug(
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => added_item
+            }) <>
+              sse_oai("response.output_item.done", %{
+                "type" => "response.output_item.done",
+                "output_index" => 0,
+                "item" => done_item
+              }) <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_pref_nodelta",
+                  "status" => "completed",
+                  "output" => [done_item],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        {:ok, %{messages: [nd_msg]}} =
+          OpenAI.stream(
+            [Message.user("hi")],
+            [],
+            %{
+              api_key: "sk-oai",
+              model: "gpt-5.4",
+              req_options: [plug: prefix_done_plug],
+              on_event: &send(parent, {:pref_nodelta_ev, &1})
+            },
+            fn _ -> :ok end
+          )
+
+        assert [%{type: "tool_use", id: "call_pref_nodelta", name: "echo", input: %{"x" => 1}}] =
+                 nd_msg.content
+
+        nd_deltas =
+          drain_tagged(:pref_nodelta_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+        assert Enum.all?(nd_deltas, &(&1.id == "call_pref_nodelta" and &1.name == "echo"))
+        assert Enum.map_join(nd_deltas, & &1.arguments_delta) == "{\"x\":1}"
+      end
     end
   end
 

@@ -641,7 +641,7 @@ defmodule Alloy.Provider.OpenAI do
          event_type
        ) do
     header_emitted? = match?(%{id: ^call_id, name: ^name}, existing)
-    args_emitted? = match?(%{args_emitted?: true}, existing)
+    emitted_args = if is_map(existing), do: Map.get(existing, :emitted_args, ""), else: ""
 
     if event_type == "response.output_item.done" and not header_emitted? and
          invalid_whole_item_args?(item) do
@@ -659,13 +659,12 @@ defmodule Alloy.Provider.OpenAI do
       {pending_deltas, next_pending} =
         pop_pending_deltas(acc.pending_function_deltas, item_id, index)
 
-      emit_buffered_args(acc.on_event, base_meta, pending_deltas)
-      args_emitted? = args_emitted? or pending_deltas != []
+      emitted_args = emit_buffered_args(acc.on_event, base_meta, pending_deltas, emitted_args)
 
-      args_emitted? =
-        maybe_emit_whole_item_args(acc.on_event, base_meta, item, event_type, args_emitted?)
+      emitted_args =
+        maybe_emit_whole_item_args(acc.on_event, base_meta, item, event_type, emitted_args)
 
-      meta = Map.merge(base_meta, %{item_id: item_id, args_emitted?: args_emitted?})
+      meta = Map.merge(base_meta, %{item_id: item_id, emitted_args: emitted_args})
 
       function_calls =
         acc.function_calls
@@ -697,25 +696,32 @@ defmodule Alloy.Provider.OpenAI do
 
   defp maybe_buffer_added_args(acc, _event_type, _item, _item_id, _index), do: acc
 
-  defp maybe_emit_whole_item_args(on_event, base_meta, item, event_type, false)
+  defp maybe_emit_whole_item_args(on_event, base_meta, item, event_type, emitted_args)
        when event_type in [
               "response.output_item.added",
               "response.output_item.done",
               "response.completed"
             ] do
-    case item_args_delta(item, event_type) do
-      "" ->
-        false
+    args = item_args_delta(item, event_type)
 
-      args ->
-        event = Map.put(base_meta, :arguments_delta, args)
+    cond do
+      args == "" or args == emitted_args ->
+        emitted_args
+
+      String.starts_with?(args, emitted_args) ->
+        prefix_len = byte_size(emitted_args)
+        suffix = binary_part(args, prefix_len, byte_size(args) - prefix_len)
+        event = Map.put(base_meta, :arguments_delta, suffix)
         on_event.({:tool_call_delta, event})
-        true
+        args
+
+      true ->
+        emitted_args
     end
   end
 
-  defp maybe_emit_whole_item_args(_on_event, _base_meta, _item, _event_type, args_emitted?),
-    do: args_emitted?
+  defp maybe_emit_whole_item_args(_on_event, _base_meta, _item, _event_type, emitted_args),
+    do: emitted_args
 
   defp item_args_delta(item, event_type) do
     case Map.get(item, "arguments") do
@@ -802,7 +808,7 @@ defmodule Alloy.Provider.OpenAI do
            }}
         )
 
-        updated_meta = %{meta | args_emitted?: true}
+        updated_meta = %{meta | emitted_args: Map.get(meta, :emitted_args, "") <> delta}
 
         function_calls =
           acc.function_calls
@@ -854,8 +860,8 @@ defmodule Alloy.Provider.OpenAI do
     {ordered, pending}
   end
 
-  defp emit_buffered_args(on_event, meta, deltas) do
-    Enum.each(deltas, fn {raw_index, delta} ->
+  defp emit_buffered_args(on_event, meta, deltas, emitted_args) do
+    Enum.reduce(deltas, emitted_args, fn {raw_index, delta}, acc_args ->
       on_event.(
         {:tool_call_delta,
          %{
@@ -865,6 +871,8 @@ defmodule Alloy.Provider.OpenAI do
            arguments_delta: delta
          }}
       )
+
+      acc_args <> delta
     end)
   end
 
