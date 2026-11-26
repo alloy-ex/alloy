@@ -3505,6 +3505,83 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert :atomics.get(compat_neg_attempts, 1) == 2
       refute Enum.any?(drain_tagged(:compat_neg_ev), &(&1.event == :tool_call_delta))
+
+      # 6. OpenAI/xAI: non-empty arguments prefix in output_item.added is preserved once and
+      #    combines with subsequent deltas without duplication on .done/.completed (both with
+      #    immediate call_id and deferred call_id).
+      for include_call_id? <- [true, false] do
+        added_item =
+          %{
+            "type" => "function_call",
+            "id" => "fc_pref",
+            "name" => "echo",
+            "arguments" => "{\"x\":"
+          }
+          |> then(fn m ->
+            if include_call_id?, do: Map.put(m, "call_id", "call_pref_oai"), else: m
+          end)
+
+        done_item = %{
+          "type" => "function_call",
+          "id" => "fc_pref",
+          "call_id" => "call_pref_oai",
+          "name" => "echo",
+          "arguments" => "{\"x\":1}"
+        }
+
+        added_prefix_plug =
+          sse_plug(
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => added_item
+            }) <>
+              sse_oai("response.function_call_arguments.delta", %{
+                "type" => "response.function_call_arguments.delta",
+                "output_index" => 0,
+                "item_id" => "fc_pref",
+                "delta" => "1}"
+              }) <>
+              sse_oai("response.output_item.done", %{
+                "type" => "response.output_item.done",
+                "output_index" => 0,
+                "item" => done_item
+              }) <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_added_pref",
+                  "status" => "completed",
+                  "output" => [done_item],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        {:ok, %{messages: [ap_msg]}} =
+          OpenAI.stream(
+            [Message.user("hi")],
+            [],
+            %{
+              api_key: "sk-oai",
+              model: "gpt-5.4",
+              req_options: [plug: added_prefix_plug],
+              on_event: &send(parent, {:added_pref_ev, &1})
+            },
+            fn _ -> :ok end
+          )
+
+        assert [%{type: "tool_use", id: "call_pref_oai", name: "echo", input: %{"x" => 1}}] =
+                 ap_msg.content
+
+        ap_deltas =
+          drain_tagged(:added_pref_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+        assert Enum.all?(ap_deltas, &(&1.id == "call_pref_oai" and &1.name == "echo"))
+        assert Enum.map_join(ap_deltas, & &1.arguments_delta) == "{\"x\":1}"
+      end
     end
   end
 

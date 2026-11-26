@@ -616,9 +616,9 @@ defmodule Alloy.Provider.OpenAI do
         )
 
       deferred_call_id_header?(event_type, index, raw_call_id, item_id, name) ->
-        # Legitimate partial header waiting for call_id: buffer deltas until
-        # output_item.done or response.completed resolves call_id.
-        acc
+        # Legitimate partial header waiting for call_id: preserve any initial
+        # arguments prefix on .added and buffer deltas until call_id resolves.
+        maybe_buffer_added_args(acc, event_type, item, item_id, index)
 
       event_type == "response.output_item.added" ->
         # Record rejected headers so subsequent argument deltas for the same
@@ -688,26 +688,50 @@ defmodule Alloy.Provider.OpenAI do
     not match?({:ok, _}, decode_function_call_arguments(item))
   end
 
+  defp maybe_buffer_added_args(acc, "response.output_item.added", item, item_id, index) do
+    case item_args_delta(item, "response.output_item.added") do
+      "" -> acc
+      prefix -> buffer_pending_delta(acc, item_id, index, prefix)
+    end
+  end
+
+  defp maybe_buffer_added_args(acc, _event_type, _item, _item_id, _index), do: acc
+
   defp maybe_emit_whole_item_args(on_event, base_meta, item, event_type, false)
-       when event_type in ["response.output_item.done", "response.completed"] do
-    case Map.get(item, "arguments") do
-      args when is_binary(args) and args != "" ->
+       when event_type in [
+              "response.output_item.added",
+              "response.output_item.done",
+              "response.completed"
+            ] do
+    case item_args_delta(item, event_type) do
+      "" ->
+        false
+
+      args ->
         event = Map.put(base_meta, :arguments_delta, args)
         on_event.({:tool_call_delta, event})
         true
-
-      args when is_map(args) ->
-        event = Map.put(base_meta, :arguments_delta, Jason.encode!(args))
-        on_event.({:tool_call_delta, event})
-        true
-
-      _ ->
-        false
     end
   end
 
   defp maybe_emit_whole_item_args(_on_event, _base_meta, _item, _event_type, args_emitted?),
     do: args_emitted?
+
+  defp item_args_delta(item, event_type) do
+    case Map.get(item, "arguments") do
+      args when is_binary(args) and args != "" ->
+        args
+
+      args when is_map(args) and map_size(args) > 0 ->
+        Jason.encode!(args)
+
+      args when is_map(args) and event_type != "response.output_item.added" ->
+        Jason.encode!(args)
+
+      _ ->
+        ""
+    end
+  end
 
   defp deferred_call_id_header?(event_type, index, nil, item_id, name)
        when event_type in ["response.output_item.added", "response.output_item.done"] do
