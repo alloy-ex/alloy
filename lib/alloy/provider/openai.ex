@@ -642,6 +642,7 @@ defmodule Alloy.Provider.OpenAI do
        ) do
     header_emitted? = match?(%{id: ^call_id, name: ^name}, existing)
     emitted_args = if is_map(existing), do: Map.get(existing, :emitted_args, ""), else: ""
+    stable_index = if is_map(existing), do: Map.get(existing, :index, index), else: index
 
     if event_type == "response.output_item.done" and not header_emitted? and
          invalid_whole_item_args?(item) do
@@ -649,7 +650,7 @@ defmodule Alloy.Provider.OpenAI do
       # can fail with :malformed_reply before chunks_emitted? is flipped.
       acc
     else
-      base_meta = %{id: call_id, index: index, name: name}
+      base_meta = %{id: call_id, index: stable_index, name: name}
 
       unless header_emitted? do
         header_event = Map.put(base_meta, :arguments_delta, "")
@@ -657,9 +658,17 @@ defmodule Alloy.Provider.OpenAI do
       end
 
       {pending_deltas, next_pending} =
-        pop_pending_deltas(acc.pending_function_deltas, item_id, index)
+        pop_pending_deltas(acc.pending_function_deltas, item_id, stable_index)
 
-      emitted_args = emit_buffered_args(acc.on_event, base_meta, pending_deltas, emitted_args)
+      emitted_args =
+        emit_reconciled_pending_args(
+          acc.on_event,
+          base_meta,
+          pending_deltas,
+          item,
+          event_type,
+          emitted_args
+        )
 
       emitted_args =
         maybe_emit_whole_item_args(acc.on_event, base_meta, item, event_type, emitted_args)
@@ -670,7 +679,7 @@ defmodule Alloy.Provider.OpenAI do
       function_calls =
         acc.function_calls
         |> maybe_put_call_meta(effective_item_id, meta)
-        |> Map.put({:index, index}, meta)
+        |> Map.put({:index, stable_index}, meta)
 
       %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
     end
@@ -863,6 +872,32 @@ defmodule Alloy.Provider.OpenAI do
       |> Enum.map(fn {_seq, raw_index, delta} -> {raw_index, delta} end)
 
     {ordered, pending}
+  end
+
+  # When nothing has been emitted yet and a terminal/done item carries the
+  # authoritative complete arguments, only emit buffered fragments if they are
+  # a byte-exact prefix of the authoritative arguments; otherwise discard the
+  # inconsistent buffered data so maybe_emit_whole_item_args emits the exact
+  # validated arguments matching the final tool input.
+  defp emit_reconciled_pending_args(on_event, meta, pending_deltas, item, event_type, "")
+       when event_type in ["response.output_item.done", "response.completed"] do
+    matching =
+      Enum.filter(pending_deltas, fn {raw_index, _delta} ->
+        is_nil(raw_index) or raw_index == meta.index
+      end)
+
+    whole_args = item_args_delta(item, event_type)
+    buffered = Enum.map_join(matching, fn {_raw_index, delta} -> delta end)
+
+    if whole_args != "" and not String.starts_with?(whole_args, buffered) do
+      ""
+    else
+      emit_buffered_args(on_event, meta, matching, "")
+    end
+  end
+
+  defp emit_reconciled_pending_args(on_event, meta, pending_deltas, _item, _event_type, emitted) do
+    emit_buffered_args(on_event, meta, pending_deltas, emitted)
   end
 
   defp emit_buffered_args(on_event, meta, deltas, emitted_args) do

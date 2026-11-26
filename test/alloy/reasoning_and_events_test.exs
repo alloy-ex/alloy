@@ -3818,6 +3818,64 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert conflict_deltas
              |> Enum.filter(&(&1.id == "call_1"))
              |> Enum.all?(&(&1.index == 1))
+
+      # 9. OpenAI/xAI: buffered headerless deltas that conflict with authoritative terminal
+      #    arguments (or differ due to map-typed JSON serialization whitespace) are discarded
+      #    before emission so emitted arguments always reconstruct the executed tool input.
+      for {buffered_prefix, final_args} <- [
+            {"{\"x\": ", %{"x" => 1}},
+            {"{\"x\":2}", "{\"x\":1}"}
+          ] do
+        item = %{
+          "type" => "function_call",
+          "id" => "fc_reconcile",
+          "call_id" => "call_reconcile",
+          "name" => "echo",
+          "arguments" => final_args
+        }
+
+        reconcile_plug =
+          sse_plug(
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "item_id" => "fc_reconcile",
+              "output_index" => 0,
+              "delta" => buffered_prefix
+            }) <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_reconcile",
+                  "status" => "completed",
+                  "output" => [item],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        {:ok, %{messages: [rec_msg]}} =
+          OpenAI.stream(
+            [Message.user("hi")],
+            [],
+            %{
+              api_key: "sk-oai",
+              model: "gpt-5.4",
+              req_options: [plug: reconcile_plug],
+              on_event: &send(parent, {:rec_ev, &1})
+            },
+            fn _ -> :ok end
+          )
+
+        assert [%{type: "tool_use", id: "call_reconcile", name: "echo", input: %{"x" => 1}}] =
+                 rec_msg.content
+
+        rec_deltas =
+          drain_tagged(:rec_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+        assert Jason.decode!(Enum.map_join(rec_deltas, & &1.arguments_delta)) == %{"x" => 1}
+      end
     end
   end
 
