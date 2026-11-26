@@ -33,10 +33,11 @@ defmodule Alloy.Context.Compactor do
   @behaviour Alloy.Middleware
 
   alias Alloy.Agent.State
+  alias Alloy.Cancel
   alias Alloy.Context.Compactor.Estimator
   alias Alloy.Internal.Sanitize
   alias Alloy.{Message, Middleware}
-  alias Alloy.Provider.Retry
+  alias Alloy.Provider.{Error, Retry}
 
   require Logger
 
@@ -554,22 +555,38 @@ defmodule Alloy.Context.Compactor do
   defp summarize_or_fallback(%State{} = state, messages, opts) do
     keep_recent_tokens = state.config.compaction.keep_recent_tokens
 
+    if Cancel.cancelled?(state.config.cancel_token) do
+      {state, messages}
+    else
+      do_summarize_or_fallback(state, messages, keep_recent_tokens, opts)
+    end
+  end
+
+  defp do_summarize_or_fallback(state, messages, keep_recent_tokens, opts) do
     case prepare_summary_compaction(messages, keep_recent_tokens) do
       {:ok, prepared} ->
         fire_on_compaction(prepared.messages_to_summarize, state)
-        {result, usage} = summarize_compaction(prepared, state, opts)
-        state = State.merge_usage(state, usage)
 
-        case result do
-          {:ok, summary_text} ->
-            {state, [prepared.first, build_summary_message(summary_text) | prepared.recent]}
+        if Cancel.cancelled?(state.config.cancel_token) do
+          {state, messages}
+        else
+          {result, usage} = summarize_compaction(prepared, state, opts)
+          state = State.merge_usage(state, usage)
 
-          {:error, reason} ->
-            Logger.warning(
-              "summary compaction failed, falling back to truncation: #{Sanitize.inspect_bounded(reason)}"
-            )
+          case result do
+            {:ok, summary_text} ->
+              {state, [prepared.first, build_summary_message(summary_text) | prepared.recent]}
 
-            {state, fallback_compact(state, messages)}
+            {:error, %Error{kind: :cancelled}} ->
+              {state, messages}
+
+            {:error, reason} ->
+              Logger.warning(
+                "summary compaction failed, falling back to truncation: #{Sanitize.inspect_bounded(reason)}"
+              )
+
+              {state, fallback_compact(state, messages)}
+          end
         end
 
       :noop ->
@@ -826,6 +843,11 @@ defmodule Alloy.Context.Compactor do
       |> then(fn cfg ->
         if is_integer(hard_deadline),
           do: Map.put(cfg, :alloy_request_deadline, hard_deadline),
+          else: cfg
+      end)
+      |> then(fn cfg ->
+        if state.config.cancel_token,
+          do: Map.put(cfg, :alloy_cancel_token, state.config.cancel_token),
           else: cfg
       end)
 

@@ -6,6 +6,7 @@ defmodule Alloy.Agent.Config do
   updated through `Alloy.Agent.State.prepare/2` in middleware.
   """
 
+  alias Alloy.Cancel
   alias Alloy.Context.Compactor
   alias Alloy.Internal.Sanitize
   alias Alloy.ModelMetadata
@@ -17,6 +18,9 @@ defmodule Alloy.Agent.Config do
     :stop_after_tool,
     :output_schema,
     :reasoning,
+    :cancel_token,
+    :steering,
+    :follow_up,
     :provider,
     :tools,
     :system_prompt,
@@ -97,6 +101,9 @@ defmodule Alloy.Agent.Config do
           stop_after_tool: String.t() | nil,
           output_schema: OutputSchema.t() | nil,
           reasoning: Alloy.Provider.normalized_reasoning() | nil,
+          cancel_token: Cancel.t() | nil,
+          steering: (Alloy.Agent.State.t() -> [Alloy.Message.t()]) | nil,
+          follow_up: (Alloy.Agent.State.t() -> [Alloy.Message.t()]) | nil,
           middleware: [module()],
           compaction: compaction(),
           compaction_explicit: %{
@@ -132,6 +139,9 @@ defmodule Alloy.Agent.Config do
     stop_after_tool: nil,
     output_schema: nil,
     reasoning: nil,
+    cancel_token: nil,
+    steering: nil,
+    follow_up: nil,
     middleware: [],
     compaction: %{
       reserve_tokens: 16_384,
@@ -191,6 +201,9 @@ defmodule Alloy.Agent.Config do
     tool_validation = Keyword.get(opts, :tool_validation, :required)
     context = Keyword.get(opts, :context, %{})
     on_compaction = opts[:on_compaction]
+    cancel_token = opts[:cancel_token]
+    steering = opts[:steering]
+    follow_up = opts[:follow_up]
     code_execution = Keyword.get(opts, :code_execution, false)
 
     %__MODULE__{
@@ -226,6 +239,24 @@ defmodule Alloy.Agent.Config do
         ),
       output_schema: OutputSchema.normalize!(Keyword.get(opts, :output_schema)),
       reasoning: Alloy.Provider.normalize_reasoning!(Keyword.get(opts, :reasoning)),
+      cancel_token:
+        require_opt_shape!(
+          is_nil(cancel_token) or match?(%Cancel{}, cancel_token),
+          cancel_token,
+          "cancel_token must be an Alloy.Cancel struct or nil"
+        ),
+      steering:
+        require_opt!(
+          is_nil(steering) or is_function(steering, 1),
+          steering,
+          "steering must be a 1-arity function or nil"
+        ),
+      follow_up:
+        require_opt!(
+          is_nil(follow_up) or is_function(follow_up, 1),
+          follow_up,
+          "follow_up must be a 1-arity function or nil"
+        ),
       middleware:
         resolve_middleware(
           validate_middleware!(Keyword.get(opts, :middleware, [])),

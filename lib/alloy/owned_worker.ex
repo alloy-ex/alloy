@@ -9,16 +9,19 @@ defmodule Alloy.OwnedWorker do
   # directly to the owner task bypasses owner cleanup, so a worker that sets
   # `:trap_exit` would not receive an explicit kill in that edge case.)
 
+  alias Alloy.Cancel
   alias Alloy.Internal.Sanitize
 
   @worker_kill_timeout_ms 1_000
   @cancel_timeout_ms 1_500
+  @cancel_poll_ms 25
 
-  @spec start(integer(), (-> term())) :: Task.t()
-  def start(deadline, fun)
-      when is_integer(deadline) and is_function(fun, 0) do
+  @spec start(integer() | nil, (-> term()), keyword()) :: Task.t()
+  def start(deadline, fun, opts \\ [])
+      when (is_integer(deadline) or is_nil(deadline)) and is_function(fun, 0) and is_list(opts) do
     caller = self()
     caller_ctx = capture_caller_context()
+    cancel_token = Keyword.get(opts, :cancel_token)
 
     Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
       Process.flag(:trap_exit, true)
@@ -33,22 +36,28 @@ defmodule Alloy.OwnedWorker do
           exit(reason)
       after
         0 ->
-          if deadline <= System.monotonic_time(:millisecond) do
-            Process.demonitor(caller_ref, [:flush])
-            :timeout
-          else
-            callers = [self() | Process.get(:"$callers", [])]
-            owner = self()
-            done_ref = make_ref()
+          cond do
+            Cancel.cancelled?(cancel_token) ->
+              Process.demonitor(caller_ref, [:flush])
+              :cancelled
 
-            worker =
-              spawn_link(fn ->
-                Process.put(:"$callers", callers)
-                restore_caller_context(caller_ctx)
-                run_worker(owner, done_ref, deadline, fun)
-              end)
+            deadline_expired?(deadline) ->
+              Process.demonitor(caller_ref, [:flush])
+              :timeout
 
-            await_worker(caller_ref, worker, done_ref, deadline)
+            true ->
+              callers = [self() | Process.get(:"$callers", [])]
+              owner = self()
+              done_ref = make_ref()
+
+              worker =
+                spawn_link(fn ->
+                  Process.put(:"$callers", callers)
+                  restore_caller_context(caller_ctx)
+                  run_worker(owner, done_ref, deadline, cancel_token, fun)
+                end)
+
+              await_worker(caller_ref, worker, done_ref, deadline, cancel_token)
           end
       end
     end)
@@ -70,12 +79,17 @@ defmodule Alloy.OwnedWorker do
   @spec format_exit_reason(term()) :: String.t()
   def format_exit_reason(reason), do: Sanitize.exit_summary(reason, :redact)
 
-  defp run_worker(owner, done_ref, deadline, fun) do
-    if deadline <= System.monotonic_time(:millisecond) do
-      send(owner, {done_ref, :timeout})
-    else
-      result = fun.()
-      send(owner, {done_ref, {:ok, result}})
+  defp run_worker(owner, done_ref, deadline, cancel_token, fun) do
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        send(owner, {done_ref, :cancelled})
+
+      deadline_expired?(deadline) ->
+        send(owner, {done_ref, :timeout})
+
+      true ->
+        result = fun.()
+        send(owner, {done_ref, {:ok, result}})
     end
   catch
     kind, reason ->
@@ -108,36 +122,65 @@ defmodule Alloy.OwnedWorker do
     if otel_ctx != nil, do: Process.put(:"$__current_otel_ctx", otel_ctx)
   end
 
-  defp await_worker(caller_ref, worker, done_ref, deadline) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+  defp await_worker(caller_ref, worker, done_ref, deadline, cancel_token) do
+    if Cancel.cancelled?(cancel_token) do
+      Process.demonitor(caller_ref, [:flush])
+      kill_worker(worker)
+      :cancelled
+    else
+      wait_ms = next_wait_ms(deadline, cancel_token)
 
-    receive do
-      {^done_ref, reply} ->
-        Process.demonitor(caller_ref, [:flush])
-        await_worker_exit(worker)
-        reply
+      receive do
+        {^done_ref, reply} ->
+          Process.demonitor(caller_ref, [:flush])
+          await_worker_exit(worker)
+          reply
 
-      {:EXIT, ^worker, reason} ->
-        Process.demonitor(caller_ref, [:flush])
-        {:worker_exit, reason}
+        {:EXIT, ^worker, reason} ->
+          Process.demonitor(caller_ref, [:flush])
+          {:worker_exit, reason}
 
-      # Respect supervisor shutdown and explicit cancel/1 signals promptly by
-      # brutally killing and awaiting the worker before exiting.
-      {:EXIT, from, reason} when is_pid(from) ->
-        Process.demonitor(caller_ref, [:flush])
-        kill_worker(worker)
-        exit(reason)
+        # Respect supervisor shutdown and explicit cancel/1 signals promptly by
+        # brutally killing and awaiting the worker before exiting.
+        {:EXIT, from, reason} when is_pid(from) ->
+          Process.demonitor(caller_ref, [:flush])
+          kill_worker(worker)
+          exit(reason)
 
-      {:DOWN, ^caller_ref, :process, _pid, _reason} ->
-        kill_worker(worker)
-        :caller_down
-    after
-      remaining ->
-        Process.demonitor(caller_ref, [:flush])
-        kill_worker(worker)
-        :timeout
+        {:DOWN, ^caller_ref, :process, _pid, _reason} ->
+          kill_worker(worker)
+          :caller_down
+      after
+        wait_ms ->
+          cond do
+            Cancel.cancelled?(cancel_token) ->
+              Process.demonitor(caller_ref, [:flush])
+              kill_worker(worker)
+              :cancelled
+
+            deadline_expired?(deadline) ->
+              Process.demonitor(caller_ref, [:flush])
+              kill_worker(worker)
+              :timeout
+
+            true ->
+              await_worker(caller_ref, worker, done_ref, deadline, cancel_token)
+          end
+      end
     end
   end
+
+  defp deadline_expired?(nil), do: false
+  defp deadline_expired?(deadline), do: deadline <= System.monotonic_time(:millisecond)
+
+  defp next_wait_ms(nil, nil), do: :infinity
+  defp next_wait_ms(nil, _cancel_token), do: @cancel_poll_ms
+
+  defp next_wait_ms(deadline, nil),
+    do: max(deadline - System.monotonic_time(:millisecond), 0)
+
+  defp next_wait_ms(deadline, _cancel_token),
+    do: min(max(deadline - System.monotonic_time(:millisecond), 0), @cancel_poll_ms)
 
   defp await_worker_exit(worker) do
     receive do

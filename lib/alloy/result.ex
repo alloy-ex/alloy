@@ -29,7 +29,7 @@ defmodule Alloy.Result do
       :schema_mismatch | :invalid_schema | :truncated | :refusal | :missing_text,
       message: String.t(), decoded: term() | nil}` when `:output_schema` decoding
       or validation fails)
-    * `:status` — final run status (`:completed`, `:max_turns`, `:error`, `:halted`)
+    * `:status` — final run status (`:completed`, `:max_turns`, `:error`, `:halted`, `:cancelled`)
     * `:stop_reason` — why the model stopped on the last provider response
       (`:end_turn`, `:tool_use`, `:max_tokens`, `:refusal`, `:pause_turn`), or
       `nil` if no response arrived. Check for `:max_tokens` to detect a
@@ -102,7 +102,7 @@ defmodule Alloy.Result do
   Tags a result the way `Alloy.run/2` returns it.
 
   `{:ok, result}` when the run completed or stopped at `:max_turns`;
-  `{:error, result}` for every other status (`:error`, `:halted`).
+  `{:error, result}` for every other status (`:error`, `:halted`, `:cancelled`).
   """
   @spec wrap(t()) :: {:ok, t()} | {:error, t()}
   def wrap(%__MODULE__{status: status} = result) when status in [:completed, :max_turns],

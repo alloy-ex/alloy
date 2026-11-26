@@ -120,6 +120,7 @@ defmodule Alloy.MixProject do
         Core: [
           Alloy,
           Alloy.Agent.Config,
+          Alloy.Cancel,
           Alloy.Events,
           Alloy.ModelCatalog,
           Alloy.ModelMetadata,

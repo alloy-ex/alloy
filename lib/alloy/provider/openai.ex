@@ -131,7 +131,7 @@ defmodule Alloy.Provider.OpenAI do
              headers(config, api_key),
              body,
              Map.get(config, :req_options, []),
-             deadline: Map.get(config, :alloy_request_deadline)
+             HTTP.request_opts(config)
            ) do
       parse_response(resp_body)
     end
@@ -167,7 +167,7 @@ defmodule Alloy.Provider.OpenAI do
              initial_acc,
              &handle_stream_event/2,
              Map.get(config, :req_options, []),
-             deadline: Map.get(config, :alloy_request_deadline)
+             HTTP.request_opts(config)
            ) do
       build_stream_response(acc)
     end

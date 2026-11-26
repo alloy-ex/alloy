@@ -215,6 +215,15 @@ defmodule Alloy.Provider.Codex do
      }}
   end
 
+  defp session_result({:error, %Error{kind: :cancelled} = error}, {:resume, _id, _count}) do
+    {:error,
+     %{
+       error
+       | message:
+           "Codex resume cancelled; change :session_generation before continuing: #{error.message}"
+     }}
+  end
+
   defp session_result({:error, reason}, {:resume, _id, _count}) do
     {:error,
      %Error{

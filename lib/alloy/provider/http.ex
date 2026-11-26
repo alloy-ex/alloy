@@ -4,12 +4,24 @@ defmodule Alloy.Provider.HTTP do
   # Req's own retries switched off (Alloy.Provider.Retry owns retries and the
   # turn deadline), and every failure turned into an Alloy.Provider.Error.
 
+  alias Alloy.Cancel
   alias Alloy.Internal.Sanitize
   alias Alloy.OwnedWorker
   alias Alloy.Provider
   alias Alloy.Provider.{Error, SSE}
 
+  @cancel_poll_ms 25
+
   @type headers :: [{String.t(), String.t()}]
+
+  @doc false
+  @spec request_opts(map()) :: keyword()
+  def request_opts(config) when is_map(config) do
+    [
+      deadline: Map.get(config, :alloy_request_deadline),
+      cancel_token: Map.get(config, :alloy_cancel_token)
+    ]
+  end
 
   @doc """
   POSTs `body` as JSON. Returns the response body of a 200 response (raw binary
@@ -17,17 +29,24 @@ defmodule Alloy.Provider.HTTP do
   providers decode via `Alloy.Provider.decode_body/1`).
 
   `opts` may carry `:deadline` (monotonic ms) to enforce an absolute wall-clock
-  bound even if the server trickles bytes slowly. Passing `:deadline` requires
+  bound even if the server trickles bytes slowly, and `:cancel_token`
+  (`Alloy.Cancel.t()`) for cooperative cancellation. Passing either requires
   `Alloy.TaskSupervisor` to be running (started by the `:alloy` application).
   """
   @spec post_json(String.t(), headers(), map(), keyword(), keyword()) ::
           {:ok, term()} | {:error, Error.t()}
   def post_json(url, headers, body, req_options, opts \\ []) do
-    case Keyword.get(opts, :deadline) do
-      deadline when is_integer(deadline) ->
-        post_json_with_deadline(url, headers, body, req_options, deadline)
+    deadline = Keyword.get(opts, :deadline)
+    cancel_token = Keyword.get(opts, :cancel_token)
 
-      _nil ->
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        cancelled_error("Request cancelled")
+
+      is_integer(deadline) or not is_nil(cancel_token) ->
+        post_json_managed(url, headers, body, req_options, deadline, cancel_token)
+
+      true ->
         decode_post_result(request(url, headers, body, req_options))
     end
   end
@@ -39,8 +58,10 @@ defmodule Alloy.Provider.HTTP do
 
   `req_options` may carry extra Req options such as `params:`.
   `opts` may carry `:deadline` (monotonic ms) to enforce an absolute wall-clock
-  bound across stalled and trickling streams while running `handle_event` in
-  the caller's process (requires `Alloy.TaskSupervisor` to be running).
+  bound across stalled and trickling streams, and `:cancel_token`
+  (`Alloy.Cancel.t()`) for cooperative cancellation, while running
+  `handle_event` in the caller's process (requires `Alloy.TaskSupervisor` to be
+  running).
   """
   @spec stream_sse(
           String.t(),
@@ -53,19 +74,26 @@ defmodule Alloy.Provider.HTTP do
         ) ::
           {:ok, map()} | {:error, Error.t()}
   def stream_sse(url, headers, body, initial_acc, handle_event, req_options, opts \\ []) do
-    case Keyword.get(opts, :deadline) do
-      deadline when is_integer(deadline) ->
-        stream_sse_with_deadline(
+    deadline = Keyword.get(opts, :deadline)
+    cancel_token = Keyword.get(opts, :cancel_token)
+
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        cancelled_error("Stream cancelled")
+
+      is_integer(deadline) or not is_nil(cancel_token) ->
+        stream_sse_managed(
           url,
           headers,
           body,
           initial_acc,
           handle_event,
           req_options,
-          deadline
+          deadline,
+          cancel_token
         )
 
-      _nil ->
+      true ->
         handler = SSE.req_stream_handler(initial_acc, handle_event)
 
         decode_sse_result(
@@ -188,7 +216,11 @@ defmodule Alloy.Provider.HTTP do
         validate_api_key_bytes(key)
 
       fun when is_function(fun, 0) ->
-        resolve_api_key_callback(fun, Map.get(config, :alloy_request_deadline))
+        resolve_api_key_callback(
+          fun,
+          Map.get(config, :alloy_request_deadline),
+          Map.get(config, :alloy_cancel_token)
+        )
 
       nil ->
         {:error, %Error{kind: :auth, message: "Missing :api_key in provider config"}}
@@ -232,38 +264,51 @@ defmodule Alloy.Provider.HTTP do
     end
   end
 
-  defp resolve_api_key_callback(fun, deadline) when is_integer(deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
+  defp resolve_api_key_callback(fun, deadline, cancel_token)
+       when is_integer(deadline) or not is_nil(cancel_token) do
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        cancelled_error("Request cancelled while resolving :api_key")
 
-    if remaining <= 0 do
-      {:error,
-       %Error{kind: :timeout, message: "Request exceeded deadline while resolving :api_key"}}
-    else
-      owner = OwnedWorker.start(deadline, fn -> invoke_api_key_callback(fun) end)
+      deadline_expired?(deadline) ->
+        {:error,
+         %Error{kind: :timeout, message: "Request exceeded deadline while resolving :api_key"}}
 
-      case await_monitored_post(owner, deadline) do
-        {:ok, result} ->
-          result
+      true ->
+        owner =
+          OwnedWorker.start(deadline, fn -> invoke_api_key_callback(fun) end,
+            cancel_token: cancel_token
+          )
 
-        {:shutdown, _reason} ->
-          shutdown_error()
+        case await_monitored_post(owner, deadline, cancel_token) do
+          {:ok, result} ->
+            result
 
-        {:worker_exit, reason} ->
-          {:error,
-           %Error{
-             kind: :auth,
-             message:
-               "Dynamic :api_key callback exited: #{OwnedWorker.format_exit_reason(reason)}"
-           }}
+          :cancelled ->
+            cancelled_error("Request cancelled while resolving :api_key")
 
-        :timeout ->
-          {:error,
-           %Error{kind: :timeout, message: "Dynamic :api_key callback exceeded request deadline"}}
-      end
+          {:shutdown, _reason} ->
+            shutdown_error()
+
+          {:worker_exit, reason} ->
+            {:error,
+             %Error{
+               kind: :auth,
+               message:
+                 "Dynamic :api_key callback exited: #{OwnedWorker.format_exit_reason(reason)}"
+             }}
+
+          :timeout ->
+            {:error,
+             %Error{
+               kind: :timeout,
+               message: "Dynamic :api_key callback exceeded request deadline"
+             }}
+        end
     end
   end
 
-  defp resolve_api_key_callback(fun, _no_deadline), do: invoke_api_key_callback(fun)
+  defp resolve_api_key_callback(fun, _no_deadline, nil), do: invoke_api_key_callback(fun)
 
   defp invoke_api_key_callback(fun) do
     case fun.() do
@@ -367,177 +412,306 @@ defmodule Alloy.Provider.HTTP do
     }
   end
 
-  defp post_json_with_deadline(url, headers, body, req_options, deadline) do
+  defp post_json_managed(url, headers, body, req_options, deadline, cancel_token) do
     encoded_body = Jason.encode!(body)
-    remaining = deadline - System.monotonic_time(:millisecond)
 
-    if remaining <= 0 do
-      {:error, %Error{kind: :timeout, message: "Request exceeded deadline"}}
-    else
-      req_options = clamp_receive_timeout(req_options, remaining)
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        cancelled_error("Request cancelled")
 
-      owner =
-        OwnedWorker.start(deadline, fn ->
-          request_encoded(url, headers, encoded_body, req_options)
-        end)
+      deadline_expired?(deadline) ->
+        {:error, %Error{kind: :timeout, message: "Request exceeded deadline"}}
 
-      case await_monitored_post(owner, deadline) do
-        {:ok, result} -> decode_post_result(result)
-        {:shutdown, _reason} -> shutdown_error()
-        {:worker_exit, reason} -> propagate_worker_exit(reason)
-        :timeout -> {:error, %Error{kind: :timeout, message: "Request exceeded deadline"}}
-      end
+      true ->
+        req_options = maybe_clamp_receive_timeout(req_options, deadline)
+
+        owner =
+          OwnedWorker.start(
+            deadline,
+            fn -> request_encoded(url, headers, encoded_body, req_options) end,
+            cancel_token: cancel_token
+          )
+
+        case await_monitored_post(owner, deadline, cancel_token) do
+          {:ok, result} -> decode_post_result(result)
+          :cancelled -> cancelled_error("Request cancelled")
+          {:shutdown, _reason} -> shutdown_error()
+          {:worker_exit, reason} -> propagate_worker_exit(reason)
+          :timeout -> {:error, %Error{kind: :timeout, message: "Request exceeded deadline"}}
+        end
     end
   end
 
-  defp stream_sse_with_deadline(
+  defp stream_sse_managed(
          url,
          headers,
          body,
          initial_acc,
          handle_event,
          req_options,
-         deadline
+         deadline,
+         cancel_token
        ) do
     encoded_body = Jason.encode!(body)
-    remaining = deadline - System.monotonic_time(:millisecond)
 
-    if remaining <= 0 do
-      {:error, %Error{kind: :timeout, message: "Stream exceeded request deadline"}}
-    else
-      caller = self()
-      tag = make_ref()
-      req_options = clamp_receive_timeout(req_options, remaining)
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        cancelled_error("Stream cancelled")
 
-      # Synchronous per-chunk acknowledgement on 200 streams keeps at most one
-      # chunk in flight (preserving backpressure while running callbacks in the
-      # caller). Non-200 chunks stay scoped to each Req response's private map so
-      # redirect bodies never contaminate a later error response.
-      into_fn = fn {:data, chunk}, {req, resp} ->
-        if Map.get(resp, :status, 200) == 200 do
-          ack = make_ref()
-          send(caller, {tag, :chunk, self(), ack, chunk})
-
-          receive do
-            {^ack, :ok} -> {:cont, {req, resp}}
-            {^ack, :halt} -> {:halt, {req, resp}}
-          end
-        else
-          SSE.append_error_chunk(chunk, req, resp)
-        end
-      end
-
-      owner =
-        OwnedWorker.start(deadline, fn ->
-          request_encoded(url, headers, encoded_body, [into: into_fn] ++ req_options)
-        end)
-
-      outcome =
-        try do
-          await_sse(owner, tag, initial_acc, handle_event, deadline)
-        catch
-          kind, reason ->
-            OwnedWorker.cancel(owner)
-            flush_chunks(tag)
-            :erlang.raise(kind, reason, __STACKTRACE__)
-        end
-
-      case outcome do
-        {:propagate, reason} -> propagate_worker_exit(reason)
-        result -> result
-      end
-    end
-  end
-
-  defp await_monitored_post(%Task{ref: ref} = owner, deadline) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
-
-    receive do
-      {^ref, {:ok, result}} ->
-        _ = Task.ignore(owner)
-        {:ok, result}
-
-      {^ref, {:worker_exit, reason}} ->
-        _ = Task.ignore(owner)
-
-        if worker_shutdown_reason?(reason),
-          do: {:shutdown, reason},
-          else: {:worker_exit, reason}
-
-      {^ref, :timeout} ->
-        _ = Task.ignore(owner)
-        :timeout
-
-      {:DOWN, ^ref, :process, _pid, reason} ->
-        if OwnedWorker.shutdown_reason?(reason),
-          do: {:shutdown, reason},
-          else: {:worker_exit, reason}
-    after
-      remaining ->
-        OwnedWorker.cancel(owner)
-        :timeout
-    end
-  end
-
-  defp await_sse(%Task{ref: ref} = owner, tag, acc, handle_event, deadline) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
-
-    receive do
-      {^tag, :chunk, worker, ack, chunk} ->
-        if System.monotonic_time(:millisecond) >= deadline do
-          send(worker, {ack, :halt})
-          abort_sse_timeout(owner, tag)
-        else
-          case SSE.apply_chunk_until(acc, chunk, handle_event, deadline) do
-            {:ok, %{sse_handler_error: %Error{} = error}} ->
-              send(worker, {ack, :halt})
-              OwnedWorker.cancel(owner)
-              flush_chunks(tag)
-              {:error, error}
-
-            {:ok, next_acc} ->
-              send(worker, {ack, :ok})
-              await_sse(owner, tag, next_acc, handle_event, deadline)
-
-            {:timeout, _partial_acc} ->
-              send(worker, {ack, :halt})
-              abort_sse_timeout(owner, tag)
-          end
-        end
-
-      {^ref, {:ok, req_result}} ->
-        _ = Task.ignore(owner)
-        finish_stream_result(req_result, acc)
-
-      {^ref, {:worker_exit, reason}} ->
-        _ = Task.ignore(owner)
-        flush_chunks(tag)
-
-        if worker_shutdown_reason?(reason),
-          do: shutdown_error(),
-          else: {:propagate, reason}
-
-      {^ref, :timeout} ->
-        _ = Task.ignore(owner)
-        flush_chunks(tag)
+      deadline_expired?(deadline) ->
         {:error, %Error{kind: :timeout, message: "Stream exceeded request deadline"}}
 
-      {:DOWN, ^ref, :process, _pid, reason} ->
-        flush_chunks(tag)
+      true ->
+        caller = self()
+        tag = make_ref()
+        req_options = maybe_clamp_receive_timeout(req_options, deadline)
 
-        if OwnedWorker.shutdown_reason?(reason),
-          do: shutdown_error(),
-          else: {:propagate, reason}
-    after
-      remaining ->
-        abort_sse_timeout(owner, tag)
+        # Synchronous per-chunk acknowledgement on 200 streams keeps at most one
+        # chunk in flight (preserving backpressure while running callbacks in the
+        # caller). Non-200 chunks stay scoped to each Req response's private map so
+        # redirect bodies never contaminate a later error response.
+        into_fn = fn {:data, chunk}, {req, resp} ->
+          if Map.get(resp, :status, 200) == 200 do
+            ack = make_ref()
+            send(caller, {tag, :chunk, self(), ack, chunk})
+
+            receive do
+              {^ack, :ok} -> {:cont, {req, resp}}
+              {^ack, :halt} -> {:halt, {req, resp}}
+            end
+          else
+            SSE.append_error_chunk(chunk, req, resp)
+          end
+        end
+
+        owner =
+          OwnedWorker.start(
+            deadline,
+            fn -> request_encoded(url, headers, encoded_body, [into: into_fn] ++ req_options) end,
+            cancel_token: cancel_token
+          )
+
+        sse = %{
+          owner: owner,
+          ref: owner.ref,
+          tag: tag,
+          handle_event: handle_event,
+          deadline: deadline,
+          cancel_token: cancel_token
+        }
+
+        outcome =
+          try do
+            await_sse(sse, initial_acc)
+          catch
+            kind, reason ->
+              OwnedWorker.cancel(owner)
+              flush_task_reply(owner.ref)
+              flush_chunks(tag)
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+
+        case outcome do
+          {:propagate, reason} -> propagate_worker_exit(reason)
+          result -> result
+        end
     end
   end
 
-  defp abort_sse_timeout(owner, tag) do
+  defp await_monitored_post(%Task{ref: ref} = owner, deadline, cancel_token) do
+    if Cancel.cancelled?(cancel_token) do
+      OwnedWorker.cancel(owner)
+      flush_task_reply(ref)
+      :cancelled
+    else
+      wait_ms = next_wait_ms(deadline, cancel_token)
+
+      receive do
+        {^ref, {:ok, result}} ->
+          _ = Task.ignore(owner)
+          {:ok, result}
+
+        {^ref, {:worker_exit, reason}} ->
+          _ = Task.ignore(owner)
+
+          if worker_shutdown_reason?(reason),
+            do: {:shutdown, reason},
+            else: {:worker_exit, reason}
+
+        {^ref, :timeout} ->
+          _ = Task.ignore(owner)
+          :timeout
+
+        {^ref, :cancelled} ->
+          _ = Task.ignore(owner)
+          :cancelled
+
+        {:DOWN, ^ref, :process, _pid, reason} ->
+          if OwnedWorker.shutdown_reason?(reason),
+            do: {:shutdown, reason},
+            else: {:worker_exit, reason}
+      after
+        wait_ms ->
+          handle_post_wait_timeout(owner, ref, deadline, cancel_token)
+      end
+    end
+  end
+
+  defp handle_post_wait_timeout(owner, ref, deadline, cancel_token) do
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        OwnedWorker.cancel(owner)
+        flush_task_reply(ref)
+        :cancelled
+
+      deadline_expired?(deadline) ->
+        OwnedWorker.cancel(owner)
+        flush_task_reply(ref)
+        :timeout
+
+      true ->
+        await_monitored_post(owner, deadline, cancel_token)
+    end
+  end
+
+  defp await_sse(
+         %{
+           owner: owner,
+           ref: ref,
+           tag: tag,
+           deadline: deadline,
+           cancel_token: cancel_token
+         } = sse,
+         acc
+       ) do
+    if Cancel.cancelled?(cancel_token) do
+      abort_sse_cancelled(owner, ref, tag)
+    else
+      wait_ms = next_wait_ms(deadline, cancel_token)
+
+      receive do
+        {^tag, :chunk, worker, ack, chunk} ->
+          handle_sse_chunk(sse, worker, ack, chunk, acc)
+
+        {^ref, {:ok, req_result}} ->
+          _ = Task.ignore(owner)
+          finish_stream_result(req_result, acc)
+
+        {^ref, {:worker_exit, reason}} ->
+          _ = Task.ignore(owner)
+          flush_chunks(tag)
+
+          if worker_shutdown_reason?(reason),
+            do: shutdown_error(),
+            else: {:propagate, reason}
+
+        {^ref, :timeout} ->
+          _ = Task.ignore(owner)
+          flush_chunks(tag)
+          {:error, %Error{kind: :timeout, message: "Stream exceeded request deadline"}}
+
+        {^ref, :cancelled} ->
+          _ = Task.ignore(owner)
+          flush_chunks(tag)
+          cancelled_error("Stream cancelled")
+
+        {:DOWN, ^ref, :process, _pid, reason} ->
+          flush_chunks(tag)
+
+          if OwnedWorker.shutdown_reason?(reason),
+            do: shutdown_error(),
+            else: {:propagate, reason}
+      after
+        wait_ms ->
+          handle_sse_wait_timeout(sse, acc)
+      end
+    end
+  end
+
+  defp handle_sse_chunk(
+         %{
+           owner: owner,
+           ref: ref,
+           tag: tag,
+           handle_event: handle_event,
+           deadline: deadline,
+           cancel_token: cancel_token
+         } = sse,
+         worker,
+         ack,
+         chunk,
+         acc
+       ) do
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        send(worker, {ack, :halt})
+        abort_sse_cancelled(owner, ref, tag)
+
+      deadline_expired?(deadline) ->
+        send(worker, {ack, :halt})
+        abort_sse_timeout(owner, ref, tag)
+
+      true ->
+        case SSE.apply_chunk_until(acc, chunk, handle_event, deadline, cancel_token) do
+          {:ok, %{sse_handler_error: %Error{} = error}} ->
+            send(worker, {ack, :halt})
+            OwnedWorker.cancel(owner)
+            flush_task_reply(ref)
+            flush_chunks(tag)
+            {:error, error}
+
+          {:ok, next_acc} ->
+            send(worker, {ack, :ok})
+            await_sse(sse, next_acc)
+
+          {:cancelled, _partial_acc} ->
+            send(worker, {ack, :halt})
+            abort_sse_cancelled(owner, ref, tag)
+
+          {:timeout, _partial_acc} ->
+            send(worker, {ack, :halt})
+            abort_sse_timeout(owner, ref, tag)
+        end
+    end
+  end
+
+  defp handle_sse_wait_timeout(
+         %{owner: owner, ref: ref, tag: tag, deadline: deadline, cancel_token: cancel_token} =
+           sse,
+         acc
+       ) do
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        abort_sse_cancelled(owner, ref, tag)
+
+      deadline_expired?(deadline) ->
+        abort_sse_timeout(owner, ref, tag)
+
+      true ->
+        await_sse(sse, acc)
+    end
+  end
+
+  defp abort_sse_timeout(owner, ref, tag) do
     OwnedWorker.cancel(owner)
+    flush_task_reply(ref)
     flush_chunks(tag)
     {:error, %Error{kind: :timeout, message: "Stream exceeded request deadline"}}
+  end
+
+  defp abort_sse_cancelled(owner, ref, tag) do
+    OwnedWorker.cancel(owner)
+    flush_task_reply(ref)
+    flush_chunks(tag)
+    cancelled_error("Stream cancelled")
+  end
+
+  defp flush_task_reply(ref) do
+    receive do
+      {^ref, _reply} -> flush_task_reply(ref)
+    after
+      0 -> :ok
+    end
   end
 
   defp flush_chunks(tag) do
@@ -546,6 +720,29 @@ defmodule Alloy.Provider.HTTP do
     after
       0 -> :ok
     end
+  end
+
+  defp deadline_expired?(nil), do: false
+  defp deadline_expired?(deadline), do: System.monotonic_time(:millisecond) >= deadline
+
+  defp next_wait_ms(nil, nil), do: :infinity
+  defp next_wait_ms(nil, _cancel_token), do: @cancel_poll_ms
+
+  defp next_wait_ms(deadline, nil),
+    do: max(deadline - System.monotonic_time(:millisecond), 0)
+
+  defp next_wait_ms(deadline, _cancel_token),
+    do: min(max(deadline - System.monotonic_time(:millisecond), 0), @cancel_poll_ms)
+
+  defp maybe_clamp_receive_timeout(req_options, nil), do: req_options
+
+  defp maybe_clamp_receive_timeout(req_options, deadline) when is_integer(deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 1)
+    clamp_receive_timeout(req_options, remaining)
+  end
+
+  defp cancelled_error(message) do
+    {:error, %Error{kind: :cancelled, message: message}}
   end
 
   # Dedicated non-retryable :shutdown kind (never produced from provider

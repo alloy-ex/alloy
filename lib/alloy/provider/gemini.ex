@@ -146,7 +146,7 @@ defmodule Alloy.Provider.Gemini do
              build_headers(config, api_key, auth_scheme),
              body,
              Map.get(config, :req_options, []),
-             deadline: Map.get(config, :alloy_request_deadline)
+             HTTP.request_opts(config)
            ) do
       parse_response(resp_body)
     end
@@ -180,7 +180,7 @@ defmodule Alloy.Provider.Gemini do
              initial_acc,
              &handle_sse_event/2,
              [params: [alt: "sse"]] ++ Map.get(config, :req_options, []),
-             deadline: Map.get(config, :alloy_request_deadline)
+             HTTP.request_opts(config)
            ) do
       build_stream_response(acc)
     end

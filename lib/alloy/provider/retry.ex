@@ -9,6 +9,7 @@ defmodule Alloy.Provider.Retry do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Cancel
   alias Alloy.Internal.Sanitize
   alias Alloy.Message
   alias Alloy.Provider.Error
@@ -18,6 +19,7 @@ defmodule Alloy.Provider.Retry do
   # Cap per-retry delay when timeout_ms: :infinity so a hostile or distant
   # Retry-After header (e.g. hours/days) aborts instead of sleeping forever.
   @max_unbounded_retry_delay_ms 60_000
+  @cancel_poll_ms 25
 
   @doc """
   Call a provider with retry, backoff, and fallback logic.
@@ -51,6 +53,8 @@ defmodule Alloy.Provider.Retry do
     primary_origin = Message.origin(provider, provider_config)
     base_messages = Message.attribute_file_blocks(state.messages, primary_origin, provider)
     base_state = %{state | messages: base_messages}
+    cancel_token = effective_cancel_token(state, provider_config)
+    provider_config = maybe_put_cancel_token(provider_config, cancel_token)
 
     {result, chunks_emitted?} =
       do_provider_call(
@@ -72,20 +76,25 @@ defmodule Alloy.Provider.Retry do
       {:error, _reason} = error when chunks_emitted? ->
         {error, base_messages, true}
 
-      # Do not spawn fallback workers against a supervisor that is shutting down.
-      {:error, %Error{kind: :shutdown}} = error ->
+      # Do not spawn fallback workers against a supervisor that is shutting down
+      # or after cooperative cancellation.
+      {:error, %Error{kind: kind}} = error when kind in [:shutdown, :cancelled] ->
         {error, base_messages, false}
 
       {:error, _reason} = error ->
-        try_fallback_providers(
-          base_state,
-          provider_config,
-          primary_origin,
-          streaming?,
-          on_chunk,
-          deadline,
-          error
-        )
+        if Cancel.cancelled?(cancel_token) do
+          {{:error, cancelled_error()}, base_messages, false}
+        else
+          try_fallback_providers(
+            base_state,
+            provider_config,
+            primary_origin,
+            streaming?,
+            on_chunk,
+            deadline,
+            error
+          )
+        end
     end
   end
 
@@ -160,8 +169,11 @@ defmodule Alloy.Provider.Retry do
         :on_event,
         :alloy_on_text_event,
         :alloy_request_deadline,
+        :alloy_cancel_token,
         :output_schema
       ])
+
+    cancel_token = effective_cancel_token(state, provider_config)
 
     Enum.reduce_while(
       state.config.fallback_providers,
@@ -169,56 +181,102 @@ defmodule Alloy.Provider.Retry do
       fn {fb_provider, fb_config}, {acc_err, messages_acc, _emitted?} ->
         now = System.monotonic_time(:millisecond)
 
-        if is_integer(deadline) and deadline - now <= 0 do
-          {:halt, {acc_err, messages_acc, false}}
-        else
-          fb_provider_config =
-            fb_config
-            |> Map.merge(runtime_overrides)
-            |> maybe_put_reasoning(state.config.reasoning)
+        cond do
+          Cancel.cancelled?(cancel_token) ->
+            {:halt, {{:error, cancelled_error()}, messages_acc, false}}
 
-          fb_streaming? = streaming? and supports_streaming?(fb_provider)
-          fb_origin = Message.origin(fb_provider, fb_provider_config)
+          is_integer(deadline) and deadline - now <= 0 ->
+            {:halt, {acc_err, messages_acc, false}}
 
-          attempt_messages =
-            Message.attribute_file_blocks(messages_acc, fb_origin, fb_provider)
+          true ->
+            fb_provider_config =
+              fb_config
+              |> Map.merge(runtime_overrides)
+              |> maybe_put_reasoning(state.config.reasoning)
 
-          attributed_state = %{state | messages: attempt_messages}
+            fb_streaming? = streaming? and supports_streaming?(fb_provider)
+            fb_origin = Message.origin(fb_provider, fb_provider_config)
 
-          {result, chunks_emitted?} =
-            do_provider_call(
-              normalize_for(attributed_state, fb_provider, fb_provider_config),
+            attempt_messages =
+              Message.attribute_file_blocks(messages_acc, fb_origin, fb_provider)
+
+            attributed_state = %{state | messages: attempt_messages}
+
+            {result, chunks_emitted?} =
+              do_provider_call(
+                normalize_for(attributed_state, fb_provider, fb_provider_config),
+                fb_provider,
+                fb_provider_config,
+                fb_streaming?,
+                on_chunk,
+                state.config.max_retries,
+                deadline
+              )
+
+            handle_fallback_result(
+              result,
+              chunks_emitted?,
               fb_provider,
               fb_provider_config,
-              fb_streaming?,
-              on_chunk,
-              state.config.max_retries,
-              deadline
+              primary_origin,
+              attempt_messages,
+              cancel_token
             )
-
-          case result do
-            {:ok, response} ->
-              {:halt,
-               {{:ok,
-                 isolate_fallback_state(
-                   response,
-                   fb_provider,
-                   fb_provider_config,
-                   primary_origin
-                 )}, attempt_messages, chunks_emitted?}}
-
-            {:error, _} = error when chunks_emitted? ->
-              {:halt, {error, attempt_messages, true}}
-
-            {:error, %Error{kind: :shutdown}} = error ->
-              {:halt, {error, attempt_messages, false}}
-
-            {:error, _} = error ->
-              {:cont, {error, attempt_messages, false}}
-          end
         end
       end
     )
+  end
+
+  defp handle_fallback_result(
+         {:ok, response},
+         chunks_emitted?,
+         fb_provider,
+         fb_provider_config,
+         primary_origin,
+         attempt_messages,
+         _cancel_token
+       ) do
+    isolated = isolate_fallback_state(response, fb_provider, fb_provider_config, primary_origin)
+    {:halt, {{:ok, isolated}, attempt_messages, chunks_emitted?}}
+  end
+
+  defp handle_fallback_result(
+         {:error, _} = error,
+         true,
+         _fb_provider,
+         _fb_provider_config,
+         _primary_origin,
+         attempt_messages,
+         _cancel_token
+       ) do
+    {:halt, {error, attempt_messages, true}}
+  end
+
+  defp handle_fallback_result(
+         {:error, %Error{kind: kind}} = error,
+         _chunks_emitted?,
+         _fb_provider,
+         _fb_provider_config,
+         _primary_origin,
+         attempt_messages,
+         _cancel_token
+       )
+       when kind in [:shutdown, :cancelled] do
+    {:halt, {error, attempt_messages, false}}
+  end
+
+  defp handle_fallback_result(
+         {:error, _} = error,
+         _chunks_emitted?,
+         _fb_provider,
+         _fb_provider_config,
+         _primary_origin,
+         attempt_messages,
+         cancel_token
+       ) do
+    if Cancel.cancelled?(cancel_token),
+      do: {:halt, {{:error, cancelled_error()}, attempt_messages, false}},
+      else: {:cont, {error, attempt_messages, false}}
   end
 
   defp isolate_fallback_state(response, fb_provider, fb_config, primary_origin) do
@@ -242,20 +300,26 @@ defmodule Alloy.Provider.Retry do
          retries_left,
          deadline
        ) do
-    case apply_request_deadline(provider_config, deadline, streaming?) do
-      :expired ->
-        {{:error, %Error{kind: :timeout, message: "Request deadline exceeded"}}, false}
+    cancel_token = effective_cancel_token(state, provider_config)
 
-      {:ok, provider_config} ->
-        execute_provider_attempt(
-          state,
-          provider,
-          provider_config,
-          streaming?,
-          on_chunk,
-          retries_left,
-          deadline
-        )
+    if Cancel.cancelled?(cancel_token) do
+      {{:error, cancelled_error()}, false}
+    else
+      case apply_request_deadline(provider_config, deadline, streaming?) do
+        :expired ->
+          {{:error, %Error{kind: :timeout, message: "Request deadline exceeded"}}, false}
+
+        {:ok, provider_config} ->
+          execute_provider_attempt(
+            state,
+            provider,
+            provider_config,
+            streaming?,
+            on_chunk,
+            retries_left,
+            deadline
+          )
+      end
     end
   end
 
@@ -308,42 +372,57 @@ defmodule Alloy.Provider.Retry do
   end
 
   defp maybe_retry_attempt(reason, chunks_emitted?, ctx) do
-    if retryable?(reason) and not chunks_emitted? do
-      attempt = ctx.state.config.max_retries - ctx.retries_left + 1
-      base = round(ctx.state.config.retry_backoff_ms * :math.pow(2, attempt - 1))
-      # Full jitter: uniform random in [1, 2*base] when base > 0 (0 when
-      # retry_backoff_ms: 0) — prevents thundering herd when multiple agents
-      # hit the same rate limit simultaneously. Never retry sooner than the
-      # provider's Retry-After.
-      jitter = if base > 0, do: :rand.uniform(base * 2), else: 0
-      retry_after = retry_after_ms(reason)
+    cancel_token = effective_cancel_token(ctx.state, ctx.provider_config)
 
-      backoff =
-        if is_nil(ctx.deadline) do
-          max(min(jitter, @max_unbounded_retry_delay_ms), retry_after)
-        else
-          max(jitter, retry_after)
-        end
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        {{:error, cancelled_error()}, chunks_emitted?}
 
-      if retry_budget_exhausted?(ctx.deadline, backoff) do
-        # Not enough time left — return the error rather than sleeping
-        # past the turn deadline.
-        {{:error, reason}, false}
+      retryable?(reason) and not chunks_emitted? ->
+        schedule_retry_attempt(reason, ctx, cancel_token)
+
+      true ->
+        {{:error, reason}, chunks_emitted?}
+    end
+  end
+
+  defp schedule_retry_attempt(reason, ctx, cancel_token) do
+    attempt = ctx.state.config.max_retries - ctx.retries_left + 1
+    base = round(ctx.state.config.retry_backoff_ms * :math.pow(2, attempt - 1))
+    # Full jitter: uniform random in [1, 2*base] when base > 0 (0 when
+    # retry_backoff_ms: 0) — prevents thundering herd when multiple agents
+    # hit the same rate limit simultaneously. Never retry sooner than the
+    # provider's Retry-After.
+    jitter = if base > 0, do: :rand.uniform(base * 2), else: 0
+    retry_after = retry_after_ms(reason)
+
+    backoff =
+      if is_nil(ctx.deadline) do
+        max(min(jitter, @max_unbounded_retry_delay_ms), retry_after)
       else
-        sleep_backoff(backoff)
-
-        do_provider_call(
-          ctx.state,
-          ctx.provider,
-          ctx.provider_config,
-          ctx.streaming?,
-          ctx.on_chunk,
-          ctx.retries_left - 1,
-          ctx.deadline
-        )
+        max(jitter, retry_after)
       end
+
+    if retry_budget_exhausted?(ctx.deadline, backoff) do
+      # Not enough time left — return the error rather than sleeping
+      # past the turn deadline.
+      {{:error, reason}, false}
     else
-      {{:error, reason}, chunks_emitted?}
+      case sleep_backoff(backoff, cancel_token) do
+        :cancelled ->
+          {{:error, cancelled_error()}, false}
+
+        :ok ->
+          do_provider_call(
+            ctx.state,
+            ctx.provider,
+            ctx.provider_config,
+            ctx.streaming?,
+            ctx.on_chunk,
+            ctx.retries_left - 1,
+            ctx.deadline
+          )
+      end
     end
   end
 
@@ -375,8 +454,44 @@ defmodule Alloy.Provider.Retry do
   defp retry_after_ms(%Error{retry_after_ms: ms}) when is_integer(ms), do: ms
   defp retry_after_ms(_reason), do: 0
 
-  defp sleep_backoff(0), do: :ok
-  defp sleep_backoff(ms) when ms > 0, do: Process.sleep(ms)
+  defp sleep_backoff(0, cancel_token),
+    do: if(Cancel.cancelled?(cancel_token), do: :cancelled, else: :ok)
+
+  defp sleep_backoff(ms, nil) when ms > 0 do
+    Process.sleep(ms)
+    :ok
+  end
+
+  defp sleep_backoff(ms, cancel_token) when ms > 0 do
+    sleep_until(System.monotonic_time(:millisecond) + ms, cancel_token)
+  end
+
+  defp sleep_until(target_ms, cancel_token) do
+    remaining = target_ms - System.monotonic_time(:millisecond)
+
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        :cancelled
+
+      remaining <= 0 ->
+        :ok
+
+      true ->
+        Process.sleep(min(remaining, @cancel_poll_ms))
+        sleep_until(target_ms, cancel_token)
+    end
+  end
+
+  defp effective_cancel_token(state, provider_config) do
+    Map.get(provider_config, :alloy_cancel_token) || state.config.cancel_token
+  end
+
+  defp maybe_put_cancel_token(provider_config, nil), do: provider_config
+
+  defp maybe_put_cancel_token(provider_config, cancel_token),
+    do: Map.put(provider_config, :alloy_cancel_token, cancel_token)
+
+  defp cancelled_error, do: %Error{kind: :cancelled, message: "Request cancelled"}
 
   # Calls the provider and returns {result, chunks_emitted?}.
   # For streaming calls, wraps on_chunk to detect whether any chunks were

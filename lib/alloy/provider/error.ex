@@ -31,6 +31,8 @@ defmodule Alloy.Provider.Error do
       `:session_uncertain` (a persisted CLI turn may have been recorded),
       `:shutdown` (interrupted by supervisor shutdown; skips retries and
       fallbacks — on a resumed Codex session, also rotate `:session_generation`),
+      `:cancelled` (interrupted cooperatively via `Alloy.Cancel`; skips retries
+      and fallbacks — on a resumed Codex session, also rotate `:session_generation`),
       `:unknown`
   """
 
@@ -50,6 +52,7 @@ defmodule Alloy.Provider.Error do
           | :auth
           | :invalid_request
           | :shutdown
+          | :cancelled
           | :unknown
 
   @type t :: %__MODULE__{

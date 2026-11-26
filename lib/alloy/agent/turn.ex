@@ -9,6 +9,7 @@ defmodule Alloy.Agent.Turn do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Cancel
   alias Alloy.Events
   alias Alloy.Internal.Sanitize
   alias Alloy.{Message, Middleware, OutputSchema, Provider, Usage}
@@ -133,13 +134,18 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp loop(%State{turn: turn, config: config} = state, opts) do
-    if turn >= config.max_turns do
-      %{state | status: :max_turns}
-    else
-      case run_turn(state, opts) do
-        {:continue, state} -> loop(state, opts)
-        {:halt, state} -> state
-      end
+    cond do
+      Cancel.cancelled?(config.cancel_token) ->
+        cancel_state(state)
+
+      turn >= config.max_turns ->
+        %{state | status: :max_turns}
+
+      true ->
+        case run_turn(state, opts) do
+          {:continue, state} -> loop(state, opts)
+          {:halt, state} -> state
+        end
     end
   end
 
@@ -156,12 +162,17 @@ defmodule Alloy.Agent.Turn do
         Events.emit(opts, turn, {:turn_start, %{turn: turn}})
 
         turn_span(turn, fn ->
-          if state.turn > 0 and deadline_expired?(state) do
-            {:halt, fail(state, timeout_error(state))}
-          else
-            state
-            |> complete(Keyword.put(opts, :turn_progress_key, progress_key), false)
-            |> finalize_turn_limits()
+          cond do
+            Cancel.cancelled?(state.config.cancel_token) ->
+              {:halt, cancel_state(state)}
+
+            state.turn > 0 and deadline_expired?(state) ->
+              {:halt, fail(state, timeout_error(state))}
+
+            true ->
+              state
+              |> complete(Keyword.put(opts, :turn_progress_key, progress_key), false)
+              |> finalize_turn_limits()
           end
         end)
         |> recheck_post_span_deadline()
@@ -213,10 +224,13 @@ defmodule Alloy.Agent.Turn do
     step
   end
 
-  # Resolve run-level termination limits (deadline first, then max_turns) before
-  # publishing :turn_end so the final turn never reports status: :running.
+  # Resolve run-level termination limits (cancellation first, then deadline, then
+  # max_turns) before publishing :turn_end so the final turn never reports :running.
   defp finalize_turn_limits({:continue, %State{} = next_state}) do
     cond do
+      Cancel.cancelled?(next_state.config.cancel_token) ->
+        {:halt, cancel_state(next_state)}
+
       next_state.turn > 0 and deadline_expired?(next_state) ->
         {:halt, fail(next_state, timeout_error(next_state))}
 
@@ -230,20 +244,34 @@ defmodule Alloy.Agent.Turn do
 
   defp finalize_turn_limits({:halt, _state} = step), do: step
 
-  # Recheck the run deadline after [:alloy, :turn, :stop] telemetry finishes
-  # and before :turn_end is published so a slow stop handler flips the single
-  # turn verdict to :error instead of synthesizing a phantom follow-up turn.
+  # Recheck cancellation and run deadline after [:alloy, :turn, :stop] telemetry
+  # finishes and before :turn_end is published so a slow stop handler flips the
+  # single turn verdict instead of synthesizing a phantom follow-up turn.
   defp recheck_post_span_deadline({:continue, %State{turn: t} = next_state}) when t > 0 do
-    if deadline_expired?(next_state),
-      do: {:halt, fail(next_state, timeout_error(next_state))},
-      else: {:continue, next_state}
+    cond do
+      Cancel.cancelled?(next_state.config.cancel_token) ->
+        {:halt, cancel_state(next_state)}
+
+      deadline_expired?(next_state) ->
+        {:halt, fail(next_state, timeout_error(next_state))}
+
+      true ->
+        {:continue, next_state}
+    end
   end
 
   defp recheck_post_span_deadline({:halt, %State{status: :max_turns, turn: t} = next_state})
        when t > 0 do
-    if deadline_expired?(next_state),
-      do: {:halt, fail(next_state, timeout_error(next_state))},
-      else: {:halt, next_state}
+    cond do
+      Cancel.cancelled?(next_state.config.cancel_token) ->
+        {:halt, cancel_state(next_state)}
+
+      deadline_expired?(next_state) ->
+        {:halt, fail(next_state, timeout_error(next_state))}
+
+      true ->
+        {:halt, next_state}
+    end
   end
 
   defp recheck_post_span_deadline(step), do: step
@@ -306,6 +334,7 @@ defmodule Alloy.Agent.Turn do
       end
 
     with {:continue, state} <- run_middleware(:before_completion, state),
+         :ok <- check_cancelled(state),
          :ok <- check_deadline(state) do
       record_turn_progress(opts, nil, state.usage)
       {schemas, state} = refresh_tool_schemas(state, pre_key, schemas)
@@ -325,7 +354,12 @@ defmodule Alloy.Agent.Turn do
             |> account_response(response)
 
           record_turn_progress(opts, next_state.stop_reason, next_state.usage)
-          continue_after(next_state, stop_reason, new_msgs, {post_key, schemas}, opts)
+
+          if Cancel.cancelled?(next_state.config.cancel_token) do
+            {:halt, cancel_after_response(next_state, new_msgs)}
+          else
+            continue_after(next_state, stop_reason, new_msgs, {post_key, schemas}, opts)
+          end
 
         {:error, reason} ->
           handle_provider_error(reason, state, opts, overflow_retried? or emitted?)
@@ -364,6 +398,11 @@ defmodule Alloy.Agent.Turn do
       |> then(fn cfg ->
         if is_integer(state.run_deadline),
           do: Map.put(cfg, :alloy_request_deadline, state.run_deadline),
+          else: cfg
+      end)
+      |> then(fn cfg ->
+        if state.config.cancel_token,
+          do: Map.put(cfg, :alloy_cancel_token, state.config.cancel_token),
           else: cfg
       end)
       |> then(fn cfg ->
@@ -496,14 +535,27 @@ defmodule Alloy.Agent.Turn do
   defp halt(%State{} = state, reason),
     do: %{state | status: :halted, error: "Halted by middleware: #{reason}"}
 
+  defp handle_provider_error(%Error{kind: :cancelled}, state, _opts, _overflow_retried?),
+    do: {:halt, cancel_state(state)}
+
   defp handle_provider_error(reason, state, opts, false = _overflow_retried?) do
-    if prompt_too_long?(reason),
-      do: recover_from_overflow(reason, state, opts),
-      else: {:halt, fail(state, reason)}
+    cond do
+      Cancel.cancelled?(state.config.cancel_token) ->
+        {:halt, cancel_state(state)}
+
+      prompt_too_long?(reason) ->
+        recover_from_overflow(reason, state, opts)
+
+      true ->
+        {:halt, fail(state, reason)}
+    end
   end
 
-  defp handle_provider_error(reason, state, _opts, true = _overflow_retried?),
-    do: {:halt, fail(state, reason)}
+  defp handle_provider_error(reason, state, _opts, true = _overflow_retried?) do
+    if Cancel.cancelled?(state.config.cancel_token),
+      do: {:halt, cancel_state(state)},
+      else: {:halt, fail(state, reason)}
+  end
 
   # The provider rejected the prompt as too long. :on_context_overflow
   # middleware (compaction, unless it is turned off) may shrink the history;
@@ -517,18 +569,27 @@ defmodule Alloy.Agent.Turn do
 
       {:continue, %State{messages: messages} = unchanged} when messages == state.messages ->
         overflow_event(state, false)
-        {:halt, fail(unchanged, reason)}
+
+        if Cancel.cancelled?(unchanged.config.cancel_token),
+          do: {:halt, cancel_state(unchanged)},
+          else: {:halt, fail(unchanged, reason)}
 
       {:continue, shrunk} ->
-        Logger.info("[Turn] Prompt too long — history shrunk by middleware, retrying")
-        overflow_event(state, true)
+        if Cancel.cancelled?(shrunk.config.cancel_token) do
+          overflow_event(state, false)
+          {:halt, cancel_state(shrunk)}
+        else
+          Logger.info("[Turn] Prompt too long — history shrunk by middleware, retrying")
+          overflow_event(state, true)
 
-        case complete(shrunk, opts, true) do
-          {:halt, %State{status: status} = failed} when status in [:error, :halted] ->
-            {:halt, failed}
+          case complete(shrunk, opts, true) do
+            {:halt, %State{status: status} = failed}
+            when status in [:error, :halted, :cancelled] ->
+              {:halt, failed}
 
-          {next, recovered} ->
-            {next, State.merge_run_metadata(recovered, %{prompt_too_long_recovery: true})}
+            {next, recovered} ->
+              {next, State.merge_run_metadata(recovered, %{prompt_too_long_recovery: true})}
+          end
         end
     end
   end
@@ -547,13 +608,23 @@ defmodule Alloy.Agent.Turn do
   defp put_provider_error(state, _reason), do: state
 
   defp handle_tool_use(%State{} = state, tool_calls, prepared_schemas, opts) do
-    if deadline_expired?(state) do
-      {:halt, abandon_tool_calls(state, tool_calls, timeout_error(state))}
-    else
-      case run_middleware(:after_tool_request, state) do
-        {:continue, state} -> execute_tools(state, tool_calls, prepared_schemas, opts)
-        {:halt, state} -> {:halt, answer_tool_calls(state, tool_calls, [])}
-      end
+    cond do
+      Cancel.cancelled?(state.config.cancel_token) ->
+        {:halt, cancel_tool_calls(state, tool_calls)}
+
+      deadline_expired?(state) ->
+        {:halt, abandon_tool_calls(state, tool_calls, timeout_error(state))}
+
+      true ->
+        case run_middleware(:after_tool_request, state) do
+          {:continue, state} ->
+            if Cancel.cancelled?(state.config.cancel_token),
+              do: {:halt, cancel_tool_calls(state, tool_calls)},
+              else: execute_tools(state, tool_calls, prepared_schemas, opts)
+
+          {:halt, state} ->
+            {:halt, answer_tool_calls(state, tool_calls, [])}
+        end
     end
   end
 
@@ -566,12 +637,45 @@ defmodule Alloy.Agent.Turn do
       {:halted, reason} ->
         {:halt, state |> halt(reason) |> answer_tool_calls(tool_calls, [])}
 
-      {:ok, result_blocks, tool_call_meta} ->
-        state
-        |> answer_tool_calls(tool_calls, result_blocks)
-        |> State.append_tool_calls(tool_call_meta)
-        |> then(&run_middleware(:after_tool_execution, &1))
-        |> maybe_finish_after_tool(tool_call_meta)
+      {:steering_error, result_blocks, tool_call_meta, reason} ->
+        failed =
+          state
+          |> answer_tool_calls(tool_calls, result_blocks)
+          |> State.append_tool_calls(tool_call_meta)
+          |> fail(reason)
+
+        {:halt, failed}
+
+      {:ok, result_blocks, tool_call_meta, steering_msgs} ->
+        state =
+          state
+          |> answer_tool_calls(tool_calls, result_blocks)
+          |> State.append_tool_calls(tool_call_meta)
+
+        if Cancel.cancelled?(state.config.cancel_token) do
+          {:halt, cancel_state(state)}
+        else
+          finish_tool_round(state, tool_call_meta, steering_msgs)
+        end
+    end
+  end
+
+  defp finish_tool_round(state, tool_call_meta, steering_msgs) do
+    case run_middleware(:after_tool_execution, state) do
+      {:halt, _halted} = halted ->
+        halted
+
+      {:continue, next_state} ->
+        cond do
+          Cancel.cancelled?(next_state.config.cancel_token) ->
+            {:halt, cancel_state(next_state)}
+
+          steering_msgs != [] ->
+            {:continue, State.append_messages(next_state, steering_msgs)}
+
+          true ->
+            maybe_finish_after_tool({:continue, next_state}, tool_call_meta)
+        end
     end
   end
 
@@ -592,8 +696,6 @@ defmodule Alloy.Agent.Turn do
 
     {schemas, %{state | tool_schema_cache: cache}}
   end
-
-  defp maybe_finish_after_tool({:halt, _state} = halted, _calls), do: halted
 
   defp maybe_finish_after_tool({:continue, state} = next, calls) do
     calls = Enum.take(state.tool_calls, -length(calls))
@@ -631,6 +733,13 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp run_executor(calls, state, schemas, opts) do
+    poll_steering =
+      if is_function(state.config.steering, 1) do
+        fn steering_state ->
+          poll_messages_callback(:steering, state.config.steering, steering_state)
+        end
+      end
+
     executor_opts =
       opts
       |> Keyword.take([:event_seq_ref, :event_correlation_id, :event_subscriber?])
@@ -638,12 +747,20 @@ defmodule Alloy.Agent.Turn do
         on_event: &Events.emit(opts, state.turn, &1),
         event_turn: state.turn,
         tool_schemas: schemas,
-        run_deadline: state.run_deadline
+        run_deadline: state.run_deadline,
+        cancel_token: state.config.cancel_token,
+        poll_steering: poll_steering
       )
 
-    case Executor.execute_all(calls, state.tool_fns, state, executor_opts) do
-      {:ok, %Message{content: blocks}, tool_call_meta} -> {:ok, blocks, tool_call_meta}
-      {:halted, _reason} = halted -> halted
+    case Executor.execute_all_for_turn(calls, state.tool_fns, state, executor_opts) do
+      {:ok, %Message{content: blocks}, tool_call_meta, steering_msgs} ->
+        {:ok, blocks, tool_call_meta, steering_msgs}
+
+      {:steering_error, %Message{content: blocks}, tool_call_meta, reason} ->
+        {:steering_error, blocks, tool_call_meta, reason}
+
+      {:halted, _reason} = halted ->
+        halted
     end
   end
 
@@ -710,8 +827,9 @@ defmodule Alloy.Agent.Turn do
 
   # Once a final answer or stop_after_tool outcome has already completed, do not
   # discard it on timeout (which would push callers to retry completed side
-  # effects). When until_tool requires another turn, returning {:continue, state}
-  # enters loop/2's turn > 0 deadline check before starting it.
+  # effects). When until_tool or :follow_up requires another turn, returning
+  # {:continue, state} enters finalize_turn_limits/1 to enforce cancellation,
+  # deadline, and max_turns before starting it.
   defp finish(state, new_msgs) do
     cond do
       structured_output_refusal?(state, new_msgs) ->
@@ -728,16 +846,51 @@ defmodule Alloy.Agent.Turn do
         {:continue, State.append_messages(state, [reminder])}
 
       true ->
-        case decode_structured_output(state, new_msgs) do
-          {:ok, state} ->
-            case run_middleware(:after_completion, state) do
-              {:continue, state} -> {:halt, %{state | status: :completed}}
-              {:halt, state} -> {:halt, state}
-            end
+        maybe_follow_up_or_complete(state, new_msgs)
+    end
+  end
 
-          {:error, state, reason} ->
-            {:halt, fail(state, reason)}
+  defp maybe_follow_up_or_complete(
+         %State{
+           stop_reason: :end_turn,
+           config: %{follow_up: follow_up}
+         } = state,
+         new_msgs
+       )
+       when is_function(follow_up, 1) and not is_map_key(state.run_metadata, :final_tool) do
+    case poll_messages_callback(:follow_up, follow_up, state) do
+      {:ok, []} ->
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:halt, cancel_state(state)},
+          else: complete_run(state, new_msgs)
+
+      {:ok, follow_up_msgs} ->
+        if Cancel.cancelled?(state.config.cancel_token),
+          do: {:halt, cancel_state(state)},
+          else: {:continue, State.append_messages(state, follow_up_msgs)}
+
+      {:error, reason} ->
+        {:halt, fail(state, reason)}
+    end
+  end
+
+  defp maybe_follow_up_or_complete(state, new_msgs), do: complete_run(state, new_msgs)
+
+  defp complete_run(state, new_msgs) do
+    case decode_structured_output(state, new_msgs) do
+      {:ok, state} ->
+        case run_middleware(:after_completion, state) do
+          {:continue, state} ->
+            if Cancel.cancelled?(state.config.cancel_token),
+              do: {:halt, cancel_state(state)},
+              else: {:halt, %{state | status: :completed}}
+
+          {:halt, state} ->
+            {:halt, state}
         end
+
+      {:error, state, reason} ->
+        {:halt, fail(state, reason)}
     end
   end
 
@@ -813,6 +966,52 @@ defmodule Alloy.Agent.Turn do
       end)
 
     if joined == "", do: nil, else: joined
+  end
+
+  defp check_cancelled(state) do
+    if Cancel.cancelled?(state.config.cancel_token),
+      do: {:halt, cancel_state(state)},
+      else: :ok
+  end
+
+  defp cancel_state(%State{} = state), do: %{state | status: :cancelled, error: :cancelled}
+
+  defp cancel_after_response(state, new_msgs) do
+    case extract_tool_calls(new_msgs) do
+      [] -> cancel_state(state)
+      calls -> cancel_tool_calls(state, calls)
+    end
+  end
+
+  defp cancel_tool_calls(state, calls) do
+    results =
+      Enum.map(calls, &Message.tool_result_block(&1.id, "Not executed: Cancelled", true))
+
+    state
+    |> State.append_messages(Message.tool_results(results))
+    |> cancel_state()
+  end
+
+  defp poll_messages_callback(name, callback, state) do
+    case callback.(state) do
+      msgs when is_list(msgs) ->
+        if Enum.all?(msgs, &is_struct(&1, Message)) do
+          {:ok, msgs}
+        else
+          {:error,
+           "#{name} callback returned invalid messages: expected a list of Alloy.Message structs, got #{Sanitize.shape_summary(msgs)}"}
+        end
+
+      other ->
+        {:error,
+         "#{name} callback returned invalid messages: expected a list of Alloy.Message structs, got #{Sanitize.shape_summary(other)}"}
+    end
+  rescue
+    e ->
+      {:error, "#{name} callback failed (#{Sanitize.exception_summary(e, 500)})"}
+  catch
+    kind, reason ->
+      {:error, "#{name} callback #{kind}: #{Sanitize.exit_summary(reason, :redact)}"}
   end
 
   defp check_deadline(state) do

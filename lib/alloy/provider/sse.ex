@@ -11,6 +11,7 @@ defmodule Alloy.Provider.SSE do
   on the parsed events returned here.
   """
 
+  alias Alloy.Cancel
   alias Alloy.Internal.Sanitize
   alias Alloy.Provider.Error
 
@@ -123,17 +124,29 @@ defmodule Alloy.Provider.SSE do
   end
 
   @doc false
-  @spec apply_chunk_until(map(), String.t(), (map(), sse_event() -> map()), integer()) ::
-          {:ok, map()} | {:timeout, map()}
-  def apply_chunk_until(acc, chunk, handle_event, deadline) when is_integer(deadline) do
+  @spec apply_chunk_until(
+          map(),
+          String.t(),
+          (map(), sse_event() -> map()),
+          integer() | nil,
+          Cancel.t() | nil
+        ) ::
+          {:ok, map()} | {:timeout, map()} | {:cancelled, map()}
+  def apply_chunk_until(acc, chunk, handle_event, deadline, cancel_token \\ nil)
+      when is_integer(deadline) or is_nil(deadline) do
     {events, remaining} = process_chunk(acc.buffer, chunk)
     acc = %{acc | buffer: remaining}
 
     Enum.reduce_while(events, {:ok, acc}, fn event, {:ok, acc} ->
-      if System.monotonic_time(:millisecond) >= deadline do
-        {:halt, {:timeout, acc}}
-      else
-        {:cont, {:ok, invoke_event_handler(acc, event, handle_event)}}
+      cond do
+        Cancel.cancelled?(cancel_token) ->
+          {:halt, {:cancelled, acc}}
+
+        is_integer(deadline) and System.monotonic_time(:millisecond) >= deadline ->
+          {:halt, {:timeout, acc}}
+
+        true ->
+          {:cont, {:ok, invoke_event_handler(acc, event, handle_event)}}
       end
     end)
   end

@@ -25,7 +25,7 @@ defmodule Alloy.Agent.State do
   alias Alloy.{Message, OutputSchema, Usage}
   alias Alloy.Tool.Registry
 
-  @type status :: :idle | :running | :completed | :error | :max_turns | :halted
+  @type status :: :idle | :running | :completed | :error | :max_turns | :halted | :cancelled
 
   @type t :: %__MODULE__{
           config: Config.t(),

@@ -25,6 +25,7 @@ defmodule Alloy.Tool.Executor do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Cancel
   alias Alloy.Internal.Sanitize
   alias Alloy.{Message, Middleware, OwnedWorker}
   alias Alloy.Tool.Inline
@@ -34,6 +35,7 @@ defmodule Alloy.Tool.Executor do
   require Logger
 
   @max_inflight_tool_updates 256
+  @cancel_poll_ms 25
 
   @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t()) ::
           Message.t() | {:halted, String.t()}
@@ -47,6 +49,35 @@ defmodule Alloy.Tool.Executor do
   @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t(), keyword()) ::
           {:ok, Message.t(), [map()]} | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
+    {run, inline_tools} = build_run(tool_fns, state, opts)
+
+    with {:ok, tagged} <- tag_tool_calls(state, tool_calls) do
+      {results, meta} =
+        tagged
+        |> batches(inline_tools, state.config.tool_concurrency == 1)
+        |> Enum.flat_map(&run_batch(&1, run))
+        |> Enum.unzip()
+
+      {:ok, Message.tool_results(results), Enum.reject(meta, &is_nil/1)}
+    end
+  end
+
+  @doc false
+  @spec execute_all_for_turn([map()], %{String.t() => Registry.tool()}, State.t(), keyword()) ::
+          {:ok, Message.t(), [map()], [Message.t()]}
+          | {:steering_error, Message.t(), [map()], String.t()}
+          | {:halted, String.t()}
+  def execute_all_for_turn(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
+    {run, inline_tools} = build_run(tool_fns, state, opts)
+    poll_steering = Keyword.get(opts, :poll_steering)
+
+    with {:ok, tagged} <- tag_tool_calls(state, tool_calls) do
+      batches = batches(tagged, inline_tools, state.config.tool_concurrency == 1)
+      run_batches(batches, run, poll_steering, [], [])
+    end
+  end
+
+  defp build_run(tool_fns, state, opts) do
     inline_tools = Map.new(tool_fns, fn {name, tool} -> {name, Registry.to_inline(tool)} end)
 
     schemas =
@@ -68,6 +99,7 @@ defmodule Alloy.Tool.Executor do
       context: build_context(state),
       timeout: state.config.tool_timeout,
       run_deadline: Keyword.get(opts, :run_deadline),
+      cancel_token: Keyword.get(opts, :cancel_token, state.config.cancel_token),
       on_event: Keyword.get(opts, :on_event, fn _ -> :ok end),
       emit_tool_updates?: emit_tool_updates?,
       seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
@@ -75,15 +107,54 @@ defmodule Alloy.Tool.Executor do
       turn: Keyword.get(opts, :event_turn, state.turn)
     }
 
-    with {:ok, tagged} <- tag_tool_calls(state, tool_calls) do
-      {results, meta} =
-        tagged
-        |> batches(inline_tools, state.config.tool_concurrency == 1)
-        |> Enum.flat_map(&run_batch(&1, run))
-        |> Enum.unzip()
+    {run, inline_tools}
+  end
 
-      {:ok, Message.tool_results(results), Enum.reject(meta, &is_nil/1)}
+  defp run_batches([], _run, _poll_steering, results_rev, metas_rev) do
+    {:ok, Message.tool_results(Enum.reverse(results_rev)), Enum.reverse(metas_rev), []}
+  end
+
+  defp run_batches([batch | rest], run, poll_steering, results_rev, metas_rev) do
+    {batch_results, batch_metas} = batch |> run_batch(run) |> Enum.unzip()
+    next_results_rev = Enum.reverse(batch_results, results_rev)
+    next_metas_rev = batch_metas |> Enum.reject(&is_nil/1) |> Enum.reverse(metas_rev)
+
+    if is_function(poll_steering, 1) and
+         not Cancel.cancelled?(run.cancel_token) and
+         not deadline_expired?(run.run_deadline) do
+      steering_state = State.append_tool_calls(run.state, Enum.reverse(next_metas_rev))
+
+      case poll_steering.(steering_state) do
+        {:ok, []} ->
+          run_batches(rest, run, poll_steering, next_results_rev, next_metas_rev)
+
+        {:ok, steering_msgs} ->
+          if Cancel.cancelled?(run.cancel_token) do
+            skipped = skip_batches(rest, &unexecuted_cancelled_result/1)
+            all_results = Enum.reverse(next_results_rev, skipped)
+            {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
+          else
+            skipped = skip_batches(rest, &unexecuted_steering_result/1)
+            all_results = Enum.reverse(next_results_rev, skipped)
+            {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), steering_msgs}
+          end
+
+        {:error, reason} ->
+          skipped = skip_batches(rest, &unexecuted_error_result(&1, "Not executed: #{reason}"))
+          all_results = Enum.reverse(next_results_rev, skipped)
+
+          {:steering_error, Message.tool_results(all_results), Enum.reverse(next_metas_rev),
+           reason}
+      end
+    else
+      run_batches(rest, run, poll_steering, next_results_rev, next_metas_rev)
     end
+  end
+
+  defp skip_batches(batches, mapper) do
+    batches
+    |> List.flatten()
+    |> Enum.map(mapper)
   end
 
   # Calls run in the order the model made them, so a sequential call sees
@@ -126,11 +197,16 @@ defmodule Alloy.Tool.Executor do
   # the configured cap, defaulting to schedulers_online; a queued call's duration
   # includes its wait.
   defp run_batch(batch, run) do
-    if deadline_expired?(run.run_deadline) do
-      Enum.map(batch, &unexecuted_result(&1, run))
-    else
-      started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
-      execute_batch_tasks(started, batch, run)
+    cond do
+      Cancel.cancelled?(run.cancel_token) ->
+        Enum.map(batch, &{unexecuted_cancelled_result(&1), nil})
+
+      deadline_expired?(run.run_deadline) ->
+        Enum.map(batch, &unexecuted_result(&1, run))
+
+      true ->
+        started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
+        execute_batch_tasks(started, batch, run)
     end
   end
 
@@ -168,13 +244,16 @@ defmodule Alloy.Tool.Executor do
   defp await_batch(running, aliases, pending, done, ctx) do
     # Prioritize terminal worker messages ahead of queued :alloy_tool_update
     # messages so a burst of updates with a slow :on_event callback cannot delay
-    # timeout or completion handling past :tool_timeout / :timeout_ms.
+    # timeout, cancellation, or completion handling.
     receive do
       {ref, {:ok, outcome}} when is_map_key(running, ref) ->
         handle_worker_ok(ref, outcome, running, aliases, pending, done, ctx)
 
       {ref, :timeout} when is_map_key(running, ref) ->
         handle_worker_timeout(ref, running, aliases, pending, done, ctx)
+
+      {ref, :cancelled} when is_map_key(running, ref) ->
+        handle_worker_cancelled(ref, running, aliases, pending, done, ctx)
 
       {ref, {:worker_exit, reason}} when is_map_key(running, ref) ->
         handle_worker_exit(ref, reason, running, aliases, pending, done, ctx)
@@ -183,30 +262,88 @@ defmodule Alloy.Tool.Executor do
         handle_worker_down(ref, reason, running, aliases, pending, done, ctx)
     after
       0 ->
-        receive do
-          {ref, {:ok, outcome}} when is_map_key(running, ref) ->
-            handle_worker_ok(ref, outcome, running, aliases, pending, done, ctx)
+        await_batch_blocking(running, aliases, pending, done, ctx)
+    end
+  end
 
-          {ref, :timeout} when is_map_key(running, ref) ->
-            handle_worker_timeout(ref, running, aliases, pending, done, ctx)
+  defp await_batch_blocking(running, aliases, pending, done, ctx) do
+    if Cancel.cancelled?(ctx.run.cancel_token) do
+      abort_batch_cancelled(running, pending, done, ctx)
+    else
+      wait_ms = if ctx.run.cancel_token, do: @cancel_poll_ms, else: :infinity
 
-          {ref, {:worker_exit, reason}} when is_map_key(running, ref) ->
-            handle_worker_exit(ref, reason, running, aliases, pending, done, ctx)
+      receive do
+        {ref, {:ok, outcome}} when is_map_key(running, ref) ->
+          handle_worker_ok(ref, outcome, running, aliases, pending, done, ctx)
 
-          {:DOWN, ref, :process, _pid, reason} when is_map_key(running, ref) ->
-            handle_worker_down(ref, reason, running, aliases, pending, done, ctx)
+        {ref, :timeout} when is_map_key(running, ref) ->
+          handle_worker_timeout(ref, running, aliases, pending, done, ctx)
 
-          {:alloy_tool_update, call_alias, call_id, name, start_seq, chunk}
-          when is_map_key(aliases, call_alias) ->
-            handle_tool_update(
-              {call_alias, call_id, name, start_seq, chunk},
-              running,
-              aliases,
-              pending,
-              done,
-              ctx
-            )
+        {ref, :cancelled} when is_map_key(running, ref) ->
+          handle_worker_cancelled(ref, running, aliases, pending, done, ctx)
+
+        {ref, {:worker_exit, reason}} when is_map_key(running, ref) ->
+          handle_worker_exit(ref, reason, running, aliases, pending, done, ctx)
+
+        {:DOWN, ref, :process, _pid, reason} when is_map_key(running, ref) ->
+          handle_worker_down(ref, reason, running, aliases, pending, done, ctx)
+
+        {:alloy_tool_update, call_alias, call_id, name, start_seq, chunk}
+        when is_map_key(aliases, call_alias) ->
+          handle_tool_update(
+            {call_alias, call_id, name, start_seq, chunk},
+            running,
+            aliases,
+            pending,
+            done,
+            ctx
+          )
+      after
+        wait_ms ->
+          if Cancel.cancelled?(ctx.run.cancel_token),
+            do: abort_batch_cancelled(running, pending, done, ctx),
+            else: await_batch(running, aliases, pending, done, ctx)
+      end
+    end
+  end
+
+  defp abort_batch_cancelled(running, pending, done, ctx) do
+    # Kill every running worker and flush all aliases/replies before invoking
+    # :after_tool_call / :on_event so a throwing callback cannot leak siblings.
+    stopped =
+      running
+      |> Enum.map(fn {ref, entry} ->
+        if entry.update_alias, do: Process.unalias(entry.update_alias)
+        OwnedWorker.cancel(entry.owner)
+        Process.demonitor(ref, [:flush])
+        flush_worker_reply(ref)
+        flush_alias_updates(entry.update_alias)
+        entry
+      end)
+      |> Enum.sort_by(& &1.started.index)
+
+    done_after_running =
+      Enum.reduce(stopped, done, fn entry, acc ->
+        outcome = {:error, "Tool #{entry.started.call[:name]} was cancelled.", nil}
+        [finish(entry.started, outcome, ctx.run) | acc]
+      end)
+
+    Enum.reduce(pending, done_after_running, fn started, acc ->
+      outcome =
+        case started.tag do
+          {:blocked, _call, reason} -> {:error, "Blocked: #{reason}", nil}
+          {:execute, _call} -> {:error, "Not executed: Cancelled", nil}
         end
+
+      [finish(started, outcome, ctx.run) | acc]
+    end)
+  end
+
+  defp flush_worker_reply(ref) do
+    receive do
+      {^ref, _reply} -> flush_worker_reply(ref)
+    after
+      0 -> :ok
     end
   end
 
@@ -223,7 +360,9 @@ defmodule Alloy.Tool.Executor do
     :atomics.sub(inflight, 1, 1)
 
     _ =
-      unless deadline_expired?(ctx.run.run_deadline) or deadline_expired?(call_deadline) do
+      unless Cancel.cancelled?(ctx.run.cancel_token) or
+               deadline_expired?(ctx.run.run_deadline) or
+               deadline_expired?(call_deadline) do
         run_or_cleanup(running, fn ->
           emit_update(call_id, name, start_seq, chunk, ctx.run)
         end)
@@ -245,6 +384,15 @@ defmodule Alloy.Tool.Executor do
     next_aliases = deactivate_update_alias(aliases, entry.update_alias)
     Process.demonitor(ref, [:flush])
     outcome = exit_outcome(entry.started.call, :timeout, ctx.run, entry.deadline_capped?)
+    done_entry = finish_or_cleanup(entry, outcome, false, ctx.run, next_running)
+    await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
+  end
+
+  defp handle_worker_cancelled(ref, running, aliases, pending, done, ctx) do
+    {entry, next_running} = Map.pop!(running, ref)
+    next_aliases = deactivate_update_alias(aliases, entry.update_alias)
+    Process.demonitor(ref, [:flush])
+    outcome = {:error, "Tool #{entry.started.call[:name]} was cancelled.", nil}
     done_entry = finish_or_cleanup(entry, outcome, false, ctx.run, next_running)
     await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
   end
@@ -325,6 +473,19 @@ defmodule Alloy.Tool.Executor do
   end
 
   defp fill_slots(running, aliases, [started | rest], done, ctx) do
+    if Cancel.cancelled?(ctx.run.cancel_token) do
+      entry =
+        run_or_cleanup(running, fn ->
+          finish(started, {:error, "Not executed: Cancelled", nil}, ctx.run)
+        end)
+
+      fill_slots(running, aliases, rest, [entry | done], ctx)
+    else
+      fill_slot_with_budget(running, aliases, started, rest, done, ctx)
+    end
+  end
+
+  defp fill_slot_with_budget(running, aliases, started, rest, done, ctx) do
     case task_deadline(ctx.run) do
       :expired ->
         entry =
@@ -339,7 +500,9 @@ defmodule Alloy.Tool.Executor do
 
         owner =
           try do
-            OwnedWorker.start(deadline, fn -> invoke(started.tag, call_run) end)
+            OwnedWorker.start(deadline, fn -> invoke(started.tag, call_run) end,
+              cancel_token: ctx.run.cancel_token
+            )
           catch
             kind, reason ->
               if call_alias, do: Process.unalias(call_alias)
@@ -433,7 +596,7 @@ defmodule Alloy.Tool.Executor do
   defp drain_call_updates(nil, _start_seq, _run), do: :ok
 
   defp drain_call_updates(call_alias, start_seq, run) do
-    if deadline_expired?(run.run_deadline) do
+    if Cancel.cancelled?(run.cancel_token) or deadline_expired?(run.run_deadline) do
       flush_alias_updates(call_alias)
     else
       receive do
@@ -480,6 +643,24 @@ defmodule Alloy.Tool.Executor do
   defp unexecuted_result({:execute, call}, run) do
     {Message.tool_result_block(call[:id], deadline_skipped_message(run), true), nil}
   end
+
+  defp unexecuted_cancelled_result({:blocked, call, reason}),
+    do: Message.tool_result_block(call[:id], "Blocked: #{reason}", true)
+
+  defp unexecuted_cancelled_result({:execute, call}),
+    do: Message.tool_result_block(call[:id], "Not executed: Cancelled", true)
+
+  defp unexecuted_steering_result({:blocked, call, reason}),
+    do: Message.tool_result_block(call[:id], "Blocked: #{reason}", true)
+
+  defp unexecuted_steering_result({:execute, call}),
+    do: Message.tool_result_block(call[:id], "Skipped due to steering message.", true)
+
+  defp unexecuted_error_result({:blocked, call, reason}, _message),
+    do: Message.tool_result_block(call[:id], "Blocked: #{reason}", true)
+
+  defp unexecuted_error_result({:execute, call}, message),
+    do: Message.tool_result_block(call[:id], message, true)
 
   defp deadline_expired?(nil), do: false
   defp deadline_expired?(deadline), do: System.monotonic_time(:millisecond) >= deadline

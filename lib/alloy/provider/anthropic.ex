@@ -172,7 +172,7 @@ defmodule Alloy.Provider.Anthropic do
              build_headers(config, api_key, auth_scheme, body),
              body,
              Map.get(config, :req_options, []),
-             deadline: Map.get(config, :alloy_request_deadline)
+             HTTP.request_opts(config)
            ) do
       parse_response(resp_body)
     end
@@ -216,7 +216,7 @@ defmodule Alloy.Provider.Anthropic do
              initial_acc,
              &handle_sse_raw_event/2,
              Map.get(config, :req_options, []),
-             deadline: Map.get(config, :alloy_request_deadline)
+             HTTP.request_opts(config)
            ) do
       build_stream_response(sse_acc)
     end

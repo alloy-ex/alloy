@@ -116,7 +116,7 @@ defmodule Alloy.Provider.OpenAICompat do
              build_headers(config, api_key),
              body,
              Map.get(config, :req_options, []),
-             deadline: Map.get(config, :alloy_request_deadline)
+             HTTP.request_opts(config)
            ) do
       parse_response(resp_body)
     end
@@ -139,8 +139,11 @@ defmodule Alloy.Provider.OpenAICompat do
         body,
         on_chunk,
         Map.get(config, :req_options, []),
-        deadline: Map.get(config, :alloy_request_deadline),
-        on_event: Map.get(config, :on_event, fn _ -> :ok end)
+        Keyword.put(
+          HTTP.request_opts(config),
+          :on_event,
+          Map.get(config, :on_event, fn _ -> :ok end)
+        )
       )
     end
   end
