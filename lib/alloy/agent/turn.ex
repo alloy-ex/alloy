@@ -155,10 +155,11 @@ defmodule Alloy.Agent.Turn do
     turn = state.turn + 1
     usage_before = state.usage
     progress_key = {:alloy_turn_progress, make_ref()}
-    Events.emit(opts, turn, {:turn_start, %{turn: turn}})
 
     step =
       try do
+        Events.emit(opts, turn, {:turn_start, %{turn: turn}})
+
         turn_span(turn, fn ->
           state
           |> complete(Keyword.put(opts, :turn_progress_key, progress_key), false)

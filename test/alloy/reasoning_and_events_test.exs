@@ -2964,6 +2964,207 @@ defmodule Alloy.ReasoningAndEventsTest do
                  }
                }
              ] = ref_turn_ends
+
+      # 9. OpenAI/xAI invalid non-string whole-item arguments (nil, [], 42) suppress
+      #    :tool_call_delta and preserve both retry and fallback eligibility.
+      for bad_args <- [nil, [], 42] do
+        attempts = :atomics.new(1, signed: false)
+
+        bad_type_plug = fn conn ->
+          n = :atomics.add_get(attempts, 1, 1)
+
+          sse =
+            if n == 1 do
+              sse_oai("response.output_item.done", %{
+                "type" => "response.output_item.done",
+                "output_index" => 0,
+                "item" => %{
+                  "type" => "function_call",
+                  "id" => "fc_bad_type",
+                  "call_id" => "call_bad_type",
+                  "name" => "echo",
+                  "arguments" => bad_args
+                }
+              }) <>
+                sse_oai("response.completed", %{
+                  "type" => "response.completed",
+                  "response" => %{
+                    "id" => "resp_bt",
+                    "status" => "completed",
+                    "output" => [
+                      %{
+                        "type" => "function_call",
+                        "id" => "fc_bad_type",
+                        "call_id" => "call_bad_type",
+                        "name" => "echo",
+                        "arguments" => bad_args
+                      }
+                    ],
+                    "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                  }
+                })
+            else
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_bt_ok",
+                  "status" => "completed",
+                  "output" => [
+                    %{
+                      "type" => "message",
+                      "role" => "assistant",
+                      "content" => [%{"type" => "output_text", "text" => "ok after bad type"}]
+                    }
+                  ],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+            end
+
+          conn
+          |> Plug.Conn.put_resp_content_type("text/event-stream")
+          |> Plug.Conn.send_resp(200, sse)
+        end
+
+        assert {:ok, %{text: "ok after bad type"}} =
+                 Alloy.stream("hi", fn _ -> :ok end,
+                   provider:
+                     {OpenAI,
+                      api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: bad_type_plug]},
+                   max_retries: 1,
+                   retry_backoff_ms: 0,
+                   on_event: &send(parent, {:bad_type_ev, &1})
+                 )
+
+        assert :atomics.get(attempts, 1) == 2
+        refute Enum.any?(drain_tagged(:bad_type_ev), &(&1.event == :tool_call_delta))
+      end
+
+      # Also verify fallback eligibility when primary returns malformed non-string arguments with max_retries: 0.
+      fb_bad_plug =
+        sse_plug(
+          sse_oai("response.output_item.done", %{
+            "type" => "response.output_item.done",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_fb",
+              "call_id" => "call_fb",
+              "name" => "echo",
+              "arguments" => nil
+            }
+          }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_fb_bad",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_fb",
+                    "call_id" => "call_fb",
+                    "name" => "echo",
+                    "arguments" => nil
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      {:ok, fb_pid} = TestProvider.start_link([TestProvider.text_response("from fallback")])
+
+      assert {:ok, %{text: "from fallback"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI, api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: fb_bad_plug]},
+                 fallback_providers: [{TestProvider, agent_pid: fb_pid}],
+                 max_retries: 0,
+                 on_event: &send(parent, {:fb_bad_ev, &1})
+               )
+
+      refute Enum.any?(drain_tagged(:fb_bad_ev), &(&1.event == :tool_call_delta))
+
+      # 10. OpenAI/xAI map-typed arguments (both output_item.done and terminal-only response.completed)
+      #     are JSON-encoded into :tool_call_delta.
+      for include_done? <- [true, false] do
+        item = %{
+          "type" => "function_call",
+          "id" => "fc_map",
+          "call_id" => "call_map",
+          "name" => "echo",
+          "arguments" => %{"x" => 1}
+        }
+
+        done_chunk =
+          if include_done?,
+            do:
+              sse_oai("response.output_item.done", %{
+                "type" => "response.output_item.done",
+                "output_index" => 0,
+                "item" => item
+              }),
+            else: ""
+
+        map_args_plug =
+          sse_plug(
+            done_chunk <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_map",
+                  "status" => "completed",
+                  "output" => [item],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        {:ok, %{messages: [map_msg]}} =
+          OpenAI.stream(
+            [Message.user("hi")],
+            [],
+            %{
+              api_key: "sk-oai",
+              model: "gpt-5.4",
+              req_options: [plug: map_args_plug],
+              on_event: &send(parent, {:map_args_ev, &1})
+            },
+            fn _ -> :ok end
+          )
+
+        assert [%{type: "tool_use", id: "call_map", name: "echo", input: %{"x" => 1}}] =
+                 map_msg.content
+
+        map_deltas =
+          drain_tagged(:map_args_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+        assert Jason.decode!(Enum.map_join(map_deltas, & &1.arguments_delta)) == %{"x" => 1}
+      end
+
+      # 11. Throwing from :turn_start still attempts paired :turn_end (status: :error) before propagating.
+      {:ok, ts_pid} = TestProvider.start_link([TestProvider.text_response("never")])
+
+      assert catch_throw(
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: ts_pid},
+                 on_event: fn
+                   %{event: :turn_start} = ev ->
+                     send(parent, {:ts_throw_ev, ev})
+                     throw(:abort_on_start)
+
+                   ev ->
+                     send(parent, {:ts_throw_ev, ev})
+                 end
+               )
+             ) == :abort_on_start
+
+      ts_events = drain_tagged(:ts_throw_ev)
+      assert Enum.any?(ts_events, &(&1.event == :turn_start and &1.turn == 1))
+      assert Enum.any?(ts_events, &(&1.event == :turn_end and &1.payload.status == :error))
     end
   end
 

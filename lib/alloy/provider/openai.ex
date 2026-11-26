@@ -673,20 +673,20 @@ defmodule Alloy.Provider.OpenAI do
     end
   end
 
-  defp invalid_whole_item_args?(%{"arguments" => args}) when is_binary(args) and args != "" do
-    case Jason.decode(args) do
-      {:ok, map} when is_map(map) -> false
-      _ -> true
-    end
+  defp invalid_whole_item_args?(item) do
+    not match?({:ok, _}, decode_function_call_arguments(item))
   end
-
-  defp invalid_whole_item_args?(_item), do: false
 
   defp maybe_emit_whole_item_args(on_event, base_meta, item, event_type, false)
        when event_type in ["response.output_item.done", "response.completed"] do
-    case item["arguments"] do
+    case Map.get(item, "arguments") do
       args when is_binary(args) and args != "" ->
         event = Map.put(base_meta, :arguments_delta, args)
+        on_event.({:tool_call_delta, event})
+        true
+
+      args when is_map(args) ->
+        event = Map.put(base_meta, :arguments_delta, Jason.encode!(args))
         on_event.({:tool_call_delta, event})
         true
 
