@@ -87,12 +87,17 @@ defmodule Alloy.Provider.Gemini do
   semantics.
   """
   @type config :: %{
-          required(:api_key) => String.t(),
+          required(:api_key) => Alloy.Provider.api_key(),
           required(:model) => String.t(),
           optional(:max_tokens) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:api_url) => String.t(),
           optional(:api_version) => String.t(),
+          optional(:origin_key) => String.t(),
+          optional(:cached_content) => String.t(),
+          optional(:google_search) => boolean() | map(),
+          optional(:url_context) => boolean() | map(),
+          optional(:code_execution) => boolean() | map(),
           optional(:generation_config) => map() | keyword() | nil,
           optional(:tool_config) => map(),
           optional(:safety_settings) => [map()],
@@ -105,11 +110,12 @@ defmodule Alloy.Provider.Gemini do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, api_key} <- HTTP.resolve_api_key(config),
+         {:ok, body} <- build_request_body(messages, tool_defs, config),
          {:ok, resp_body} <-
            HTTP.post_json(
              request_url(config, "generateContent"),
-             build_headers(config),
+             build_headers(config, api_key),
              body,
              Map.get(config, :req_options, []),
              deadline: Map.get(config, :alloy_request_deadline)
@@ -133,11 +139,12 @@ defmodule Alloy.Provider.Gemini do
       on_chunk: on_chunk
     }
 
-    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, api_key} <- HTTP.resolve_api_key(config),
+         {:ok, body} <- build_request_body(messages, tool_defs, config),
          {:ok, acc} <-
            HTTP.stream_sse(
              request_url(config, "streamGenerateContent"),
-             build_headers(config),
+             build_headers(config, api_key),
              body,
              initial_acc,
              &handle_sse_event/2,
@@ -159,16 +166,18 @@ defmodule Alloy.Provider.Gemini do
   defp normalize_model("models/" <> model), do: model
   defp normalize_model(model), do: model
 
-  defp build_headers(config) do
+  defp build_headers(config, api_key) do
     [
-      {"x-goog-api-key", config.api_key},
+      {"x-goog-api-key", api_key},
       {"x-goog-api-client", "alloy/#{Application.spec(:alloy, :vsn) |> to_string()}"},
       {"content-type", "application/json"}
     ] ++ Map.get(config, :extra_headers, [])
   end
 
   defp build_request_body(messages, tool_defs, config) do
-    body = %{"contents" => build_contents(messages)}
+    body =
+      %{"contents" => build_contents(messages)}
+      |> HTTP.maybe_put_unless_empty_map("cachedContent", Map.get(config, :cached_content))
 
     body =
       case Map.get(config, :system_prompt) do
@@ -191,16 +200,8 @@ defmodule Alloy.Provider.Gemini do
 
       body = HTTP.maybe_put_unless_empty_map(body, "generationConfig", generation_config)
 
-      body =
-        case tool_defs do
-          [] ->
-            body
-
-          defs ->
-            Map.put(body, "tools", [
-              %{"functionDeclarations" => Enum.map(defs, &format_tool_def/1)}
-            ])
-        end
+      tools = build_tools(tool_defs, config)
+      body = HTTP.maybe_put_unless_empty_list(body, "tools", tools)
 
       body =
         case Map.get(config, :tool_config) do
@@ -224,6 +225,26 @@ defmodule Alloy.Provider.Gemini do
       validate_output_schema_conflicts(body, raw_generation_config, output_schema)
     end
   end
+
+  defp build_tools(tool_defs, config) do
+    fn_tools =
+      case tool_defs do
+        [] -> []
+        defs -> [%{"functionDeclarations" => Enum.map(defs, &format_tool_def/1)}]
+      end
+
+    fn_tools
+    |> maybe_append_native_tool("googleSearch", Map.get(config, :google_search))
+    |> maybe_append_native_tool("urlContext", Map.get(config, :url_context))
+    |> maybe_append_native_tool("codeExecution", Map.get(config, :code_execution))
+  end
+
+  defp maybe_append_native_tool(tools, key, true), do: tools ++ [%{key => %{}}]
+
+  defp maybe_append_native_tool(tools, key, cfg) when is_map(cfg) and not is_struct(cfg),
+    do: tools ++ [%{key => Provider.stringify_keys(cfg)}]
+
+  defp maybe_append_native_tool(tools, _key, _other), do: tools
 
   defp normalize_generation_config(config) do
     case Map.get(config, :generation_config) do
@@ -335,13 +356,30 @@ defmodule Alloy.Provider.Gemini do
     %{"inlineData" => %{"mimeType" => mime_type, "data" => data}}
   end
 
+  defp format_content_block(%{type: "image", url: url} = block, _messages) when is_binary(url) do
+    %{"fileData" => %{"fileUri" => url} |> HTTP.maybe_put("mimeType", block[:mime_type])}
+  end
+
   defp format_content_block(%{type: type, mime_type: mime_type, data: data}, _messages)
        when type in ["audio", "video"] do
     %{"inlineData" => %{"mimeType" => mime_type, "data" => data}}
   end
 
+  defp format_content_block(%{type: "document", mime_type: mime_type, data: data}, _messages)
+       when is_binary(mime_type) and is_binary(data) do
+    %{"inlineData" => %{"mimeType" => mime_type, "data" => data}}
+  end
+
   defp format_content_block(%{type: "document", mime_type: mime_type, uri: uri}, _messages) do
     %{"fileData" => %{"mimeType" => mime_type, "fileUri" => uri}}
+  end
+
+  defp format_content_block(
+         %{type: "document", mime_type: mime_type, file_id: file_id},
+         _messages
+       )
+       when is_binary(mime_type) and is_binary(file_id) do
+    %{"fileData" => %{"mimeType" => mime_type, "fileUri" => file_id}}
   end
 
   # Opaque OpenAI Responses items in a transcript that switched provider;

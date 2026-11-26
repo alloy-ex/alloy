@@ -1019,6 +1019,36 @@ defmodule Alloy.Provider.HTTPTest do
       acc2 = HTTP.record_sticky_error(acc1, :server_error, "second")
       assert %Error{kind: :protocol_error, message: "first"} = acc2.sticky_error
     end
+
+    test "resolve_api_key/1 and resolve_optional_api_key/1 support callbacks and sanitize failures" do
+      assert {:ok, "static"} = HTTP.resolve_api_key(%{api_key: "static"})
+      assert {:ok, "from-fun"} = HTTP.resolve_api_key(%{api_key: fn -> "from-fun" end})
+      assert {:ok, "from-tuple"} = HTTP.resolve_api_key(%{api_key: fn -> {:ok, "from-tuple"} end})
+      assert {:ok, nil} = HTTP.resolve_optional_api_key(%{})
+
+      assert {:error, %Error{kind: :auth, message: msg1}} =
+               HTTP.resolve_api_key(%{api_key: fn -> {:error, {:token_err, "sk-secret"}} end})
+
+      refute msg1 =~ "sk-secret"
+      assert msg1 =~ "{:token_err, string}"
+
+      assert {:error, %Error{kind: :auth, message: msg2}} =
+               HTTP.resolve_api_key(%{api_key: fn -> raise ArgumentError, "sk-secret" end})
+
+      refute msg2 =~ "sk-secret"
+      assert msg2 =~ "ArgumentError"
+
+      assert {:error, %Error{kind: :auth, message: msg3}} =
+               HTTP.resolve_api_key(%{api_key: fn -> "" end})
+
+      assert msg3 =~ "invalid value: string"
+
+      assert {:error, %Error{kind: :auth}} = HTTP.resolve_api_key(%{})
+      assert HTTP.http_url?("https://example.com/a.pdf")
+      assert HTTP.http_url?("http://localhost/a.pdf")
+      refute HTTP.http_url?("gs://bucket/a.pdf")
+      refute HTTP.http_url?("https://")
+    end
   end
 
   defp start_tcp_http_server(handler) do

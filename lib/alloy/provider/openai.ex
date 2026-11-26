@@ -84,17 +84,20 @@ defmodule Alloy.Provider.OpenAI do
   semantics.
   """
   @type config :: %{
-          required(:api_key) => String.t(),
+          required(:api_key) => Alloy.Provider.api_key(),
           required(:model) => String.t(),
           optional(:max_tokens) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:api_url) => String.t(),
+          optional(:origin_key) => String.t(),
           optional(:provider_state) => map(),
           optional(:store) => boolean(),
           optional(:include) => [String.t()],
           optional(:tool_choice) => String.t() | map(),
           optional(:parallel_tool_calls) => boolean(),
           optional(:previous_response_id) => String.t(),
+          optional(:prompt_cache_key) => String.t(),
+          optional(:prompt_cache_retention) => String.t(),
           optional(:built_in_tools) => [map()],
           optional(:web_search) => boolean() | map(),
           optional(:x_search) => boolean() | map(),
@@ -109,10 +112,11 @@ defmodule Alloy.Provider.OpenAI do
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
-    with {:ok, resp_body} <-
+    with {:ok, api_key} <- HTTP.resolve_api_key(config),
+         {:ok, resp_body} <-
            HTTP.post_json(
              responses_url(config),
-             headers(config),
+             headers(config, api_key),
              body,
              Map.get(config, :req_options, []),
              deadline: Map.get(config, :alloy_request_deadline)
@@ -138,10 +142,11 @@ defmodule Alloy.Provider.OpenAI do
       on_chunk: on_chunk
     }
 
-    with {:ok, acc} <-
+    with {:ok, api_key} <- HTTP.resolve_api_key(config),
+         {:ok, acc} <-
            HTTP.stream_sse(
              responses_url(config),
-             headers(config),
+             headers(config, api_key),
              body,
              initial_acc,
              &handle_stream_event/2,
@@ -155,8 +160,8 @@ defmodule Alloy.Provider.OpenAI do
   defp responses_url(config),
     do: HTTP.join_url(Map.get(config, :api_url, @default_api_url), "/v1/responses")
 
-  defp headers(config) do
-    [{"authorization", "Bearer #{config.api_key}"}, {"content-type", "application/json"}] ++
+  defp headers(config, api_key) do
+    [{"authorization", "Bearer #{api_key}"}, {"content-type", "application/json"}] ++
       Map.get(config, :extra_headers, [])
   end
 
@@ -179,6 +184,11 @@ defmodule Alloy.Provider.OpenAI do
       |> HTTP.maybe_put_unless_empty_list(
         "parallel_tool_calls",
         Map.get(config, :parallel_tool_calls)
+      )
+      |> HTTP.maybe_put_unless_empty_list("prompt_cache_key", Map.get(config, :prompt_cache_key))
+      |> HTTP.maybe_put_unless_empty_list(
+        "prompt_cache_retention",
+        Map.get(config, :prompt_cache_retention)
       )
 
     tools = Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
@@ -323,6 +333,14 @@ defmodule Alloy.Provider.OpenAI do
     %{"type" => "input_image", "image_url" => "data:#{mime_type};base64,#{data}"}
   end
 
+  defp format_user_content_block(%{type: "image", url: url}) when is_binary(url) do
+    if HTTP.http_url?(url) do
+      %{"type" => "input_image", "image_url" => url}
+    else
+      unsupported_media_notice("image")
+    end
+  end
+
   defp format_user_content_block(%{type: "audio", mime_type: mime_type}) do
     unsupported_media_notice(mime_type)
   end
@@ -331,11 +349,39 @@ defmodule Alloy.Provider.OpenAI do
     unsupported_media_notice(mime_type)
   end
 
+  defp format_user_content_block(%{type: "document", mime_type: mime_type, data: data} = block)
+       when is_binary(mime_type) and is_binary(data) do
+    %{
+      "type" => "input_file",
+      "filename" => block[:filename] || block[:title] || default_document_filename(mime_type),
+      "file_data" => "data:#{mime_type};base64,#{data}"
+    }
+  end
+
+  defp format_user_content_block(%{type: "document", file_id: file_id})
+       when is_binary(file_id) do
+    %{"type" => "input_file", "file_id" => file_id}
+  end
+
+  defp format_user_content_block(%{type: "document", uri: uri} = block) when is_binary(uri) do
+    if HTTP.http_url?(uri) do
+      %{"type" => "input_file", "file_url" => uri}
+    else
+      unsupported_media_notice(Map.get(block, :mime_type, "document"))
+    end
+  end
+
   defp format_user_content_block(%{type: "document", mime_type: mime_type}) do
     unsupported_media_notice(mime_type)
   end
 
   defp format_user_content_block(_block), do: nil
+
+  defp default_document_filename("application/pdf"), do: "document.pdf"
+  defp default_document_filename("text/plain"), do: "document.txt"
+  defp default_document_filename("text/markdown"), do: "document.md"
+  defp default_document_filename("text/csv"), do: "document.csv"
+  defp default_document_filename(_mime_type), do: "document"
 
   defp format_assistant_block(%{type: "text", text: text} = block, _stateless?)
        when is_binary(text) and text != "" do

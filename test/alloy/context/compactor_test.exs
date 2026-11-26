@@ -1269,6 +1269,50 @@ defmodule Alloy.Context.CompactorTest do
       assert summary_config[:generation_config] == [temperature: 0.2]
     end
 
+    test "strips caching and Gemini native tool keys on summary requests" do
+      messages = [
+        Message.user("original"),
+        Message.assistant(String.duplicate("x", 1200)),
+        Message.user("middle"),
+        Message.assistant("recent"),
+        Message.user("latest")
+      ]
+
+      state =
+        build_state(messages,
+          max_tokens: 250,
+          compaction: [reserve_tokens: 20, keep_recent_tokens: 20],
+          provider: ProbeProvider,
+          provider_config: %{
+            prompt_cache_key: "tenant-1",
+            prompt_cache_retention: "24h",
+            cached_content: "cachedContents/abc",
+            google_search: true,
+            url_context: true,
+            store: false,
+            extra_body: %{"cachedContent" => "cachedContents/abc", "store" => false},
+            summary_response: {:ok, summary_text("Clean")},
+            test_pid: self()
+          }
+        )
+
+      {:compacted, _compacted} = Compactor.maybe_compact(state)
+      assert_received {:summary_request, _msgs, _tools, summary_config}
+
+      for key <- [
+            :prompt_cache_key,
+            :prompt_cache_retention,
+            :cached_content,
+            :google_search,
+            :url_context
+          ] do
+        refute Map.has_key?(summary_config, key)
+      end
+
+      assert summary_config[:store] == false
+      assert summary_config[:extra_body] == %{"store" => false}
+    end
+
     test "logs stacktrace when on_compaction throws" do
       callback = fn _middle, _state ->
         throw(:kaboom)

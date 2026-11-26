@@ -108,24 +108,28 @@ defmodule Alloy.Provider.Anthropic do
   # with either newer tool version and tags programmatic calls with it.
   @code_execution_caller "code_execution_20260120"
   @context_management_beta "context-management-2025-06-27"
+  @files_api_beta "files-api-2025-04-14"
+  @web_search_tool_type "web_search_20260209"
 
   @typedoc """
   Configuration for the Anthropic provider. See the module doc for field
   semantics.
   """
   @type config :: %{
-          required(:api_key) => String.t(),
+          required(:api_key) => Alloy.Provider.api_key(),
           required(:model) => String.t(),
           optional(:max_tokens) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:api_url) => String.t(),
           optional(:api_version) => String.t(),
+          optional(:origin_key) => String.t(),
           optional(:extra_headers) => [{String.t(), String.t()}],
           optional(:extra_body) => map(),
           optional(:server_tools) => [map()],
+          optional(:web_search) => boolean() | map(),
           optional(:req_options) => keyword(),
           optional(:on_event) => (term() -> :ok),
-          optional(:cache) => boolean(),
+          optional(:cache) => boolean() | String.t() | map(),
           optional(:code_execution) => boolean(),
           optional(:provider_state) => map()
         }
@@ -134,12 +138,12 @@ defmodule Alloy.Provider.Anthropic do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    body = build_request_body(messages, tool_defs, config)
-
-    with {:ok, resp_body} <-
+    with {:ok, api_key} <- HTTP.resolve_api_key(config),
+         {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, resp_body} <-
            HTTP.post_json(
              messages_url(config),
-             build_headers(config, body),
+             build_headers(config, api_key, body),
              body,
              Map.get(config, :req_options, []),
              deadline: Map.get(config, :alloy_request_deadline)
@@ -159,10 +163,6 @@ defmodule Alloy.Provider.Anthropic do
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
-    body =
-      build_request_body(messages, tool_defs, config)
-      |> Map.put("stream", true)
-
     on_event = Map.get(config, :on_event, fn _ -> :ok end)
 
     initial_acc = %{
@@ -178,10 +178,13 @@ defmodule Alloy.Provider.Anthropic do
       on_event: on_event
     }
 
-    with {:ok, sse_acc} <-
+    with {:ok, api_key} <- HTTP.resolve_api_key(config),
+         {:ok, body} <- build_request_body(messages, tool_defs, config),
+         body = Map.put(body, "stream", true),
+         {:ok, sse_acc} <-
            HTTP.stream_sse(
              messages_url(config),
-             build_headers(config, body),
+             build_headers(config, api_key, body),
              body,
              initial_acc,
              &handle_sse_raw_event/2,
@@ -588,54 +591,90 @@ defmodule Alloy.Provider.Anthropic do
   # --- Request Building ---
 
   defp build_request_body(messages, tool_defs, config) do
-    body = %{
-      "model" => config.model,
-      "max_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
-      "messages" => Enum.map(messages, &format_message/1)
-    }
-
-    cache? = Map.get(config, :cache, false)
-    body = maybe_add_cache_to_conversation_tail(body, cache?)
-
-    body =
-      case Map.get(config, :system_prompt) do
-        nil ->
-          body
-
-        prompt when cache? ->
-          Map.put(body, "system", [
-            %{
-              "type" => "text",
-              "text" => prompt,
-              "cache_control" => %{"type" => "ephemeral"}
-            }
-          ])
-
-        prompt ->
-          Map.put(body, "system", prompt)
-      end
-
-    client_tools =
-      tool_defs
-      |> Enum.map(&format_tool_def/1)
-      |> maybe_add_cache_to_last_tool(cache?)
-
-    tools =
-      client_tools ++ code_execution_tools(config) ++ server_tools(config)
-
-    body =
-      body
-      |> HTTP.maybe_put_unless_empty_list("tools", tools)
-      |> maybe_put_container(config)
-      |> maybe_put_output_schema(config)
-
     reject_extended_thinking!(config)
 
-    HTTP.merge_extra_body(
-      body,
-      HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
-      "output_config"
-    )
+    with {:ok, cache_control} <- normalize_cache(config) do
+      body = %{
+        "model" => config.model,
+        "max_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
+        "messages" => Enum.map(messages, &format_message/1)
+      }
+
+      body = maybe_add_cache_to_conversation_tail(body, cache_control)
+
+      body =
+        case Map.get(config, :system_prompt) do
+          nil ->
+            body
+
+          prompt when is_map(cache_control) ->
+            Map.put(body, "system", [
+              %{
+                "type" => "text",
+                "text" => prompt,
+                "cache_control" => cache_control
+              }
+            ])
+
+          prompt ->
+            Map.put(body, "system", prompt)
+        end
+
+      client_tools =
+        tool_defs
+        |> Enum.map(&format_tool_def/1)
+        |> maybe_add_cache_to_last_tool(cache_control)
+
+      tools =
+        client_tools ++
+          code_execution_tools(config) ++ web_search_tools(config) ++ server_tools(config)
+
+      body =
+        body
+        |> HTTP.maybe_put_unless_empty_list("tools", tools)
+        |> maybe_put_container(config)
+        |> maybe_put_output_schema(config)
+
+      {:ok,
+       HTTP.merge_extra_body(
+         body,
+         HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
+         "output_config"
+       )}
+    end
+  end
+
+  defp normalize_cache(config) do
+    case Map.get(config, :cache, false) do
+      val when val in [false, nil] ->
+        {:ok, nil}
+
+      val when val in [true, "5m"] ->
+        {:ok, %{"type" => "ephemeral"}}
+
+      "1h" ->
+        {:ok, %{"type" => "ephemeral", "ttl" => "1h"}}
+
+      %{ttl: "5m"} ->
+        {:ok, %{"type" => "ephemeral"}}
+
+      %{"ttl" => "5m"} ->
+        {:ok, %{"type" => "ephemeral"}}
+
+      %{ttl: "1h"} ->
+        {:ok, %{"type" => "ephemeral", "ttl" => "1h"}}
+
+      %{"ttl" => "1h"} ->
+        {:ok, %{"type" => "ephemeral", "ttl" => "1h"}}
+
+      other ->
+        {:error,
+         %Error{
+           kind: :invalid_request,
+           message:
+             "Invalid :cache for Anthropic: expected boolean, \"5m\", \"1h\", or %{ttl: \"5m\" | \"1h\"}, got #{Sanitize.inspect_bounded(other)}"
+         }}
+    end
   end
 
   defp maybe_put_output_schema(body, config) do
@@ -664,6 +703,20 @@ defmodule Alloy.Provider.Anthropic do
 
   defp code_execution_tools(_config), do: []
 
+  defp web_search_tools(%{web_search: true}),
+    do: [%{"type" => @web_search_tool_type, "name" => "web_search"}]
+
+  defp web_search_tools(%{web_search: cfg}) when is_map(cfg) and not is_struct(cfg) do
+    [
+      cfg
+      |> Alloy.Provider.stringify_keys()
+      |> Map.put_new("type", @web_search_tool_type)
+      |> Map.put_new("name", "web_search")
+    ]
+  end
+
+  defp web_search_tools(_config), do: []
+
   # Anthropic runs these tools itself, so they are sent exactly as given.
   defp server_tools(config),
     do: config |> Map.get(:server_tools, []) |> Alloy.Provider.stringify_keys()
@@ -689,7 +742,7 @@ defmodule Alloy.Provider.Anthropic do
 
   defp container_live?(_state), do: true
 
-  defp build_headers(config, body) do
+  defp build_headers(config, api_key, body) do
     {user_betas, other_headers} =
       config
       |> Map.get(:extra_headers, [])
@@ -698,16 +751,37 @@ defmodule Alloy.Provider.Anthropic do
     betas = Enum.map(user_betas, fn {_name, value} -> value end) ++ required_betas(body)
 
     [
-      {"x-api-key", config.api_key},
+      {"x-api-key", api_key},
       {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
       {"content-type", "application/json"}
     ] ++ beta_header(betas) ++ other_headers
   end
 
   # Code execution, memory, tool search and tool use examples went GA on
-  # 2026-02-17 and need no header; context editing is still in beta.
-  defp required_betas(%{"context_management" => _}), do: [@context_management_beta]
-  defp required_betas(_body), do: []
+  # 2026-02-17 and need no header; context editing and Files API require betas.
+  defp required_betas(body) do
+    betas = []
+
+    betas =
+      if Map.has_key?(body, "context_management"),
+        do: [@context_management_beta | betas],
+        else: betas
+
+    betas = if has_file_document?(body), do: [@files_api_beta | betas], else: betas
+    Enum.reverse(betas)
+  end
+
+  defp has_file_document?(%{"messages" => messages}) when is_list(messages) do
+    Enum.any?(messages, fn
+      %{"content" => blocks} when is_list(blocks) ->
+        Enum.any?(blocks, &match?(%{"type" => "document", "source" => %{"type" => "file"}}, &1))
+
+      _ ->
+        false
+    end)
+  end
+
+  defp has_file_document?(_body), do: false
 
   # The API reads one comma-separated anthropic-beta header.
   defp beta_header(values) do
@@ -722,37 +796,42 @@ defmodule Alloy.Provider.Anthropic do
   defp joined_beta_header([]), do: []
   defp joined_beta_header(betas), do: [{"anthropic-beta", Enum.join(betas, ",")}]
 
-  defp maybe_add_cache_to_conversation_tail(body, false), do: body
+  defp maybe_add_cache_to_conversation_tail(body, nil), do: body
 
-  defp maybe_add_cache_to_conversation_tail(%{"messages" => []} = body, true), do: body
+  defp maybe_add_cache_to_conversation_tail(%{"messages" => []} = body, _cache_control), do: body
 
-  defp maybe_add_cache_to_conversation_tail(%{"messages" => messages} = body, true) do
+  defp maybe_add_cache_to_conversation_tail(%{"messages" => messages} = body, cache_control) do
     {init, [last]} = Enum.split(messages, -1)
-    Map.put(body, "messages", init ++ [add_cache_to_message_tail(last)])
+    Map.put(body, "messages", init ++ [add_cache_to_message_tail(last, cache_control)])
   end
 
-  defp add_cache_to_message_tail(%{"content" => content} = message) when is_binary(content) do
+  defp add_cache_to_message_tail(%{"content" => content} = message, cache_control)
+       when is_binary(content) do
     Map.put(message, "content", [
-      %{"type" => "text", "text" => content, "cache_control" => %{"type" => "ephemeral"}}
+      %{"type" => "text", "text" => content, "cache_control" => cache_control}
     ])
   end
 
-  defp add_cache_to_message_tail(%{"content" => blocks} = message)
+  defp add_cache_to_message_tail(%{"content" => blocks} = message, cache_control)
        when is_list(blocks) and blocks != [] do
-    Map.put(message, "content", put_cache_on_last(blocks, &cacheable_message_block?/1))
+    Map.put(
+      message,
+      "content",
+      put_cache_on_last(blocks, &cacheable_message_block?/1, cache_control)
+    )
   end
 
-  defp add_cache_to_message_tail(message), do: message
+  defp add_cache_to_message_tail(message, _cache_control), do: message
 
   # Marks the last item that may carry a breakpoint; none if no item may.
-  defp put_cache_on_last(items, cacheable?) do
+  defp put_cache_on_last(items, cacheable?, cache_control) do
     {items, _added?} =
       items
       |> Enum.reverse()
       |> Enum.map_reduce(false, fn
         item, false ->
           if cacheable?.(item) do
-            {Map.put(item, "cache_control", %{"type" => "ephemeral"}), true}
+            {Map.put(item, "cache_control", cache_control), true}
           else
             {item, false}
           end
@@ -838,14 +917,66 @@ defmodule Alloy.Provider.Anthropic do
     }
   end
 
+  defp format_content_block(%{type: "image", url: url}) when is_binary(url) do
+    if HTTP.http_url?(url) do
+      %{"type" => "image", "source" => %{"type" => "url", "url" => url}}
+    else
+      %{"type" => "text", "text" => "[Unsupported image URL scheme for Anthropic provider]"}
+    end
+  end
+
   # Anthropic does not support audio or video inline. Convert to a text notice
   # so the conversation can continue without crashing the turn loop.
   defp format_content_block(%{type: type}) when type in ["audio", "video"] do
     %{"type" => "text", "text" => "[Unsupported media type for Anthropic provider: #{type}]"}
   end
 
-  # Document blocks require Anthropic's Files API (separate upload step). Convert
-  # to a text notice in the same spirit as the audio/video fallback above.
+  defp format_content_block(%{type: "document", mime_type: mime_type, data: data} = block)
+       when is_binary(mime_type) and is_binary(data) do
+    %{
+      "type" => "document",
+      "source" => %{
+        "type" => "base64",
+        "media_type" => mime_type,
+        "data" => data
+      }
+    }
+    |> HTTP.maybe_put("title", block[:title] || block[:filename])
+  end
+
+  defp format_content_block(%{type: "document", file_id: file_id} = block)
+       when is_binary(file_id) do
+    %{
+      "type" => "document",
+      "source" => %{
+        "type" => "file",
+        "file_id" => file_id
+      }
+    }
+    |> HTTP.maybe_put("title", block[:title] || block[:filename])
+  end
+
+  defp format_content_block(%{type: "document", uri: uri} = block) when is_binary(uri) do
+    if HTTP.http_url?(uri) do
+      %{
+        "type" => "document",
+        "source" => %{
+          "type" => "url",
+          "url" => uri
+        }
+      }
+      |> HTTP.maybe_put("title", block[:title] || block[:filename])
+    else
+      mime = Map.get(block, :mime_type, "document")
+
+      %{
+        "type" => "text",
+        "text" =>
+          "[Unsupported document URI (#{mime}) for Anthropic provider: use HTTPS URL, base64 data, or Files API]"
+      }
+    end
+  end
+
   defp format_content_block(%{type: "document", mime_type: mime_type}) do
     %{
       "type" => "text",
@@ -859,8 +990,10 @@ defmodule Alloy.Provider.Anthropic do
     Map.new(block, fn {k, v} -> {to_string(k), v} end)
   end
 
-  defp maybe_add_cache_to_last_tool(tools, false), do: tools
-  defp maybe_add_cache_to_last_tool(tools, true), do: put_cache_on_last(tools, &cacheable_tool?/1)
+  defp maybe_add_cache_to_last_tool(tools, nil), do: tools
+
+  defp maybe_add_cache_to_last_tool(tools, cache_control),
+    do: put_cache_on_last(tools, &cacheable_tool?/1, cache_control)
 
   # The API rejects cache_control on a tool with defer_loading: true.
   defp cacheable_tool?(%{"defer_loading" => true}), do: false

@@ -394,6 +394,69 @@ defmodule Alloy.Provider.GeminiTest do
       assert {:ok, %{messages: [%Message{content: [%{type: "text", signature: []}]}]}} =
                Gemini.complete([Message.user("Hi")], [], list_sig_config)
     end
+
+    test "formats inline/file_id documents, image URLs, cached_content, native tools, and dynamic api_key" do
+      config =
+        config_that_captures_request()
+        |> Map.merge(%{
+          api_key: fn -> {:ok, "dyn-gem-key"} end,
+          cached_content: "cachedContents/abc123",
+          google_search: true,
+          url_context: true,
+          code_execution: true
+        })
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            Message.image_url("https://example.com/pic.png", mime_type: "image/png"),
+            Message.document_data("application/pdf", "JVBERi0="),
+            Message.document_file("application/pdf", "files/gem-file-1")
+          ]
+        }
+      ]
+
+      tool_defs = [
+        %{
+          name: "read",
+          description: "Read a file",
+          input_schema: %{type: "object", properties: %{}}
+        }
+      ]
+
+      assert {:ok, _} = Gemini.complete(messages, tool_defs, config)
+      assert_received {:request_body, body}
+      assert_received {:request_headers, headers}
+
+      assert {"x-goog-api-key", "dyn-gem-key"} in headers
+      decoded = Jason.decode!(body)
+      assert decoded["cachedContent"] == "cachedContents/abc123"
+
+      assert [
+               %{"functionDeclarations" => [%{"name" => "read"}]},
+               %{"googleSearch" => %{}},
+               %{"urlContext" => %{}},
+               %{"codeExecution" => %{}}
+             ] = decoded["tools"]
+
+      [%{"parts" => [img, doc_data, doc_file]}] = decoded["contents"]
+
+      assert img == %{
+               "fileData" => %{
+                 "fileUri" => "https://example.com/pic.png",
+                 "mimeType" => "image/png"
+               }
+             }
+
+      assert doc_data == %{
+               "inlineData" => %{"mimeType" => "application/pdf", "data" => "JVBERi0="}
+             }
+
+      assert doc_file == %{
+               "fileData" => %{"mimeType" => "application/pdf", "fileUri" => "files/gem-file-1"}
+             }
+    end
   end
 
   describe "stream/4" do

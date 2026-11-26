@@ -15,9 +15,12 @@ defmodule Alloy.Message do
 
   ### Media blocks (pass-through — providers map these to their wire format)
   - `%{type: "image", mime_type: "image/jpeg", data: "base64..."}` - Inline image
+  - `%{type: "image", url: "https://..."}` - URL-referenced image (optional `:mime_type`)
   - `%{type: "audio", mime_type: "audio/mp3", data: "base64..."}` - Inline audio
   - `%{type: "video", mime_type: "video/mp4", data: "base64..."}` - Inline video
-  - `%{type: "document", mime_type: "application/pdf", uri: "..."}` - URI-referenced document
+  - `%{type: "document", mime_type: "application/pdf", data: "base64..."}` - Inline document (optional `:filename`, `:title`)
+  - `%{type: "document", mime_type: "application/pdf", uri: "..."}` - URL/URI-referenced document
+  - `%{type: "document", mime_type: "application/pdf", file_id: "..."}` - Provider Files API document (origin-scoped)
 
   Alloy Core does not read, transcode, or base64-encode media. It expects callers
   (e.g. Anvil connectors) to supply pre-encoded data or provider-specific URIs.
@@ -165,6 +168,22 @@ defmodule Alloy.Message do
   def image(mime_type, data), do: %{type: "image", mime_type: mime_type, data: data}
 
   @doc """
+  Creates a URL-referenced image content block.
+
+  Supported by Anthropic, OpenAI/xAI Responses, OpenAICompat, and Gemini
+  (pass `mime_type: "image/png"` in `opts` when sending URL images to Gemini).
+  """
+  @spec image_url(String.t(), keyword()) :: content_block()
+  def image_url(url, opts \\ []) when is_binary(url) and is_list(opts) do
+    base = %{type: "image", url: url}
+
+    case Keyword.get(opts, :mime_type) do
+      mime when is_binary(mime) and mime != "" -> Map.put(base, :mime_type, mime)
+      _ -> base
+    end
+  end
+
+  @doc """
   Creates an inline audio content block.
 
   `mime_type` is typically `"audio/mp3"`, `"audio/wav"`, `"audio/ogg"`, etc.
@@ -183,24 +202,75 @@ defmodule Alloy.Message do
   def video(mime_type, data), do: %{type: "video", mime_type: mime_type, data: data}
 
   @doc """
-  Creates a URI-referenced document content block.
+  Creates a URL- or URI-referenced document content block.
 
-  Used with provider APIs that require pre-uploaded files (e.g. Google File API).
-  `uri` is the provider-specific URI returned after uploading the file.
+  Accepts HTTP(S) URLs (supported by Anthropic, OpenAI/xAI, and Gemini) as well
+  as provider-specific URIs such as Google File API / GCS URIs (`gs://...`,
+  used with Gemini). Optional `:filename` and `:title` keys may be passed in
+  `opts`.
   """
-  @spec document(String.t(), String.t()) :: content_block()
-  def document(mime_type, uri), do: %{type: "document", mime_type: mime_type, uri: uri}
+  @spec document(String.t(), String.t(), keyword()) :: content_block()
+  def document(mime_type, uri, opts \\ [])
+      when is_binary(mime_type) and is_binary(uri) and is_list(opts) do
+    %{type: "document", mime_type: mime_type, uri: uri}
+    |> put_document_opts(opts)
+  end
+
+  @doc """
+  Creates an inline base64-encoded document content block (for example a PDF).
+
+  Supported natively by Anthropic, OpenAI/xAI Responses, and Gemini. Optional
+  `:filename` and `:title` keys may be passed in `opts`.
+  """
+  @spec document_data(String.t(), String.t(), keyword()) :: content_block()
+  def document_data(mime_type, data, opts \\ [])
+      when is_binary(mime_type) and is_binary(data) and is_list(opts) do
+    %{type: "document", mime_type: mime_type, data: data}
+    |> put_document_opts(opts)
+  end
+
+  @doc """
+  Creates a provider Files API document content block.
+
+  `file_id` is origin-scoped to the provider account that uploaded the file
+  (Anthropic Files API, OpenAI Files API, or Gemini File URI). Cross-origin
+  `normalize_for/3` drops `file_id` document blocks automatically.
+  """
+  @spec document_file(String.t(), String.t(), keyword()) :: content_block()
+  def document_file(mime_type, file_id, opts \\ [])
+      when is_binary(mime_type) and is_binary(file_id) and is_list(opts) do
+    %{type: "document", mime_type: mime_type, file_id: file_id}
+    |> put_document_opts(opts)
+  end
+
+  defp put_document_opts(block, opts) do
+    Enum.reduce([:filename, :title], block, fn key, acc ->
+      case Keyword.get(opts, key) do
+        val when is_binary(val) and val != "" -> Map.put(acc, key, val)
+        _ -> acc
+      end
+    end)
+  end
 
   @doc """
   The origin fingerprint for a provider and its config: a hash of the
-  module, `:api_url` and `:api_key`. Two configs share an origin exactly
-  when they reach the same endpoint with the same credentials.
+  module, `:api_url` and `:origin_key` (falling back to `:api_key`). Two
+  configs share an origin exactly when they reach the same endpoint with the
+  same credentials. Function-valued `:api_key` callbacks are never invoked
+  during origin hashing; pass `:origin_key` if you construct a fresh closure
+  per call for the same account.
   """
   @spec origin(module(), map()) :: String.t()
   def origin(provider, config) when is_atom(provider) and is_map(config) do
+    credential =
+      case Map.get(config, :origin_key) do
+        nil -> Map.get(config, :api_key)
+        key -> key
+      end
+
     input =
       Enum.map_join(
-        [inspect(provider), Map.get(config, :api_url), Map.get(config, :api_key)],
+        [inspect(provider), Map.get(config, :api_url), credential],
         "\n",
         &origin_part/1
       )
@@ -299,6 +369,9 @@ defmodule Alloy.Message do
       _text -> {[Map.drop(block, @signature_keys)], ids}
     end
   end
+
+  # Files API IDs belong strictly to the provider account that uploaded them.
+  defp foreign_block(%{type: "document", file_id: _}, ids), do: {[], ids}
 
   defp foreign_block(%{type: type} = block, ids) when type in @portable_blocks,
     do: {[Map.drop(block, @signature_keys)], ids}

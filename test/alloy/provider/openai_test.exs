@@ -1313,6 +1313,61 @@ defmodule Alloy.Provider.OpenAITest do
 
       refute Map.has_key?(assistant_input, "phase")
     end
+
+    test "formats image URLs, inline/URL/file_id documents, prompt_cache options, and dynamic api_key" do
+      test_pid = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, body})
+        send(test_pid, {:request_headers, conn.req_headers})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(response_payload([assistant_text_item("ok")])))
+      end
+
+      config = %{
+        api_key: fn -> {:ok, "dyn-oai-key"} end,
+        model: "gpt-5.4",
+        prompt_cache_key: "tenant-1",
+        prompt_cache_retention: "24h",
+        req_options: [plug: plug]
+      }
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            Message.image_url("https://example.com/a.png"),
+            Message.document_data("application/pdf", "JVBERi0=", filename: "plan.pdf"),
+            Message.document("application/pdf", "https://example.com/remote.pdf"),
+            Message.document_file("application/pdf", "file_oai_1")
+          ]
+        }
+      ]
+
+      assert {:ok, _} = OpenAI.complete(messages, [], config)
+      assert_received {:request_body, body}
+      assert_received {:request_headers, headers}
+
+      assert {"authorization", "Bearer dyn-oai-key"} in headers
+      decoded = Jason.decode!(body)
+      assert decoded["prompt_cache_key"] == "tenant-1"
+      assert decoded["prompt_cache_retention"] == "24h"
+
+      [%{"role" => "user", "content" => [img, doc_data, doc_url, doc_file]}] = decoded["input"]
+      assert img == %{"type" => "input_image", "image_url" => "https://example.com/a.png"}
+
+      assert doc_data == %{
+               "type" => "input_file",
+               "filename" => "plan.pdf",
+               "file_data" => "data:application/pdf;base64,JVBERi0="
+             }
+
+      assert doc_url == %{"type" => "input_file", "file_url" => "https://example.com/remote.pdf"}
+      assert doc_file == %{"type" => "input_file", "file_id" => "file_oai_1"}
+    end
   end
 
   # --- Test Helpers ---

@@ -1175,6 +1175,92 @@ defmodule Alloy.Provider.AnthropicTest do
       [block] = user_msg["content"]
       assert is_map(block)
     end
+
+    test "formats image URLs, base64/URL/Files API documents, dynamic api_key, 1h cache TTL, and web_search" do
+      counter = :atomics.new(1, signed: false)
+
+      config =
+        config_that_captures_request()
+        |> Map.merge(%{
+          api_key: fn ->
+            n = :atomics.add_get(counter, 1, 1)
+            {:ok, "dyn-ant-key-#{n}"}
+          end,
+          system_prompt: "You are concise.",
+          cache: "1h",
+          web_search: %{max_uses: 3}
+        })
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            Message.image_url("https://example.com/pic.png"),
+            Message.document_data("application/pdf", "JVBERi0=", title: "Report"),
+            Message.document("application/pdf", "https://example.com/doc.pdf",
+              filename: "doc.pdf"
+            ),
+            Message.document_file("application/pdf", "file_abc", title: "Uploaded"),
+            Message.document("application/pdf", "gs://bucket/skip.pdf")
+          ]
+        }
+      ]
+
+      assert {:ok, _} = Anthropic.complete(messages, [], config)
+      assert_received {:request_body, body}
+      assert_received {:request_headers, headers}
+
+      assert {"x-api-key", "dyn-ant-key-1"} in headers
+
+      assert Enum.any?(headers, fn {k, v} ->
+               k == "anthropic-beta" and v =~ "files-api-2025-04-14"
+             end)
+
+      decoded = Jason.decode!(body)
+
+      assert [%{"cache_control" => %{"type" => "ephemeral", "ttl" => "1h"}}] = decoded["system"]
+
+      assert [
+               %{"type" => "web_search_20260209", "name" => "web_search", "max_uses" => 3}
+             ] = decoded["tools"]
+
+      [img, doc_b64, doc_url, doc_file, doc_gcs] = hd(decoded["messages"])["content"]
+
+      assert img == %{
+               "type" => "image",
+               "source" => %{"type" => "url", "url" => "https://example.com/pic.png"}
+             }
+
+      assert doc_b64 == %{
+               "type" => "document",
+               "title" => "Report",
+               "source" => %{
+                 "type" => "base64",
+                 "media_type" => "application/pdf",
+                 "data" => "JVBERi0="
+               }
+             }
+
+      assert doc_url == %{
+               "type" => "document",
+               "title" => "doc.pdf",
+               "source" => %{"type" => "url", "url" => "https://example.com/doc.pdf"}
+             }
+
+      assert doc_file == %{
+               "type" => "document",
+               "title" => "Uploaded",
+               "source" => %{"type" => "file", "file_id" => "file_abc"}
+             }
+
+      assert doc_gcs["type"] == "text"
+      assert doc_gcs["text"] =~ "Unsupported document URI"
+      assert doc_gcs["cache_control"] == %{"type" => "ephemeral", "ttl" => "1h"}
+
+      # Invalid :cache returns non-retryable :invalid_request
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Anthropic.complete([Message.user("Hi")], [], Map.put(config, :cache, "2h"))
+    end
   end
 
   # ── stream/4 ──────────────────────────────────────────────────────────

@@ -42,6 +42,78 @@ defmodule Alloy.MessageTest do
                uri: "gs://bucket/report.pdf"
              }
     end
+
+    test "image_url/2, document_data/3, and document_file/3 build multimodal blocks" do
+      assert Message.image_url("https://example.com/a.png") == %{
+               type: "image",
+               url: "https://example.com/a.png"
+             }
+
+      assert Message.image_url("https://example.com/a.png", mime_type: "image/png") == %{
+               type: "image",
+               url: "https://example.com/a.png",
+               mime_type: "image/png"
+             }
+
+      assert Message.document_data("application/pdf", "JVBERi0=",
+               filename: "spec.pdf",
+               title: "Spec"
+             ) == %{
+               type: "document",
+               mime_type: "application/pdf",
+               data: "JVBERi0=",
+               filename: "spec.pdf",
+               title: "Spec"
+             }
+
+      assert Message.document_file("application/pdf", "file_123", title: "Invoice") == %{
+               type: "document",
+               mime_type: "application/pdf",
+               file_id: "file_123",
+               title: "Invoice"
+             }
+    end
+
+    test "origin/2 never invokes function api_key and respects :origin_key" do
+      auth_fun = fn -> raise "should never be invoked during origin hashing" end
+
+      o1 = Message.origin(Alloy.Provider.Anthropic, %{api_key: auth_fun})
+      o2 = Message.origin(Alloy.Provider.Anthropic, %{api_key: auth_fun})
+      assert o1 == o2
+
+      ok1 =
+        Message.origin(Alloy.Provider.Anthropic, %{
+          api_key: fn -> "tok1" end,
+          origin_key: "acct-a"
+        })
+
+      ok2 =
+        Message.origin(Alloy.Provider.Anthropic, %{
+          api_key: fn -> "tok2" end,
+          origin_key: "acct-a"
+        })
+
+      assert ok1 == ok2
+    end
+
+    test "normalize_for/3 drops cross-origin file_id documents while keeping data/uri documents" do
+      msg = %Message{
+        role: :assistant,
+        origin: Message.origin(Alloy.Provider.Anthropic, %{api_key: "k1"}),
+        content: [
+          %{type: "text", text: "See attached"},
+          Message.document_file("application/pdf", "file_secret"),
+          Message.document_data("application/pdf", "JVBERi0=")
+        ]
+      }
+
+      [normalized] = Message.normalize_for([msg], Alloy.Provider.OpenAI, %{api_key: "k2"})
+
+      assert normalized.content == [
+               %{type: "text", text: "See attached"},
+               %{type: "document", mime_type: "application/pdf", data: "JVBERi0="}
+             ]
+    end
   end
 
   describe "composing media blocks into messages" do

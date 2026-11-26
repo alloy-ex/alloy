@@ -47,6 +47,11 @@ defmodule Alloy.Provider do
           optional(:response_metadata) => map()
         }
 
+  @typedoc """
+  Static API key string or 0-arity callback invoked per HTTP request attempt.
+  """
+  @type api_key :: String.t() | (-> String.t() | {:ok, String.t()} | {:error, term()})
+
   @doc """
   Send messages to the provider and get a completion response.
 

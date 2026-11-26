@@ -77,7 +77,17 @@ defmodule Alloy.Context.Compactor do
     :code_execution,
     "code_execution",
     :tool_config,
-    "tool_config"
+    "tool_config",
+    :google_search,
+    "google_search",
+    :url_context,
+    "url_context",
+    :cached_content,
+    "cached_content",
+    :prompt_cache_key,
+    "prompt_cache_key",
+    :prompt_cache_retention,
+    "prompt_cache_retention"
   ]
 
   # extra_body keys that alter thinking, tools, context editing, or output
@@ -105,7 +115,15 @@ defmodule Alloy.Context.Compactor do
     :text,
     "text",
     :previous_response_id,
-    "previous_response_id"
+    "previous_response_id",
+    :cachedContent,
+    "cachedContent",
+    :cached_content,
+    "cached_content",
+    :prompt_cache_key,
+    "prompt_cache_key",
+    :prompt_cache_retention,
+    "prompt_cache_retention"
   ]
 
   # Gemini generationConfig keys that force structured output or thinking

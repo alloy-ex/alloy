@@ -86,7 +86,8 @@ defmodule Alloy.Provider.OpenAICompat do
   @type config :: %{
           required(:api_url) => String.t(),
           required(:model) => String.t(),
-          optional(:api_key) => String.t(),
+          optional(:api_key) => Alloy.Provider.api_key(),
+          optional(:origin_key) => String.t(),
           optional(:max_tokens) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:chat_path) => String.t(),
@@ -102,10 +103,11 @@ defmodule Alloy.Provider.OpenAICompat do
   def complete(messages, tool_defs, config) do
     body = build_request_body(messages, tool_defs, config)
 
-    with {:ok, resp_body} <-
+    with {:ok, api_key} <- HTTP.resolve_optional_api_key(config),
+         {:ok, resp_body} <-
            HTTP.post_json(
              chat_url(config),
-             build_headers(config),
+             build_headers(config, api_key),
              body,
              Map.get(config, :req_options, []),
              deadline: Map.get(config, :alloy_request_deadline)
@@ -123,24 +125,26 @@ defmodule Alloy.Provider.OpenAICompat do
     body =
       if config[:stream_options] == false, do: Map.put(body, "stream_options", false), else: body
 
-    OpenAIStream.stream(
-      chat_url(config),
-      build_headers(config),
-      body,
-      on_chunk,
-      Map.get(config, :req_options, []),
-      deadline: Map.get(config, :alloy_request_deadline)
-    )
+    with {:ok, api_key} <- HTTP.resolve_optional_api_key(config) do
+      OpenAIStream.stream(
+        chat_url(config),
+        build_headers(config, api_key),
+        body,
+        on_chunk,
+        Map.get(config, :req_options, []),
+        deadline: Map.get(config, :alloy_request_deadline)
+      )
+    end
   end
 
   defp chat_url(config),
     do: HTTP.join_url(config.api_url, Map.get(config, :chat_path, @default_chat_path))
 
-  defp build_headers(config) do
+  defp build_headers(config, api_key) do
     base = [{"content-type", "application/json"}]
 
     base =
-      case Map.get(config, :api_key) do
+      case api_key do
         nil -> base
         key -> [{"authorization", "Bearer #{key}"} | base]
       end
@@ -272,6 +276,12 @@ defmodule Alloy.Provider.OpenAICompat do
 
   defp format_user_content_block(%{type: "image", mime_type: mime, data: data}),
     do: %{"type" => "image_url", "image_url" => %{"url" => "data:#{mime};base64,#{data}"}}
+
+  defp format_user_content_block(%{type: "image", url: url}) when is_binary(url) do
+    if HTTP.http_url?(url),
+      do: %{"type" => "image_url", "image_url" => %{"url" => url}},
+      else: nil
+  end
 
   defp format_user_content_block(_), do: nil
 

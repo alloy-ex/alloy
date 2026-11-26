@@ -4,6 +4,7 @@ defmodule Alloy.Provider.HTTP do
   # Req's own retries switched off (Alloy.Provider.Retry owns retries and the
   # turn deadline), and every failure turned into an Alloy.Provider.Error.
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.OwnedWorker
   alias Alloy.Provider
   alias Alloy.Provider.{Error, SSE}
@@ -143,6 +144,93 @@ defmodule Alloy.Provider.HTTP do
   def join_url(base_url, path) when is_binary(base_url) and is_binary(path) do
     String.trim_trailing(base_url, "/") <> "/" <> String.trim_leading(path, "/")
   end
+
+  @doc false
+  @spec http_url?(term()) :: boolean()
+  def http_url?("https://" <> rest) when byte_size(rest) > 0, do: true
+  def http_url?("http://" <> rest) when byte_size(rest) > 0, do: true
+  def http_url?(_other), do: false
+
+  @doc false
+  @spec resolve_api_key(map()) :: {:ok, String.t()} | {:error, Error.t()}
+  def resolve_api_key(config) when is_map(config) do
+    case Map.get(config, :api_key) do
+      key when is_binary(key) ->
+        {:ok, key}
+
+      fun when is_function(fun, 0) ->
+        invoke_api_key_callback(fun)
+
+      nil ->
+        {:error, %Error{kind: :auth, message: "Missing :api_key in provider config"}}
+
+      other ->
+        {:error,
+         %Error{
+           kind: :auth,
+           message: "Invalid :api_key in provider config: #{Sanitize.shape_summary(other)}"
+         }}
+    end
+  end
+
+  @doc false
+  @spec resolve_optional_api_key(map()) :: {:ok, String.t() | nil} | {:error, Error.t()}
+  def resolve_optional_api_key(config) when is_map(config) do
+    case Map.get(config, :api_key) do
+      nil -> {:ok, nil}
+      _present -> resolve_api_key(config)
+    end
+  end
+
+  defp invoke_api_key_callback(fun) do
+    case fun.() do
+      {:ok, key} when is_binary(key) and byte_size(key) > 0 ->
+        {:ok, key}
+
+      key when is_binary(key) and byte_size(key) > 0 ->
+        {:ok, key}
+
+      {:error, reason} ->
+        {:error,
+         %Error{
+           kind: :auth,
+           message: "Dynamic :api_key callback failed: #{format_auth_callback_error(reason)}"
+         }}
+
+      other ->
+        {:error,
+         %Error{
+           kind: :auth,
+           message:
+             "Dynamic :api_key callback returned invalid value: #{Sanitize.shape_summary(other)}"
+         }}
+    end
+  rescue
+    exception ->
+      {:error,
+       %Error{
+         kind: :auth,
+         message:
+           "Dynamic :api_key callback raised: #{Sanitize.exception_summary(exception, 200)}"
+       }}
+  catch
+    kind, reason ->
+      {:error,
+       %Error{
+         kind: :auth,
+         message: "Dynamic :api_key callback #{kind}: #{Sanitize.exit_summary(reason, :redact)}"
+       }}
+  end
+
+  defp format_auth_callback_error(reason) when is_binary(reason),
+    do: Sanitize.cap_bytes(reason, 200)
+
+  defp format_auth_callback_error(reason) when is_atom(reason), do: inspect(reason)
+
+  defp format_auth_callback_error(reason) when is_exception(reason),
+    do: Sanitize.exception_summary(reason, 200)
+
+  defp format_auth_callback_error(reason), do: Sanitize.shape_summary(reason)
 
   @doc false
   @spec cache_adjusted_usage(

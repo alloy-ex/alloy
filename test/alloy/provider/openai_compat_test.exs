@@ -1096,5 +1096,62 @@ defmodule Alloy.Provider.OpenAICompatTest do
       assert outgoing["content"] == "kept"
       refute Map.has_key?(outgoing, "reasoning_content")
     end
+
+    test "formats URL images and resolves dynamic optional api_key callbacks" do
+      test_pid = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, body})
+        send(test_pid, {:request_headers, conn.req_headers})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "choices" => [
+              %{
+                "message" => %{"role" => "assistant", "content" => "ok"},
+                "finish_reason" => "stop"
+              }
+            ]
+          })
+        )
+      end
+
+      config = %{
+        api_url: "http://localhost:11434",
+        model: "llama4",
+        api_key: fn -> {:ok, "dyn-compat-key"} end,
+        req_options: [plug: plug]
+      }
+
+      messages = [
+        %Message{
+          role: :user,
+          content: [
+            %{type: "text", text: "Describe"},
+            Message.image_url("https://example.com/photo.jpg"),
+            Message.image_url("gs://ignored/not-http.jpg")
+          ]
+        }
+      ]
+
+      assert {:ok, _} = OpenAICompat.complete(messages, [], config)
+      assert_received {:request_body, body}
+      assert_received {:request_headers, headers}
+
+      assert {"authorization", "Bearer dyn-compat-key"} in headers
+      [%{"role" => "user", "content" => parts}] = Jason.decode!(body)["messages"]
+
+      assert parts == [
+               %{"type" => "text", "text" => "Describe"},
+               %{
+                 "type" => "image_url",
+                 "image_url" => %{"url" => "https://example.com/photo.jpg"}
+               }
+             ]
+    end
   end
 end
