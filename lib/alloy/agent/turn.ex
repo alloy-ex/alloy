@@ -133,18 +133,13 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp loop(%State{turn: turn, config: config} = state, opts) do
-    cond do
-      turn > 0 and deadline_expired?(state) ->
-        fail(state, timeout_error(state))
-
-      turn >= config.max_turns ->
-        %{state | status: :max_turns}
-
-      true ->
-        case run_turn(state, opts) do
-          {:continue, state} -> loop(state, opts)
-          {:halt, state} -> state
-        end
+    if turn >= config.max_turns do
+      %{state | status: :max_turns}
+    else
+      case run_turn(state, opts) do
+        {:continue, state} -> loop(state, opts)
+        {:halt, state} -> state
+      end
     end
   end
 
@@ -161,9 +156,13 @@ defmodule Alloy.Agent.Turn do
         Events.emit(opts, turn, {:turn_start, %{turn: turn}})
 
         turn_span(turn, fn ->
-          state
-          |> complete(Keyword.put(opts, :turn_progress_key, progress_key), false)
-          |> finalize_turn_limits()
+          if state.turn > 0 and deadline_expired?(state) do
+            {:halt, fail(state, timeout_error(state))}
+          else
+            state
+            |> complete(Keyword.put(opts, :turn_progress_key, progress_key), false)
+            |> finalize_turn_limits()
+          end
         end)
       catch
         kind, reason ->

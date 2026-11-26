@@ -9,6 +9,7 @@ defmodule Alloy.ReasoningAndEventsTest do
   alias Alloy.Provider
   alias Alloy.Provider.{Anthropic, Codex, Error, Gemini, OpenAI, OpenAICompat, XAI}
   alias Alloy.Provider.Test, as: TestProvider
+  alias Alloy.Test.EchoTool
   alias Alloy.Tool.Core.Bash
   alias Alloy.Tool.Inline
   alias Alloy.Usage
@@ -4715,6 +4716,74 @@ defmodule Alloy.ReasoningAndEventsTest do
         |> Enum.uniq()
 
       assert pcb_ids == ["call_pcb_1"]
+
+      # 20. Deadline expiry during a slow [:alloy, :turn, :stop] telemetry handler OR a slow
+      #     :turn_end :on_event callback routes the boundary timeout through turn lifecycle
+      #     reporting so the final :turn_end always agrees with Result.status (:error).
+      tel_handler_id = "slice2-slow-turn-stop-#{inspect(make_ref())}"
+
+      :ok =
+        :telemetry.attach(
+          tel_handler_id,
+          [:alloy, :turn, :stop],
+          fn _ev, _meas, meta, _cfg ->
+            if self() == parent and meta.turn == 1, do: Process.sleep(160)
+          end,
+          nil
+        )
+
+      try do
+        {:ok, slow_tel_pid} =
+          TestProvider.start_link([
+            TestProvider.tool_use_response([
+              %{id: "t_tel", name: "echo", input: %{"text" => "hi"}}
+            ]),
+            TestProvider.text_response("should not run")
+          ])
+
+        assert {:error, %Alloy.Result{status: :error, turns: 1}} =
+                 Alloy.run("go",
+                   provider: {TestProvider, agent_pid: slow_tel_pid},
+                   tools: [EchoTool],
+                   timeout_ms: 120,
+                   on_event: &send(parent, {:slow_tel_ev, &1})
+                 )
+      after
+        :telemetry.detach(tel_handler_id)
+      end
+
+      slow_tel_ends =
+        drain_tagged(:slow_tel_ev)
+        |> Enum.filter(&(&1.event == :turn_end))
+
+      assert length(slow_tel_ends) == 2
+      assert List.last(slow_tel_ends).payload.status == :error
+
+      {:ok, slow_cb_pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "t_cb", name: "echo", input: %{"text" => "hi"}}
+          ]),
+          TestProvider.text_response("should not run")
+        ])
+
+      assert {:error, %Alloy.Result{status: :error, turns: 1}} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: slow_cb_pid},
+                 tools: [EchoTool],
+                 timeout_ms: 120,
+                 on_event: fn ev ->
+                   send(parent, {:slow_cb_ev, ev})
+                   if ev.event == :turn_end and ev.turn == 1, do: Process.sleep(160)
+                 end
+               )
+
+      slow_cb_ends =
+        drain_tagged(:slow_cb_ev)
+        |> Enum.filter(&(&1.event == :turn_end))
+
+      assert length(slow_cb_ends) == 2
+      assert List.last(slow_cb_ends).payload.status == :error
     end
   end
 
