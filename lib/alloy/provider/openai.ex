@@ -146,6 +146,7 @@ defmodule Alloy.Provider.OpenAI do
       sticky_error: nil,
       function_calls: %{},
       pending_function_deltas: %{},
+      pending_delta_seq: 0,
       on_chunk: on_chunk,
       on_event: Map.get(config, :on_event, fn _ -> :ok end)
     }
@@ -589,40 +590,63 @@ defmodule Alloy.Provider.OpenAI do
   defp process_stream_event(acc, _event_type, _payload), do: acc
 
   defp register_function_call_item(acc, item, index, event_type) do
-    call_id = item["call_id"] || item["id"]
-    name = item["name"]
+    raw_call_id = Map.get(item, "call_id")
     item_id = item["id"]
+    name = item["name"]
 
-    if valid_function_call_header?(index, call_id, name) do
-      meta = %{id: call_id, index: index, name: name}
-      already_known? = lookup_function_call_meta(acc.function_calls, item_id, index) == meta
+    # During streaming (output_item.added / output_item.done), require the true
+    # call_id so consumers never receive item_id when call_id arrives later.
+    # Only the terminal response.completed payload may fall back to item["id"]
+    # (matching parse_output_to_blocks/2).
+    call_id =
+      if event_type == "response.completed",
+        do: raw_call_id || item_id,
+        else: raw_call_id
 
-      unless already_known? do
-        header_event = Map.put(meta, :arguments_delta, "")
-        acc.on_event.({:tool_call_delta, header_event})
-      end
+    cond do
+      valid_function_call_header?(index, call_id, name) ->
+        meta = %{id: call_id, index: index, name: name}
+        already_known? = lookup_function_call_meta(acc.function_calls, item_id, index) == meta
 
-      {pending_deltas, next_pending} =
-        pop_pending_deltas(acc.pending_function_deltas, item_id, index)
+        unless already_known? do
+          header_event = Map.put(meta, :arguments_delta, "")
+          acc.on_event.({:tool_call_delta, header_event})
+        end
 
-      emit_buffered_args(acc.on_event, meta, pending_deltas)
+        {pending_deltas, next_pending} =
+          pop_pending_deltas(acc.pending_function_deltas, item_id, index)
 
-      function_calls =
-        acc.function_calls
-        |> maybe_put_call_meta(item_id, meta)
-        |> Map.put({:index, index}, meta)
+        emit_buffered_args(acc.on_event, meta, pending_deltas)
 
-      %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
-    else
-      # Record rejected headers so subsequent argument deltas for the same
-      # item_id or output_index cannot bypass suppression and trip chunks_emitted?.
-      if event_type == "response.output_item.added" do
-        mark_rejected_function_call(acc, item_id, index)
-      else
+        function_calls =
+          acc.function_calls
+          |> maybe_put_call_meta(item_id, meta)
+          |> Map.put({:index, index}, meta)
+
+        %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
+
+      deferred_call_id_header?(event_type, index, raw_call_id, item_id, name) ->
+        # Legitimate partial header waiting for call_id: buffer deltas until
+        # output_item.done or response.completed resolves call_id.
         acc
-      end
+
+      event_type == "response.output_item.added" ->
+        # Record rejected headers so subsequent argument deltas for the same
+        # item_id or output_index cannot bypass suppression and trip chunks_emitted?.
+        mark_rejected_function_call(acc, item_id, index)
+
+      true ->
+        acc
     end
   end
+
+  defp deferred_call_id_header?(event_type, index, nil, item_id, name)
+       when event_type in ["response.output_item.added", "response.output_item.done"] do
+    is_integer(index) and index >= 0 and is_binary(item_id) and item_id != "" and
+      is_binary(name) and name != ""
+  end
+
+  defp deferred_call_id_header?(_event_type, _index, _raw_call_id, _item_id, _name), do: false
 
   defp valid_function_call_header?(index, call_id, name) do
     is_integer(index) and index >= 0 and is_binary(call_id) and call_id != "" and
@@ -703,15 +727,10 @@ defmodule Alloy.Provider.OpenAI do
     if is_nil(key) do
       acc
     else
-      updated =
-        Map.update(
-          acc.pending_function_deltas,
-          key,
-          [{raw_index, delta}],
-          &[{raw_index, delta} | &1]
-        )
-
-      %{acc | pending_function_deltas: updated}
+      seq = acc.pending_delta_seq + 1
+      entry = {seq, raw_index, delta}
+      updated = Map.update(acc.pending_function_deltas, key, [entry], &[entry | &1])
+      %{acc | pending_function_deltas: updated, pending_delta_seq: seq}
     end
   end
 
@@ -726,7 +745,12 @@ defmodule Alloy.Provider.OpenAI do
         do: Map.pop(pending, {:index, index}, []),
         else: {[], pending}
 
-    {Enum.reverse(by_id) ++ Enum.reverse(by_index), pending}
+    ordered =
+      (by_id ++ by_index)
+      |> Enum.sort_by(fn {seq, _raw_index, _delta} -> seq end)
+      |> Enum.map(fn {_seq, raw_index, delta} -> {raw_index, delta} end)
+
+    {ordered, pending}
   end
 
   defp emit_buffered_args(on_event, meta, deltas) do

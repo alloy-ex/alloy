@@ -285,27 +285,33 @@ defmodule Alloy.Tool.Core.Bash do
         exit(reason)
     after
       0 ->
-        port = Port.open({:spawn_executable, bash}, opts)
         output_worker = start_output_worker(callbacks.bash_on_output)
 
-        run = %{
-          port: port,
-          os_pid: OSProcess.os_pid(port),
-          caller_ref: caller_ref,
-          deadline: System.monotonic_time(:millisecond) + timeout,
-          on_tool_update: callbacks.on_tool_update,
-          utf8_carry: <<>>,
-          output_worker: output_worker
-        }
-
-        send(caller, {:bash_os_pid, self(), run.os_pid})
-
         try do
-          collect(run, new_output())
+          port = Port.open({:spawn_executable, bash}, opts)
+          os_pid = OSProcess.os_pid(port)
+          send(caller, {:bash_os_pid, self(), os_pid})
+
+          run = %{
+            port: port,
+            os_pid: os_pid,
+            caller_ref: caller_ref,
+            deadline: System.monotonic_time(:millisecond) + timeout,
+            on_tool_update: callbacks.on_tool_update,
+            utf8_carry: <<>>,
+            output_worker: output_worker
+          }
+
+          try do
+            collect(run, new_output())
+          catch
+            kind, reason ->
+              OSProcess.signal_group(os_pid, "KILL")
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
         catch
           kind, reason ->
-            OSProcess.signal_group(run.os_pid, "KILL")
-            kill_output_worker(run.output_worker)
+            kill_output_worker(output_worker)
             :erlang.raise(kind, reason, __STACKTRACE__)
         after
           Process.demonitor(caller_ref, [:flush])
@@ -333,11 +339,22 @@ defmodule Alloy.Tool.Core.Bash do
   end
 
   defp receive_output(%{port: port, caller_ref: caller_ref} = run, output, remaining) do
+    worker_mon_ref = output_worker_ref(run.output_worker)
+
     receive do
       {^port, {:data, data}} ->
         utf8_carry = emit_utf8_update(run.on_tool_update, run.utf8_carry, data)
         dispatch_bash_on_output(run.output_worker, data)
         collect(%{run | utf8_carry: utf8_carry}, append(output, data))
+
+      {:DOWN, ^worker_mon_ref, :process, _pid, reason} when is_reference(worker_mon_ref) ->
+        if reason != :normal do
+          Logger.warning(
+            "[Alloy.Tool.Core.Bash] :bash_on_output callback worker exited (#{Sanitize.exit_summary(reason)}); command continues without further callback output."
+          )
+        end
+
+        collect(%{run | output_worker: nil}, output)
 
       {^port, {:exit_status, status}} ->
         flush_utf8_carry(run.on_tool_update, run.utf8_carry)
@@ -389,34 +406,37 @@ defmodule Alloy.Tool.Core.Bash do
     budget = :atomics.new(3, signed: false)
     ready_ref = make_ref()
 
-    {:ok, watcher} =
-      Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
-        owner_ref = Process.monitor(owner)
+    case Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
+           owner_ref = Process.monitor(owner)
 
-        {worker_pid, worker_ref} =
-          spawn_monitor(fn -> output_worker_loop(fun, budget, false) end)
+           {worker_pid, worker_ref} =
+             spawn_monitor(fn -> output_worker_loop(fun, budget, false) end)
 
-        send(owner, {:output_worker_ready, ready_ref, worker_pid})
+           send(owner, {:output_worker_ready, ready_ref, worker_pid})
+
+           receive do
+             {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
+               Process.exit(worker_pid, :kill)
+
+             {:DOWN, ^worker_ref, :process, ^worker_pid, _reason} ->
+               Process.demonitor(owner_ref, [:flush])
+           end
+         end) do
+      {:ok, watcher} ->
+        watcher_ref = Process.monitor(watcher)
 
         receive do
-          {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
-            Process.exit(worker_pid, :kill)
+          {:output_worker_ready, ^ready_ref, worker_pid} ->
+            Process.demonitor(watcher_ref, [:flush])
+            mon_ref = Process.monitor(worker_pid)
+            {worker_pid, mon_ref, budget}
 
-          {:DOWN, ^worker_ref, :process, ^worker_pid, _reason} ->
-            Process.demonitor(owner_ref, [:flush])
+          {:DOWN, ^watcher_ref, :process, ^watcher, _reason} ->
+            nil
         end
-      end)
 
-    watcher_ref = Process.monitor(watcher)
-
-    receive do
-      {:output_worker_ready, ^ready_ref, worker_pid} ->
-        Process.demonitor(watcher_ref, [:flush])
-        mon_ref = Process.monitor(worker_pid)
-        {worker_pid, mon_ref, budget}
-
-      {:DOWN, ^watcher_ref, :process, ^watcher, _reason} ->
-        nil
+      {:error, reason} ->
+        exit({:output_worker_start_failed, reason})
     end
   end
 
@@ -509,6 +529,9 @@ defmodule Alloy.Tool.Core.Bash do
 
     :ok
   end
+
+  defp output_worker_ref({_pid, mon_ref, _budget}), do: mon_ref
+  defp output_worker_ref(nil), do: nil
 
   defp kill_output_worker(nil), do: :ok
 

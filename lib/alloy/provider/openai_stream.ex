@@ -384,7 +384,8 @@ defmodule Alloy.Provider.OpenAIStream do
             id: nil,
             name: nil,
             arguments_buffer: "",
-            thought_signature: nil
+            thought_signature: nil,
+            emitted_header?: false
           })
 
         with {:ok, existing} <- merge_tool_call_id(existing, Map.fetch(tc_delta, "id")),
@@ -392,26 +393,14 @@ defmodule Alloy.Provider.OpenAIStream do
              with_sig = if(sig, do: %{existing | thought_signature: sig}, else: existing),
              {:ok, updated, args_delta} <-
                merge_function_delta(with_sig, Map.fetch(tc_delta, "function")) do
+          {updated, next_events} =
+            maybe_emit_tool_call_delta(updated, index, args_delta, events)
+
           next_acc = %{
             acc
             | tool_calls: Map.put(acc.tool_calls, index, updated),
               last_tool_call_index: index
           }
-
-          next_events =
-            if should_emit_tool_call_delta?(tc_delta, updated, args_delta) do
-              [
-                %{
-                  id: updated.id,
-                  index: index,
-                  name: updated.name,
-                  arguments_delta: args_delta
-                }
-                | events
-              ]
-            else
-              events
-            end
 
           {next_acc, next_events}
         else
@@ -439,22 +428,39 @@ defmodule Alloy.Provider.OpenAIStream do
   defp merge_tool_call_id(_existing, {:ok, _invalid}),
     do: {:error, "Invalid tool call id in Chat Completions SSE chunk"}
 
-  defp should_emit_tool_call_delta?(_tc_delta, %{id: id, name: name}, _args_delta)
-       when not is_binary(id) or id == "" or not is_binary(name) or name == "",
-       do: false
-
-  defp should_emit_tool_call_delta?(_tc_delta, _updated, args_delta) when args_delta != "",
-    do: true
-
-  defp should_emit_tool_call_delta?(tc_delta, _updated, "") do
-    has_id? = is_binary(tc_delta["id"]) and tc_delta["id"] != ""
-
-    has_name? =
-      is_map(tc_delta["function"]) and is_binary(tc_delta["function"]["name"]) and
-        tc_delta["function"]["name"] != ""
-
-    has_id? or has_name?
+  defp maybe_emit_tool_call_delta(%{id: id, name: name} = updated, _index, _args_delta, events)
+       when not is_binary(id) or id == "" or not is_binary(name) or name == "" do
+    {updated, events}
   end
+
+  defp maybe_emit_tool_call_delta(
+         %{emitted_header?: false} = updated,
+         index,
+         _args_delta,
+         events
+       ) do
+    event = %{
+      id: updated.id,
+      index: index,
+      name: updated.name,
+      arguments_delta: updated.arguments_buffer
+    }
+
+    {%{updated | emitted_header?: true}, [event | events]}
+  end
+
+  defp maybe_emit_tool_call_delta(updated, index, args_delta, events) when args_delta != "" do
+    event = %{
+      id: updated.id,
+      index: index,
+      name: updated.name,
+      arguments_delta: args_delta
+    }
+
+    {updated, [event | events]}
+  end
+
+  defp maybe_emit_tool_call_delta(updated, _index, "", events), do: {updated, events}
 
   # Some Chat Completions-compatible servers (notably Gemini's OpenAI-compat
   # endpoint) omit "index" on streamed tool call deltas. Reuse an existing

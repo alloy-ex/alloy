@@ -2302,6 +2302,222 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert_received {:tel_text_delta, %{event: :text_delta, turn: 1}}
     end
+
+    test "late call_id resolution, interleaved buffered order, Chat Completions prefix preservation, and Bash worker exit diagnostics" do
+      parent = self()
+
+      # 1. OpenAI Responses: output_item.added without call_id buffers until response.completed
+      #    resolves call_id (never emitting item_id "fc_1"), and retries if response.failed arrives first.
+      late_id_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{"id" => "fc_1", "type" => "function_call", "name" => "echo"}
+          }) <>
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "output_index" => 0,
+              "delta" => "{\"x\":"
+            }) <>
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "item_id" => "fc_1",
+              "delta" => "1}"
+            }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_late",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_1",
+                    "call_id" => "call_1",
+                    "name" => "echo",
+                    "arguments" => "{\"x\":1}"
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      {:ok, %{messages: [late_msg]}} =
+        OpenAI.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_key: "sk-oai",
+            model: "gpt-5.4",
+            req_options: [plug: late_id_plug],
+            on_event: &send(parent, {:late_id_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      assert [%{type: "tool_use", id: "call_1", name: "echo", input: %{"x" => 1}}] =
+               late_msg.content
+
+      late_deltas =
+        drain_tagged(:late_id_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.all?(late_deltas, &(&1.id == "call_1" and &1.name == "echo"))
+      assert Enum.map_join(late_deltas, & &1.arguments_delta) == "{\"x\":1}"
+
+      # Failure before call_id resolution must not set chunks_emitted? and must still retry.
+      late_fail_attempts = :atomics.new(1, signed: false)
+
+      late_fail_plug = fn conn ->
+        n = :atomics.add_get(late_fail_attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{"id" => "fc_retry", "type" => "function_call", "name" => "echo"}
+            }) <>
+              sse_oai("response.function_call_arguments.delta", %{
+                "type" => "response.function_call_arguments.delta",
+                "item_id" => "fc_retry",
+                "delta" => "{\"x\":1}"
+              }) <>
+              sse_oai("response.failed", %{
+                "type" => "response.failed",
+                "response" => %{
+                  "status" => "failed",
+                  "error" => %{"code" => "server_error", "message" => "transient"}
+                }
+              })
+          else
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_ok_late",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "message",
+                    "role" => "assistant",
+                    "content" => [%{"type" => "output_text", "text" => "recovered late"}]
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "recovered late"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: late_fail_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0,
+                 on_event: &send(parent, {:late_fail_ev, &1})
+               )
+
+      assert :atomics.get(late_fail_attempts, 1) == 2
+      refute Enum.any?(drain_tagged(:late_fail_ev), &(&1.event == :tool_call_delta))
+
+      # 2. Chat Completions (OpenAIStream): argument prefix before complete header is preserved
+      #    and concatenated emitted arguments match the final decoded tool input.
+      prefix_compat_plug =
+        sse_plug(
+          "data: " <>
+            Jason.encode!(%{
+              "choices" => [
+                %{
+                  "index" => 0,
+                  "delta" => %{
+                    "tool_calls" => [
+                      %{"index" => 0, "function" => %{"arguments" => "{\"x\":"}}
+                    ]
+                  }
+                }
+              ]
+            }) <>
+            "\n\n" <>
+            "data: " <>
+            Jason.encode!(%{
+              "choices" => [
+                %{
+                  "index" => 0,
+                  "delta" => %{
+                    "tool_calls" => [
+                      %{
+                        "index" => 0,
+                        "id" => "call_pref",
+                        "function" => %{"name" => "echo", "arguments" => "1}"}
+                      }
+                    ]
+                  }
+                }
+              ]
+            }) <>
+            "\n\n" <>
+            "data: " <>
+            Jason.encode!(%{
+              "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => "tool_calls"}],
+              "usage" => %{"prompt_tokens" => 1, "completion_tokens" => 1}
+            }) <> "\n\ndata: [DONE]\n\n"
+        )
+
+      {:ok, %{messages: [pref_msg]}} =
+        OpenAICompat.stream(
+          [Message.user("hi")],
+          [],
+          %{
+            api_url: "https://compat.example/v1",
+            api_key: "sk-compat",
+            model: "qwen3",
+            req_options: [plug: prefix_compat_plug],
+            on_event: &send(parent, {:pref_ev, &1})
+          },
+          fn _ -> :ok end
+        )
+
+      assert [%{type: "tool_use", id: "call_pref", name: "echo", input: %{"x" => 1}}] =
+               pref_msg.content
+
+      pref_deltas =
+        drain_tagged(:pref_ev)
+        |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+        |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+      assert Enum.all?(pref_deltas, &(&1.id == "call_pref" and &1.name == "echo"))
+      assert Enum.map_join(pref_deltas, & &1.arguments_delta) == "{\"x\":1}"
+
+      # 3. Bash: callback worker exiting via throw logs the real exit reason (not backpressure)
+      #    while the command still completes cleanly, and Port.open failure cleans up output worker.
+      log =
+        capture_log(fn ->
+          assert {:ok, out} =
+                   Bash.execute(
+                     %{"command" => "seq 1 200", "timeout" => 5_000},
+                     %{
+                       bash_restricted: false,
+                       bash_on_output: fn _chunk ->
+                         throw(:abort_callback)
+                       end
+                     }
+                   )
+
+          assert out =~ "exit code: 0"
+        end)
+
+      assert log =~ "callback worker exited"
+      refute log =~ "backpressure queue limit reached"
+    end
   end
 
   defp wait_until_dead(os_pid, timeout_ms) do
