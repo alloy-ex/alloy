@@ -2209,6 +2209,27 @@ defmodule Alloy.CancelSteeringFollowUpTest do
           },
           Message.tool_results([Message.tool_result_block("bad_caller_1", "ok", false)])
         ],
+        [
+          %Message{
+            role: :assistant,
+            content: [
+              %{
+                type: "tool_use",
+                id: "bad_thought_sig_1",
+                name: "t",
+                input: %{},
+                thought_signature: %{bad: "sk-thought-sig-secret"}
+              }
+            ]
+          },
+          Message.tool_results([Message.tool_result_block("bad_thought_sig_1", "ok", false)])
+        ],
+        [
+          %Message{
+            role: :assistant,
+            content: [%{type: "text", text: "hi", thought_signature: 123}]
+          }
+        ],
         [Message.user(<<0xFF, 0xFE>>)]
       ]
 
@@ -2236,7 +2257,13 @@ defmodule Alloy.CancelSteeringFollowUpTest do
 
         assert err =~ "steering callback"
 
-        for secret <- ["sk-tuple-secret", "sk-phase-secret", "sk-sig-secret", "sk-caller-secret"] do
+        for secret <- [
+              "sk-tuple-secret",
+              "sk-phase-secret",
+              "sk-sig-secret",
+              "sk-caller-secret",
+              "sk-thought-sig-secret"
+            ] do
           refute err =~ secret
         end
 
@@ -2265,7 +2292,13 @@ defmodule Alloy.CancelSteeringFollowUpTest do
 
         assert err =~ "follow_up callback"
 
-        for secret <- ["sk-tuple-secret", "sk-phase-secret", "sk-sig-secret", "sk-caller-secret"] do
+        for secret <- [
+              "sk-tuple-secret",
+              "sk-phase-secret",
+              "sk-sig-secret",
+              "sk-caller-secret",
+              "sk-thought-sig-secret"
+            ] do
           refute err =~ secret
         end
 
@@ -2371,6 +2404,10 @@ defmodule Alloy.CancelSteeringFollowUpTest do
       for bad_action <- [
             fn ->
               Process.sleep(100)
+              []
+            end,
+            fn ->
+              Process.sleep(100)
               :not_a_list
             end,
             fn ->
@@ -2413,6 +2450,10 @@ defmodule Alloy.CancelSteeringFollowUpTest do
 
       # Deadline expiry during steering must not be masked by stop_after_tool
       for steering_action <- [
+            fn ->
+              Process.sleep(100)
+              []
+            end,
             fn ->
               Process.sleep(100)
               [Message.user("more")]

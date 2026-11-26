@@ -141,60 +141,65 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
-  defp handle_steering_poll({:ok, []}, rest, run, poll_steering, next_results_rev, next_metas_rev) do
+  defp handle_steering_poll(outcome, rest, run, poll_steering, next_results_rev, next_metas_rev) do
+    cond do
+      Cancel.cancelled?(run.cancel_token) ->
+        skipped = skip_batches(rest, &unexecuted_cancelled_result/1)
+        all_results = Enum.reverse(next_results_rev, skipped)
+        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
+
+      deadline_expired?(run.run_deadline) ->
+        skipped = skip_batches(rest, &elem(unexecuted_result(&1, run), 0))
+        all_results = Enum.reverse(next_results_rev, skipped)
+        {:deadline_expired, Message.tool_results(all_results), Enum.reverse(next_metas_rev)}
+
+      true ->
+        apply_steering_outcome(
+          outcome,
+          rest,
+          run,
+          poll_steering,
+          next_results_rev,
+          next_metas_rev
+        )
+    end
+  end
+
+  defp apply_steering_outcome(
+         {:ok, []},
+         rest,
+         run,
+         poll_steering,
+         next_results_rev,
+         next_metas_rev
+       ) do
     run_batches(rest, run, poll_steering, next_results_rev, next_metas_rev)
   end
 
-  defp handle_steering_poll(
+  defp apply_steering_outcome(
          {:ok, steering_msgs},
          rest,
-         run,
+         _run,
          _poll_steering,
          next_results_rev,
          next_metas_rev
        ) do
-    cond do
-      Cancel.cancelled?(run.cancel_token) ->
-        skipped = skip_batches(rest, &unexecuted_cancelled_result/1)
-        all_results = Enum.reverse(next_results_rev, skipped)
-        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
-
-      deadline_expired?(run.run_deadline) ->
-        skipped = skip_batches(rest, &elem(unexecuted_result(&1, run), 0))
-        all_results = Enum.reverse(next_results_rev, skipped)
-        {:deadline_expired, Message.tool_results(all_results), Enum.reverse(next_metas_rev)}
-
-      true ->
-        skipped = skip_batches(rest, &unexecuted_steering_result/1)
-        all_results = Enum.reverse(next_results_rev, skipped)
-        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), steering_msgs}
-    end
+    skipped = skip_batches(rest, &unexecuted_steering_result/1)
+    all_results = Enum.reverse(next_results_rev, skipped)
+    {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), steering_msgs}
   end
 
-  defp handle_steering_poll(
+  defp apply_steering_outcome(
          {:error, reason},
          rest,
-         run,
+         _run,
          _poll_steering,
          next_results_rev,
          next_metas_rev
        ) do
-    cond do
-      Cancel.cancelled?(run.cancel_token) ->
-        skipped = skip_batches(rest, &unexecuted_cancelled_result/1)
-        all_results = Enum.reverse(next_results_rev, skipped)
-        {:ok, Message.tool_results(all_results), Enum.reverse(next_metas_rev), []}
-
-      deadline_expired?(run.run_deadline) ->
-        skipped = skip_batches(rest, &elem(unexecuted_result(&1, run), 0))
-        all_results = Enum.reverse(next_results_rev, skipped)
-        {:deadline_expired, Message.tool_results(all_results), Enum.reverse(next_metas_rev)}
-
-      true ->
-        skipped = skip_batches(rest, &unexecuted_error_result(&1, "Not executed: #{reason}"))
-        all_results = Enum.reverse(next_results_rev, skipped)
-        {:steering_error, Message.tool_results(all_results), Enum.reverse(next_metas_rev), reason}
-    end
+    skipped = skip_batches(rest, &unexecuted_error_result(&1, "Not executed: #{reason}"))
+    all_results = Enum.reverse(next_results_rev, skipped)
+    {:steering_error, Message.tool_results(all_results), Enum.reverse(next_metas_rev), reason}
   end
 
   defp skip_batches(batches, mapper) do

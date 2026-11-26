@@ -920,34 +920,20 @@ defmodule Alloy.Agent.Turn do
   defp maybe_follow_up_or_complete(state, new_msgs), do: complete_run(state, new_msgs)
 
   defp poll_follow_up(state, follow_up, new_msgs) do
-    case poll_messages_callback(:follow_up, follow_up, state) do
-      {:ok, []} ->
-        if Cancel.cancelled?(state.config.cancel_token),
-          do: {:halt, cancel_state(state)},
-          else: complete_run(state, new_msgs)
+    outcome = poll_messages_callback(:follow_up, follow_up, state)
 
-      {:ok, follow_up_msgs} ->
-        cond do
-          Cancel.cancelled?(state.config.cancel_token) ->
-            {:halt, cancel_state(state)}
+    cond do
+      Cancel.cancelled?(state.config.cancel_token) ->
+        {:halt, cancel_state(state)}
 
-          deadline_expired?(state) ->
-            {:halt, fail(state, timeout_error(state))}
+      deadline_expired?(state) ->
+        {:halt, fail(state, timeout_error(state))}
 
-          true ->
-            {:continue, State.append_messages(state, follow_up_msgs)}
-        end
-
-      {:error, reason} ->
-        cond do
-          Cancel.cancelled?(state.config.cancel_token) ->
-            {:halt, cancel_state(state)}
-
-          deadline_expired?(state) ->
-            {:halt, fail(state, timeout_error(state))}
-
-          true ->
-            {:halt, fail(state, reason)}
+      true ->
+        case outcome do
+          {:ok, []} -> complete_run(state, new_msgs)
+          {:ok, follow_up_msgs} -> {:continue, State.append_messages(state, follow_up_msgs)}
+          {:error, reason} -> {:halt, fail(state, reason)}
         end
     end
   end
@@ -1136,12 +1122,14 @@ defmodule Alloy.Agent.Turn do
     valid_utf8?(Map.get(block, :text)) and
       optional_boolean?(block, :refusal) and
       optional_utf8?(block, :phase) and
-      optional_utf8?(block, :signature)
+      optional_utf8?(block, :signature) and
+      optional_utf8?(block, :thought_signature)
   end
 
   defp valid_callback_thinking?(block) do
     valid_utf8?(Map.get(block, :thinking)) and
       optional_utf8?(block, :signature) and
+      optional_utf8?(block, :thought_signature) and
       optional_utf8?(block, :source)
   end
 
@@ -1153,6 +1141,7 @@ defmodule Alloy.Agent.Turn do
     non_empty_utf8?(id) and non_empty_utf8?(name) and
       plain_map?(input) and
       optional_utf8?(block, :signature) and
+      optional_utf8?(block, :thought_signature) and
       optional_plain_map?(block, :caller)
   end
 
