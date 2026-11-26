@@ -3166,6 +3166,162 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert Enum.any?(ts_events, &(&1.event == :turn_start and &1.turn == 1))
       assert Enum.any?(ts_events, &(&1.event == :turn_end and &1.payload.status == :error))
     end
+
+    test "OpenAI malformed output_item.added arguments and Gemini generation-error candidate suppress deltas and preserve retries" do
+      parent = self()
+
+      # 1. OpenAI/xAI: output_item.added with invalid argument types (nil, [], 42) must NOT emit
+      #    :tool_call_delta and must preserve retry and fallback eligibility on response.failed.
+      for bad_args <- [nil, [], 42] do
+        attempts = :atomics.new(1, signed: false)
+
+        added_bad_plug = fn conn ->
+          n = :atomics.add_get(attempts, 1, 1)
+
+          sse =
+            if n == 1 do
+              sse_oai("response.output_item.added", %{
+                "type" => "response.output_item.added",
+                "output_index" => 0,
+                "item" => %{
+                  "type" => "function_call",
+                  "id" => "fc_add_bad",
+                  "call_id" => "call_add_bad",
+                  "name" => "echo",
+                  "arguments" => bad_args
+                }
+              }) <>
+                sse_oai("response.failed", %{
+                  "type" => "response.failed",
+                  "response" => %{
+                    "status" => "failed",
+                    "error" => %{"code" => "server_error", "message" => "transient"}
+                  }
+                })
+            else
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_add_ok",
+                  "status" => "completed",
+                  "output" => [
+                    %{
+                      "type" => "message",
+                      "role" => "assistant",
+                      "content" => [%{"type" => "output_text", "text" => "retried added"}]
+                    }
+                  ],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+            end
+
+          conn
+          |> Plug.Conn.put_resp_content_type("text/event-stream")
+          |> Plug.Conn.send_resp(200, sse)
+        end
+
+        assert {:ok, %{text: "retried added"}} =
+                 Alloy.stream("hi", fn _ -> :ok end,
+                   provider:
+                     {OpenAI,
+                      api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: added_bad_plug]},
+                   max_retries: 1,
+                   retry_backoff_ms: 0,
+                   on_event: &send(parent, {:added_bad_ev, &1})
+                 )
+
+        assert :atomics.get(attempts, 1) == 2
+        refute Enum.any?(drain_tagged(:added_bad_ev), &(&1.event == :tool_call_delta))
+      end
+
+      # 2. Gemini: candidate carrying finishReason "UNEXPECTED_TOOL_CALL" suppresses :tool_call_delta
+      #    and preserves both retry and fallback eligibility.
+      gem_attempts = :atomics.new(1, signed: false)
+
+      gem_err_plug = fn conn ->
+        n = :atomics.add_get(gem_attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            "data: " <>
+              Jason.encode!(%{
+                "candidates" => [
+                  %{
+                    "content" => %{
+                      "role" => "model",
+                      "parts" => [%{"functionCall" => %{"name" => "echo", "args" => %{"x" => 1}}}]
+                    },
+                    "finishReason" => "UNEXPECTED_TOOL_CALL"
+                  }
+                ],
+                "usageMetadata" => %{"promptTokenCount" => 1, "candidatesTokenCount" => 1}
+              }) <> "\n\n"
+          else
+            "data: " <>
+              Jason.encode!(%{
+                "candidates" => [
+                  %{
+                    "content" => %{"role" => "model", "parts" => [%{"text" => "gemini ok"}]},
+                    "finishReason" => "STOP"
+                  }
+                ],
+                "usageMetadata" => %{"promptTokenCount" => 1, "candidatesTokenCount" => 1}
+              }) <> "\n\n"
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "gemini ok"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {Gemini,
+                    api_key: "sk-gem",
+                    model: "gemini-3.8-flash",
+                    req_options: [plug: gem_err_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0,
+                 on_event: &send(parent, {:gem_err_ev, &1})
+               )
+
+      assert :atomics.get(gem_attempts, 1) == 2
+      refute Enum.any?(drain_tagged(:gem_err_ev), &(&1.event == :tool_call_delta))
+
+      # Also verify Gemini fallback eligibility with max_retries: 0.
+      gem_fb_plug =
+        sse_plug(
+          "data: " <>
+            Jason.encode!(%{
+              "candidates" => [
+                %{
+                  "content" => %{
+                    "role" => "model",
+                    "parts" => [%{"functionCall" => %{"name" => "echo", "args" => %{"x" => 1}}}]
+                  },
+                  "finishReason" => "UNEXPECTED_TOOL_CALL"
+                }
+              ],
+              "usageMetadata" => %{"promptTokenCount" => 1, "candidatesTokenCount" => 1}
+            }) <> "\n\n"
+        )
+
+      {:ok, gem_fb_pid} = TestProvider.start_link([TestProvider.text_response("gem fallback")])
+
+      assert {:ok, %{text: "gem fallback"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {Gemini,
+                    api_key: "sk-gem", model: "gemini-3.8-flash", req_options: [plug: gem_fb_plug]},
+                 fallback_providers: [{TestProvider, agent_pid: gem_fb_pid}],
+                 max_retries: 0,
+                 on_event: &send(parent, {:gem_fb_ev, &1})
+               )
+
+      refute Enum.any?(drain_tagged(:gem_fb_ev), &(&1.event == :tool_call_delta))
+    end
   end
 
   defp wait_until_dead(os_pid, timeout_ms) do

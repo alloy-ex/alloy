@@ -600,6 +600,9 @@ defmodule Alloy.Provider.OpenAI do
       existing == :rejected ->
         acc
 
+      event_type == "response.output_item.added" and not valid_added_item_args?(item) ->
+        mark_rejected_function_call(acc, item_id, index)
+
       valid_function_call_header?(index, call_id, name) ->
         emit_and_store_function_call(
           acc,
@@ -670,6 +673,14 @@ defmodule Alloy.Provider.OpenAI do
         |> Map.put({:index, index}, meta)
 
       %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
+    end
+  end
+
+  defp valid_added_item_args?(item) do
+    case Map.fetch(item, "arguments") do
+      :error -> true
+      {:ok, args} when is_binary(args) or is_map(args) -> true
+      {:ok, _invalid} -> false
     end
   end
 

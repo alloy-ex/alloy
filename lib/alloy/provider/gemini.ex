@@ -955,9 +955,13 @@ defmodule Alloy.Provider.Gemini do
     case extract_candidate_blocks(candidate) do
       {:ok, blocks} ->
         tool_call_count =
-          Enum.reduce(blocks, acc.tool_call_count, fn block, tc_idx ->
-            emit_stream_block_event(block, tc_idx, acc.on_chunk, acc.on_event)
-          end)
+          if Map.get(candidate, "finishReason") in @generation_errors do
+            acc.tool_call_count
+          else
+            Enum.reduce(blocks, acc.tool_call_count, fn block, tc_idx ->
+              emit_stream_block_event(block, tc_idx, acc.on_chunk, acc.on_event)
+            end)
+          end
 
         candidate_updates =
           candidate
