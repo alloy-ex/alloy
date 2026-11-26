@@ -1285,18 +1285,33 @@ defmodule Alloy.Provider.OpenAITest do
 
       assert symmetric_metadata == %{citations: %{}, stop_details: %{}}
 
-      # Optional request fields follow the same nil/[]-only omission rule.
+      # Optional request fields and replayed assistant phase follow the same nil/[]-only rule.
       capture_config =
         config_that_captures_request()
         |> Map.put(:store, true)
         |> Map.put(:tool_choice, [])
         |> Map.put(:include, [])
 
-      OpenAI.complete([Message.user("Hi")], [], capture_config)
+      messages = [
+        Message.user("Hi"),
+        Message.assistant_blocks([%{type: "text", text: "previous answer", phase: []}]),
+        Message.user("Follow-up")
+      ]
+
+      OpenAI.complete(messages, [], capture_config)
       assert_received {:request_body, req_body}
       decoded = Jason.decode!(req_body)
+      assert decoded["store"] == true
       refute Map.has_key?(decoded, "tool_choice")
       refute Map.has_key?(decoded, "include")
+
+      assert [
+               %{"role" => "user", "content" => "Hi"},
+               %{"role" => "assistant", "content" => "previous answer"} = assistant_input,
+               %{"role" => "user", "content" => "Follow-up"}
+             ] = decoded["input"]
+
+      refute Map.has_key?(assistant_input, "phase")
     end
   end
 

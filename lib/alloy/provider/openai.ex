@@ -340,7 +340,7 @@ defmodule Alloy.Provider.OpenAI do
   defp format_assistant_block(%{type: "text", text: text} = block, _stateless?)
        when is_binary(text) and text != "" do
     [
-      HTTP.maybe_put(
+      HTTP.maybe_put_unless_empty_list(
         %{"role" => "assistant", "content" => text},
         "phase",
         block[:phase]

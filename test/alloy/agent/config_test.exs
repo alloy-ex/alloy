@@ -253,6 +253,7 @@ defmodule Alloy.Agent.ConfigTest do
         end
 
       refute Exception.message(prompt_err) =~ secret
+      assert Exception.message(prompt_err) =~ "got: map"
 
       mw_err =
         assert_raise ArgumentError, ~r/middleware must be a list of module atoms/, fn ->
@@ -264,7 +265,6 @@ defmodule Alloy.Agent.ConfigTest do
 
       refute Exception.message(mw_err) =~ secret
       assert Exception.message(mw_err) =~ "got: list"
-      assert Exception.message(prompt_err) =~ "got: map"
     end
   end
 
