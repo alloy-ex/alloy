@@ -98,7 +98,9 @@ defmodule Alloy.Agent.State do
 
   Accepts `:messages`, `:tools`, `:system_prompt`, `:provider` (the same
   provider tuple accepted by `Alloy.run/2`), `:output_schema`, and
-  `:reasoning`. Changes persist for later turns.
+  `:reasoning`. Changes persist for later turns (updating `:reasoning` overrides
+  any earlier primary provider-level `:reasoning`, while fallback providers that
+  configured their own explicit `:reasoning` keep theirs).
   Tools and their wire definitions are rebuilt together. Provider changes
   re-derive model limits and discard previous opaque provider state; pass an
   explicit `provider_state` in the new provider config to restore it.

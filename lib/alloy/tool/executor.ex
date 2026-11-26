@@ -33,6 +33,8 @@ defmodule Alloy.Tool.Executor do
 
   require Logger
 
+  @max_inflight_tool_updates 256
+
   @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t()) ::
           Message.t() | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state) do
@@ -55,6 +57,9 @@ defmodule Alloy.Tool.Executor do
         prepared
       end)
 
+    emit_tool_updates? =
+      Keyword.get(opts, :event_subscriber?, Keyword.has_key?(opts, :on_event))
+
     run = %{
       state: state,
       schemas: schemas,
@@ -64,6 +69,7 @@ defmodule Alloy.Tool.Executor do
       timeout: state.config.tool_timeout,
       run_deadline: Keyword.get(opts, :run_deadline),
       on_event: Keyword.get(opts, :on_event, fn _ -> :ok end),
+      emit_tool_updates?: emit_tool_updates?,
       seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
       corr_id: Keyword.get(opts, :event_correlation_id, random_id()),
       turn: Keyword.get(opts, :event_turn, state.turn)
@@ -133,137 +139,172 @@ defmodule Alloy.Tool.Executor do
   # caller, and kills the worker immediately on expiry, caller death, or cancel
   # even if the caller is busy inside a slow `:on_event` callback.
   #
-  # Incremental `:tool_update` messages are routed through a per-batch process
-  # alias (`Process.alias/0`), which is unaliased on normal completion and abort
-  # so late updates from subprocesses (e.g. Bash's port runner) are dropped by
-  # the runtime instead of polluting the caller's mailbox.
+  # Incremental `:tool_update` messages are gated on subscriber presence and
+  # routed through a per-call process alias (`Process.alias/0`) with a bounded
+  # in-flight credit counter. The alias is unaliased the instant the call
+  # completes, times out, or aborts so surviving child processes cannot keep
+  # replenishing the caller's mailbox during draining or after `:tool_end`.
   defp execute_batch_tasks(started, batch, run) do
-    update_alias = Process.alias()
-    max_concurrency = min(length(batch), run.concurrency)
-
     ctx = %{
-      update_alias: update_alias,
       run: run,
-      max_concurrency: max_concurrency
+      max_concurrency: min(length(batch), run.concurrency)
     }
 
-    results = await_batch(%{}, started, [], ctx)
-    Process.unalias(update_alias)
-    flush_alias_updates(update_alias)
+    results = await_batch(%{}, %{}, started, [], ctx)
 
     results
     |> Enum.sort_by(fn {index, _pair} -> index end)
     |> Enum.map(fn {_index, pair} -> pair end)
   end
 
-  defp await_batch(running, [], done, _ctx) when map_size(running) == 0, do: done
+  defp await_batch(running, _aliases, [], done, _ctx) when map_size(running) == 0, do: done
 
-  defp await_batch(running, pending, done, ctx)
+  defp await_batch(running, aliases, pending, done, ctx)
        when map_size(running) < ctx.max_concurrency and pending != [] do
-    {running, pending, done} = fill_slots(running, pending, done, ctx)
-    await_batch(running, pending, done, ctx)
+    {running, aliases, pending, done} = fill_slots(running, aliases, pending, done, ctx)
+    await_batch(running, aliases, pending, done, ctx)
   end
 
-  defp await_batch(running, pending, done, ctx) do
-    %{update_alias: update_alias, run: run} = ctx
+  defp await_batch(running, aliases, pending, done, ctx) do
+    %{run: run} = ctx
 
     receive do
-      {:alloy_tool_update, ^update_alias, call_id, name, start_seq, chunk} ->
-        _ =
-          if running_start_seq?(running, start_seq) do
-            run_or_cleanup(running, update_alias, fn ->
-              emit_update(call_id, name, start_seq, chunk, run)
-            end)
-          end
+      {:alloy_tool_update, call_alias, call_id, name, start_seq, chunk}
+      when is_map_key(aliases, call_alias) ->
+        ref = Map.fetch!(aliases, call_alias)
+        %{inflight: inflight} = Map.fetch!(running, ref)
+        :atomics.sub(inflight, 1, 1)
 
-        await_batch(running, pending, done, ctx)
+        _ =
+          run_or_cleanup(running, fn ->
+            emit_update(call_id, name, start_seq, chunk, run)
+          end)
+
+        await_batch(running, aliases, pending, done, ctx)
 
       {ref, {:ok, outcome}} when is_map_key(running, ref) ->
-        {%{started: started}, next_running} = Map.pop!(running, ref)
+        {entry, next_running} = Map.pop!(running, ref)
+        next_aliases = deactivate_update_alias(aliases, entry.update_alias)
         Process.demonitor(ref, [:flush])
-        entry = finish_or_cleanup(started, outcome, update_alias, run, next_running)
-        await_batch(next_running, pending, [entry | done], ctx)
+        done_entry = finish_or_cleanup(entry, outcome, true, run, next_running)
+        await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
 
       {ref, :timeout} when is_map_key(running, ref) ->
-        {%{started: started, deadline_capped?: capped?}, next_running} = Map.pop!(running, ref)
+        {entry, next_running} = Map.pop!(running, ref)
+        next_aliases = deactivate_update_alias(aliases, entry.update_alias)
         Process.demonitor(ref, [:flush])
-        outcome = exit_outcome(started.call, :timeout, run, capped?)
-        entry = finish_or_cleanup(started, outcome, update_alias, run, next_running)
-        await_batch(next_running, pending, [entry | done], ctx)
+        outcome = exit_outcome(entry.started.call, :timeout, run, entry.deadline_capped?)
+        done_entry = finish_or_cleanup(entry, outcome, false, run, next_running)
+        await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
 
       {ref, {:worker_exit, reason}} when is_map_key(running, ref) ->
-        {%{started: started, deadline_capped?: capped?}, next_running} = Map.pop!(running, ref)
+        {entry, next_running} = Map.pop!(running, ref)
+        next_aliases = deactivate_update_alias(aliases, entry.update_alias)
         Process.demonitor(ref, [:flush])
-        outcome = worker_exit_outcome(started.call, reason, run, capped?)
-        entry = finish_or_cleanup(started, outcome, update_alias, run, next_running)
-        await_batch(next_running, pending, [entry | done], ctx)
+        outcome = worker_exit_outcome(entry.started.call, reason, run, entry.deadline_capped?)
+        done_entry = finish_or_cleanup(entry, outcome, false, run, next_running)
+        await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
 
       {:DOWN, ref, :process, _pid, reason} when is_map_key(running, ref) ->
-        {%{started: started, deadline_capped?: capped?}, next_running} = Map.pop!(running, ref)
-        outcome = exit_outcome(started.call, reason, run, capped?)
-        entry = finish_or_cleanup(started, outcome, update_alias, run, next_running)
-        await_batch(next_running, pending, [entry | done], ctx)
+        {entry, next_running} = Map.pop!(running, ref)
+        next_aliases = deactivate_update_alias(aliases, entry.update_alias)
+        outcome = exit_outcome(entry.started.call, reason, run, entry.deadline_capped?)
+        done_entry = finish_or_cleanup(entry, outcome, false, run, next_running)
+        await_batch(next_running, next_aliases, pending, [done_entry | done], ctx)
     end
   end
 
-  defp finish_or_cleanup(started, outcome, update_alias, run, remaining_running) do
-    run_or_cleanup(remaining_running, update_alias, fn ->
-      drain_call_updates(update_alias, started.start_seq, run)
-      finish(started, outcome, run)
+  defp finish_or_cleanup(entry, outcome, emit_queued?, run, remaining_running) do
+    run_or_cleanup(remaining_running, fn ->
+      if emit_queued? do
+        drain_call_updates(entry.update_alias, entry.started.start_seq, run)
+      else
+        flush_alias_updates(entry.update_alias)
+      end
+
+      finish(entry.started, outcome, run)
     end)
+  after
+    flush_alias_updates(entry.update_alias)
   end
 
-  defp run_or_cleanup(running, update_alias, fun) do
+  defp run_or_cleanup(running, fun) do
     fun.()
   catch
     kind, reason ->
-      cleanup_running(running, update_alias)
+      cleanup_running(running)
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
-  defp cleanup_running(running, update_alias) do
-    Process.unalias(update_alias)
-
-    Enum.each(running, fn {_ref, %{owner: owner}} ->
+  defp cleanup_running(running) do
+    Enum.each(running, fn {_ref, %{owner: owner, update_alias: call_alias}} ->
+      if call_alias, do: Process.unalias(call_alias)
       OwnedWorker.cancel(owner)
+      flush_alias_updates(call_alias)
     end)
-
-    flush_alias_updates(update_alias)
   end
 
-  defp fill_slots(running, [], done, _ctx), do: {running, [], done}
+  defp deactivate_update_alias(aliases, nil), do: aliases
 
-  defp fill_slots(running, pending, done, ctx) when map_size(running) >= ctx.max_concurrency,
-    do: {running, pending, done}
+  defp deactivate_update_alias(aliases, call_alias) do
+    Process.unalias(call_alias)
+    Map.delete(aliases, call_alias)
+  end
 
-  defp fill_slots(running, [%{tag: {:blocked, _call, reason}} = started | rest], done, ctx) do
+  defp fill_slots(running, aliases, [], done, _ctx), do: {running, aliases, [], done}
+
+  defp fill_slots(running, aliases, pending, done, ctx)
+       when map_size(running) >= ctx.max_concurrency,
+       do: {running, aliases, pending, done}
+
+  defp fill_slots(
+         running,
+         aliases,
+         [%{tag: {:blocked, _call, reason}} = started | rest],
+         done,
+         ctx
+       ) do
     entry =
-      run_or_cleanup(running, ctx.update_alias, fn ->
+      run_or_cleanup(running, fn ->
         finish(started, {:error, "Blocked: #{reason}", nil}, ctx.run)
       end)
 
-    fill_slots(running, rest, [entry | done], ctx)
+    fill_slots(running, aliases, rest, [entry | done], ctx)
   end
 
-  defp fill_slots(running, [started | rest], done, ctx) do
+  defp fill_slots(running, aliases, [started | rest], done, ctx) do
     case task_deadline(ctx.run) do
       :expired ->
         entry =
-          run_or_cleanup(running, ctx.update_alias, fn ->
+          run_or_cleanup(running, fn ->
             finish(started, deadline_skipped_outcome(ctx.run), ctx.run)
           end)
 
-        fill_slots(running, rest, [entry | done], ctx)
+        fill_slots(running, aliases, rest, [entry | done], ctx)
 
       {deadline, deadline_capped?} ->
-        owner =
-          run_or_cleanup(running, ctx.update_alias, fn ->
-            call_run = put_tool_update_callback(ctx.run, ctx.update_alias, started)
-            OwnedWorker.start(deadline, fn -> invoke(started.tag, call_run) end)
-          end)
+        {call_run, call_alias, inflight} = maybe_attach_tool_updates(ctx.run, started)
 
-        entry = %{owner: owner, started: started, deadline_capped?: deadline_capped?}
-        fill_slots(Map.put(running, owner.ref, entry), rest, done, ctx)
+        owner =
+          try do
+            OwnedWorker.start(deadline, fn -> invoke(started.tag, call_run) end)
+          catch
+            kind, reason ->
+              if call_alias, do: Process.unalias(call_alias)
+              cleanup_running(running)
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+
+        entry = %{
+          owner: owner,
+          started: started,
+          deadline_capped?: deadline_capped?,
+          update_alias: call_alias,
+          inflight: inflight
+        }
+
+        next_aliases = if call_alias, do: Map.put(aliases, call_alias, owner.ref), else: aliases
+        fill_slots(Map.put(running, owner.ref, entry), next_aliases, rest, done, ctx)
     end
   end
 
@@ -298,17 +339,27 @@ defmodule Alloy.Tool.Executor do
     exit_outcome(call, reason, run, capped?)
   end
 
-  defp put_tool_update_callback(run, update_alias, started) do
+  defp maybe_attach_tool_updates(%{emit_tool_updates?: false} = run, _started) do
+    {run, nil, nil}
+  end
+
+  defp maybe_attach_tool_updates(run, started) do
+    call_alias = Process.alias()
+    inflight = :atomics.new(1, signed: false)
     call_id = started.call[:id]
     call_name = started.call[:name]
     start_seq = started.start_seq
 
     on_update = fn
       chunk when is_binary(chunk) and byte_size(chunk) > 0 ->
-        send(
-          update_alias,
-          {:alloy_tool_update, update_alias, call_id, call_name, start_seq, chunk}
-        )
+        if :atomics.add_get(inflight, 1, 1) <= @max_inflight_tool_updates do
+          send(
+            call_alias,
+            {:alloy_tool_update, call_alias, call_id, call_name, start_seq, chunk}
+          )
+        else
+          :atomics.sub(inflight, 1, 1)
+        end
 
         :ok
 
@@ -316,27 +367,31 @@ defmodule Alloy.Tool.Executor do
         :ok
     end
 
-    %{run | context: Map.put(run.context, :on_tool_update, on_update)}
+    {%{run | context: Map.put(run.context, :on_tool_update, on_update)}, call_alias, inflight}
   end
 
-  defp running_start_seq?(running, start_seq) do
-    Enum.any?(running, fn {_ref, %{started: %{start_seq: seq}}} -> seq == start_seq end)
-  end
+  defp drain_call_updates(nil, _start_seq, _run), do: :ok
 
-  defp drain_call_updates(update_alias, start_seq, run) do
-    receive do
-      {:alloy_tool_update, ^update_alias, call_id, name, ^start_seq, chunk} ->
-        emit_update(call_id, name, start_seq, chunk, run)
-        drain_call_updates(update_alias, start_seq, run)
-    after
-      0 -> :ok
+  defp drain_call_updates(call_alias, start_seq, run) do
+    if deadline_expired?(run.run_deadline) do
+      flush_alias_updates(call_alias)
+    else
+      receive do
+        {:alloy_tool_update, ^call_alias, call_id, name, ^start_seq, chunk} ->
+          emit_update(call_id, name, start_seq, chunk, run)
+          drain_call_updates(call_alias, start_seq, run)
+      after
+        0 -> :ok
+      end
     end
   end
 
-  defp flush_alias_updates(update_alias) do
+  defp flush_alias_updates(nil), do: :ok
+
+  defp flush_alias_updates(call_alias) do
     receive do
-      {:alloy_tool_update, ^update_alias, _id, _name, _seq, _chunk} ->
-        flush_alias_updates(update_alias)
+      {:alloy_tool_update, ^call_alias, _id, _name, _seq, _chunk} ->
+        flush_alias_updates(call_alias)
     after
       0 -> :ok
     end

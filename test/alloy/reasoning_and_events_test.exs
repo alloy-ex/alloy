@@ -51,6 +51,14 @@ defmodule Alloy.ReasoningAndEventsTest do
     def call(_hook, state), do: state
   end
 
+  defmodule RaiseAfterCompletionMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:after_completion, _state), do: raise("after_completion_boom")
+    def call(_hook, state), do: state
+  end
+
   defmodule CaptureReasoningProvider do
     @behaviour Alloy.Provider
 
@@ -1577,6 +1585,333 @@ defmodule Alloy.ReasoningAndEventsTest do
       boom_events = drain_tagged(:boom_ev)
       assert Enum.any?(boom_events, &(&1.event == :turn_start and &1.turn == 1))
       assert Enum.any?(boom_events, &(&1.event == :turn_end and &1.payload.status == :error))
+
+      # 5. Post-response exception (:after_completion) preserves accounted stop_reason and usage.
+      {:ok, post_err_pid} =
+        TestProvider.start_link([
+          {:ok,
+           %{
+             stop_reason: :end_turn,
+             messages: [Message.assistant("done")],
+             usage: %{input_tokens: 7, output_tokens: 3}
+           }}
+        ])
+
+      assert_raise RuntimeError, "after_completion_boom", fn ->
+        Alloy.run("go",
+          provider: {TestProvider, agent_pid: post_err_pid},
+          middleware: [RaiseAfterCompletionMiddleware],
+          on_event: &send(parent, {:post_boom_ev, &1})
+        )
+      end
+
+      post_boom_events = drain_tagged(:post_boom_ev)
+
+      assert [
+               %{
+                 event: :turn_end,
+                 payload: %{
+                   turn: 1,
+                   status: :error,
+                   stop_reason: :end_turn,
+                   usage: %Alloy.Usage{input_tokens: 7, output_tokens: 3}
+                 }
+               }
+             ] = Enum.filter(post_boom_events, &(&1.event == :turn_end))
+    end
+
+    test "OpenAI malformed interim tool header with valid response.completed succeeds; OpenAICompat malformed id suppresses delta and retries" do
+      parent = self()
+
+      # 1. OpenAI Responses: malformed interim function_call header + valid response.completed
+      #    must succeed (with or without :on_event) without emitting invalid :tool_call_delta.
+      quirky_oai_plug =
+        sse_plug(
+          sse_oai("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => -1,
+            "item" => %{"id" => %{}, "type" => "function_call", "name" => ""}
+          }) <>
+            sse_oai("response.function_call_arguments.delta", %{
+              "type" => "response.function_call_arguments.delta",
+              "output_index" => -1,
+              "delta" => "{}"
+            }) <>
+            sse_oai("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_quirky",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "message",
+                    "role" => "assistant",
+                    "content" => [%{"type" => "output_text", "text" => "still valid"}]
+                  }
+                ],
+                "usage" => %{"input_tokens" => 2, "output_tokens" => 2}
+              }
+            })
+        )
+
+      assert {:ok, %{text: "still valid"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: quirky_oai_plug]},
+                 on_event: &send(parent, {:quirky_ev, &1})
+               )
+
+      quirky_events = drain_tagged(:quirky_ev)
+      refute Enum.any?(quirky_events, &(&1.event == :tool_call_delta))
+
+      assert {:ok, %{text: "still valid"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: quirky_oai_plug]}
+               )
+
+      # 2. Chat Completions (OpenAIStream): malformed non-string id in tool header must NOT emit
+      #    an invalid :tool_call_delta and must still retry on subsequent transient server_error.
+      compat_attempts = :atomics.new(1, signed: false)
+
+      flaky_compat_plug = fn conn ->
+        n = :atomics.add_get(compat_attempts, 1, 1)
+
+        sse =
+          if n == 1 do
+            "data: " <>
+              Jason.encode!(%{
+                "choices" => [
+                  %{
+                    "index" => 0,
+                    "delta" => %{
+                      "tool_calls" => [
+                        %{
+                          "index" => 0,
+                          "id" => %{},
+                          "function" => %{"name" => "echo", "arguments" => ""}
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }) <>
+              "\n\n" <>
+              "data: " <>
+              Jason.encode!(%{
+                "error" => %{"type" => "server_error", "message" => "transient"}
+              }) <> "\n\n"
+          else
+            "data: " <>
+              Jason.encode!(%{
+                "choices" => [
+                  %{"index" => 0, "delta" => %{"content" => "recovered"}, "finish_reason" => nil}
+                ]
+              }) <>
+              "\n\n" <>
+              "data: " <>
+              Jason.encode!(%{
+                "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => "stop"}],
+                "usage" => %{"prompt_tokens" => 1, "completion_tokens" => 1}
+              }) <> "\n\ndata: [DONE]\n\n"
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{text: "recovered"}} =
+               Alloy.stream("hi", fn _ -> :ok end,
+                 provider:
+                   {OpenAICompat,
+                    api_url: "https://compat.example/v1",
+                    api_key: "sk-compat",
+                    model: "qwen3",
+                    req_options: [plug: flaky_compat_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0,
+                 on_event: &send(parent, {:compat_ev, &1})
+               )
+
+      assert :atomics.get(compat_attempts, 1) == 2
+      compat_events = drain_tagged(:compat_ev)
+      refute Enum.any?(compat_events, &(&1.event == :tool_call_delta))
+    end
+
+    test "Executor closes per-call update alias before draining sustained child producers and gates :on_tool_update on subscriber" do
+      parent = self()
+
+      # 1. Without :on_event subscriber, :on_tool_update is not injected into tool context.
+      no_sub_tool = %Inline{
+        name: "check_ctx",
+        description: "Checks on_tool_update presence",
+        input_schema: %{type: "object", properties: %{}},
+        execute: fn _input, context ->
+          send(parent, {:has_update_cb, Map.has_key?(context, :on_tool_update)})
+          {:ok, "ok"}
+        end
+      }
+
+      {:ok, pid0} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "c0", name: "check_ctx", input: %{}}]),
+          TestProvider.text_response("done")
+        ])
+
+      assert {:ok, %{status: :completed}} =
+               Alloy.run("go", provider: {TestProvider, agent_pid: pid0}, tools: [no_sub_tool])
+
+      assert_received {:has_update_cb, false}
+
+      # 2. A surviving child process spamming on_tool_update every 5ms after tool return
+      #    cannot keep finish/3 or the run alive indefinitely.
+      stop_spammer = :atomics.new(1, signed: false)
+
+      spammer_tool = %Inline{
+        name: "spammer",
+        description: "Spawns persistent updater",
+        input_schema: %{type: "object", properties: %{}},
+        execute: fn _input, context ->
+          fun = Map.fetch!(context, :on_tool_update)
+
+          child =
+            spawn(fn ->
+              Stream.repeatedly(fn -> :tick end)
+              |> Enum.reduce_while(:ok, fn :tick, :ok ->
+                if :atomics.get(stop_spammer, 1) == 1 do
+                  {:halt, :ok}
+                else
+                  fun.("spam")
+                  Process.sleep(5)
+                  {:cont, :ok}
+                end
+              end)
+            end)
+
+          send(parent, {:spammer_child, child})
+          Process.sleep(15)
+          {:ok, "done"}
+        end
+      }
+
+      {:ok, pid1} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([%{id: "c_spam", name: "spammer", input: %{}}]),
+          TestProvider.text_response("finished")
+        ])
+
+      started_at = System.monotonic_time(:millisecond)
+
+      assert {:ok, %{status: :completed, text: "finished"}} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid1},
+                 tools: [spammer_tool],
+                 timeout_ms: 500,
+                 on_event: fn
+                   %{event: :tool_update} = ev ->
+                     send(parent, {:spam_ev, ev})
+                     Process.sleep(10)
+
+                   ev ->
+                     send(parent, {:spam_ev, ev})
+                 end
+               )
+
+      elapsed = System.monotonic_time(:millisecond) - started_at
+      :atomics.put(stop_spammer, 1, 1)
+      assert_receive {:spammer_child, child_pid}, 1_000
+      assert elapsed < 400
+
+      spam_events = drain_tagged(:spam_ev)
+      end_idx = Enum.find_index(spam_events, &(&1.event == :tool_end))
+      assert is_integer(end_idx)
+      refute Enum.any?(Enum.drop(spam_events, end_idx + 1), &(&1.event == :tool_update))
+      refute_receive _, 80
+      Process.exit(child_pid, :kill)
+    end
+
+    test "Core.Bash preserves exit status on slow :bash_on_output, bounds high-volume backpressure, and cleans up worker on crash" do
+      parent = self()
+
+      # 1. Slow :bash_on_output on a fast-exiting command must preserve exit status 0
+      #    and complete within the short flush grace window (not turn into a timeout).
+      started = System.monotonic_time(:millisecond)
+
+      assert {:ok, out} =
+               Bash.execute(
+                 %{"command" => "printf 'hello\\n'", "timeout" => 5_000},
+                 %{
+                   bash_restricted: false,
+                   bash_on_output: fn _chunk ->
+                     send(parent, {:slow_worker_pid, self()})
+                     Process.sleep(4_000)
+                   end
+                 }
+               )
+
+      elapsed = System.monotonic_time(:millisecond) - started
+      assert out =~ "hello"
+      assert out =~ "exit code: 0"
+      assert elapsed < 1_000
+
+      assert_receive {:slow_worker_pid, slow_worker}, 500
+      ref = Process.monitor(slow_worker)
+      assert_receive {:DOWN, ^ref, :process, ^slow_worker, _}, 500
+
+      # 2. High-volume output (~1 MiB) with a slow callback stays bounded under backpressure
+      #    and finishes cleanly without exhausting memory.
+      chunks_seen = :atomics.new(1, signed: false)
+      bytes_seen = :atomics.new(1, signed: false)
+
+      assert {:ok, big_out} =
+               Bash.execute(
+                 %{
+                   "command" => "head -c 1048576 /dev/zero | tr '\\0' A",
+                   "timeout" => 5_000
+                 },
+                 %{
+                   bash_restricted: false,
+                   bash_on_output: fn chunk ->
+                     :atomics.add(chunks_seen, 1, 1)
+                     :atomics.add(bytes_seen, 1, byte_size(chunk))
+                     Process.sleep(40)
+                   end
+                 }
+               )
+
+      assert big_out =~ "exit code: 0"
+      assert big_out =~ "bytes of output truncated"
+      assert :atomics.get(chunks_seen, 1) >= 1
+      assert :atomics.get(bytes_seen, 1) < 1_048_576
+
+      # 3. Direct Bash.execute with a raising :on_tool_update still tears down the
+      #    :bash_on_output worker (no orphaned worker left in output_worker_loop).
+      assert {:error, crash_msg} =
+               Bash.execute(
+                 %{
+                   "command" => "echo first; sleep 0.1; echo second; sleep 5",
+                   "timeout" => 5_000
+                 },
+                 %{
+                   bash_restricted: false,
+                   bash_on_output: fn _chunk ->
+                     send(parent, {:crash_worker_pid, self()})
+                     :ok
+                   end,
+                   on_tool_update: fn chunk ->
+                     if String.contains?(chunk, "second"), do: raise("direct_update_boom")
+                     :ok
+                   end
+                 }
+               )
+
+      assert crash_msg =~ "Executor crashed"
+      assert_receive {:crash_worker_pid, wpid}, 500
+      wref = Process.monitor(wpid)
+      assert_receive {:DOWN, ^wref, :process, ^wpid, _}, 500
     end
   end
 

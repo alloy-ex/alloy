@@ -154,13 +154,22 @@ defmodule Alloy.Agent.Turn do
   defp run_turn(%State{} = state, opts) do
     turn = state.turn + 1
     usage_before = state.usage
+    progress_key = {:alloy_turn_progress, make_ref()}
     Events.emit(opts, turn, {:turn_start, %{turn: turn}})
 
     step =
       try do
-        turn_span(turn, fn -> complete(state, opts, false) end)
+        turn_span(turn, fn ->
+          complete(state, Keyword.put(opts, :turn_progress_key, progress_key), false)
+        end)
       catch
         kind, reason ->
+          {stop_reason, usage} =
+            case Process.delete(progress_key) do
+              {sr, u} -> {sr, Usage.diff(u, usage_before)}
+              nil -> {nil, %Usage{}}
+            end
+
           Events.emit(
             opts,
             turn,
@@ -168,14 +177,15 @@ defmodule Alloy.Agent.Turn do
              %{
                turn: turn,
                status: :error,
-               stop_reason: nil,
-               usage: %Usage{}
+               stop_reason: stop_reason,
+               usage: usage
              }}
           )
 
           :erlang.raise(kind, reason, __STACKTRACE__)
       end
 
+    Process.delete(progress_key)
     step = finalize_turn_limits(step)
     {_, step_state} = step
     turn_stop_reason = if step_state.turn == turn, do: step_state.stop_reason, else: nil
@@ -271,6 +281,7 @@ defmodule Alloy.Agent.Turn do
 
     with {:continue, state} <- run_middleware(:before_completion, state),
          :ok <- check_deadline(state) do
+      record_turn_progress(opts, nil, state.usage)
       {schemas, state} = refresh_tool_schemas(state, pre_key, schemas)
       post_key = tool_schema_key(state)
 
@@ -279,18 +290,31 @@ defmodule Alloy.Agent.Turn do
 
       case result do
         {:ok, %{stop_reason: :refusal} = response} ->
-          {:halt, refuse(state, response)}
+          refused = refuse(state, response)
+          record_turn_progress(opts, refused.stop_reason, refused.usage)
+          {:halt, refused}
 
         {:ok, %{stop_reason: stop_reason, messages: new_msgs} = response} ->
-          state
-          |> State.append_messages(new_msgs)
-          |> account_response(response)
-          |> continue_after(stop_reason, new_msgs, {post_key, schemas}, opts)
+          next_state =
+            state
+            |> State.append_messages(new_msgs)
+            |> account_response(response)
+
+          record_turn_progress(opts, next_state.stop_reason, next_state.usage)
+          continue_after(next_state, stop_reason, new_msgs, {post_key, schemas}, opts)
 
         {:error, reason} ->
           handle_provider_error(reason, state, opts, overflow_retried?)
       end
     end
+  end
+
+  defp record_turn_progress(opts, stop_reason, usage) do
+    if key = Keyword.get(opts, :turn_progress_key) do
+      Process.put(key, {stop_reason, usage})
+    end
+
+    :ok
   end
 
   defp request(%State{} = state, opts) do
@@ -580,7 +604,7 @@ defmodule Alloy.Agent.Turn do
   defp run_executor(calls, state, schemas, opts) do
     executor_opts =
       opts
-      |> Keyword.take([:event_seq_ref, :event_correlation_id])
+      |> Keyword.take([:event_seq_ref, :event_correlation_id, :event_subscriber?])
       |> Keyword.merge(
         on_event: &Events.emit(opts, state.turn, &1),
         event_turn: state.turn,

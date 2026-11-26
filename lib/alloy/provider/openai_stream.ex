@@ -387,15 +387,8 @@ defmodule Alloy.Provider.OpenAIStream do
             thought_signature: nil
           })
 
-        existing =
-          case tc_delta do
-            # Some providers (DeepInfra) repeat "id": null on every later chunk of
-            # the same call; only a real id may set it, or it is overwritten.
-            %{"id" => id} when is_binary(id) and id != "" -> %{existing | id: id}
-            _ -> existing
-          end
-
-        with {:ok, sig} <- extract_thought_signature(tc_delta),
+        with {:ok, existing} <- merge_tool_call_id(existing, Map.fetch(tc_delta, "id")),
+             {:ok, sig} <- extract_thought_signature(tc_delta),
              with_sig = if(sig, do: %{existing | thought_signature: sig}, else: existing),
              {:ok, updated, args_delta} <-
                merge_function_delta(with_sig, Map.fetch(tc_delta, "function")) do
@@ -406,7 +399,7 @@ defmodule Alloy.Provider.OpenAIStream do
           }
 
           next_events =
-            if should_emit_tool_call_delta?(tc_delta, args_delta) do
+            if should_emit_tool_call_delta?(tc_delta, updated, args_delta) do
               [
                 %{
                   id: updated.id,
@@ -434,9 +427,26 @@ defmodule Alloy.Provider.OpenAIStream do
     {record_protocol_error(acc, "Invalid tool call delta in Chat Completions SSE chunk"), events}
   end
 
-  defp should_emit_tool_call_delta?(_tc_delta, args_delta) when args_delta != "", do: true
+  # Some providers (DeepInfra) repeat "id": null on every later chunk of the
+  # same call; only a real id may set it, while non-string/non-nil ids fail fast.
+  defp merge_tool_call_id(existing, :error), do: {:ok, existing}
+  defp merge_tool_call_id(existing, {:ok, nil}), do: {:ok, existing}
+  defp merge_tool_call_id(existing, {:ok, ""}), do: {:ok, existing}
 
-  defp should_emit_tool_call_delta?(tc_delta, "") do
+  defp merge_tool_call_id(existing, {:ok, id}) when is_binary(id),
+    do: {:ok, %{existing | id: id}}
+
+  defp merge_tool_call_id(_existing, {:ok, _invalid}),
+    do: {:error, "Invalid tool call id in Chat Completions SSE chunk"}
+
+  defp should_emit_tool_call_delta?(_tc_delta, %{id: id}, _args_delta)
+       when not is_binary(id) or id == "",
+       do: false
+
+  defp should_emit_tool_call_delta?(_tc_delta, _updated, args_delta) when args_delta != "",
+    do: true
+
+  defp should_emit_tool_call_delta?(tc_delta, _updated, "") do
     has_id? = is_binary(tc_delta["id"]) and tc_delta["id"] != ""
 
     has_name? =

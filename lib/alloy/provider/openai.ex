@@ -558,11 +558,10 @@ defmodule Alloy.Provider.OpenAI do
 
       %{acc | function_calls: function_calls}
     else
-      HTTP.record_sticky_error(
-        acc,
-        :protocol_error,
-        "Malformed function_call item in OpenAI SSE stream"
-      )
+      # Skip invalid interim headers without failing the stream: the terminal
+      # response.completed payload carries the authoritative output items, and
+      # skipping emission avoids tripping chunks_emitted? before retries.
+      acc
     end
   end
 
@@ -577,11 +576,7 @@ defmodule Alloy.Provider.OpenAI do
     if valid_optional_output_index?(raw_index) do
       emit_function_call_args_delta(acc, payload, raw_index, delta)
     else
-      HTTP.record_sticky_error(
-        acc,
-        :protocol_error,
-        "Invalid output_index in OpenAI function_call_arguments.delta"
-      )
+      acc
     end
   end
 
@@ -636,15 +631,9 @@ defmodule Alloy.Provider.OpenAI do
            arguments_delta: delta
          }}
       )
-
-      acc
-    else
-      HTTP.record_sticky_error(
-        acc,
-        :protocol_error,
-        "Malformed function_call_arguments.delta metadata in OpenAI SSE stream"
-      )
     end
+
+    acc
   end
 
   defp valid_tool_call_meta?(%{id: id, name: name}) do

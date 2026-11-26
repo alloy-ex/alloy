@@ -56,7 +56,10 @@ defmodule Alloy.Provider.Gemini do
   (`"MINIMAL"`, `"LOW"`, `"MEDIUM"` or `"HIGH"`; each model accepts a
   subset) under `thinkingConfig`. `thinkingBudget`, a token count, is the
   older control: Gemini 2.5 models need it, and Gemini 3 still accepts it.
-  Never send both; the API rejects the request. Thinking tokens are billed
+  Never send both; the API rejects the request. Portable `:reasoning` maps
+  `:off` to `thinkingBudget: 0` and `:low..:xhigh` to `thinkingLevel` (so
+  when targeting Gemini 2.5, pass explicit `generation_config: %{"thinkingConfig" => %{"thinkingBudget" => ...}}`
+  or set `reasoning: nil` on the Gemini provider entry). Thinking tokens are billed
   as output and count against `:max_tokens`, so lower `thinkingLevel`
   rather than `:max_tokens` to save cost. Set `includeThoughts: true` to
   get thought summaries back as `"thinking"` blocks.
