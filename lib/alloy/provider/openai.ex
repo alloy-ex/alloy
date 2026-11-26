@@ -585,13 +585,13 @@ defmodule Alloy.Provider.OpenAI do
     raw_call_id = Map.get(item, "call_id")
     item_id = item["id"]
     name = item["name"]
-    existing = lookup_function_call_meta(acc.function_calls, item_id, index)
 
     # During streaming (output_item.added / output_item.done), require the true
     # call_id so consumers never receive item_id when call_id arrives later.
     # Terminal response.completed fallback to item["id"] happens in
     # plan_completed_function_call/4 (matching parse_output_to_blocks/2).
     call_id = raw_call_id
+    existing = lookup_function_call_item(acc.function_calls, item_id, call_id, index)
 
     cond do
       existing == :rejected ->
@@ -690,6 +690,8 @@ defmodule Alloy.Provider.OpenAI do
             function_calls =
               acc.function_calls
               |> maybe_put_call_meta(effective_item_id, meta)
+              |> maybe_put_call_meta(is_map(existing) && Map.get(existing, :item_id), meta)
+              |> Map.put({:call_id, call_id}, meta)
               |> Map.put({:index, stable_index}, meta)
 
             {:ok, %{acc | function_calls: function_calls, pending_function_deltas: next_pending},
@@ -917,6 +919,12 @@ defmodule Alloy.Provider.OpenAI do
     %{acc | function_calls: function_calls, pending_function_deltas: next_pending}
   end
 
+  defp lookup_function_call_item(calls, item_id, call_id, index) do
+    maybe_get_by_id(calls, item_id) ||
+      maybe_get_by_call_id(calls, call_id) ||
+      lookup_call_by_index(calls, index)
+  end
+
   defp lookup_function_call_meta(calls, item_id, index) do
     case maybe_get_by_id(calls, item_id) do
       nil ->
@@ -937,6 +945,11 @@ defmodule Alloy.Provider.OpenAI do
 
   defp maybe_get_by_id(calls, id) when is_binary(id) and id != "", do: Map.get(calls, id)
   defp maybe_get_by_id(_calls, _id), do: nil
+
+  defp maybe_get_by_call_id(calls, call_id) when is_binary(call_id) and call_id != "",
+    do: Map.get(calls, {:call_id, call_id})
+
+  defp maybe_get_by_call_id(_calls, _call_id), do: nil
 
   defp maybe_put_call_meta(map, id, meta) when is_binary(id) and id != "",
     do: Map.put(map, id, meta)
@@ -977,6 +990,7 @@ defmodule Alloy.Provider.OpenAI do
             acc.function_calls
             |> maybe_put_call_meta(item_id, updated_meta)
             |> maybe_put_call_meta(Map.get(meta, :item_id), updated_meta)
+            |> Map.put({:call_id, id}, updated_meta)
             |> Map.put({:index, idx}, updated_meta)
 
           %{acc | function_calls: function_calls}
@@ -1077,49 +1091,88 @@ defmodule Alloy.Provider.OpenAI do
 
       mode ->
         strict? = mode == :normal
-
-        result =
-          output
-          |> Enum.with_index()
-          |> Enum.reduce_while({:ok, acc, []}, fn
-            {%{"type" => "function_call"} = item, idx}, {:ok, current, rev_events} ->
-              case plan_completed_function_call(current, item, idx, strict?) do
-                {:ok, updated, events} ->
-                  {:cont, {:ok, updated, Enum.reverse(events, rev_events)}}
-
-                {:error, _} = err ->
-                  {:halt, err}
-              end
-
-            _other, state ->
-              {:cont, state}
-          end)
-
-        case result do
-          {:ok, _final_acc, rev_events} ->
-            rev_events |> Enum.reverse() |> Enum.each(acc.on_event)
-            :ok
-
-          {:error, _} = err ->
-            err
-        end
+        result = reduce_completed_output(output, acc, strict?)
+        finish_completed_flush(result, acc, strict?)
     end
   end
 
-  defp flush_pending_from_response(_acc, _response), do: :ok
+  defp flush_pending_from_response(acc, response) when is_map(response) do
+    if parse_output_mode(response) == :normal do
+      check_missing_emitted_calls(acc.function_calls, MapSet.new())
+    else
+      :ok
+    end
+  end
+
+  defp reduce_completed_output(output, acc, strict?) do
+    output
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, acc, [], MapSet.new()}, fn
+      {%{"type" => "function_call"} = item, idx}, {:ok, current, rev_events, seen} ->
+        case plan_completed_function_call(current, item, idx, strict?) do
+          {:ok, updated, events, seen_call_id} ->
+            next_seen = if seen_call_id, do: MapSet.put(seen, seen_call_id), else: seen
+            {:cont, {:ok, updated, Enum.reverse(events, rev_events), next_seen}}
+
+          {:error, _} = err ->
+            {:halt, err}
+        end
+
+      _other, state ->
+        {:cont, state}
+    end)
+  end
+
+  defp finish_completed_flush({:error, _} = err, _acc, _strict?), do: err
+
+  defp finish_completed_flush({:ok, _final_acc, rev_events, seen}, acc, true) do
+    case check_missing_emitted_calls(acc.function_calls, seen) do
+      :ok ->
+        rev_events |> Enum.reverse() |> Enum.each(acc.on_event)
+        :ok
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp finish_completed_flush({:ok, _final_acc, rev_events, _seen}, acc, false) do
+    rev_events |> Enum.reverse() |> Enum.each(acc.on_event)
+    :ok
+  end
+
+  defp check_missing_emitted_calls(function_calls, seen_call_ids) do
+    case Enum.find_value(function_calls, fn
+           {{:call_id, call_id}, %{}} ->
+             if MapSet.member?(seen_call_ids, call_id), do: nil, else: call_id
+
+           _other ->
+             nil
+         end) do
+      nil ->
+        :ok
+
+      missing_id ->
+        {:error,
+         %Error{
+           kind: :malformed_reply,
+           message: "Streamed tool call #{missing_id} missing from completed response"
+         }}
+    end
+  end
 
   defp plan_completed_function_call(acc, item, idx, strict?) do
     item_id = item["id"]
     call_id = Map.get(item, "call_id") || item_id
     name = item["name"]
-    existing = lookup_function_call_meta(acc.function_calls, item_id, idx)
+    existing = lookup_function_call_item(acc.function_calls, item_id, call_id, idx)
 
     cond do
       existing == :rejected ->
-        {:ok, acc, []}
+        {:ok, acc, [], nil}
 
       not valid_function_call_header?(idx, call_id, name) ->
-        {:ok, acc, []}
+        {:ok, acc, [], nil}
 
       true ->
         call_info = %{
@@ -1131,7 +1184,10 @@ defmodule Alloy.Provider.OpenAI do
           name: name
         }
 
-        plan_and_store_function_call(acc, call_info, "response.completed", strict?)
+        case plan_and_store_function_call(acc, call_info, "response.completed", strict?) do
+          {:ok, updated, events} -> {:ok, updated, events, call_id}
+          {:error, _} = err -> err
+        end
     end
   end
 

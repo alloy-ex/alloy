@@ -4307,6 +4307,82 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert Enum.all?(ocr_deltas, &(&1.id == "call_a" and &1.name == "read"))
       assert Jason.decode!(Enum.map_join(ocr_deltas, & &1.arguments_delta)) == %{"x" => 1}
+
+      # 15. OpenAI/xAI: changed non-empty item_id on response.completed (whether retaining
+      #     call_id with contradictory args, replacing call_id/name at the same index, or dropping
+      #     a previously emitted call from completed output) fails with :malformed_reply instead
+      #     of bypassing reconciliation and emitting duplicate/invalid concatenated JSON.
+      for completed_output <- [
+            [
+              %{
+                "type" => "function_call",
+                "id" => "fc_b",
+                "call_id" => "call_a",
+                "name" => "read",
+                "arguments" => "{\"x\":2}"
+              }
+            ],
+            [
+              %{
+                "type" => "function_call",
+                "id" => "fc_b",
+                "call_id" => "call_b",
+                "name" => "delete",
+                "arguments" => "{\"x\":2}"
+              }
+            ],
+            [
+              %{
+                "type" => "message",
+                "role" => "assistant",
+                "content" => [%{"type" => "output_text", "text" => "changed my mind"}]
+              }
+            ]
+          ] do
+        changed_id_plug =
+          sse_plug(
+            sse_oai("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_a",
+                "call_id" => "call_a",
+                "name" => "read",
+                "arguments" => "{\"x\":1}"
+              }
+            }) <>
+              sse_oai("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_changed_item_id",
+                  "status" => "completed",
+                  "output" => completed_output,
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAI.stream(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_key: "sk-oai",
+                     model: "gpt-5.4",
+                     req_options: [plug: changed_id_plug],
+                     on_event: &send(parent, {:cid_ev, &1})
+                   },
+                   fn _ -> :ok end
+                 )
+
+        cid_deltas =
+          drain_tagged(:cid_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p end)
+
+        assert Enum.map_join(cid_deltas, & &1.arguments_delta) == "{\"x\":1}"
+      end
     end
   end
 
