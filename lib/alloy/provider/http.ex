@@ -174,20 +174,25 @@ defmodule Alloy.Provider.HTTP do
   end
 
   defp validate_api_key_bytes(key) do
-    if contains_control_byte?(key) do
+    if contains_invalid_header_byte?(key) do
       {:error,
        %Error{
          kind: :auth,
-         message: "Invalid :api_key: contains control characters or newline"
+         message: "Invalid :api_key: contains non-ASCII or control bytes"
        }}
     else
       {:ok, key}
     end
   end
 
-  defp contains_control_byte?(<<>>), do: false
-  defp contains_control_byte?(<<b, _rest::binary>>) when b < 0x20 or b == 0x7F, do: true
-  defp contains_control_byte?(<<_b, rest::binary>>), do: contains_control_byte?(rest)
+  # Mint's HTTP/1 encoder rejects bytes outside printable ASCII (0x20..0x7E)
+  # with {:invalid_header_value, name, value}; reject them upfront so secrets
+  # can never leak into transport error messages.
+  defp contains_invalid_header_byte?(<<>>), do: false
+  defp contains_invalid_header_byte?(<<b, _rest::binary>>) when b < 0x20 or b >= 0x7F, do: true
+
+  defp contains_invalid_header_byte?(<<_b, rest::binary>>),
+    do: contains_invalid_header_byte?(rest)
 
   @doc false
   @spec resolve_optional_api_key(map()) :: {:ok, String.t() | nil} | {:error, Error.t()}
@@ -239,6 +244,9 @@ defmodule Alloy.Provider.HTTP do
       key when is_binary(key) and byte_size(key) > 0 ->
         validate_api_key_bytes(key)
 
+      {:error, %Error{} = err} ->
+        {:error, err}
+
       {:error, reason} ->
         {:error,
          %Error{
@@ -268,6 +276,23 @@ defmodule Alloy.Provider.HTTP do
          kind: :auth,
          message: "Dynamic :api_key callback #{kind}: #{Sanitize.exit_summary(reason, :redact)}"
        }}
+  end
+
+  @doc false
+  @spec resolve_auth_scheme(map()) :: {:ok, :api_key | :bearer} | {:error, Error.t()}
+  def resolve_auth_scheme(config) when is_map(config) do
+    case Map.get(config, :auth_scheme, :api_key) do
+      scheme when scheme in [:api_key, :bearer] ->
+        {:ok, scheme}
+
+      other ->
+        {:error,
+         %Error{
+           kind: :invalid_request,
+           message:
+             "Invalid :auth_scheme: expected :api_key or :bearer, got #{Sanitize.shape_summary(other)}"
+         }}
+    end
   end
 
   @doc false

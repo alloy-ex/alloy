@@ -10,10 +10,18 @@ defmodule Alloy.Provider.OpenAI do
   ## Config
 
   Required:
-  - `:api_key` - OpenAI API key
+  - `:api_key` - OpenAI API key string, or a 0-arity callback returning
+    `String.t() | {:ok, String.t()} | {:error, term()}` invoked per HTTP
+    attempt (inside a deadline-bounded worker when `:timeout_ms` is finite).
+    When passing a callback via `Alloy.run/2`, also set `:origin_key` to a
+    stable non-empty string for account isolation.
   - `:model` - Model name (e.g., "gpt-6-astra", "gpt-6.1-sol", "gpt-5.4")
 
   Optional:
+  - `:origin_key` - Account identifier used for cross-origin provenance hashing
+    (required when `:api_key` is a function)
+  - `:prompt_cache_key` - Optional cache routing key for Responses prompt caching
+  - `:prompt_cache_retention` - Optional cache retention policy (e.g. `"in_memory"`, `"24h"`)
   - `:max_tokens` - Max output tokens, reasoning tokens included. Omitted
     unless set, so the model's own limit applies: a small cap can leave a
     reasoning model with no tokens for its answer
@@ -185,8 +193,8 @@ defmodule Alloy.Provider.OpenAI do
         "parallel_tool_calls",
         Map.get(config, :parallel_tool_calls)
       )
-      |> HTTP.maybe_put_unless_empty_list("prompt_cache_key", Map.get(config, :prompt_cache_key))
-      |> HTTP.maybe_put_unless_empty_list(
+      |> maybe_put_non_empty_string("prompt_cache_key", Map.get(config, :prompt_cache_key))
+      |> maybe_put_non_empty_string(
         "prompt_cache_retention",
         Map.get(config, :prompt_cache_retention)
       )
@@ -206,6 +214,11 @@ defmodule Alloy.Provider.OpenAI do
       "text"
     )
   end
+
+  defp maybe_put_non_empty_string(body, key, value) when is_binary(value) and value != "",
+    do: Map.put(body, key, value)
+
+  defp maybe_put_non_empty_string(body, _key, _other), do: body
 
   defp maybe_put_output_schema(body, config) do
     case Map.get(config, :output_schema) do

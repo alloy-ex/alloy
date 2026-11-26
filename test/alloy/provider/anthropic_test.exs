@@ -1370,6 +1370,24 @@ defmodule Alloy.Provider.AnthropicTest do
       [%{"type" => "text", "text" => notice}] = hd(decoded["messages"])["content"]
       assert notice =~ "URL documents require application/pdf"
     end
+
+    test "supports auth_scheme: :bearer for OAuth tokens and rejects invalid auth_scheme" do
+      bearer_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{api_key: fn -> {:ok, "oauth-tok"} end, auth_scheme: :bearer})
+
+      assert {:ok, _} = Anthropic.complete([Message.user("Hi")], [], bearer_cfg)
+      assert_received {:request_headers, b_headers}
+      assert {"authorization", "Bearer oauth-tok"} in b_headers
+      refute Enum.any?(b_headers, fn {k, _} -> k == "x-api-key" end)
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Anthropic.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(bearer_cfg, :auth_scheme, :bad)
+               )
+    end
   end
 
   # ── stream/4 ──────────────────────────────────────────────────────────

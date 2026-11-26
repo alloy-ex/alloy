@@ -217,6 +217,12 @@ defmodule Alloy.Agent.Turn do
       {schemas, state} = refresh_tool_schemas(state, pre_key, schemas)
       post_key = tool_schema_key(state)
 
+      # Attribute unattributed user file_id attachments before the first
+      # provider attempt so failed runs and exhausted fallbacks also retain
+      # provenance when callers resume result.messages on another provider.
+      primary_origin = Message.origin(state.config.provider, state.config.provider_config)
+      state = %{state | messages: Message.attribute_file_blocks(state.messages, primary_origin)}
+
       case request(state, opts) do
         {:ok, %{stop_reason: :refusal} = response} ->
           {:halt, refuse(state, response)}
@@ -551,12 +557,16 @@ defmodule Alloy.Agent.Turn do
     |> maybe_put_output_schema(config.output_schema)
   end
 
-  # Top-level :code_execution enables Anthropic's programmatic code execution
-  # tool; other providers configure native code execution in their own config.
-  defp maybe_enable_code_execution(provider_config, Alloy.Provider.Anthropic, true),
+  # Top-level :code_execution enables Anthropic-compatible server code execution
+  # while excluding Gemini (whose :code_execution opt is configured explicitly in
+  # provider config to avoid silently changing Gemini runs).
+  defp maybe_enable_code_execution(provider_config, Alloy.Provider.Gemini, _flag),
+    do: provider_config
+
+  defp maybe_enable_code_execution(provider_config, _provider, true),
     do: Map.put(provider_config, :code_execution, true)
 
-  defp maybe_enable_code_execution(provider_config, _provider, _flag), do: provider_config
+  defp maybe_enable_code_execution(provider_config, _provider, false), do: provider_config
 
   defp maybe_put_output_schema(provider_config, nil),
     do: Map.delete(provider_config, :output_schema)

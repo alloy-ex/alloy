@@ -1053,8 +1053,14 @@ defmodule Alloy.Provider.HTTPTest do
         assert msg =~ "invalid value"
       end
 
-      # Control bytes / trailing newlines are rejected without leaking the secret.
-      for dirty_key <- ["sk-secret\n", "sk-secret\r\n", "sk-secret\0"] do
+      # Control bytes, non-ASCII whitespace, and invalid UTF-8 are rejected without leaking the secret.
+      for dirty_key <- [
+            "sk-secret\n",
+            "sk-secret\r\n",
+            "sk-secret\0",
+            "sk-secret\u00A0",
+            <<"sk-secret", 0xFF>>
+          ] do
         assert {:error, %Error{kind: :auth, message: m_static}} =
                  HTTP.resolve_api_key(%{api_key: dirty_key})
 
@@ -1065,6 +1071,23 @@ defmodule Alloy.Provider.HTTPTest do
 
         refute m_cb =~ "sk-secret"
       end
+
+      # Explicit %Error{} from callback passes through (allowing callers to signal retryable :timeout).
+      transient = %Error{kind: :timeout, message: "token endpoint timed out"}
+
+      assert {:error, ^transient} =
+               HTTP.resolve_api_key(%{api_key: fn -> {:error, transient} end})
+
+      # Transport-layer invalid_header_value errors redact header values as defense in depth.
+      err_t = Error.from_transport({:invalid_header_value, "authorization", "Bearer sk-secret"})
+      refute err_t.message =~ "sk-secret"
+      assert err_t.message =~ "authorization"
+
+      assert {:ok, :api_key} = HTTP.resolve_auth_scheme(%{})
+      assert {:ok, :bearer} = HTTP.resolve_auth_scheme(%{auth_scheme: :bearer})
+
+      assert {:error, %Error{kind: :invalid_request}} =
+               HTTP.resolve_auth_scheme(%{auth_scheme: :basic})
 
       assert {:error, %Error{kind: :auth}} = HTTP.resolve_api_key(%{})
 

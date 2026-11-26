@@ -183,13 +183,24 @@ defmodule Alloy.Provider.Error do
   """
   @spec from_transport(term()) :: t()
   def from_transport(reason) do
-    detail = Sanitize.inspect_bounded(reason)
+    detail = format_transport_reason(reason)
 
     %__MODULE__{
       kind: transport_kind(reason),
       message: "HTTP request failed: #{detail}"
     }
   end
+
+  defp format_transport_reason({:invalid_header_value, name, _value}),
+    do: "invalid HTTP header value for #{format_header_name(name)}"
+
+  defp format_transport_reason(%{__struct__: mod, reason: {:invalid_header_value, name, _value}}),
+    do: "#{inspect(mod)}: invalid HTTP header value for #{format_header_name(name)}"
+
+  defp format_transport_reason(reason), do: Sanitize.inspect_bounded(reason)
+
+  defp format_header_name(name) when is_binary(name), do: inspect(Sanitize.cap_bytes(name, 64))
+  defp format_header_name(name), do: Sanitize.shape_summary(name)
 
   # ── Body parsing ──────────────────────────────────────────────────────────
 

@@ -396,21 +396,70 @@ defmodule Alloy.Provider.GeminiTest do
     end
 
     test "formats inline/file_id documents, image URLs, cached_content conflicts, native tools, and server-tool replay" do
-      # 1. Valid :cached_content without system_prompt/tools/tool_config succeeds.
+      # 1. :cached_content works with system_prompt and local Alloy tools (omitting
+      #    systemInstruction/tools from the wire body while still executing returned calls).
+      test_pid = self()
+      turn_counter = :atomics.new(1, signed: false)
+
+      cached_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:cached_req_body, body})
+        send(test_pid, {:cached_req_headers, conn.req_headers})
+
+        resp =
+          if :atomics.add_get(turn_counter, 1, 1) == 1 do
+            gemini_response([
+              %{
+                "functionCall" => %{"id" => "c1", "name" => "echo", "args" => %{}},
+                "thoughtSignature" => "sig_cached_1"
+              }
+            ])
+          else
+            gemini_response([%{"text" => "cached done"}])
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(resp))
+      end
+
+      echo_tool =
+        Alloy.Tool.inline(
+          name: "echo",
+          description: "Echo",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> {:ok, "ran locally"} end
+        )
+
+      assert {:ok, %{text: "cached done"}} =
+               Alloy.run("Hi",
+                 system_prompt: "Baked into cache",
+                 tools: [echo_tool],
+                 provider:
+                   {Gemini,
+                    api_key: fn -> {:ok, "adc-bearer-tok"} end,
+                    origin_key: "gem-acct-1",
+                    auth_scheme: :bearer,
+                    model: "gemini-3.8-flash",
+                    cached_content: "cachedContents/abc123",
+                    req_options: [plug: cached_plug]}
+               )
+
+      assert_received {:cached_req_body, cache_body}
+      assert_received {:cached_req_headers, headers}
+      assert {"authorization", "Bearer adc-bearer-tok"} in headers
+      refute Enum.any?(headers, fn {k, _} -> k == "x-goog-api-key" end)
+      decoded_cached = Jason.decode!(cache_body)
+      assert decoded_cached["cachedContent"] == "cachedContents/abc123"
+      refute Map.has_key?(decoded_cached, "systemInstruction")
+      refute Map.has_key?(decoded_cached, "tools")
+
+      # 2. :cached_content combined with explicit provider-level tool_config, native tools,
+      #    or extra_body tools fails fast; invalid :auth_scheme also fails fast.
       cache_only =
         config_that_captures_request()
-        |> Map.merge(%{
-          api_key: fn -> {:ok, "dyn-gem-key"} end,
-          cached_content: "cachedContents/abc123"
-        })
+        |> Map.put(:cached_content, "cachedContents/abc123")
 
-      assert {:ok, _} = Gemini.complete([Message.user("Hi")], [], cache_only)
-      assert_received {:request_body, cache_body}
-      assert_received {:request_headers, headers}
-      assert {"x-goog-api-key", "dyn-gem-key"} in headers
-      assert Jason.decode!(cache_body)["cachedContent"] == "cachedContents/abc123"
-
-      # 2. :cached_content combined with system_prompt, tools, or tool_config fails fast.
       tool_defs = [
         %{
           name: "read",
@@ -423,17 +472,28 @@ defmodule Alloy.Provider.GeminiTest do
                Gemini.complete(
                  [Message.user("Hi")],
                  [],
-                 Map.put(cache_only, :system_prompt, "Sys")
+                 Map.put(cache_only, :tool_config, %{functionCallingConfig: %{mode: "AUTO"}})
                )
-
-      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
-               Gemini.complete([Message.user("Hi")], tool_defs, cache_only)
 
       assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
                Gemini.complete(
                  [Message.user("Hi")],
                  [],
-                 Map.put(cache_only, :tool_config, %{functionCallingConfig: %{mode: "AUTO"}})
+                 Map.put(cache_only, :google_search, true)
+               )
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(cache_only, :extra_body, %{"tools" => [%{"googleSearch" => %{}}]})
+               )
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(cache_only, :auth_scheme, :basic)
                )
 
       # 3. Combining native tools + custom functionDeclarations sets includeServerSideToolInvocations

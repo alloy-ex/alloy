@@ -8,11 +8,19 @@ defmodule Alloy.Provider.Anthropic do
   ## Config
 
   Required:
-  - `:api_key` - Anthropic API key
+  - `:api_key` - Anthropic API key string, or a 0-arity callback returning
+    `String.t() | {:ok, String.t()} | {:error, term()}` invoked per HTTP
+    attempt (inside a deadline-bounded worker when `:timeout_ms` is finite).
+    When passing a callback via `Alloy.run/2`, also set `:origin_key` to a
+    stable non-empty string for account isolation.
   - `:model` - Model name (e.g., "claude-opus-4-6",
     "claude-sonnet-4-6", "claude-haiku-4-5")
 
   Optional:
+  - `:auth_scheme` - `:api_key` (default, sends `x-api-key`) or `:bearer`
+    (sends `Authorization: Bearer` for OAuth tokens)
+  - `:origin_key` - Account identifier used for cross-origin provenance hashing
+    (required when `:api_key` is a function)
   - `:max_tokens` - Max output tokens, thinking included (default: 16_000).
     Thinking is on by default on Claude 5.x models and counts toward this
     limit, so a low value can cut off the answer (`stop_reason: :max_tokens`).
@@ -123,6 +131,7 @@ defmodule Alloy.Provider.Anthropic do
   @type config :: %{
           required(:api_key) => Alloy.Provider.api_key(),
           required(:model) => String.t(),
+          optional(:auth_scheme) => :api_key | :bearer,
           optional(:max_tokens) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:api_url) => String.t(),
@@ -143,12 +152,13 @@ defmodule Alloy.Provider.Anthropic do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, auth_scheme} <- HTTP.resolve_auth_scheme(config),
+         {:ok, body} <- build_request_body(messages, tool_defs, config),
          {:ok, api_key} <- HTTP.resolve_api_key(config),
          {:ok, resp_body} <-
            HTTP.post_json(
              messages_url(config),
-             build_headers(config, api_key, body),
+             build_headers(config, api_key, auth_scheme, body),
              body,
              Map.get(config, :req_options, []),
              deadline: Map.get(config, :alloy_request_deadline)
@@ -183,13 +193,14 @@ defmodule Alloy.Provider.Anthropic do
       on_event: on_event
     }
 
-    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, auth_scheme} <- HTTP.resolve_auth_scheme(config),
+         {:ok, body} <- build_request_body(messages, tool_defs, config),
          {:ok, api_key} <- HTTP.resolve_api_key(config),
          body = Map.put(body, "stream", true),
          {:ok, sse_acc} <-
            HTTP.stream_sse(
              messages_url(config),
-             build_headers(config, api_key, body),
+             build_headers(config, api_key, auth_scheme, body),
              body,
              initial_acc,
              &handle_sse_raw_event/2,
@@ -756,7 +767,7 @@ defmodule Alloy.Provider.Anthropic do
 
   defp container_live?(_state), do: true
 
-  defp build_headers(config, api_key, body) do
+  defp build_headers(config, api_key, auth_scheme, body) do
     {user_betas, other_headers} =
       config
       |> Map.get(:extra_headers, [])
@@ -765,11 +776,14 @@ defmodule Alloy.Provider.Anthropic do
     betas = Enum.map(user_betas, fn {_name, value} -> value end) ++ required_betas(body)
 
     [
-      {"x-api-key", api_key},
+      auth_header(api_key, auth_scheme),
       {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
       {"content-type", "application/json"}
     ] ++ beta_header(betas) ++ other_headers
   end
+
+  defp auth_header(api_key, :bearer), do: {"authorization", "Bearer #{api_key}"}
+  defp auth_header(api_key, :api_key), do: {"x-api-key", api_key}
 
   # Code execution, memory, tool search and tool use examples went GA on
   # 2026-02-17 and need no header; context editing and Files API require betas.

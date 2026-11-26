@@ -1583,6 +1583,67 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:oai_turn2_body, t2_body}
       refute t2_body =~ "file_ant_turn1"
       assert t2_body =~ "Read file"
+
+      # 3. Failed run (including exhausted fallback chain) still persists file_id origin so
+      #    resuming failed.messages on another provider strips the foreign file_id.
+      failing_ant = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(500, Jason.encode!(%{"error" => %{"message" => "boom"}}))
+      end
+
+      failing_fb = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(503, Jason.encode!(%{"error" => %{"message" => "fb down"}}))
+      end
+
+      fail_msg = %Alloy.Message{
+        role: :user,
+        content: [Message.document_file("application/pdf", "file_failed_ant")]
+      }
+
+      assert {:error, failed_result} =
+               Alloy.run(nil,
+                 messages: [fail_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: "ant-k", model: "claude-sonnet-5-5", req_options: [plug: failing_ant]},
+                 fallback_providers: [
+                   {OpenAI, api_key: "oai-k", model: "gpt-5.4", req_options: [plug: failing_fb]}
+                 ],
+                 max_retries: 0
+               )
+
+      resume_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:resumed_oai_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(response_payload([assistant_text_item("resumed")]))
+        )
+      end
+
+      assert {:ok, %{text: "resumed"}} =
+               Alloy.run(nil,
+                 messages: failed_result.messages,
+                 provider:
+                   {OpenAI,
+                    api_key: "oai-k",
+                    model: "gpt-5.4",
+                    prompt_cache_key: "",
+                    prompt_cache_retention: "",
+                    req_options: [plug: resume_plug]}
+               )
+
+      assert_received {:resumed_oai_body, resumed_body}
+      refute resumed_body =~ "file_failed_ant"
+      decoded_resumed = Jason.decode!(resumed_body)
+      refute Map.has_key?(decoded_resumed, "prompt_cache_key")
+      refute Map.has_key?(decoded_resumed, "prompt_cache_retention")
     end
   end
 

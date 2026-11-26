@@ -8,12 +8,30 @@ defmodule Alloy.Provider.Gemini do
   ## Config
 
   Required:
-  - `:api_key` - Gemini API key
+  - `:api_key` - Gemini API key string, or a 0-arity callback returning
+    `String.t() | {:ok, String.t()} | {:error, term()}` invoked per HTTP
+    attempt (inside a deadline-bounded worker when `:timeout_ms` is finite).
+    When passing a callback via `Alloy.run/2`, also set `:origin_key` to a
+    stable non-empty string for account isolation.
   - `:model` - Model name, for example `"gemini-3.8-flash"` or
     `"gemini-3.5-flash-lite"`. Gemini 2.5 models are open only to projects
     that already used them.
 
   Optional:
+  - `:auth_scheme` - `:api_key` (default, sends `x-goog-api-key`) or `:bearer`
+    (sends `Authorization: Bearer` for Google OAuth / ADC access tokens)
+  - `:origin_key` - Account identifier used for cross-origin provenance hashing
+    (required when `:api_key` is a function)
+  - `:cached_content` - Gemini cached content resource name
+    (e.g. `"cachedContents/..."`). Because Gemini requires `systemInstruction`,
+    `tools`, and `toolConfig` to be baked into the cached content resource,
+    setting `:cached_content` omits `systemInstruction` and `functionDeclarations`
+    from the wire body (while keeping `Alloy.run/2` local tool handlers active)
+    and rejects explicit provider-level `:tool_config`, `:google_search`,
+    `:url_context`, or `:code_execution` conflicts.
+  - `:google_search` - `true` or config map to enable Google Search grounding
+  - `:url_context` - `true` or config map to enable URL context retrieval
+  - `:code_execution` - `true` or config map to enable Gemini code execution
   - `:max_tokens` - Max output tokens, sent as `maxOutputTokens`. Thinking
     tokens count against it. When unset, the model's own output limit
     applies (Alloy 0.12.4 and earlier sent `4096`)
@@ -89,6 +107,7 @@ defmodule Alloy.Provider.Gemini do
   @type config :: %{
           required(:api_key) => Alloy.Provider.api_key(),
           required(:model) => String.t(),
+          optional(:auth_scheme) => :api_key | :bearer,
           optional(:max_tokens) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:api_url) => String.t(),
@@ -110,12 +129,13 @@ defmodule Alloy.Provider.Gemini do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, auth_scheme} <- HTTP.resolve_auth_scheme(config),
+         {:ok, body} <- build_request_body(messages, tool_defs, config),
          {:ok, api_key} <- HTTP.resolve_api_key(config),
          {:ok, resp_body} <-
            HTTP.post_json(
              request_url(config, "generateContent"),
-             build_headers(config, api_key),
+             build_headers(config, api_key, auth_scheme),
              body,
              Map.get(config, :req_options, []),
              deadline: Map.get(config, :alloy_request_deadline)
@@ -139,12 +159,13 @@ defmodule Alloy.Provider.Gemini do
       on_chunk: on_chunk
     }
 
-    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, auth_scheme} <- HTTP.resolve_auth_scheme(config),
+         {:ok, body} <- build_request_body(messages, tool_defs, config),
          {:ok, api_key} <- HTTP.resolve_api_key(config),
          {:ok, acc} <-
            HTTP.stream_sse(
              request_url(config, "streamGenerateContent"),
-             build_headers(config, api_key),
+             build_headers(config, api_key, auth_scheme),
              body,
              initial_acc,
              &handle_sse_event/2,
@@ -166,22 +187,31 @@ defmodule Alloy.Provider.Gemini do
   defp normalize_model("models/" <> model), do: model
   defp normalize_model(model), do: model
 
-  defp build_headers(config, api_key) do
+  defp build_headers(config, api_key, auth_scheme) do
     [
-      {"x-goog-api-key", api_key},
+      auth_header(api_key, auth_scheme),
       {"x-goog-api-client", "alloy/#{Application.spec(:alloy, :vsn) |> to_string()}"},
       {"content-type", "application/json"}
     ] ++ Map.get(config, :extra_headers, [])
   end
 
+  defp auth_header(api_key, :bearer), do: {"authorization", "Bearer #{api_key}"}
+  defp auth_header(api_key, :api_key), do: {"x-goog-api-key", api_key}
+
   defp build_request_body(messages, tool_defs, config) do
-    body =
-      %{"contents" => build_contents(messages)}
-      |> HTTP.maybe_put_unless_empty_map("cachedContent", Map.get(config, :cached_content))
+    cached_content =
+      case Map.get(config, :cached_content) do
+        name when is_binary(name) and name != "" -> name
+        _ -> nil
+      end
 
     body =
-      case Map.get(config, :system_prompt) do
-        prompt when is_binary(prompt) and prompt != "" ->
+      %{"contents" => build_contents(messages)}
+      |> HTTP.maybe_put("cachedContent", cached_content)
+
+    body =
+      case {cached_content, Map.get(config, :system_prompt)} do
+        {nil, prompt} when is_binary(prompt) and prompt != "" ->
           Map.put(body, "systemInstruction", %{"parts" => [%{"text" => prompt}]})
 
         _other ->
@@ -190,7 +220,8 @@ defmodule Alloy.Provider.Gemini do
 
     output_schema = Map.get(config, :output_schema)
 
-    with {:ok, raw_generation_config} <- normalize_generation_config(config) do
+    with {:ok, raw_generation_config} <- normalize_generation_config(config),
+         :ok <- validate_cached_content_config(cached_content, config) do
       # No default maxOutputTokens: the budget includes thinking, so a fixed
       # default truncates thinking models; each model's own limit is larger.
       generation_config =
@@ -200,11 +231,20 @@ defmodule Alloy.Provider.Gemini do
 
       body = HTTP.maybe_put_unless_empty_map(body, "generationConfig", generation_config)
 
-      {tools, has_native_tools?} = build_tools(tool_defs, config)
-      body = HTTP.maybe_put_unless_empty_list(body, "tools", tools)
+      # When :cached_content is set, Gemini requires tools and toolConfig to
+      # live inside the cached resource; omit client functionDeclarations from
+      # the wire body while Alloy still dispatches returned calls locally.
+      body =
+        if is_nil(cached_content) do
+          {tools, has_native_tools?} = build_tools(tool_defs, config)
+          tool_config = build_tool_config(config, tool_defs != [] and has_native_tools?)
 
-      tool_config = build_tool_config(config, tool_defs != [] and has_native_tools?)
-      body = HTTP.maybe_put_unless_empty_map(body, "toolConfig", tool_config)
+          body
+          |> HTTP.maybe_put_unless_empty_list("tools", tools)
+          |> HTTP.maybe_put_unless_empty_map("toolConfig", tool_config)
+        else
+          body
+        end
 
       body =
         case Map.get(config, :safety_settings) do
@@ -225,6 +265,31 @@ defmodule Alloy.Provider.Gemini do
       end
     end
   end
+
+  defp validate_cached_content_config(nil, _config), do: :ok
+
+  defp validate_cached_content_config(_cached_content, config) do
+    has_conflict? =
+      not is_nil(Map.get(config, :tool_config)) or
+        truthy_tool?(Map.get(config, :google_search)) or
+        truthy_tool?(Map.get(config, :url_context)) or
+        truthy_tool?(Map.get(config, :code_execution))
+
+    if has_conflict? do
+      {:error,
+       %Error{
+         kind: :invalid_request,
+         message:
+           "Gemini :cached_content cannot be combined with :tool_config, :google_search, :url_context, or :code_execution; include them in the cached content resource instead"
+       }}
+    else
+      :ok
+    end
+  end
+
+  defp truthy_tool?(true), do: true
+  defp truthy_tool?(cfg) when is_map(cfg) and not is_struct(cfg), do: true
+  defp truthy_tool?(_other), do: false
 
   defp build_tools(tool_defs, config) do
     fn_tools =

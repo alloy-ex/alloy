@@ -28,7 +28,12 @@ defmodule Alloy.Provider.OpenAICompat do
   - `:model` - Model name
 
   Optional:
-  - `:api_key` - API key (omit for local providers like Ollama)
+  - `:api_key` - API key string or 0-arity callback returning
+    `String.t() | {:ok, String.t()} | {:error, term()}` (omit for local
+    providers like Ollama; set `:origin_key` when passing a callback via
+    `Alloy.run/2`)
+  - `:origin_key` - Account identifier used for cross-origin provenance hashing
+    (required when `:api_key` is a function)
   - `:max_tokens` - Max output tokens. Omitted unless set, so the server's
     default applies
   - `:system_prompt` - System prompt string
