@@ -143,8 +143,8 @@ defmodule Alloy.Provider.Anthropic do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    with {:ok, api_key} <- HTTP.resolve_api_key(config),
-         {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- HTTP.resolve_api_key(config),
          {:ok, resp_body} <-
            HTTP.post_json(
              messages_url(config),
@@ -183,8 +183,8 @@ defmodule Alloy.Provider.Anthropic do
       on_event: on_event
     }
 
-    with {:ok, api_key} <- HTTP.resolve_api_key(config),
-         {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- HTTP.resolve_api_key(config),
          body = Map.put(body, "stream", true),
          {:ok, sse_acc} <-
            HTTP.stream_sse(
@@ -630,9 +630,18 @@ defmodule Alloy.Provider.Anthropic do
         |> Enum.map(&format_tool_def/1)
         |> maybe_add_cache_to_last_tool(cache_control)
 
+      extra_server_tools = server_tools(config)
+
+      search_tools =
+        if Enum.any?(extra_server_tools, &(Map.get(&1, "name") == "web_search")) do
+          []
+        else
+          web_search_tools(config)
+        end
+
       tools =
         client_tools ++
-          code_execution_tools(config) ++ web_search_tools(config) ++ server_tools(config)
+          code_execution_tools(config) ++ search_tools ++ extra_server_tools
 
       body =
         body
@@ -989,7 +998,8 @@ defmodule Alloy.Provider.Anthropic do
     |> HTTP.maybe_put("title", block[:title] || block[:filename])
   end
 
-  defp format_content_block(%{type: "document", uri: uri} = block) when is_binary(uri) do
+  defp format_content_block(%{type: "document", mime_type: "application/pdf", uri: uri} = block)
+       when is_binary(uri) do
     if HTTP.http_url?(uri) do
       %{
         "type" => "document",
@@ -1000,14 +1010,22 @@ defmodule Alloy.Provider.Anthropic do
       }
       |> HTTP.maybe_put("title", block[:title] || block[:filename])
     else
-      mime = Map.get(block, :mime_type, "document")
-
       %{
         "type" => "text",
         "text" =>
-          "[Unsupported document URI (#{mime}) for Anthropic provider: use HTTPS URL, base64 data, or Files API]"
+          "[Unsupported document URI (application/pdf) for Anthropic provider: use HTTPS URL, base64 data, or Files API]"
       }
     end
+  end
+
+  defp format_content_block(%{type: "document", uri: uri} = block) when is_binary(uri) do
+    mime = Map.get(block, :mime_type, "document")
+
+    %{
+      "type" => "text",
+      "text" =>
+        "[Unsupported document URI (#{mime}) for Anthropic provider: URL documents require application/pdf over HTTPS]"
+    }
   end
 
   defp format_content_block(%{type: "document", mime_type: mime_type}) do

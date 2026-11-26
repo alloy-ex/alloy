@@ -39,13 +39,16 @@ defmodule Alloy.Message do
 
   The loop records which provider and model wrote each assistant message in
   `:provider` and `:model`, and in `:origin` a fingerprint of the provider
-  module, its `:api_url` and its `:api_key` (a hash; the key itself is never
-  stored). All three are `nil` for messages you build yourself. When a
-  conversation moves to a different origin — a fallback provider, another
-  account or endpoint, or a different provider after a model switch —
-  `normalize_for/3` rewrites the other origin's messages so the new one can
-  read them; see its docs. Persist these fields with your transcripts:
-  without them a reloaded message is sent as it is.
+  module, its `:api_url`, and its `:origin_key` (falling back to `:api_key`,
+  hashed so credentials are never stored). All three are `nil` for messages you
+  build yourself. Note that migrating a saved session from a static `:api_key`
+  to a dynamic callback + `:origin_key` changes the origin fingerprint once,
+  causing earlier assistant messages to be treated as foreign on that first
+  resumed turn. When a conversation moves to a different origin — a fallback
+  provider, another account or endpoint, or a different provider after a model
+  switch — `normalize_for/3` rewrites the other origin's messages and strips
+  foreign `file_id` document attachments; see its docs. Persist these fields
+  with your transcripts: without them a reloaded message is sent as it is.
   """
 
   @type role :: :user | :assistant
@@ -360,12 +363,14 @@ defmodule Alloy.Message do
       with the tool results that answer them
     * a message left with no content is dropped
 
-  Messages from the same origin, messages without one (built by hand, or
-  persisted without the provenance fields) and user messages are
-  unchanged. Switching models on one origin changes nothing: Anthropic,
-  OpenAI and Gemini each document that their APIs handle another model's
-  reasoning themselves. The result depends only on the arguments, so the
-  same history is sent as the same bytes on every request.
+  Messages from the same origin and messages without one (built by hand, or
+  persisted without the provenance fields) are unchanged except for any
+  `file_id` document blocks that carry a different explicit `:origin` (or
+  belong to a user message with a different `:origin`), which are omitted.
+  Switching models on one origin changes nothing: Anthropic, OpenAI and Gemini
+  each document that their APIs handle another model's reasoning themselves.
+  The result depends only on the arguments, so the same history is sent as the
+  same bytes on every request.
 
   The loop applies this before every provider request, including fallback
   providers; call it yourself only when you call a provider directly.
@@ -380,7 +385,20 @@ defmodule Alloy.Message do
 
   # A same-origin (or unattributed) assistant message starts a new round with
   # no foreign ID renames, so later tool results reusing the same raw ID keep
-  # their original pairing.
+  # their original pairing. Explicit block-level foreign `file_id` attachments
+  # are still stripped so account-scoped file references never cross origins.
+  defp normalize(
+         %__MODULE__{role: :assistant, origin: from, content: blocks} = message,
+         _ids,
+         target
+       )
+       when from in [nil, target] and is_list(blocks) do
+    case strip_foreign_assistant_file_blocks(blocks, target) do
+      {[], true} -> {[], %{}}
+      {kept, _dropped?} -> {[%{message | content: kept}], %{}}
+    end
+  end
+
   defp normalize(%__MODULE__{role: :assistant, origin: from} = message, _ids, target)
        when from in [nil, target],
        do: {[message], %{}}
@@ -414,6 +432,20 @@ defmodule Alloy.Message do
   defp normalize(%__MODULE__{role: :user} = message, _ids, _target), do: {[message], %{}}
 
   defp normalize(message, ids, _target), do: {[message], ids}
+
+  defp strip_foreign_assistant_file_blocks(blocks, target) do
+    {kept, dropped?} =
+      Enum.reduce(blocks, {[], false}, fn
+        %{type: "document", file_id: _, origin: block_origin}, {acc, _dropped?}
+        when is_binary(block_origin) and block_origin != target ->
+          {acc, true}
+
+        block, {acc, dropped?} ->
+          {[block | acc], dropped?}
+      end)
+
+    {Enum.reverse(kept), dropped?}
+  end
 
   defp strip_foreign_user_file_blocks(blocks, msg_origin, target) do
     {kept, dropped?} =

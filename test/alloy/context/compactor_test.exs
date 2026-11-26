@@ -1284,6 +1284,7 @@ defmodule Alloy.Context.CompactorTest do
           compaction: [reserve_tokens: 20, keep_recent_tokens: 20],
           provider: ProbeProvider,
           provider_config: %{
+            cache: "1h",
             prompt_cache_key: "tenant-1",
             prompt_cache_retention: "24h",
             cached_content: "cachedContents/abc",
@@ -1300,6 +1301,7 @@ defmodule Alloy.Context.CompactorTest do
       assert_received {:summary_request, _msgs, _tools, summary_config}
 
       for key <- [
+            :cache,
             :prompt_cache_key,
             :prompt_cache_retention,
             :cached_content,

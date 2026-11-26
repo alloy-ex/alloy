@@ -156,7 +156,7 @@ defmodule Alloy.Provider.HTTP do
   def resolve_api_key(config) when is_map(config) do
     case Map.get(config, :api_key) do
       key when is_binary(key) ->
-        {:ok, key}
+        validate_api_key_bytes(key)
 
       fun when is_function(fun, 0) ->
         resolve_api_key_callback(fun, Map.get(config, :alloy_request_deadline))
@@ -172,6 +172,22 @@ defmodule Alloy.Provider.HTTP do
          }}
     end
   end
+
+  defp validate_api_key_bytes(key) do
+    if contains_control_byte?(key) do
+      {:error,
+       %Error{
+         kind: :auth,
+         message: "Invalid :api_key: contains control characters or newline"
+       }}
+    else
+      {:ok, key}
+    end
+  end
+
+  defp contains_control_byte?(<<>>), do: false
+  defp contains_control_byte?(<<b, _rest::binary>>) when b < 0x20 or b == 0x7F, do: true
+  defp contains_control_byte?(<<_b, rest::binary>>), do: contains_control_byte?(rest)
 
   @doc false
   @spec resolve_optional_api_key(map()) :: {:ok, String.t() | nil} | {:error, Error.t()}
@@ -218,10 +234,10 @@ defmodule Alloy.Provider.HTTP do
   defp invoke_api_key_callback(fun) do
     case fun.() do
       {:ok, key} when is_binary(key) and byte_size(key) > 0 ->
-        {:ok, key}
+        validate_api_key_bytes(key)
 
       key when is_binary(key) and byte_size(key) > 0 ->
-        {:ok, key}
+        validate_api_key_bytes(key)
 
       {:error, reason} ->
         {:error,

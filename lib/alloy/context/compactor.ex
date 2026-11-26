@@ -76,6 +76,8 @@ defmodule Alloy.Context.Compactor do
     "server_tools",
     :code_execution,
     "code_execution",
+    :cache,
+    "cache",
     :tool_config,
     "tool_config",
     :google_search,

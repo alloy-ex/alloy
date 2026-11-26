@@ -1470,6 +1470,120 @@ defmodule Alloy.Provider.OpenAITest do
       refute fb_body =~ "file_ant_only"
       assert fb_body =~ "Summarize"
     end
+
+    test "stamps user file_id origin after turn 1 so State.prepare/2 provider switch strips it, and streams with dynamic api_key" do
+      test_pid = self()
+
+      # 1. OpenAI.stream/4 resolves dynamic :api_key.
+      stream_plug = fn conn ->
+        send(test_pid, {:oai_stream_headers, conn.req_headers})
+
+        sse =
+          "event: response.completed\ndata: " <>
+            Jason.encode!(%{
+              "type" => "response.completed",
+              "response" => response_payload([assistant_text_item("streamed")])
+            }) <> "\n\n"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{messages: [msg]}} =
+               OpenAI.stream(
+                 [Message.user("Hi")],
+                 [],
+                 %{
+                   api_key: fn -> {:ok, "dyn-oai-stream"} end,
+                   model: "gpt-5.4",
+                   req_options: [plug: stream_plug]
+                 },
+                 fn _ -> :ok end
+               )
+
+      assert Message.text(msg) == "streamed"
+      assert_received {:oai_stream_headers, sh}
+      assert {"authorization", "Bearer dyn-oai-stream"} in sh
+
+      # 2. Turn 1 succeeds on Anthropic (tool call), middleware switches to OpenAI on turn 2:
+      #    the user's unattributed file_id is stamped on turn 1 and stripped before turn 2 hits OpenAI.
+      defmodule SwitchToOpenAIMiddleware do
+        @behaviour Alloy.Middleware
+        alias Alloy.Agent.State
+        @impl true
+        def call(:before_completion, %{turn: 1} = state) do
+          State.prepare(state, provider: state.config.context.next_provider)
+        end
+
+        def call(_hook, state), do: state
+      end
+
+      ant_plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "id" => "msg_1",
+            "type" => "message",
+            "role" => "assistant",
+            "content" => [
+              %{"type" => "tool_use", "id" => "toolu_1", "name" => "echo", "input" => %{}}
+            ],
+            "stop_reason" => "tool_use",
+            "usage" => %{"input_tokens" => 5, "output_tokens" => 5}
+          })
+        )
+      end
+
+      oai_turn2_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:oai_turn2_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(response_payload([assistant_text_item("switched cleanly")]))
+        )
+      end
+
+      echo_tool =
+        Alloy.Tool.inline(
+          name: "echo",
+          description: "Echo",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> {:ok, "done"} end
+        )
+
+      user_msg = %Alloy.Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Read file"},
+          Message.document_file("application/pdf", "file_ant_turn1")
+        ]
+      }
+
+      assert {:ok, %{text: "switched cleanly"}} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: "ant-k", model: "claude-sonnet-5-5", req_options: [plug: ant_plug]},
+                 tools: [echo_tool],
+                 middleware: [SwitchToOpenAIMiddleware],
+                 context: %{
+                   next_provider:
+                     {OpenAI,
+                      api_key: "oai-k", model: "gpt-5.4", req_options: [plug: oai_turn2_plug]}
+                 }
+               )
+
+      assert_received {:oai_turn2_body, t2_body}
+      refute t2_body =~ "file_ant_turn1"
+      assert t2_body =~ "Read file"
+    end
   end
 
   # --- Test Helpers ---

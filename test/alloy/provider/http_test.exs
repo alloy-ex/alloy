@@ -1053,6 +1053,19 @@ defmodule Alloy.Provider.HTTPTest do
         assert msg =~ "invalid value"
       end
 
+      # Control bytes / trailing newlines are rejected without leaking the secret.
+      for dirty_key <- ["sk-secret\n", "sk-secret\r\n", "sk-secret\0"] do
+        assert {:error, %Error{kind: :auth, message: m_static}} =
+                 HTTP.resolve_api_key(%{api_key: dirty_key})
+
+        refute m_static =~ "sk-secret"
+
+        assert {:error, %Error{kind: :auth, message: m_cb}} =
+                 HTTP.resolve_api_key(%{api_key: fn -> {:ok, dirty_key} end})
+
+        refute m_cb =~ "sk-secret"
+      end
+
       assert {:error, %Error{kind: :auth}} = HTTP.resolve_api_key(%{})
 
       # Stalled dynamic :api_key callback is bounded by :alloy_request_deadline.

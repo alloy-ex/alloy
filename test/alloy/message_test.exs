@@ -162,6 +162,37 @@ defmodule Alloy.MessageTest do
                %{type: "text", text: "See attached"},
                %{type: "document", mime_type: "application/pdf", data: "JVBERi0="}
              ]
+
+      # Block-level foreign file_id on unattributed (origin: nil) and same-origin
+      # assistant messages is also stripped, covering {mod, keyword} and {mod, map} origins.
+      oai_origin = Message.origin(Alloy.Provider.OpenAI, %{api_key: "k2"})
+
+      unattributed_asst =
+        Message.assistant_blocks([
+          Message.document_file("application/pdf", "file_a1",
+            origin: {Alloy.Provider.Anthropic, [api_key: "k1"]}
+          )
+        ])
+
+      conflicting_asst = %Message{
+        role: :assistant,
+        origin: oai_origin,
+        content: [
+          %{type: "text", text: "Kept"},
+          Message.document_file("application/pdf", "file_a2",
+            origin: {Alloy.Provider.Anthropic, %{api_key: "k1"}}
+          )
+        ]
+      }
+
+      assert [norm_conflicting] =
+               Message.normalize_for(
+                 [unattributed_asst, conflicting_asst],
+                 Alloy.Provider.OpenAI,
+                 %{api_key: "k2"}
+               )
+
+      assert norm_conflicting.content == [%{type: "text", text: "Kept"}]
     end
   end
 

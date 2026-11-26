@@ -563,6 +563,62 @@ defmodule Alloy.Provider.GeminiTest do
                %{type: "text", text: "4"}
              ] = streamed_asst.content
     end
+
+    test "rejects AUTO functionCallingConfig with combined native tools and scopes top-level code_execution to Anthropic" do
+      key_called = :atomics.new(1, signed: false)
+
+      tool_defs = [
+        %{name: "read", description: "Read", input_schema: %{type: "object", properties: %{}}}
+      ]
+
+      conflict_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          api_key: fn ->
+            :atomics.add_get(key_called, 1, 1)
+            {:ok, "should-not-run"}
+          end,
+          google_search: true,
+          tool_config: %{functionCallingConfig: %{mode: "AUTO"}}
+        })
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request, message: msg}} =
+               Gemini.complete([Message.user("Hi")], tool_defs, conflict_cfg)
+
+      assert msg =~ "AUTO"
+      assert :atomics.get(key_called, 1) == 0
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.stream([Message.user("Hi")], tool_defs, conflict_cfg, fn _ -> :ok end)
+
+      # VALIDATED mode succeeds alongside native + custom tools.
+      valid_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          google_search: true,
+          tool_config: %{functionCallingConfig: %{mode: "VALIDATED"}}
+        })
+
+      assert {:ok, _} = Gemini.complete([Message.user("Hi")], tool_defs, valid_cfg)
+      assert_received {:request_body, valid_body}
+
+      assert Jason.decode!(valid_body)["toolConfig"] == %{
+               "functionCallingConfig" => %{"mode" => "VALIDATED"},
+               "includeServerSideToolInvocations" => true
+             }
+
+      # Top-level Alloy.run code_execution: true does not activate Gemini codeExecution.
+      gem_cfg = config_that_captures_request()
+
+      assert {:ok, _} =
+               Alloy.run("Hi",
+                 provider: {Gemini, gem_cfg},
+                 code_execution: true
+               )
+
+      assert_received {:request_body, top_body}
+      refute Map.has_key?(Jason.decode!(top_body), "tools")
+    end
   end
 
   describe "stream/4" do

@@ -1330,6 +1330,46 @@ defmodule Alloy.Provider.AnthropicTest do
                  fn _ -> :ok end
                )
     end
+
+    test "rejects non-PDF URL documents gracefully, deduplicates web_search, and validates body before auth callback" do
+      key_calls = :atomics.new(1, signed: false)
+
+      bad_cache_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          cache: "invalid",
+          api_key: fn ->
+            :atomics.add_get(key_calls, 1, 1)
+            {:ok, "never-fetched"}
+          end
+        })
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Anthropic.complete([Message.user("Hi")], [], bad_cache_cfg)
+
+      assert :atomics.get(key_calls, 1) == 0
+
+      # Non-PDF URL document falls back to notice; explicit server_tools web_search is not duplicated.
+      dedupe_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          web_search: true,
+          server_tools: [%{"type" => "web_search_20250305", "name" => "web_search"}]
+        })
+
+      msg = %Alloy.Message{
+        role: :user,
+        content: [Message.document("text/plain", "https://example.com/notes.txt")]
+      }
+
+      assert {:ok, _} = Anthropic.complete([msg], [], dedupe_cfg)
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [%{"type" => "web_search_20250305", "name" => "web_search"}] = decoded["tools"]
+      [%{"type" => "text", "text" => notice}] = hd(decoded["messages"])["content"]
+      assert notice =~ "URL documents require application/pdf"
+    end
   end
 
   # ── stream/4 ──────────────────────────────────────────────────────────

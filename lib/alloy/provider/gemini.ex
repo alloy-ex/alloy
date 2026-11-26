@@ -110,8 +110,8 @@ defmodule Alloy.Provider.Gemini do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    with {:ok, api_key} <- HTTP.resolve_api_key(config),
-         {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- HTTP.resolve_api_key(config),
          {:ok, resp_body} <-
            HTTP.post_json(
              request_url(config, "generateContent"),
@@ -139,8 +139,8 @@ defmodule Alloy.Provider.Gemini do
       on_chunk: on_chunk
     }
 
-    with {:ok, api_key} <- HTTP.resolve_api_key(config),
-         {:ok, body} <- build_request_body(messages, tool_defs, config),
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- HTTP.resolve_api_key(config),
          {:ok, acc} <-
            HTTP.stream_sse(
              request_url(config, "streamGenerateContent"),
@@ -219,7 +219,8 @@ defmodule Alloy.Provider.Gemini do
           "generationConfig"
         )
 
-      with :ok <- validate_cached_content_conflicts(body) do
+      with :ok <- validate_cached_content_conflicts(body),
+           :ok <- validate_tool_config_conflicts(body) do
         validate_output_schema_conflicts(body, raw_generation_config, output_schema)
       end
     end
@@ -271,6 +272,24 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp validate_cached_content_conflicts(_body), do: :ok
+
+  # Google excludes functionCallingConfig.mode "AUTO" when server-side and
+  # custom tools are combined via includeServerSideToolInvocations: true.
+  defp validate_tool_config_conflicts(%{
+         "toolConfig" => %{
+           "includeServerSideToolInvocations" => true,
+           "functionCallingConfig" => %{"mode" => "AUTO"}
+         }
+       }) do
+    {:error,
+     %Error{
+       kind: :invalid_request,
+       message:
+         "Gemini tool combination (includeServerSideToolInvocations: true) is incompatible with functionCallingConfig mode \"AUTO\"; use \"VALIDATED\" or omit mode instead"
+     }}
+  end
+
+  defp validate_tool_config_conflicts(_body), do: :ok
 
   defp maybe_append_native_tool(tools, key, true), do: tools ++ [%{key => %{}}]
 

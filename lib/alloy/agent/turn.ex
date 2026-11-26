@@ -259,7 +259,13 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp account_response(state, %{stop_reason: stop_reason, usage: usage} = response) do
-    %{state | stop_reason: stop_reason}
+    origin = Message.origin(state.config.provider, state.config.provider_config)
+
+    %{
+      state
+      | stop_reason: stop_reason,
+        messages: Message.attribute_file_blocks(state.messages, origin)
+    }
     |> State.increment_turn()
     |> State.merge_usage(usage)
     |> State.merge_provider_state(Map.get(response, :provider_state))
