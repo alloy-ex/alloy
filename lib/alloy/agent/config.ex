@@ -387,22 +387,37 @@ defmodule Alloy.Agent.Config do
   defp validate_provider_auth!(provider_config, provider) do
     case Map.get(provider_config, :api_key) do
       fun when is_function(fun, 0) ->
-        origin_key = Map.get(provider_config, :origin_key)
-
-        unless is_binary(origin_key) and byte_size(origin_key) > 0 do
-          raise ArgumentError,
-                "provider #{inspect(provider)} uses a function :api_key and must also set a non-empty string :origin_key for account isolation"
-        end
-
-        provider_config
+        require_origin_key!(
+          provider_config,
+          provider,
+          "uses a function :api_key and must also set a non-empty string :origin_key for account isolation"
+        )
 
       fun when is_function(fun) ->
         raise ArgumentError,
               "provider #{inspect(provider)} :api_key callback must be a 0-arity function"
 
       _other ->
-        provider_config
+        if Map.get(provider_config, :auth_scheme) == :bearer do
+          require_origin_key!(
+            provider_config,
+            provider,
+            "uses auth_scheme: :bearer and must also set a non-empty string :origin_key so rotating bearer tokens preserve account provenance"
+          )
+        else
+          provider_config
+        end
     end
+  end
+
+  defp require_origin_key!(provider_config, provider, detail) do
+    origin_key = Map.get(provider_config, :origin_key)
+
+    unless is_binary(origin_key) and byte_size(origin_key) > 0 do
+      raise ArgumentError, "provider #{inspect(provider)} #{detail}"
+    end
+
+    provider_config
   end
 
   # `memory: binding` is shorthand for `tools: [Alloy.Memory.tool(binding)]`.

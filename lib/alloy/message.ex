@@ -43,14 +43,17 @@ defmodule Alloy.Message do
   `:provider` and `:model`, and in `:origin` a fingerprint of the provider
   module, its `:api_url`, and its `:origin_key` (falling back to `:api_key`,
   hashed so credentials are never stored). All three are `nil` for messages you
-  build yourself. Note that migrating a saved session from a static `:api_key`
-  to a dynamic callback + `:origin_key` changes the origin fingerprint once,
-  causing earlier assistant messages to be treated as foreign on that first
-  resumed turn. When a conversation moves to a different origin — a fallback
-  provider, another account or endpoint, or a different provider after a model
-  switch — `normalize_for/3` rewrites the other origin's messages and strips
-  foreign `file_id` document attachments; see its docs. Persist these fields
-  with your transcripts: without them a reloaded message is sent as it is.
+  build yourself. Set a stable `:origin_key` whenever persisting transcripts
+  across credential changes (required for function `:api_key` and
+  `auth_scheme: :bearer`, and recommended for static API keys that may rotate):
+  without `:origin_key`, rotating the credential changes the origin fingerprint
+  and causes earlier assistant messages and provider-specific file attachments
+  to be treated as foreign on resumed turns. When a conversation moves to a
+  different origin — a fallback provider, another account or endpoint, or a
+  different provider after a model switch — `normalize_for/3` rewrites the
+  other origin's messages and omits foreign provider-specific file attachments;
+  see its docs. Persist these fields with your transcripts: without them a
+  reloaded message is sent as it is.
   """
 
   alias Alloy.Provider.HTTP
@@ -338,14 +341,15 @@ defmodule Alloy.Message do
   defp origin_part(value), do: inspect(value)
 
   @doc false
-  @spec attribute_file_blocks([t()], String.t()) :: [t()]
-  def attribute_file_blocks(messages, origin_id)
-      when is_list(messages) and is_binary(origin_id) do
+  @spec attribute_file_blocks([t()], String.t(), module() | nil) :: [t()]
+  def attribute_file_blocks(messages, origin_id, provider \\ nil)
+      when is_list(messages) and is_binary(origin_id) and is_atom(provider) do
     Enum.map(messages, fn
       %__MODULE__{role: :user, content: blocks} = msg when is_list(blocks) ->
         updated =
           Enum.map(blocks, fn block ->
-            if origin_scoped_file_block?(block) and is_nil(Map.get(block, :origin) || msg.origin) do
+            if attributable_file_block?(block, provider) and
+                 is_nil(Map.get(block, :origin) || msg.origin) do
               Map.put(block, :origin, origin_id)
             else
               block
@@ -358,6 +362,18 @@ defmodule Alloy.Message do
         other
     end)
   end
+
+  defp attributable_file_block?(%{type: "document", file_id: _}, _provider), do: true
+
+  # Gemini File API URIs are recognizable by host/path and should only be bound
+  # when running on Gemini (or when no provider context is given), so an
+  # Anthropic/OpenAI primary with a Gemini fallback does not stamp them with the
+  # non-Gemini origin.
+  defp attributable_file_block?(block, provider)
+       when provider in [nil, Alloy.Provider.Gemini],
+       do: origin_scoped_file_block?(block)
+
+  defp attributable_file_block?(_block, _provider), do: false
 
   @doc """
   Prepares a conversation for `provider` configured with `config`.

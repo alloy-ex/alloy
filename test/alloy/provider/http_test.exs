@@ -1096,6 +1096,17 @@ defmodule Alloy.Provider.HTTPTest do
       assert redacted_msg == "Dynamic :api_key callback failed (timeout)"
       refute redacted_msg =~ "sk-secret"
 
+      # Disallowed kinds (like :context_overflow or nil) are normalized to :auth so
+      # an auth callback cannot trigger unrelated loop actions like compaction.
+      for disallowed_kind <- [:context_overflow, nil, :session_uncertain] do
+        assert {:error, %Error{kind: :auth, message: "Dynamic :api_key callback failed (auth)"}} =
+                 HTTP.resolve_api_key(%{
+                   api_key: fn ->
+                     {:error, %Error{kind: disallowed_kind, message: "sk-secret"}}
+                   end
+                 })
+      end
+
       # Verify end-to-end through Alloy.run/2 with both finite and :infinity timeouts.
       for timeout <- [:infinity, 1_000] do
         assert {:error, result} =

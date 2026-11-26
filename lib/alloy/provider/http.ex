@@ -274,7 +274,20 @@ defmodule Alloy.Provider.HTTP do
         validate_api_key_bytes(key)
 
       {:error, %Error{} = err} ->
-        safe_kind = if is_atom(err.kind), do: err.kind, else: :auth
+        safe_kind =
+          if err.kind in [
+               :auth,
+               :timeout,
+               :rate_limited,
+               :overloaded,
+               :server_error,
+               :network,
+               :invalid_request,
+               :quota
+             ],
+             do: err.kind,
+             else: :auth
+
         safe_status = if is_integer(err.status), do: err.status, else: nil
 
         safe_retry_after =

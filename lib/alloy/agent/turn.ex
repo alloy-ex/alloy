@@ -221,7 +221,12 @@ defmodule Alloy.Agent.Turn do
       # provider attempt so failed runs and exhausted fallbacks also retain
       # provenance when callers resume result.messages on another provider.
       primary_origin = Message.origin(state.config.provider, state.config.provider_config)
-      state = %{state | messages: Message.attribute_file_blocks(state.messages, primary_origin)}
+
+      state = %{
+        state
+        | messages:
+            Message.attribute_file_blocks(state.messages, primary_origin, state.config.provider)
+      }
 
       case request(state, opts) do
         {:ok, %{stop_reason: :refusal} = response} ->
@@ -265,13 +270,7 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp account_response(state, %{stop_reason: stop_reason, usage: usage} = response) do
-    origin = Message.origin(state.config.provider, state.config.provider_config)
-
-    %{
-      state
-      | stop_reason: stop_reason,
-        messages: Message.attribute_file_blocks(state.messages, origin)
-    }
+    %{state | stop_reason: stop_reason}
     |> State.increment_turn()
     |> State.merge_usage(usage)
     |> State.merge_provider_state(Map.get(response, :provider_state))

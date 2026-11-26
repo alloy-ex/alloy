@@ -721,6 +721,43 @@ defmodule Alloy.Provider.GeminiTest do
                "includeServerSideToolInvocations" => true
              }
 
+      # Snake_case include_server_side_tool_invocations is respected without adding a duplicate camelCase key,
+      # and unsupported image URL schemes degrade gracefully to text notices while gs:// is kept.
+      snake_opt_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          google_search: true,
+          tool_config: %{include_server_side_tool_invocations: false}
+        })
+
+      img_msgs = [
+        %Message{
+          role: :user,
+          content: [
+            Message.image_url("gs://my-bucket/photo.png", mime_type: "image/png"),
+            Message.image_url("file:///etc/passwd")
+          ]
+        }
+      ]
+
+      assert {:ok, _} = Gemini.complete(img_msgs, tool_defs, snake_opt_cfg)
+      assert_received {:request_body, snake_opt_body}
+      assert_received {:request_headers, _}
+      decoded_snake = Jason.decode!(snake_opt_body)
+
+      assert decoded_snake["toolConfig"] == %{"include_server_side_tool_invocations" => false}
+
+      [%{"parts" => [gs_part, bad_scheme_part]}] = decoded_snake["contents"]
+
+      assert gs_part == %{
+               "fileData" => %{
+                 "fileUri" => "gs://my-bucket/photo.png",
+                 "mimeType" => "image/png"
+               }
+             }
+
+      assert bad_scheme_part == %{"text" => "[Unsupported image URL scheme for Gemini provider]"}
+
       # Top-level Alloy.run code_execution: true does not activate Gemini codeExecution.
       gem_cfg = config_that_captures_request()
 

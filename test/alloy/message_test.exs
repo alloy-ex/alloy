@@ -189,10 +189,42 @@ defmodule Alloy.MessageTest do
         ]
       }
 
-      [attributed_gem_user] = Message.attribute_file_blocks([gem_user], gem_origin)
+      [attributed_gem_user] =
+        Message.attribute_file_blocks([gem_user], gem_origin, Alloy.Provider.Gemini)
 
       assert [_, %{uri: ^gem_uri, origin: ^gem_origin}, %{url: ^gem_img_uri, origin: ^gem_origin}] =
                attributed_gem_user.content
+
+      # Non-Gemini primary does NOT stamp a Gemini File API URI with its own origin,
+      # so a Gemini fallback still receives the URI intact.
+      [unattributed_on_ant] =
+        Message.attribute_file_blocks([gem_user], ant_origin, Alloy.Provider.Anthropic)
+
+      assert [_, %{uri: ^gem_uri} = u_doc, %{url: ^gem_img_uri} = u_img] =
+               unattributed_on_ant.content
+
+      refute Map.has_key?(u_doc, :origin)
+      refute Map.has_key?(u_img, :origin)
+
+      # Rotating credentials with a stable :origin_key preserves persisted user
+      # document_file attachments across resumed turns on the same account.
+      rotated_origin =
+        Message.origin(Alloy.Provider.Anthropic, %{api_key: "key-v1", origin_key: "org-1"})
+
+      persisted_user = %Message{
+        role: :user,
+        content: [
+          Message.document_file("application/pdf", "file_ws_1", origin: rotated_origin)
+        ]
+      }
+
+      [resumed_user] =
+        Message.normalize_for([persisted_user], Alloy.Provider.Anthropic, %{
+          api_key: "key-v2-rotated",
+          origin_key: "org-1"
+        })
+
+      assert [%{file_id: "file_ws_1"}] = resumed_user.content
 
       [same_gem, same_gem_asst] =
         Message.normalize_for([attributed_gem_user, gem_asst], Alloy.Provider.Gemini, %{

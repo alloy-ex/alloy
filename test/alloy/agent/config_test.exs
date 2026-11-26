@@ -287,6 +287,13 @@ defmodule Alloy.Agent.ConfigTest do
         )
       end
 
+      assert_raise ArgumentError, ~r/:origin_key/, fn ->
+        Config.from_opts(
+          provider:
+            {Alloy.Provider.Anthropic, api_key: "oauth-tok", auth_scheme: :bearer, model: "m"}
+        )
+      end
+
       cfg =
         Config.from_opts(
           provider:
@@ -294,6 +301,15 @@ defmodule Alloy.Agent.ConfigTest do
         )
 
       assert cfg.provider_config.origin_key == "acct-1"
+
+      bearer_cfg =
+        Config.from_opts(
+          provider:
+            {Alloy.Provider.Gemini,
+             api_key: "oauth-tok", auth_scheme: :bearer, origin_key: "gcp-proj-1", model: "m"}
+        )
+
+      assert bearer_cfg.provider_config.origin_key == "gcp-proj-1"
     end
   end
 

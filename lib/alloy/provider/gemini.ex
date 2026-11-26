@@ -19,9 +19,11 @@ defmodule Alloy.Provider.Gemini do
 
   Optional:
   - `:auth_scheme` - `:api_key` (default, sends `x-goog-api-key`) or `:bearer`
-    (sends `Authorization: Bearer` for Google OAuth / ADC access tokens)
+    (sends `Authorization: Bearer` for Google OAuth / ADC access tokens; pair
+    with a stable `:origin_key` when passing via `Alloy.run/2`)
   - `:origin_key` - Account identifier used for cross-origin provenance hashing
-    (required when `:api_key` is a function)
+    (required for function `:api_key` and `auth_scheme: :bearer`; recommended
+    for static keys when persisting transcripts with file attachments across key rotation)
   - `:cached_content` - Gemini cached content resource name
     (e.g. `"cachedContents/..."`). Because Gemini requires `systemInstruction`,
     `tools`, and `toolConfig` to be baked into the cached content resource,
@@ -314,8 +316,12 @@ defmodule Alloy.Provider.Gemini do
         tool_config -> Alloy.Provider.stringify_keys(tool_config)
       end
 
-    if combine_server_and_custom? do
-      Map.put_new(base, "includeServerSideToolInvocations", true)
+    already_configured? =
+      Map.has_key?(base, "includeServerSideToolInvocations") or
+        Map.has_key?(base, "include_server_side_tool_invocations")
+
+    if combine_server_and_custom? and not already_configured? do
+      Map.put(base, "includeServerSideToolInvocations", true)
     else
       base
     end
@@ -482,7 +488,11 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp format_content_block(%{type: "image", url: url} = block, _messages) when is_binary(url) do
-    %{"fileData" => %{"fileUri" => url} |> HTTP.maybe_put("mimeType", block[:mime_type])}
+    if gemini_image_url?(url) do
+      %{"fileData" => %{"fileUri" => url} |> HTTP.maybe_put("mimeType", block[:mime_type])}
+    else
+      %{"text" => "[Unsupported image URL scheme for Gemini provider]"}
+    end
   end
 
   defp format_content_block(%{type: type, mime_type: mime_type, data: data}, _messages)
@@ -522,6 +532,21 @@ defmodule Alloy.Provider.Gemini do
       "text" =>
         "[Unsupported content block for Gemini provider: #{inspect(Map.get(block, :type) || Map.get(block, "type"))}]"
     }
+  end
+
+  defp gemini_image_url?(url) do
+    HTTP.http_url?(url) or gs_uri?(url)
+  end
+
+  defp gs_uri?(uri) when is_binary(uri) do
+    case URI.parse(uri) do
+      %URI{scheme: scheme, host: host}
+      when is_binary(scheme) and is_binary(host) and host != "" ->
+        String.downcase(scheme) == "gs"
+
+      _ ->
+        false
+    end
   end
 
   defp lookup_tool_name(messages, tool_use_id) do

@@ -146,7 +146,12 @@ defmodule Alloy.Provider.Retry do
 
           attributed_state = %{
             state
-            | messages: Message.attribute_file_blocks(state.messages, primary_origin)
+            | messages:
+                Message.attribute_file_blocks(
+                  state.messages,
+                  primary_origin,
+                  state.config.provider
+                )
           }
 
           {result, chunks_emitted?} =

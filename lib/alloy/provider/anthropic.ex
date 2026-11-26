@@ -19,9 +19,11 @@ defmodule Alloy.Provider.Anthropic do
   Optional:
   - `:auth_scheme` - `:api_key` (default, sends `x-api-key`) or `:bearer`
     (sends `Authorization: Bearer` for bearer-auth gateways/proxies or OAuth;
-    Anthropic OAuth may also require an `anthropic-beta` header via `:extra_headers`)
+    pair with a stable `:origin_key` when passing via `Alloy.run/2`; Anthropic
+    OAuth may also require an `anthropic-beta` header via `:extra_headers`)
   - `:origin_key` - Account identifier used for cross-origin provenance hashing
-    (required when `:api_key` is a function)
+    (required for function `:api_key` and `auth_scheme: :bearer`; recommended
+    for static keys when persisting transcripts with file attachments across key rotation)
   - `:max_tokens` - Max output tokens, thinking included (default: 16_000).
     Thinking is on by default on Claude 5.x models and counts toward this
     limit, so a low value can cut off the answer (`stop_reason: :max_tokens`).
