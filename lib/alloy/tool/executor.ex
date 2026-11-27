@@ -86,7 +86,7 @@ defmodule Alloy.Tool.Executor do
 
       {:ok, result_block, meta} =
         Alloy.Tool.Executor.run_tool(
-          %{id: "child_1", name: "read", input: %{"path" => "mix.exs"}},
+          %{id: "child_1", name: "read", input: %{"file_path" => "mix.exs"}},
           state,
           parent_call_id: parent_call_id
         )

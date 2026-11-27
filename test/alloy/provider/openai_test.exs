@@ -1841,7 +1841,7 @@ defmodule Alloy.Provider.OpenAITest do
         sse_response_event("response.function_call_arguments.delta", %{
           "item_id" => "fc_1",
           "output_index" => 0,
-          "delta" => ~s({"path":)
+          "delta" => ~s({"path": )
         }),
         sse_response_completed([
           function_call_item("call_1", "read", ~s({"path":"mix.exs"}))
@@ -1873,8 +1873,103 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:ev,
                        {:tool_call_delta, %{id: "call_1", name: "read", arguments_delta: ""}}}
 
-      assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s({"path":)}}}
+      assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s({"path": )}}}
       assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s("mix.exs"})}}}
+    end
+
+    test "reconciles pretty-printed terminal arguments and rejects incompatible string/token whitespace" do
+      test_pid = self()
+
+      # Compact prefix against pretty-printed terminal arguments succeeds and preserves valid JSON
+      pretty_chunks = [
+        sse_response_event("response.output_item.added", %{
+          "output_index" => 0,
+          "item" => %{
+            "type" => "function_call",
+            "id" => "fc_1",
+            "call_id" => "call_1",
+            "name" => "read"
+          }
+        }),
+        sse_response_event("response.function_call_arguments.delta", %{
+          "item_id" => "fc_1",
+          "output_index" => 0,
+          "delta" => ~s({"path":)
+        }),
+        sse_response_completed([
+          function_call_item("call_1", "read", ~s({\n  "path": "a\\"b"\n}))
+        ]),
+        "data: [DONE]\n\n"
+      ]
+
+      Req.Test.stub(__MODULE__, sse_chunks_plug(pretty_chunks))
+
+      config = %{
+        api_key: "sk-test",
+        model: "gpt-5.4",
+        on_event: fn ev -> send(test_pid, {:ev, ev}) end,
+        req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+      }
+
+      assert {:ok, response} =
+               ResponsesStream.stream(
+                 "https://api.openai.com/v1/responses",
+                 [{"authorization", "Bearer sk-test"}],
+                 %{"model" => "gpt-5.4", "input" => []},
+                 fn _ -> :ok end,
+                 config
+               )
+
+      assert response.stop_reason == :tool_use
+
+      deltas =
+        Stream.repeatedly(fn ->
+          receive do
+            {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: d}}} -> d
+          after
+            0 -> :done
+          end
+        end)
+        |> Enum.take_while(&(&1 != :done))
+        |> Enum.join()
+
+      assert Jason.decode!(deltas) == %{"path" => ~s(a"b)}
+
+      # Whitespace inside a string literal or splitting a numeric token must fail closed
+      for {bad_prefix, terminal} <- [
+            {~s({"path": "mix.exs ), ~s({"path":"mix.exs"})},
+            {~s({"n": 1 ), ~s({"n":10})}
+          ] do
+        bad_chunks = [
+          sse_response_event("response.output_item.added", %{
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_bad",
+              "call_id" => "call_bad",
+              "name" => "read"
+            }
+          }),
+          sse_response_event("response.function_call_arguments.delta", %{
+            "item_id" => "fc_bad",
+            "output_index" => 0,
+            "delta" => bad_prefix
+          }),
+          sse_response_completed([function_call_item("call_bad", "read", terminal)]),
+          "data: [DONE]\n\n"
+        ]
+
+        Req.Test.stub(__MODULE__, sse_chunks_plug(bad_chunks))
+
+        assert {:error, %Alloy.Provider.Error{kind: :malformed_reply}} =
+                 ResponsesStream.stream(
+                   "https://api.openai.com/v1/responses",
+                   [{"authorization", "Bearer sk-test"}],
+                   %{"model" => "gpt-5.4", "input" => []},
+                   fn _ -> :ok end,
+                   config
+                 )
+      end
     end
   end
 

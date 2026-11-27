@@ -3536,7 +3536,7 @@ defmodule Alloy.ReasoningAndEventsTest do
     test "OpenAI Responses preserves output_item.added prefix, handles item_id changes, and reconciles equal complete JSON" do
       parent = self()
 
-      # 6. OpenAI/xAI: non-empty arguments prefix in output_item.added is preserved once and
+      # 1. OpenAI/xAI: non-empty arguments prefix in output_item.added is preserved once and
       #    combines with subsequent deltas without duplication on .done/.completed (both with
       #    immediate call_id and deferred call_id).
       for include_call_id? <- [true, false] do
@@ -3613,7 +3613,7 @@ defmodule Alloy.ReasoningAndEventsTest do
         assert Enum.map_join(ap_deltas, & &1.arguments_delta) == "{\"x\":1}"
       end
 
-      # 7. OpenAI/xAI: non-empty arguments prefix in output_item.added followed directly by
+      # 2. OpenAI/xAI: non-empty arguments prefix in output_item.added followed directly by
       #    output_item.done / response.completed (with NO intervening argument deltas) emits the
       #    missing suffix without duplication, for both immediate and deferred call_id.
       for include_call_id? <- [true, false] do
@@ -3684,7 +3684,7 @@ defmodule Alloy.ReasoningAndEventsTest do
         assert Enum.map_join(nd_deltas, & &1.arguments_delta) == "{\"x\":1}"
       end
 
-      # 8. OpenAI/xAI: omitting optional item.id on output_item.done and re-supplying it on
+      # 3. OpenAI/xAI: omitting optional item.id on output_item.done and re-supplying it on
       #    response.completed must NOT duplicate arguments, and contradictory item_id/output_index
       #    deltas must be suppressed instead of mis-indexed across calls.
       omit_id_done_plug =
@@ -3849,7 +3849,7 @@ defmodule Alloy.ReasoningAndEventsTest do
              |> Enum.filter(&(&1.id == "call_1"))
              |> Enum.all?(&(&1.index == 1))
 
-      # 9. OpenAI/xAI: buffered headerless deltas that conflict with authoritative terminal
+      # 4. OpenAI/xAI: buffered headerless deltas that conflict with authoritative terminal
       #    arguments (or differ due to map-typed JSON serialization whitespace) are discarded
       #    before emission so emitted arguments always reconstruct the executed tool input.
       for {buffered_prefix, final_args} <- [
@@ -3907,7 +3907,7 @@ defmodule Alloy.ReasoningAndEventsTest do
         assert Jason.decode!(Enum.map_join(rec_deltas, & &1.arguments_delta)) == %{"x" => 1}
       end
 
-      # 11. OpenAI/xAI: already-emitted complete JSON with extra whitespace reconciles as equal
+      # 5. OpenAI/xAI: already-emitted complete JSON with extra whitespace reconciles as equal
       #     against map-typed completed arguments without emitting duplicate deltas.
       ws_complete_item = %{
         "type" => "function_call",
@@ -3968,7 +3968,7 @@ defmodule Alloy.ReasoningAndEventsTest do
     test "OpenAI and OpenAICompat reject contradictory tool arguments and conflicting identities" do
       parent = self()
 
-      # 12. OpenAI/xAI: irreconcilable mismatch between already-emitted arguments and completed
+      # 1. OpenAI/xAI: irreconcilable mismatch between already-emitted arguments and completed
       #     arguments fails with :malformed_reply instead of silently returning mismatched inputs
       #     (covering .done + .completed, direct .completed, live delta, and empty-string args).
       for {added_args, live_delta, include_done?, final_args} <- [
@@ -4050,7 +4050,7 @@ defmodule Alloy.ReasoningAndEventsTest do
         _ = drain_tagged(:mm_ev)
       end
 
-      # 13. OpenAI/xAI: changed call_id or name on a resolved slot (including when terminal
+      # 2. OpenAI/xAI: changed call_id or name on a resolved slot (including when terminal
       #     item omits optional "id" or falls back from missing "call_id" to item "id") fails
       #     with :malformed_reply and emits no bogus header for the replacement identity.
       for terminal_item <- [
@@ -4125,7 +4125,7 @@ defmodule Alloy.ReasoningAndEventsTest do
         assert Enum.all?(idc_deltas, &(&1.id == "call_a" and &1.name == "read"))
       end
 
-      # 14. OpenAICompat: conflicting tool call id or function name on an existing index fails
+      # 3. OpenAICompat: conflicting tool call id or function name on an existing index fails
       #     with :protocol_error instead of splitting one argument document across two identities,
       #     while identical repeated metadata and omitted/null/empty metadata continue to succeed.
       for conflicting_tc <- [
@@ -4266,7 +4266,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert Enum.all?(ocr_deltas, &(&1.id == "call_a" and &1.name == "read"))
       assert Jason.decode!(Enum.map_join(ocr_deltas, & &1.arguments_delta)) == %{"x" => 1}
 
-      # 15. OpenAI/xAI: changed non-empty item_id on response.completed (whether retaining
+      # 4. OpenAI/xAI: changed non-empty item_id on response.completed (whether retaining
       #     call_id with contradictory args, replacing call_id/name at the same index, or dropping
       #     a previously emitted call from completed output) fails with :malformed_reply instead
       #     of bypassing reconciliation and emitting duplicate/invalid concatenated JSON.
@@ -4346,7 +4346,7 @@ defmodule Alloy.ReasoningAndEventsTest do
     test "overflow recovery suppression, OwnedWorker pre-deadline, item_id rotation, and provider-level on_event" do
       parent = self()
 
-      # 16. Context-overflow recovery does NOT retry after streaming deltas (:tool_call_delta)
+      # 1. Context-overflow recovery does NOT retry after streaming deltas (:tool_call_delta)
       #     have already been emitted to a subscriber, preventing duplicate/abandoned calls.
       defmodule ShrinkOverflowMiddleware do
         @behaviour Alloy.Middleware
@@ -4448,7 +4448,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert ov_tool_ids == ["call_ov_1"]
 
-      # 17. OwnedWorker enforces deadline before executing the worker function so an already
+      # 2. OwnedWorker enforces deadline before executing the worker function so an already
       #     expired deadline cannot run tool side effects even under dispatch/scheduling delay.
       expired_deadline = System.monotonic_time(:millisecond) - 1
 
@@ -4461,7 +4461,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert Task.await(owner, 1_000) == :timeout
       refute_received :expired_worker_ran
 
-      # 18. OpenAI/xAI: item_id alias rotation followed by argument deltas and terminal reuse of
+      # 3. OpenAI/xAI: item_id alias rotation followed by argument deltas and terminal reuse of
       #     the older item_id reconciles against the single canonical call record (succeeding on
       #     matching args with no duplicate deltas, failing with :malformed_reply on conflict).
       alias_conflict_plug =
@@ -4605,7 +4605,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert Enum.map_join(alias_ok_deltas, & &1.arguments_delta) == "{\"x\":1}"
 
-      # 19. Provider-level :on_event callback (without a top-level :on_event subscriber) still
+      # 4. Provider-level :on_event callback (without a top-level :on_event subscriber) still
       #     propagates chunks_emitted? from Retry to Turn so context-overflow recovery never
       #     starts a second request after emitting deltas.
       provider_cb_reqs = :atomics.new(1, signed: false)
@@ -4682,7 +4682,7 @@ defmodule Alloy.ReasoningAndEventsTest do
     test "deadline expiry during slow :turn_stop telemetry or :turn_end callback agrees with Result.status" do
       parent = self()
 
-      # 20. Deadline expiry during a slow [:alloy, :turn, :stop] telemetry handler OR a slow
+      # 1. Deadline expiry during a slow [:alloy, :turn, :stop] telemetry handler OR a slow
       #     :turn_end :on_event callback routes the boundary timeout through turn lifecycle
       #     reporting so the final :turn_end always agrees with Result.status (:error).
       tel_handler_id = "slice2-slow-turn-stop-#{inspect(make_ref())}"
@@ -4750,7 +4750,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert [%{turn: 1, payload: %{status: :running}}, %{turn: 2, payload: %{status: :error}}] =
                slow_cb_ends
 
-      # 23. Deadline expiry during [:alloy, :turn, :stop] telemetry when turn 1 was finalized
+      # 2. Deadline expiry during [:alloy, :turn, :stop] telemetry when turn 1 was finalized
       #     as :max_turns rechecks before :turn_end so the single turn verdict is :error (no
       #     phantom turn 2); time spent inside the user's own final :turn_end callback does not
       #     overturn an already-published :max_turns verdict or synthesize a turn past max_turns.
