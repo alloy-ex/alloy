@@ -117,6 +117,12 @@ defmodule Alloy.ModelMetadata do
     # to other models, so they are left out. xAI models do not enforce a
     # separate text output ceiling beyond the context window, so
     # max_output_tokens is nil.
+    {~r/^grok-4\.20-multi-agent(-[a-z0-9-]+)?$/,
+     %{
+       context_window: 1_000_000,
+       max_output_tokens: nil,
+       capabilities: Map.put(@full_capabilities, :tools?, false)
+     }},
     {~r/^grok-4\.20-[a-z0-9-]*non-reasoning(-[a-z0-9-]+)?$/,
      %{
        context_window: 1_000_000,

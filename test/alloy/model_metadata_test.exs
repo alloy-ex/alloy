@@ -260,6 +260,14 @@ defmodule Alloy.ModelMetadataTest do
       assert non_reasoning_latest.reasoning? == false
       assert non_reasoning_latest.tools? == true
 
+      for multi_agent <- ~w(
+            grok-4.20-multi-agent grok-4.20-multi-agent-0309 grok-4.20-multi-agent-latest
+          ) do
+        caps = ModelMetadata.capabilities(multi_agent)
+        assert caps.tools? == false
+        assert caps.reasoning? == true
+      end
+
       assert ModelMetadata.capabilities("gpt-5.2").structured_output? == true
       assert ModelMetadata.capabilities("gpt-5.2-pro").structured_output? == false
       assert ModelMetadata.capabilities("gpt-5.2-pro-2025-12-11").structured_output? == false
