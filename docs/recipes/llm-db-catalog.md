@@ -98,27 +98,51 @@ defmodule MyApp.LlmDbCatalog do
     end
   end
 
-  # Supports either provider-qualified specs ("anthropic:claude-sonnet-4-6") or
-  # bare model IDs ("claude-sonnet-4-6") as passed in Alloy provider configs.
+  # Resolves provider-qualified specs ("anthropic:claude-sonnet-4-6") directly.
+  # For bare model IDs ("claude-sonnet-4-6"), returns a match only when it is
+  # unambiguous across LLMDB providers (or when scoped to a single provider via
+  # `@provider`). Ambiguous bare IDs return `nil` so Alloy falls back to
+  # `default_context_window/0` rather than risking another provider's larger
+  # context window or billing rates.
+  #
+  # If your app knows which provider a run targets, define a provider-scoped
+  # catalog module (or set `@provider :anthropic`) and call
+  # `LLMDB.model(@provider, model)` directly.
+  @provider nil
+
   defp lookup(model) do
     case LLMDB.model(model) do
       {:ok, entry} ->
         entry
 
       _ ->
-        find_by_model_id(model)
+        lookup_bare_model(model, @provider)
     end
   end
 
-  defp find_by_model_id(model_id) do
-    Enum.find_value(LLMDB.providers(), fn provider ->
-      provider_id = if is_map(provider), do: Map.get(provider, :id), else: provider
+  defp lookup_bare_model(model_id, provider_id) when not is_nil(provider_id) do
+    case LLMDB.model(provider_id, model_id) do
+      {:ok, entry} -> entry
+      _ -> nil
+    end
+  end
 
-      case LLMDB.model(provider_id, model_id) do
-        {:ok, entry} -> entry
-        _ -> nil
-      end
-    end)
+  defp lookup_bare_model(model_id, nil) do
+    matches =
+      LLMDB.providers()
+      |> Enum.flat_map(fn provider ->
+        provider_id = if is_map(provider), do: Map.get(provider, :id), else: provider
+
+        case LLMDB.model(provider_id, model_id) do
+          {:ok, entry} -> [entry]
+          _ -> []
+        end
+      end)
+
+    case matches do
+      [single_entry] -> single_entry
+      _none_or_ambiguous -> nil
+    end
   end
 
   defp nested_get(nil, _keys), do: nil

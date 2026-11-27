@@ -63,44 +63,66 @@ defmodule Alloy.ModelCatalogTest do
   defmodule StructBackedLlmDbCatalog do
     @behaviour Alloy.ModelCatalog
 
-    @entries %{
-      "nested-multimodal" => %FakeLlmDbModel{
-        limits: %FakeLlmDbLimits{context: 400_000, input: 272_000, output: 128_000},
-        modalities: %{input: [:text, :image, :pdf], output: [:text]},
-        capabilities: %{
-          reasoning: %{enabled: true},
-          tools: %{enabled: true},
-          json: %{schema: true},
-          caching: %{type: "explicit"}
-        },
-        cost: %FakeLlmDbCost{input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75}
+    @providers [
+      %{
+        id: :anthropic,
+        models: %{
+          "nested-multimodal" => %FakeLlmDbModel{
+            limits: %FakeLlmDbLimits{context: 400_000, input: 272_000, output: 128_000},
+            modalities: %{input: [:text, :image, :pdf], output: [:text]},
+            capabilities: %{
+              reasoning: %{enabled: true},
+              tools: %{enabled: true},
+              json: %{schema: true},
+              caching: %{type: "explicit"}
+            },
+            cost: %FakeLlmDbCost{input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75}
+          },
+          "shared-id" => %FakeLlmDbModel{
+            limits: %FakeLlmDbLimits{context: 1_000_000, input: 1_000_000, output: 128_000},
+            modalities: %{input: [:text, :image, :pdf], output: [:text]},
+            capabilities: %{tools: %{enabled: true}, caching: %{type: "explicit"}},
+            cost: %FakeLlmDbCost{input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75}
+          }
+        }
       },
-      "implicit-caching" => %FakeLlmDbModel{
-        limits: %FakeLlmDbLimits{context: 200_000, input: nil, output: 64_000},
-        modalities: %{input: [:text, :image], output: [:text]},
-        capabilities: %{
-          reasoning: true,
-          tools: true,
-          json: %{schema: true},
-          caching: %{type: "implicit"}
-        },
-        cost: %FakeLlmDbCost{input: 1.25, output: 10.0, cache_read: 0.125, cache_write: nil}
-      },
-      "flat-booleans" => %FakeLlmDbModel{
-        limits: %FakeLlmDbLimits{context: 200_000, input: nil, output: 64_000},
-        modalities: %{input: [:text, :image], output: [:text]},
-        capabilities: %{
-          reasoning: false,
-          tools: true,
-          structured_output: true
-        },
-        cost: %FakeLlmDbCost{input: 1.0, output: 5.0, cache_read: nil, cache_write: nil}
+      %{
+        id: :alt_provider,
+        models: %{
+          "implicit-caching" => %FakeLlmDbModel{
+            limits: %FakeLlmDbLimits{context: 200_000, input: nil, output: 64_000},
+            modalities: %{input: [:text, :image], output: [:text]},
+            capabilities: %{
+              reasoning: true,
+              tools: true,
+              json: %{schema: true},
+              caching: %{type: "implicit"}
+            },
+            cost: %FakeLlmDbCost{input: 1.25, output: 10.0, cache_read: 0.125, cache_write: nil}
+          },
+          "flat-booleans" => %FakeLlmDbModel{
+            limits: %FakeLlmDbLimits{context: 200_000, input: nil, output: 64_000},
+            modalities: %{input: [:text, :image], output: [:text]},
+            capabilities: %{
+              reasoning: false,
+              tools: true,
+              structured_output: true
+            },
+            cost: %FakeLlmDbCost{input: 1.0, output: 5.0, cache_read: nil, cache_write: nil}
+          },
+          "shared-id" => %FakeLlmDbModel{
+            limits: %FakeLlmDbLimits{context: 200_000, input: 200_000, output: 64_000},
+            modalities: %{input: [:text], output: [:text]},
+            capabilities: %{tools: %{enabled: true}},
+            cost: %FakeLlmDbCost{input: 0.9, output: 5.55, cache_read: nil, cache_write: nil}
+          }
+        }
       }
-    }
+    ]
 
     @impl true
     def context_window(model) do
-      entry = Map.get(@entries, model)
+      entry = lookup(model)
 
       positive_int(nested_get(entry, [:limits, :input])) ||
         positive_int(nested_get(entry, [:limits, :context]))
@@ -108,12 +130,12 @@ defmodule Alloy.ModelCatalogTest do
 
     @impl true
     def max_output_tokens(model) do
-      positive_int(nested_get(Map.get(@entries, model), [:limits, :output]))
+      positive_int(nested_get(lookup(model), [:limits, :output]))
     end
 
     @impl true
     def capabilities(model) do
-      case Map.get(@entries, model) do
+      case lookup(model) do
         entry when is_map(entry) ->
           caps = Map.get(entry, :capabilities)
           input_modalities = List.wrap(nested_get(entry, [:modalities, :input]))
@@ -136,7 +158,7 @@ defmodule Alloy.ModelCatalogTest do
 
     @impl true
     def pricing(model) do
-      with entry when is_map(entry) <- Map.get(@entries, model),
+      with entry when is_map(entry) <- lookup(model),
            cost when is_map(cost) <- Map.get(entry, :cost),
            input when is_number(input) <- Map.get(cost, :input),
            output when is_number(output) <- Map.get(cost, :output) do
@@ -145,6 +167,29 @@ defmodule Alloy.ModelCatalogTest do
         |> maybe_put(:cache_write_per_million, Map.get(cost, :cache_write))
       else
         _ -> nil
+      end
+    end
+
+    defp lookup(model) do
+      case String.split(model, ":", parts: 2) do
+        [provider_str, model_id] ->
+          Enum.find_value(@providers, fn %{id: id, models: models} ->
+            if Atom.to_string(id) == provider_str, do: Map.get(models, model_id)
+          end)
+
+        [bare_id] ->
+          matches =
+            Enum.flat_map(@providers, fn %{models: models} ->
+              case Map.fetch(models, bare_id) do
+                {:ok, entry} -> [entry]
+                :error -> []
+              end
+            end)
+
+          case matches do
+            [single] -> single
+            _none_or_ambiguous -> nil
+          end
       end
     end
 
@@ -377,6 +422,21 @@ defmodule Alloy.ModelCatalogTest do
                  output_per_million: 5.0
                }
              }
+
+      # Ambiguous bare IDs present on multiple providers return nil rather than
+      # silently selecting another provider's limits/pricing; provider-qualified
+      # specs resolve each provider accurately.
+      ambiguous = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog, "shared-id")
+      assert ambiguous.context_window == nil
+      assert ambiguous.pricing == nil
+
+      anth = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog, "anthropic:shared-id")
+      assert anth.context_window == 1_000_000
+      assert anth.pricing.input_per_million == 3.0
+
+      alt = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog, "alt_provider:shared-id")
+      assert alt.context_window == 200_000
+      assert alt.pricing.input_per_million == 0.9
     end
   end
 end
