@@ -11,8 +11,9 @@ defmodule Alloy.Agent.Turn do
   alias Alloy.Agent.State
   alias Alloy.Cancel
   alias Alloy.Events
-  alias Alloy.Internal.Sanitize
-  alias Alloy.{Message, Middleware, OutputSchema, Provider, Transcript, Usage}
+  alias Alloy.Internal.{Deadline, Sanitize}
+  alias Alloy.{Message, Middleware, OutputSchema, Provider, Usage}
+  alias Alloy.Message.Validator
   alias Alloy.Provider.{Error, Retry}
   alias Alloy.Tool.{Executor, Validation}
 
@@ -88,55 +89,28 @@ defmodule Alloy.Agent.Turn do
   end
 
   # :telemetry.span/3 accepts extra stop measurements only from telemetry 1.3,
-  # and the run stop event has always carried :duration_ms, so the run span is
-  # emitted by hand with the same start/stop/exception shape.
+  # and the run stop event has always carried :duration_ms, so both run and
+  # turn spans are emitted with the same start/stop/exception shape and
+  # argument-stripped stacktraces.
   defp run_span(model, fun) do
     started = System.monotonic_time(:millisecond)
-    span_ctx = make_ref()
+    duration_ms = fn -> %{duration_ms: System.monotonic_time(:millisecond) - started} end
 
-    :telemetry.execute(
-      [:alloy, :run, :start],
-      %{system_time: System.system_time()},
-      %{model: model, telemetry_span_context: span_ctx}
-    )
-
-    try do
-      final_state = fun.()
-
-      :telemetry.execute(
-        [:alloy, :run, :stop],
-        %{duration_ms: System.monotonic_time(:millisecond) - started},
-        %{
-          status: final_state.status,
-          turns: final_state.turn,
-          model: model,
-          telemetry_span_context: span_ctx
-        }
+    %State{} =
+      emit_span(
+        [:alloy, :run],
+        %{system_time: System.system_time()},
+        %{model: model},
+        duration_ms,
+        fn final_state -> %{status: final_state.status, turns: final_state.turn} end,
+        fun
       )
-
-      final_state
-    catch
-      kind, reason ->
-        :telemetry.execute(
-          [:alloy, :run, :exception],
-          %{duration_ms: System.monotonic_time(:millisecond) - started},
-          %{
-            model: model,
-            kind: kind,
-            reason: reason,
-            stacktrace: Sanitize.stacktrace(__STACKTRACE__),
-            telemetry_span_context: span_ctx
-          }
-        )
-
-        :erlang.raise(kind, reason, __STACKTRACE__)
-    end
   end
 
   defp loop(%State{turn: turn, config: config} = state, opts) do
     cond do
       turn == 0 and Cancel.cancelled?(config.cancel_token) ->
-        cancel_state(state)
+        State.cancel(state)
 
       turn >= config.max_turns ->
         %{state | status: :max_turns}
@@ -162,14 +136,11 @@ defmodule Alloy.Agent.Turn do
         Events.emit(opts, turn, {:turn_start, %{turn: turn}})
 
         turn_span(turn, fn ->
-          cond do
-            Cancel.cancelled?(state.config.cancel_token) ->
-              {:halt, cancel_state(state)}
+          case check_run_interrupt(state) do
+            {:halt, _} = halted ->
+              halted
 
-            state.turn > 0 and deadline_expired?(state) ->
-              {:halt, fail(state, timeout_error(state))}
-
-            true ->
+            :ok ->
               state
               |> complete(Keyword.put(opts, :turn_progress_key, progress_key), false)
               |> finalize_turn_limits()
@@ -224,20 +195,33 @@ defmodule Alloy.Agent.Turn do
     step
   end
 
+  # Checks cancellation first, then run deadline once at least one turn has
+  # completed, so termination precedence stays identical before a turn, after a
+  # turn, and after [:alloy, :turn, :stop] telemetry.
+  defp check_run_interrupt(%State{} = state) do
+    cond do
+      Cancel.cancelled?(state.config.cancel_token) ->
+        {:halt, State.cancel(state)}
+
+      state.turn > 0 and Deadline.expired?(state.run_deadline) ->
+        {:halt, fail(state, timeout_error(state))}
+
+      true ->
+        :ok
+    end
+  end
+
   # Resolve run-level termination limits (cancellation first, then deadline, then
   # max_turns) before publishing :turn_end so the final turn never reports :running.
   defp finalize_turn_limits({:continue, %State{} = next_state}) do
-    cond do
-      Cancel.cancelled?(next_state.config.cancel_token) ->
-        {:halt, cancel_state(next_state)}
+    case check_run_interrupt(next_state) do
+      {:halt, _} = halted ->
+        halted
 
-      next_state.turn > 0 and deadline_expired?(next_state) ->
-        {:halt, fail(next_state, timeout_error(next_state))}
-
-      next_state.turn >= next_state.config.max_turns ->
+      :ok when next_state.turn >= next_state.config.max_turns ->
         {:halt, %{next_state | status: :max_turns}}
 
-      true ->
+      :ok ->
         {:continue, next_state}
     end
   end
@@ -247,30 +231,11 @@ defmodule Alloy.Agent.Turn do
   # Recheck cancellation and run deadline after [:alloy, :turn, :stop] telemetry
   # finishes and before :turn_end is published so a slow stop handler flips the
   # single turn verdict instead of synthesizing a phantom follow-up turn.
-  defp recheck_post_span_deadline({:continue, %State{turn: t} = next_state}) when t > 0 do
-    cond do
-      Cancel.cancelled?(next_state.config.cancel_token) ->
-        {:halt, cancel_state(next_state)}
-
-      deadline_expired?(next_state) ->
-        {:halt, fail(next_state, timeout_error(next_state))}
-
-      true ->
-        {:continue, next_state}
-    end
-  end
-
-  defp recheck_post_span_deadline({:halt, %State{status: :max_turns, turn: t} = next_state})
-       when t > 0 do
-    cond do
-      Cancel.cancelled?(next_state.config.cancel_token) ->
-        {:halt, cancel_state(next_state)}
-
-      deadline_expired?(next_state) ->
-        {:halt, fail(next_state, timeout_error(next_state))}
-
-      true ->
-        {:halt, next_state}
+  defp recheck_post_span_deadline({tag, %State{turn: t, status: status} = next_state} = step)
+       when t > 0 and (tag == :continue or status == :max_turns) do
+    case check_run_interrupt(next_state) do
+      {:halt, _} = halted -> halted
+      :ok -> step
     end
   end
 
@@ -278,41 +243,48 @@ defmodule Alloy.Agent.Turn do
 
   defp turn_span(turn, fun) do
     start_mono = System.monotonic_time()
-    span_ctx = make_ref()
 
-    :telemetry.execute(
-      [:alloy, :turn, :start],
+    native_duration = fn ->
+      stop_mono = System.monotonic_time()
+      %{duration: stop_mono - start_mono, monotonic_time: stop_mono}
+    end
+
+    emit_span(
+      [:alloy, :turn],
       %{monotonic_time: start_mono, system_time: System.system_time()},
-      %{turn: turn, telemetry_span_context: span_ctx}
+      %{turn: turn},
+      native_duration,
+      fn step -> %{status: step_status(step)} end,
+      fun
     )
+  end
+
+  defp emit_span(prefix, start_measurements, base_meta, end_measurements_fn, stop_meta_fn, fun) do
+    span_ctx = make_ref()
+    base_meta = Map.put(base_meta, :telemetry_span_context, span_ctx)
+
+    :telemetry.execute(prefix ++ [:start], start_measurements, base_meta)
 
     try do
-      step = fun.()
-      stop_mono = System.monotonic_time()
+      result = fun.()
 
       :telemetry.execute(
-        [:alloy, :turn, :stop],
-        %{duration: stop_mono - start_mono, monotonic_time: stop_mono},
-        %{turn: turn, status: step_status(step), telemetry_span_context: span_ctx}
+        prefix ++ [:stop],
+        end_measurements_fn.(),
+        Map.merge(base_meta, stop_meta_fn.(result))
       )
 
-      step
+      result
     catch
       kind, reason ->
-        stop_mono = System.monotonic_time()
-
-        :telemetry.execute(
-          [:alloy, :turn, :exception],
-          %{duration: stop_mono - start_mono, monotonic_time: stop_mono},
-          %{
-            turn: turn,
+        exception_meta =
+          Map.merge(base_meta, %{
             kind: kind,
             reason: reason,
-            stacktrace: Sanitize.stacktrace(__STACKTRACE__),
-            telemetry_span_context: span_ctx
-          }
-        )
+            stacktrace: Sanitize.stacktrace(__STACKTRACE__)
+          })
 
+        :telemetry.execute(prefix ++ [:exception], end_measurements_fn.(), exception_meta)
         :erlang.raise(kind, reason, __STACKTRACE__)
     end
   end
@@ -479,7 +451,7 @@ defmodule Alloy.Agent.Turn do
     record_turn_progress(opts, accounted.stop_reason, accounted.usage)
 
     if Cancel.cancelled?(accounted.config.cancel_token) do
-      cancel_state(accounted)
+      State.cancel(accounted)
     else
       accounted
       |> maybe_record_refusal_output_error(reason)
@@ -501,11 +473,8 @@ defmodule Alloy.Agent.Turn do
   defp abandon_tool_calls(state, calls, failure) do
     reason = if is_struct(failure, Error), do: Exception.message(failure), else: failure
 
-    results =
-      Enum.map(calls, &Message.tool_result_block(&1.id, "Not executed: #{reason}", true))
-
     state
-    |> State.append_messages(Message.tool_results(results))
+    |> answer_tool_calls(calls, [], reason)
     |> fail(failure)
   end
 
@@ -513,7 +482,7 @@ defmodule Alloy.Agent.Turn do
   # kept alongside it for callers that want the kind, status or code.
   defp fail(state, %Error{} = error) do
     state
-    |> State.merge_run_metadata(%{provider_error: error})
+    |> State.put_provider_error(error)
     |> fail(Exception.message(error))
   end
 
@@ -532,11 +501,11 @@ defmodule Alloy.Agent.Turn do
     case Middleware.run_hook(hook, state) do
       {:halted, reason, halted} ->
         if halted.status == :cancelled or Cancel.cancelled?(halted.config.cancel_token),
-          do: {:halt, cancel_state(halted)},
+          do: {:halt, State.cancel(halted)},
           else: {:halt, halt(halted, reason)}
 
       %State{status: :cancelled} = cancelled ->
-        {:halt, cancel_state(cancelled)}
+        {:halt, State.cancel(cancelled)}
 
       %State{} = state ->
         {:continue, state}
@@ -547,12 +516,12 @@ defmodule Alloy.Agent.Turn do
     do: %{state | status: :halted, error: "Halted by middleware: #{reason}"}
 
   defp handle_provider_error(%Error{kind: :cancelled} = error, state, _opts, _overflow_retried?),
-    do: {:halt, state |> put_provider_error(error) |> cancel_state()}
+    do: {:halt, state |> State.put_provider_error(error) |> State.cancel()}
 
   defp handle_provider_error(reason, state, opts, false = _overflow_retried?) do
     cond do
       Cancel.cancelled?(state.config.cancel_token) ->
-        {:halt, cancel_state(state)}
+        {:halt, State.cancel(state)}
 
       prompt_too_long?(reason) ->
         recover_from_overflow(reason, state, opts)
@@ -564,7 +533,7 @@ defmodule Alloy.Agent.Turn do
 
   defp handle_provider_error(reason, state, _opts, true = _overflow_retried?) do
     if Cancel.cancelled?(state.config.cancel_token),
-      do: {:halt, cancel_state(state)},
+      do: {:halt, State.cancel(state)},
       else: {:halt, fail(state, reason)}
   end
 
@@ -580,19 +549,19 @@ defmodule Alloy.Agent.Turn do
 
       {:halt, halted} ->
         overflow_event(state, false)
-        {:halt, put_provider_error(halted, reason)}
+        {:halt, State.put_provider_error(halted, reason)}
 
       {:continue, %State{messages: messages} = unchanged} when messages == state.messages ->
         overflow_event(state, false)
 
         if Cancel.cancelled?(unchanged.config.cancel_token),
-          do: {:halt, cancel_state(unchanged)},
+          do: {:halt, State.cancel(unchanged)},
           else: {:halt, fail(unchanged, reason)}
 
       {:continue, shrunk} ->
         if Cancel.cancelled?(shrunk.config.cancel_token) do
           overflow_event(state, false)
-          {:halt, cancel_state(shrunk)}
+          {:halt, State.cancel(shrunk)}
         else
           Logger.info("[Turn] Prompt too long — history shrunk by middleware, retrying")
           overflow_event(state, true)
@@ -617,17 +586,12 @@ defmodule Alloy.Agent.Turn do
     )
   end
 
-  defp put_provider_error(state, %Error{} = error),
-    do: State.merge_run_metadata(state, %{provider_error: error})
-
-  defp put_provider_error(state, _reason), do: state
-
   defp handle_tool_use(%State{} = state, tool_calls, prepared_schemas, opts) do
     cond do
       Cancel.cancelled?(state.config.cancel_token) ->
         {:halt, cancel_tool_calls(state, tool_calls)}
 
-      deadline_expired?(state) ->
+      Deadline.expired?(state.run_deadline) ->
         {:halt, abandon_tool_calls(state, tool_calls, timeout_error(state))}
 
       true ->
@@ -667,66 +631,38 @@ defmodule Alloy.Agent.Turn do
         {:halt, failed}
 
       {:deadline_expired, result_blocks, tool_call_meta} ->
-        state =
-          state
-          |> answer_tool_calls(tool_calls, result_blocks)
-          |> State.append_tool_calls(tool_call_meta)
-
-        if Cancel.cancelled?(state.config.cancel_token) do
-          {:halt, cancel_state(state)}
-        else
-          finish_tool_round_deadline_expired(state)
-        end
+        state
+        |> answer_tool_calls(tool_calls, result_blocks)
+        |> State.append_tool_calls(tool_call_meta)
+        |> finish_tool_round(:deadline_expired)
 
       {:ok, result_blocks, tool_call_meta, steering_msgs} ->
         steered? = steering_msgs != []
 
-        state =
-          state
-          |> answer_tool_calls(tool_calls, result_blocks)
-          |> State.append_tool_calls(tool_call_meta)
-          |> then(&if(steered?, do: State.append_messages(&1, steering_msgs), else: &1))
-
-        if Cancel.cancelled?(state.config.cancel_token) do
-          {:halt, cancel_state(state)}
-        else
-          finish_tool_round(state, tool_call_meta, steered?)
-        end
+        state
+        |> answer_tool_calls(tool_calls, result_blocks)
+        |> State.append_tool_calls(tool_call_meta)
+        |> then(&if(steered?, do: State.append_messages(&1, steering_msgs), else: &1))
+        |> finish_tool_round({:ok, tool_call_meta, steered?})
     end
   end
 
-  defp finish_tool_round(state, tool_call_meta, steered?) do
-    case run_middleware(:after_tool_execution, state) do
-      {:halt, _halted} = halted ->
-        halted
-
-      {:continue, next_state} ->
-        cond do
-          Cancel.cancelled?(next_state.config.cancel_token) ->
-            {:halt, cancel_state(next_state)}
-
-          steered? ->
-            {:continue, next_state}
-
-          true ->
-            maybe_finish_after_tool({:continue, next_state}, tool_call_meta)
-        end
+  defp finish_tool_round(state, outcome) do
+    with :ok <- check_cancelled(state),
+         {:continue, next_state} <- run_middleware(:after_tool_execution, state),
+         :ok <- check_cancelled(next_state) do
+      finalize_tool_round_outcome(next_state, outcome)
     end
   end
 
-  defp finish_tool_round_deadline_expired(state) do
-    case run_middleware(:after_tool_execution, state) do
-      {:halt, _halted} = halted ->
-        halted
+  defp finalize_tool_round_outcome(state, :deadline_expired),
+    do: {:halt, fail(state, timeout_error(state))}
 
-      {:continue, next_state} ->
-        if Cancel.cancelled?(next_state.config.cancel_token) do
-          {:halt, cancel_state(next_state)}
-        else
-          {:halt, fail(next_state, timeout_error(next_state))}
-        end
-    end
-  end
+  defp finalize_tool_round_outcome(state, {:ok, _tool_call_meta, true}),
+    do: {:continue, state}
+
+  defp finalize_tool_round_outcome(state, {:ok, tool_call_meta, false}),
+    do: maybe_finish_after_tool({:continue, state}, tool_call_meta)
 
   defp tool_schema_key(%State{tool_fns: tool_fns, config: %{tool_validation: mode}}),
     do: {tool_fns, mode}
@@ -785,7 +721,7 @@ defmodule Alloy.Agent.Turn do
     poll_steering =
       if is_function(state.config.steering, 1) do
         fn steering_state ->
-          poll_messages_callback(:steering, state.config.steering, steering_state)
+          Validator.poll_callback(:steering, state.config.steering, steering_state)
         end
       end
 
@@ -817,17 +753,18 @@ defmodule Alloy.Agent.Turn do
   end
 
   # Appends one tool_result per call, in call order. A call without a result
-  # (the loop halted before it ran) is answered with an error, because every
-  # API rejects a tool_use left unanswered and the halted transcript must stay
-  # usable for the next request. Tool-call IDs are unique per turn, so
-  # id-keyed lookup is safe.
-  defp answer_tool_calls(%State{} = state, tool_calls, result_blocks) do
+  # (the loop halted, failed, or cancelled before it ran) is answered with an
+  # error, because every API rejects a tool_use left unanswered and the
+  # transcript must stay usable for the next request. Tool-call IDs are unique
+  # per turn, so id-keyed lookup is safe.
+  defp answer_tool_calls(%State{} = state, tool_calls, result_blocks, fallback_reason \\ nil) do
     by_id = Map.new(result_blocks, &{&1.tool_use_id, &1})
+    reason = if is_nil(fallback_reason), do: state.error, else: fallback_reason
 
     results =
       Enum.map(tool_calls, fn %{id: id} ->
         Map.get_lazy(by_id, id, fn ->
-          Message.tool_result_block(id, "Not executed: #{state.error}", true)
+          Message.tool_result_block(id, "Not executed: #{reason}", true)
         end)
       end)
 
@@ -920,13 +857,13 @@ defmodule Alloy.Agent.Turn do
   defp maybe_follow_up_or_complete(state, new_msgs), do: complete_run(state, new_msgs)
 
   defp poll_follow_up(state, follow_up, new_msgs) do
-    outcome = poll_messages_callback(:follow_up, follow_up, state)
+    outcome = Validator.poll_callback(:follow_up, follow_up, state)
 
     cond do
       Cancel.cancelled?(state.config.cancel_token) ->
-        {:halt, cancel_state(state)}
+        {:halt, State.cancel(state)}
 
-      deadline_expired?(state) ->
+      Deadline.expired?(state.run_deadline) ->
         {:halt, fail(state, timeout_error(state))}
 
       true ->
@@ -948,7 +885,7 @@ defmodule Alloy.Agent.Turn do
         case run_middleware(:after_completion, state) do
           {:continue, state} ->
             if Cancel.cancelled?(state.config.cancel_token),
-              do: {:halt, cancel_state(state)},
+              do: {:halt, State.cancel(state)},
               else: {:halt, %{state | status: :completed}}
 
           {:halt, state} ->
@@ -962,10 +899,7 @@ defmodule Alloy.Agent.Turn do
 
   defp structured_output_refusal?(%State{config: %{output_schema: nil}}, _new_msgs), do: false
   defp structured_output_refusal?(%State{run_metadata: %{final_tool: _}}, _new_msgs), do: false
-
-  defp structured_output_refusal?(_state, new_msgs) do
-    new_msgs |> last_assistant_message() |> refusal_message?()
-  end
+  defp structured_output_refusal?(_state, new_msgs), do: refusal_response?(new_msgs)
 
   defp decode_structured_output(%State{config: %{output_schema: nil}} = state, _new_msgs),
     do: {:ok, state}
@@ -1036,212 +970,28 @@ defmodule Alloy.Agent.Turn do
 
   defp check_cancelled(state) do
     if Cancel.cancelled?(state.config.cancel_token),
-      do: {:halt, cancel_state(state)},
+      do: {:halt, State.cancel(state)},
       else: :ok
   end
 
-  defp cancel_state(%State{} = state), do: %{state | status: :cancelled, error: :cancelled}
-
   defp cancel_after_response(state, new_msgs) do
     case extract_tool_calls(new_msgs) do
-      [] -> cancel_state(state)
+      [] -> State.cancel(state)
       calls -> cancel_tool_calls(state, calls)
     end
   end
 
   defp cancel_tool_calls(state, calls) do
-    results =
-      Enum.map(calls, &Message.tool_result_block(&1.id, "Not executed: Cancelled", true))
-
     state
-    |> State.append_messages(Message.tool_results(results))
-    |> cancel_state()
-  end
-
-  defp poll_messages_callback(name, callback, state) do
-    case callback.(state) do
-      msgs when is_list(msgs) ->
-        validate_callback_messages(name, msgs)
-
-      other ->
-        {:error,
-         "#{name} callback returned invalid messages: expected a list of Alloy.Message structs, got #{Sanitize.shape_summary(other)}"}
-    end
-  rescue
-    e ->
-      {:error, "#{name} callback failed (#{Sanitize.exception_summary(e, :redact)})"}
-  catch
-    kind, reason ->
-      {:error, "#{name} callback #{kind}: #{Sanitize.exit_summary(reason, :redact)}"}
-  end
-
-  defp validate_callback_messages(name, msgs) do
-    cond do
-      not Enum.all?(msgs, &valid_callback_message?/1) ->
-        {:error,
-         "#{name} callback returned invalid messages: expected a list of Alloy.Message structs, got #{Sanitize.shape_summary(msgs)}"}
-
-      Transcript.validate(msgs) != :ok ->
-        {:error, "#{name} callback returned messages with invalid tool pairing"}
-
-      true ->
-        {:ok, msgs}
-    end
-  end
-
-  defp valid_callback_message?(%Message{role: role, content: content} = msg)
-       when role in [:user, :assistant] do
-    (is_nil(msg.provider) or is_atom(msg.provider)) and
-      optional_utf8?(msg, :model) and
-      optional_utf8?(msg, :origin) and
-      (valid_utf8?(content) or
-         (is_list(content) and content != [] and Enum.all?(content, &valid_callback_block?/1)))
-  end
-
-  defp valid_callback_message?(_other), do: false
-
-  defp valid_callback_block?(block) when is_map(block) and not is_struct(block) do
-    json_compatible?(block) and
-      case Map.get(block, :type) do
-        "text" -> valid_callback_text?(block)
-        "thinking" -> valid_callback_thinking?(block)
-        "redacted_thinking" -> valid_utf8?(Map.get(block, :data))
-        "tool_use" -> valid_callback_tool_use?(block)
-        "tool_result" -> valid_callback_tool_result?(block)
-        "image" -> valid_callback_image?(block)
-        "audio" -> valid_callback_media?(block)
-        "video" -> valid_callback_media?(block)
-        "document" -> valid_callback_document?(block)
-        _other -> false
-      end
-  end
-
-  defp valid_callback_block?(_other), do: false
-
-  defp valid_callback_text?(block) do
-    valid_utf8?(Map.get(block, :text)) and
-      optional_boolean?(block, :refusal) and
-      optional_utf8?(block, :phase) and
-      optional_utf8?(block, :signature) and
-      optional_utf8?(block, :thought_signature)
-  end
-
-  defp valid_callback_thinking?(block) do
-    valid_utf8?(Map.get(block, :thinking)) and
-      optional_utf8?(block, :signature) and
-      optional_utf8?(block, :thought_signature) and
-      optional_utf8?(block, :source)
-  end
-
-  defp valid_callback_tool_use?(block) do
-    id = Map.get(block, :id)
-    name = Map.get(block, :name)
-    input = Map.get(block, :input)
-
-    non_empty_utf8?(id) and non_empty_utf8?(name) and
-      plain_map?(input) and
-      optional_utf8?(block, :signature) and
-      optional_utf8?(block, :thought_signature) and
-      optional_plain_map?(block, :caller)
-  end
-
-  defp valid_callback_tool_result?(block) do
-    id = Map.get(block, :tool_use_id)
-    content = Map.get(block, :content)
-
-    non_empty_utf8?(id) and valid_utf8?(content) and optional_boolean?(block, :is_error)
-  end
-
-  # Reject mixed inline (:data) and URL (:url) sources and validate every
-  # supplied source/metadata field so providers never crash on malformed maps.
-  defp valid_callback_image?(block) do
-    has_data? = Map.has_key?(block, :data)
-    has_url? = Map.has_key?(block, :url)
-
-    cond do
-      has_data? and not has_url? ->
-        non_empty_utf8?(Map.get(block, :mime_type)) and valid_utf8?(Map.get(block, :data))
-
-      has_url? and not has_data? ->
-        valid_utf8?(Map.get(block, :url)) and optional_utf8?(block, :mime_type)
-
-      true ->
-        false
-    end
-  end
-
-  defp valid_callback_media?(block) do
-    not Map.has_key?(block, :url) and
-      not Map.has_key?(block, :uri) and
-      non_empty_utf8?(Map.get(block, :mime_type)) and
-      valid_utf8?(Map.get(block, :data))
-  end
-
-  defp valid_callback_document?(block) do
-    sources = Enum.filter([:data, :uri, :file_id], &Map.has_key?(block, &1))
-
-    non_empty_utf8?(Map.get(block, :mime_type)) and
-      length(sources) == 1 and
-      valid_utf8?(Map.get(block, hd(sources))) and
-      optional_utf8?(block, :filename) and
-      optional_utf8?(block, :title) and
-      optional_utf8?(block, :origin)
-  end
-
-  defp plain_map?(value), do: is_map(value) and not is_struct(value)
-  defp valid_utf8?(value), do: is_binary(value) and String.valid?(value)
-  defp non_empty_utf8?(value), do: valid_utf8?(value) and byte_size(value) > 0
-
-  defp json_compatible?(value) when is_nil(value) or is_boolean(value) or is_number(value),
-    do: true
-
-  defp json_compatible?(value) when is_binary(value), do: String.valid?(value)
-
-  defp json_compatible?(value) when is_list(value),
-    do: not List.improper?(value) and Enum.all?(value, &json_compatible?/1)
-
-  defp json_compatible?(value) when is_map(value) and not is_struct(value) do
-    Enum.all?(value, fn {k, v} ->
-      (valid_utf8?(k) or is_atom(k)) and json_compatible?(v)
-    end)
-  end
-
-  defp json_compatible?(_other), do: false
-
-  defp optional_utf8?(map, key) do
-    case Map.fetch(map, key) do
-      :error -> true
-      {:ok, nil} -> true
-      {:ok, value} -> valid_utf8?(value)
-    end
-  end
-
-  defp optional_boolean?(map, key) do
-    case Map.fetch(map, key) do
-      :error -> true
-      {:ok, value} -> is_boolean(value)
-    end
-  end
-
-  defp optional_plain_map?(map, key) do
-    case Map.fetch(map, key) do
-      :error -> true
-      {:ok, nil} -> true
-      {:ok, value} -> plain_map?(value)
-    end
+    |> answer_tool_calls(calls, [], "Cancelled")
+    |> State.cancel()
   end
 
   defp check_deadline(state) do
-    if deadline_expired?(state),
+    if Deadline.expired?(state.run_deadline),
       do: {:halt, fail(state, timeout_error(state))},
       else: :ok
   end
-
-  defp deadline_expired?(%State{run_deadline: deadline}) when is_integer(deadline) do
-    System.monotonic_time(:millisecond) >= deadline
-  end
-
-  defp deadline_expired?(_state), do: false
 
   defp timeout_error(state) do
     %Error{

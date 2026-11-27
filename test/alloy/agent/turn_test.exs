@@ -2034,13 +2034,12 @@ defmodule Alloy.Agent.TurnTest do
 
     test "a forced compaction on overflow fires :after_compaction and the done event" do
       handler = "forced-compaction-#{inspect(make_ref())}"
-      test_pid = self()
 
       :telemetry.attach(
         handler,
         [:alloy, :compaction, :done],
-        fn _event, _measurements, meta, _ -> send(test_pid, {:done, meta}) end,
-        nil
+        &__MODULE__.forward_process_telemetry/4,
+        {self(), :done}
       )
 
       on_exit(fn -> :telemetry.detach(handler) end)
@@ -2062,7 +2061,7 @@ defmodule Alloy.Agent.TurnTest do
 
       assert result.status == :completed
       assert_received {:hook, :after_compaction}
-      assert_received {:done, %{turn: 1}}
+      assert_received {:done, [:alloy, :compaction, :done], _measurements, %{turn: 1}}
     end
 
     test "a halt in :on_context_overflow keeps the provider error" do
@@ -2084,13 +2083,12 @@ defmodule Alloy.Agent.TurnTest do
 
     test "an overflow nothing can shrink runs :on_error and reports retry: false" do
       handler = "overflow-event-#{inspect(make_ref())}"
-      test_pid = self()
 
       :telemetry.attach(
         handler,
         [:alloy, :turn, :prompt_too_long_recovery],
-        fn _event, _measurements, meta, _ -> send(test_pid, {:overflow, meta}) end,
-        nil
+        &__MODULE__.forward_process_telemetry/4,
+        {self(), :overflow}
       )
 
       on_exit(fn -> :telemetry.detach(handler) end)
@@ -2111,7 +2109,9 @@ defmodule Alloy.Agent.TurnTest do
 
       assert result.status == :error
       assert_received {:hook, :on_error}
-      assert_received {:overflow, %{turn: 1, retry: false}}
+
+      assert_received {:overflow, [:alloy, :turn, :prompt_too_long_recovery], _measurements,
+                       %{turn: 1, retry: false}}
     end
   end
 
@@ -2611,16 +2611,13 @@ defmodule Alloy.Agent.TurnTest do
     end
 
     test "emits matching turn metadata for compaction cleared and done events" do
-      test_pid = self()
       handler_id = "compaction-turn-consistency-#{inspect(make_ref())}"
 
       :telemetry.attach_many(
         handler_id,
         [[:alloy, :compaction, :cleared], [:alloy, :compaction, :done]],
-        fn event, _measurements, metadata, _config ->
-          send(test_pid, {:compaction_event, event, metadata.turn})
-        end,
-        nil
+        &__MODULE__.forward_process_telemetry/4,
+        {self(), :compaction_event}
       )
 
       {:ok, pid} =
@@ -2665,8 +2662,12 @@ defmodule Alloy.Agent.TurnTest do
         state = State.init(config, messages)
         _result = Turn.run_loop(state)
 
-        assert_received {:compaction_event, [:alloy, :compaction, :cleared], cleared_turn}
-        assert_received {:compaction_event, [:alloy, :compaction, :done], done_turn}
+        assert_received {:compaction_event, [:alloy, :compaction, :cleared], _measurements,
+                         %{turn: cleared_turn}}
+
+        assert_received {:compaction_event, [:alloy, :compaction, :done], _measurements,
+                         %{turn: done_turn}}
+
         assert cleared_turn == done_turn
       after
         :telemetry.detach(handler_id)
@@ -3000,6 +3001,14 @@ defmodule Alloy.Agent.TurnTest do
   end
 
   def forward_loop_event(_event, _measurements, _metadata, _test_pid), do: :ok
+
+  @doc false
+  def forward_process_telemetry(event, measurements, metadata, {test_pid, tag})
+      when test_pid == self() do
+    send(test_pid, {tag, event, measurements, metadata})
+  end
+
+  def forward_process_telemetry(_event, _measurements, _metadata, _config), do: :ok
 
   defp collect_loop_telemetry do
     receive do

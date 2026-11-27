@@ -351,16 +351,13 @@ defmodule Alloy.Context.CompactorTest do
     end
 
     test "leaves tool results cleared by an earlier compaction untouched" do
-      test_pid = self()
       handler_id = "compaction-recleared-#{inspect(make_ref())}"
 
       :telemetry.attach(
         handler_id,
         [:alloy, :compaction, :cleared],
-        fn _event, measurements, _metadata, _config ->
-          send(test_pid, {:cleared, measurements})
-        end,
-        nil
+        &__MODULE__.forward_cleared_event/4,
+        self()
       )
 
       [first_call, first_result | rest] = bulky_tool_messages(5, 400)
@@ -391,7 +388,7 @@ defmodule Alloy.Context.CompactorTest do
                  "[tool result cleared: 9000 bytes]"
 
         assert tool_result_content(compacted.messages, "t2") == "[tool result cleared: 400 bytes]"
-        assert_received {:cleared, %{results_cleared: 1, bytes_cleared: 400}}
+        assert_received {:cleared, %{results_cleared: 1, bytes_cleared: 400}, _metadata}
       after
         :telemetry.detach(handler_id)
       end
@@ -420,16 +417,13 @@ defmodule Alloy.Context.CompactorTest do
     end
 
     test "emits telemetry when tool results are cleared" do
-      test_pid = self()
       handler_id = "compaction-cleared-#{inspect(make_ref())}"
 
       :telemetry.attach(
         handler_id,
         [:alloy, :compaction, :cleared],
-        fn _event, measurements, metadata, _config ->
-          send(test_pid, {:cleared, measurements, metadata})
-        end,
-        nil
+        &__MODULE__.forward_cleared_event/4,
+        self()
       )
 
       messages =
@@ -1787,4 +1781,11 @@ defmodule Alloy.Context.CompactorTest do
       assert cfg_tighter[:alloy_request_deadline] == tighter_opt
     end
   end
+
+  @doc false
+  def forward_cleared_event(_event, measurements, metadata, test_pid) when test_pid == self() do
+    send(test_pid, {:cleared, measurements, metadata})
+  end
+
+  def forward_cleared_event(_event, _measurements, _metadata, _test_pid), do: :ok
 end
