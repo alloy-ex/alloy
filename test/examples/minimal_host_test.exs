@@ -23,6 +23,14 @@ defmodule MinimalHostTest do
       state
     end
 
+    def call(:after_tool_call, state) do
+      if pid = state.config.context[:after_tool_call_pid] do
+        send(pid, {:after_tool_call, state.config.context.current_tool_call.id})
+      end
+
+      state
+    end
+
     def call(_hook, state), do: state
   end
 
@@ -355,8 +363,23 @@ defmodule MinimalHostTest do
   test "honors cooperative :cancel_token during child calls and between dispatches" do
     parent = self()
 
-    # 1. Cancel during child tool execution (via state.config.cancel_token)
+    # 1. Cancel during child tool execution (via state.config.cancel_token) finalizes
+    #    :after_tool_call, matching :tool_end, and stop telemetry before returning :cancelled
     outer_token = Cancel.new()
+    handler_id = "code-mode-cancel-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:alloy, :tool, :stop],
+      fn _event, _meas, meta, _cfg ->
+        if meta[:parent_call_id] == "script-cancel-1" do
+          send(parent, {:tool_stop_telemetry, meta.tool_id, meta.error})
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     slow =
       tool("slow", fn _input, _context ->
@@ -368,6 +391,8 @@ defmodule MinimalHostTest do
       Config.from_opts(
         provider: {Alloy.Provider.Test, %{}},
         tools: [slow],
+        middleware: [Policy],
+        context: %{test_pid: parent, after_tool_call_pid: parent},
         cancel_token: outer_token
       )
       |> State.init()
@@ -380,7 +405,10 @@ defmodule MinimalHostTest do
             :should_not_succeed
           end,
           state_with_cancel,
-          opts()
+          Keyword.merge(opts(),
+            parent_call_id: "script-cancel-1",
+            on_event: &send(parent, {:cancel_ev, &1})
+          )
         )
       end)
 
@@ -390,6 +418,12 @@ defmodule MinimalHostTest do
 
     assert {:error, :cancelled} = Task.await(task, 2_000)
     assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
+    assert_receive {:cancel_ev, {:tool_start, %{id: "script-cancel-1-1"}}}, 1_000
+    assert_receive {:cancel_ev, {:tool_end, %{id: "script-cancel-1-1", error: err}}}, 1_000
+    assert err =~ "was cancelled"
+    assert_receive {:after_tool_call, "script-cancel-1-1"}, 1_000
+    assert_receive {:tool_stop_telemetry, "script-cancel-1-1", stop_err}, 1_000
+    assert stop_err =~ "was cancelled"
 
     # 2. Cancel via opts[:cancel_token] while program sleeps between dispatches
     inner_token = Cancel.new()

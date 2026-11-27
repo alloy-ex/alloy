@@ -15,6 +15,7 @@ defmodule MinimalHost.CodeMode do
   alias Alloy.Tool.Executor
 
   @cancel_poll_ms 25
+  @teardown_grace_ms 1_500
 
   @spec run((function() -> term()), State.t(), keyword()) :: {:ok, term()} | {:error, term()}
   def run(program, %State{} = state, opts) when is_function(program, 1) do
@@ -50,25 +51,26 @@ defmodule MinimalHost.CodeMode do
         {:error, :timeout}
 
       true ->
+        in_dispatch = :atomics.new(1, signed: false)
+
         run_opts =
           opts
           |> Keyword.put(:run_deadline, deadline)
           |> Keyword.put(:cancel_token, cancel_token)
+          |> Keyword.put(:in_dispatch_ref, in_dispatch)
 
         task = Task.async(fn -> run_program(program, state, run_opts) end)
-        await_task(task, deadline, cancel_token)
+        await_task(task, deadline, cancel_token, in_dispatch)
     end
   end
 
-  defp await_task(task, deadline, cancel_token) do
+  defp await_task(task, deadline, cancel_token, in_dispatch) do
     cond do
       Cancel.cancelled?(cancel_token) ->
-        _ = Task.shutdown(task, :brutal_kill)
-        {:error, :cancelled}
+        shutdown_with_grace(task, in_dispatch, :cancelled)
 
       System.monotonic_time(:millisecond) >= deadline ->
-        _ = Task.shutdown(task, :brutal_kill)
-        {:error, :timeout}
+        shutdown_with_grace(task, in_dispatch, :timeout)
 
       true ->
         remaining = max(deadline - System.monotonic_time(:millisecond), 0)
@@ -82,8 +84,35 @@ defmodule MinimalHost.CodeMode do
             {:error, {:exit, reason}}
 
           nil ->
-            await_task(task, deadline, cancel_token)
+            await_task(task, deadline, cancel_token, in_dispatch)
         end
+    end
+  end
+
+  # When cancellation or deadline expiry arrives during an active Executor
+  # dispatch, give the interpreter task a bounded grace window so Executor can
+  # finish worker teardown, :after_tool_call, :tool_end, and stop telemetry
+  # before throwing :cancelled/:timeout. Outside dispatch (or if unresponsive),
+  # terminate immediately.
+  defp shutdown_with_grace(task, in_dispatch, reason) do
+    if :atomics.get(in_dispatch, 1) == 1 do
+      case Task.yield(task, @teardown_grace_ms) do
+        {:ok, {:error, terminal}} when terminal in [:cancelled, :timeout] ->
+          {:error, terminal}
+
+        {:ok, _other} ->
+          {:error, reason}
+
+        {:exit, _exit_reason} ->
+          {:error, reason}
+
+        nil ->
+          _ = Task.shutdown(task, :brutal_kill)
+          {:error, reason}
+      end
+    else
+      _ = Task.shutdown(task, :brutal_kill)
+      {:error, reason}
     end
   end
 
@@ -124,6 +153,7 @@ defmodule MinimalHost.CodeMode do
   defp dispatch(calls, key, opts) when is_list(calls) do
     deadline = Keyword.fetch!(opts, :run_deadline)
     cancel_token = Keyword.get(opts, :cancel_token)
+    in_dispatch = Keyword.fetch!(opts, :in_dispatch_ref)
     check_interpreter_limits!(deadline, cancel_token)
 
     {state, used} = Process.get(key)
@@ -156,20 +186,26 @@ defmodule MinimalHost.CodeMode do
       on_event: Keyword.get(opts, :on_event)
     ]
 
-    with %State{} = ready <- Middleware.run(:after_tool_request, requested),
-         :ok <- check_interpreter_limits!(deadline, cancel_token),
-         {:ok, results, metadata} <- run_child_calls(calls, ready, executor_opts),
-         :ok <- check_interpreter_limits!(deadline, cancel_token),
-         %State{} = finished <-
-           ready
-           |> State.append_messages(results)
-           |> State.append_tool_calls(metadata)
-           |> then(&Middleware.run(:after_tool_execution, &1)) do
-      check_interpreter_limits!(deadline, cancel_token)
-      Process.put(key, {finished, total})
-      %{results: results.content, metadata: metadata}
-    else
-      {:halted, reason} -> throw({:halted, reason})
+    :atomics.put(in_dispatch, 1, 1)
+
+    try do
+      with %State{} = ready <- Middleware.run(:after_tool_request, requested),
+           :ok <- check_interpreter_limits!(deadline, cancel_token),
+           {:ok, results, metadata} <- run_child_calls(calls, ready, executor_opts),
+           :ok <- check_interpreter_limits!(deadline, cancel_token),
+           %State{} = finished <-
+             ready
+             |> State.append_messages(results)
+             |> State.append_tool_calls(metadata)
+             |> then(&Middleware.run(:after_tool_execution, &1)) do
+        check_interpreter_limits!(deadline, cancel_token)
+        Process.put(key, {finished, total})
+        %{results: results.content, metadata: metadata}
+      else
+        {:halted, reason} -> throw({:halted, reason})
+      end
+    after
+      :atomics.put(in_dispatch, 1, 0)
     end
   end
 

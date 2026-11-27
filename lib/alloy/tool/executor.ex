@@ -64,8 +64,11 @@ defmodule Alloy.Tool.Executor do
     events, tool telemetry metadata, and returned tool-call metadata
   - `:on_event` — `(event -> any())` or `nil`, invoked in the caller process
     with raw `{:tool_start | :tool_update | :tool_end, map()}` tuples (not
-    wrapped in `Alloy.Events` v1 envelopes and not rescued; pass
-    `&Alloy.Events.emit(event_opts, turn, &1)` to emit v1 envelopes)
+    wrapped in `Alloy.Events` v1 envelopes and not rescued; to emit v1
+    envelopes inside an existing host stream, pass
+    `on_event: &Alloy.Events.emit(event_opts, turn, &1)` together with
+    `:event_seq_ref`, `:event_correlation_id`, and `:event_turn` from
+    `Alloy.Events.normalize_opts/2`)
   - `:event_subscriber?` — boolean or `nil` enabling `:tool_update` streaming
     (defaults to `is_function(opts[:on_event], 1)`)
   - `:event_seq_ref`, `:event_correlation_id`, `:event_turn` — event envelope

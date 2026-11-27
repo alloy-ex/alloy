@@ -54,14 +54,20 @@ Composite tools and custom hosts that don't need batching can call
 
 ```elixir
 # `on_event` on Executor receives raw `{:tool_start | :tool_update | :tool_end, map()}`
-# tuples directly (not rescued). Pass `&Alloy.Events.emit(event_opts, turn, &1)` to
-# wrap them into v1 `Alloy.Events` envelopes with exception rescue.
+# tuples directly (not rescued). To publish v1 `Alloy.Events` envelopes in the same
+# sequence and correlation stream as the surrounding host run, forward
+# `:event_seq_ref`, `:event_correlation_id`, and `:event_turn` alongside `Events.emit/3`:
+event_opts = Alloy.Events.normalize_opts(state, on_event: host_on_event)
+
 {:ok, result_block, meta} =
   Alloy.Tool.Executor.run_tool(
     %{id: "outer-1-sub-1", name: "read", input: %{"file_path" => "README.md"}},
     state,
     parent_call_id: "outer-1",
-    on_event: on_event
+    on_event: &Alloy.Events.emit(event_opts, state.turn, &1),
+    event_seq_ref: event_opts[:event_seq_ref],
+    event_correlation_id: event_opts[:event_correlation_id],
+    event_turn: state.turn
   )
 ```
 

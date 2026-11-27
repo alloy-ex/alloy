@@ -270,6 +270,58 @@ defmodule Alloy.Tool.RunToolTest do
       assert_receive {:telemetry, [:alloy, :tool, :start], %{parent_call_id: "parent_99"}}
       assert_receive {:telemetry, [:alloy, :tool, :stop], %{parent_call_id: "parent_99"}}
     end
+
+    test "shares monotonic seq, correlation_id, and turn across surrounding host v1 envelopes" do
+      caller = self()
+      echo = inline_tool("echo", fn %{"value" => val}, _ctx -> {:ok, val} end)
+      state = %{init_state([echo]) | turn: 3}
+
+      event_opts =
+        Events.normalize_opts(state,
+          on_event: fn envelope -> send(caller, {:host_env, envelope}) end
+        )
+
+      Events.emit(event_opts, 3, {:turn_start, %{turn: 3}})
+
+      assert {:ok, _block, _meta} =
+               Executor.run_tool(
+                 %{id: "nested_1", name: "echo", input: %{"value" => "hi"}},
+                 state,
+                 parent_call_id: "outer_3",
+                 on_event: &Events.emit(event_opts, 3, &1),
+                 event_seq_ref: event_opts[:event_seq_ref],
+                 event_correlation_id: event_opts[:event_correlation_id],
+                 event_turn: 3
+               )
+
+      Events.emit(
+        event_opts,
+        3,
+        {:turn_end, %{turn: 3, status: :completed, stop_reason: :end_turn}}
+      )
+
+      assert_receive {:host_env, %{event: :turn_start, seq: 1, correlation_id: corr, turn: 3}}
+
+      assert_receive {:host_env,
+                      %{
+                        event: :tool_start,
+                        seq: 2,
+                        correlation_id: ^corr,
+                        turn: 3,
+                        payload: %{id: "nested_1", parent_call_id: "outer_3"}
+                      }}
+
+      assert_receive {:host_env,
+                      %{
+                        event: :tool_end,
+                        seq: 3,
+                        correlation_id: ^corr,
+                        turn: 3,
+                        payload: %{id: "nested_1", parent_call_id: "outer_3"}
+                      }}
+
+      assert_receive {:host_env, %{event: :turn_end, seq: 4, correlation_id: ^corr, turn: 3}}
+    end
   end
 
   describe "run_tool/3 deadlines, timeouts, and cancellation" do
