@@ -1,3 +1,0 @@
-microseconds median/mean: {"resolve", 880, 893.715}
-microseconds median/mean: {"validate", 0, 0.173}
-microseconds median/mean: {"json", 1, 1.255}

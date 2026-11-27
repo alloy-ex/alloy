@@ -40,5 +40,5 @@ task families; confirmation followed development and is not another blind holdou
 ## References
 
 - [Google FunctionDeclaration and FunctionResponse](https://ai.google.dev/api/generate-content)
-- [Live benchmark protocol](../../benchmarks/pi-agent/live/README.md)
-- [Controlled ablation](../../benchmarks/pi-agent/live/ablation-results/runs.json)
+- [Live benchmark protocol](https://github.com/alloy-ex/alloy/blob/v0.16.0/benchmarks/pi-agent/live/README.md)
+- [Controlled ablation](https://github.com/alloy-ex/alloy/blob/v0.16.0/benchmarks/pi-agent/live/ablation-results/runs.json)
