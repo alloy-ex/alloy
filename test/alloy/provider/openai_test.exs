@@ -7,7 +7,6 @@ defmodule Alloy.Provider.OpenAITest do
   alias Alloy.Message
   alias Alloy.Provider.Error
   alias Alloy.Provider.OpenAI
-  alias Alloy.Provider.OpenAI.JSONPrefix
   alias Alloy.Provider.OpenAI.Stream, as: ResponsesStream
 
   defmodule SwitchToOpenAIMiddleware do
@@ -1824,46 +1823,6 @@ defmodule Alloy.Provider.OpenAITest do
     end
   end
 
-  describe "OpenAI.JSONPrefix" do
-    test "reconciles objects, lists, literals, strings, escapes, and numbers" do
-      cases = [
-        {~s({"a": 1, "b":), %{"a" => 1, "b" => [true, false, nil]}},
-        {~s({"key": "hel), %{"key" => "hello\n\t\"\\/"}},
-        {~s({"ch": "\\), %{"ch" => "\b\f\r"}},
-        {~s({"emoji": "\\uD83D\\uDE), %{"emoji" => "😀"}},
-        {~s({"u": "\\u00), %{"u" => "A"}},
-        {~s({"items": [1, ), %{"items" => [1, 2, 3]}},
-        {~s({"items": [), %{"items" => []}},
-        {~s({"flag": tr), %{"flag" => true}},
-        {~s({"none": nu), %{"none" => nil}},
-        {~s({"neg": -), %{"neg" => -42}},
-        {~s({"zero": -), %{"zero" => 0}},
-        {~s({"exp": 1e), %{"exp" => 100}},
-        {~s({"small": 1e-0), %{"small" => 0.001}},
-        {~s({"tiny": 1e-), %{"tiny" => 0.0}},
-        {~s({"round": 0.29), %{"round" => 0.3}},
-        {~s({"partial_k), %{"partial_key" => "v", "other" => 1}}
-      ]
-
-      for {prefix, expected} <- cases do
-        assert {:ok, suffix, combined} = JSONPrefix.reconcile(prefix, expected)
-        assert combined == prefix <> suffix
-        assert Jason.decode!(combined) == expected
-      end
-    end
-
-    test "returns :conflict and :error for mismatched or invalid JSON prefixes" do
-      assert :conflict = JSONPrefix.reconcile(~s({"a": 2}), %{"a" => 1})
-      assert :conflict = JSONPrefix.reconcile(~s({"a": 1, }), %{"a" => 1})
-      assert :conflict = JSONPrefix.reconcile(~s([1, 2, ), [1, 2])
-      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\x"}), %{"s" => "x"})
-      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\uDC00"}), %{"s" => "x"})
-      assert :conflict = JSONPrefix.reconcile(~s({"n": -), %{"n" => 5})
-      assert :conflict = JSONPrefix.reconcile(~s({"b": tr), %{"b" => false})
-      assert :error = JSONPrefix.complete(%{"a" => 1}, ~s({"a": 1} trailing))
-    end
-  end
-
   describe "OpenAI.Stream direct unit coverage" do
     test "emits reasoning deltas and reconciles streamed function call deltas" do
       test_pid = self()
@@ -1882,7 +1841,7 @@ defmodule Alloy.Provider.OpenAITest do
         sse_response_event("response.function_call_arguments.delta", %{
           "item_id" => "fc_1",
           "output_index" => 0,
-          "delta" => ~s({"path": )
+          "delta" => ~s({"path":)
         }),
         sse_response_completed([
           function_call_item("call_1", "read", ~s({"path":"mix.exs"}))
@@ -1914,7 +1873,7 @@ defmodule Alloy.Provider.OpenAITest do
       assert_received {:ev,
                        {:tool_call_delta, %{id: "call_1", name: "read", arguments_delta: ""}}}
 
-      assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s({"path": )}}}
+      assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s({"path":)}}}
       assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s("mix.exs"})}}}
     end
   end

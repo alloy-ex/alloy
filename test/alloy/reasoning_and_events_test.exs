@@ -623,10 +623,10 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       sse =
         [
-          sse_ant("message_start", %{
+          sse_event("message_start", %{
             "message" => %{"usage" => %{"input_tokens" => 5, "output_tokens" => 0}}
           }),
-          sse_ant("content_block_start", %{
+          sse_event("content_block_start", %{
             "index" => 0,
             "content_block" => %{
               "type" => "server_tool_use",
@@ -635,12 +635,12 @@ defmodule Alloy.ReasoningAndEventsTest do
               "input" => %{}
             }
           }),
-          sse_ant("content_block_delta", %{
+          sse_event("content_block_delta", %{
             "index" => 0,
             "delta" => %{"type" => "input_json_delta", "partial_json" => ~s({"q":"x"})}
           }),
-          sse_ant("content_block_stop", %{"index" => 0}),
-          sse_ant("content_block_start", %{
+          sse_event("content_block_stop", %{"index" => 0}),
+          sse_event("content_block_start", %{
             "index" => 1,
             "content_block" => %{
               "type" => "tool_use",
@@ -649,20 +649,20 @@ defmodule Alloy.ReasoningAndEventsTest do
               "input" => %{}
             }
           }),
-          sse_ant("content_block_delta", %{
+          sse_event("content_block_delta", %{
             "index" => 1,
             "delta" => %{"type" => "input_json_delta", "partial_json" => ~s({"path":)}
           }),
-          sse_ant("content_block_delta", %{
+          sse_event("content_block_delta", %{
             "index" => 1,
             "delta" => %{"type" => "input_json_delta", "partial_json" => ~s("a.ex"})}
           }),
-          sse_ant("content_block_stop", %{"index" => 1}),
-          sse_ant("message_delta", %{
+          sse_event("content_block_stop", %{"index" => 1}),
+          sse_event("message_delta", %{
             "delta" => %{"stop_reason" => "tool_use"},
             "usage" => %{"output_tokens" => 10}
           }),
-          sse_ant("message_stop", %{})
+          sse_event("message_stop", %{})
         ]
         |> Enum.join()
 
@@ -701,15 +701,15 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       sse =
         [
-          sse_oai("response.reasoning_summary_text.delta", %{
+          sse_event("response.reasoning_summary_text.delta", %{
             "type" => "response.reasoning_summary_text.delta",
             "delta" => "Thinking "
           }),
-          sse_oai("response.reasoning_text.delta", %{
+          sse_event("response.reasoning_text.delta", %{
             "type" => "response.reasoning_text.delta",
             "delta" => "deeply."
           }),
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => 1,
             "item" => %{
@@ -720,13 +720,13 @@ defmodule Alloy.ReasoningAndEventsTest do
               "arguments" => ""
             }
           }),
-          sse_oai("response.function_call_arguments.delta", %{
+          sse_event("response.function_call_arguments.delta", %{
             "type" => "response.function_call_arguments.delta",
             "item_id" => "fc_1",
             "output_index" => 1,
             "delta" => ~s({"text":"hi"})
           }),
-          sse_oai("response.completed", %{
+          sse_event("response.completed", %{
             "type" => "response.completed",
             "response" => %{
               "id" => "resp_1",
@@ -1455,7 +1455,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         sse =
           if n == 1 do
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -1466,7 +1466,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => ""
               }
             }) <>
-              sse_oai("response.failed", %{
+              sse_event("response.failed", %{
                 "type" => "response.failed",
                 "response" => %{
                   "status" => "failed",
@@ -1474,11 +1474,11 @@ defmodule Alloy.ReasoningAndEventsTest do
                 }
               })
           else
-            sse_oai("response.output_text.delta", %{
+            sse_event("response.output_text.delta", %{
               "type" => "response.output_text.delta",
               "delta" => "recovered"
             }) <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_ok",
@@ -1520,7 +1520,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         sse =
           if n == 1 do
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => -2,
               "item" => %{
@@ -1529,7 +1529,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "name" => []
               }
             }) <>
-              sse_oai("response.failed", %{
+              sse_event("response.failed", %{
                 "type" => "response.failed",
                 "response" => %{
                   "status" => "failed",
@@ -1537,7 +1537,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 }
               })
           else
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_ok2",
@@ -1651,17 +1651,17 @@ defmodule Alloy.ReasoningAndEventsTest do
       #    must succeed (with or without :on_event) without emitting invalid :tool_call_delta.
       quirky_oai_plug =
         sse_plug(
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => -1,
             "item" => %{"id" => %{}, "type" => "function_call", "name" => ""}
           }) <>
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "output_index" => -1,
               "delta" => "{}"
             }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_quirky",
@@ -2007,7 +2007,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         sse =
           if n == 1 do
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -2017,13 +2017,13 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "name" => ""
               }
             }) <>
-              sse_oai("response.function_call_arguments.delta", %{
+              sse_event("response.function_call_arguments.delta", %{
                 "type" => "response.function_call_arguments.delta",
                 "output_index" => 0,
                 "item_id" => "fc_bad",
                 "delta" => "{\"text\":\"hi\"}"
               }) <>
-              sse_oai("response.failed", %{
+              sse_event("response.failed", %{
                 "type" => "response.failed",
                 "response" => %{
                   "status" => "failed",
@@ -2031,7 +2031,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 }
               })
           else
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_ok3",
@@ -2070,13 +2070,13 @@ defmodule Alloy.ReasoningAndEventsTest do
       #    response.completed with call_id "call_1" must correlate using "call_1" (never "fc_1").
       headerless_plug =
         sse_plug(
-          sse_oai("response.function_call_arguments.delta", %{
+          sse_event("response.function_call_arguments.delta", %{
             "type" => "response.function_call_arguments.delta",
             "output_index" => 0,
             "item_id" => "fc_1",
             "delta" => "{\"text\":\"hello\"}"
           }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_hl",
@@ -2127,7 +2127,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         sse =
           if n == 1 do
-            sse_ant("message_start", %{
+            sse_event("message_start", %{
               "type" => "message_start",
               "message" => %{
                 "id" => "m1",
@@ -2135,7 +2135,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "usage" => %{"input_tokens" => 1}
               }
             }) <>
-              sse_ant("content_block_start", %{
+              sse_event("content_block_start", %{
                 "type" => "content_block_start",
                 "index" => 0,
                 "content_block" => %{
@@ -2145,17 +2145,17 @@ defmodule Alloy.ReasoningAndEventsTest do
                   "input" => %{}
                 }
               }) <>
-              sse_ant("content_block_delta", %{
+              sse_event("content_block_delta", %{
                 "type" => "content_block_delta",
                 "index" => 0,
                 "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"text\":\"x\"}"}
               }) <>
-              sse_ant("error", %{
+              sse_event("error", %{
                 "type" => "error",
                 "error" => %{"type" => "overloaded_error", "message" => "busy"}
               })
           else
-            sse_ant("message_start", %{
+            sse_event("message_start", %{
               "type" => "message_start",
               "message" => %{
                 "id" => "m2",
@@ -2163,23 +2163,23 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "usage" => %{"input_tokens" => 1}
               }
             }) <>
-              sse_ant("content_block_start", %{
+              sse_event("content_block_start", %{
                 "type" => "content_block_start",
                 "index" => 0,
                 "content_block" => %{"type" => "text", "text" => ""}
               }) <>
-              sse_ant("content_block_delta", %{
+              sse_event("content_block_delta", %{
                 "type" => "content_block_delta",
                 "index" => 0,
                 "delta" => %{"type" => "text_delta", "text" => "recovered"}
               }) <>
-              sse_ant("content_block_stop", %{"type" => "content_block_stop", "index" => 0}) <>
-              sse_ant("message_delta", %{
+              sse_event("content_block_stop", %{"type" => "content_block_stop", "index" => 0}) <>
+              sse_event("message_delta", %{
                 "type" => "message_delta",
                 "delta" => %{"stop_reason" => "end_turn"},
                 "usage" => %{"output_tokens" => 1}
               }) <>
-              sse_ant("message_stop", %{"type" => "message_stop"})
+              sse_event("message_stop", %{"type" => "message_stop"})
           end
 
         conn
@@ -2299,11 +2299,11 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       ok_oai_plug =
         sse_plug(
-          sse_oai("response.output_text.delta", %{
+          sse_event("response.output_text.delta", %{
             "type" => "response.output_text.delta",
             "delta" => "hello"
           }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_tel",
@@ -2336,22 +2336,22 @@ defmodule Alloy.ReasoningAndEventsTest do
       #    resolves call_id (never emitting item_id "fc_1"), and retries if response.failed arrives first.
       late_id_plug =
         sse_plug(
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => 0,
             "item" => %{"id" => "fc_1", "type" => "function_call", "name" => "echo"}
           }) <>
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "output_index" => 0,
               "delta" => "{\"x\":"
             }) <>
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "item_id" => "fc_1",
               "delta" => "1}"
             }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_late",
@@ -2402,17 +2402,17 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         sse =
           if n == 1 do
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{"id" => "fc_retry", "type" => "function_call", "name" => "echo"}
             }) <>
-              sse_oai("response.function_call_arguments.delta", %{
+              sse_event("response.function_call_arguments.delta", %{
                 "type" => "response.function_call_arguments.delta",
                 "item_id" => "fc_retry",
                 "delta" => "{\"x\":1}"
               }) <>
-              sse_oai("response.failed", %{
+              sse_event("response.failed", %{
                 "type" => "response.failed",
                 "response" => %{
                   "status" => "failed",
@@ -2420,7 +2420,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 }
               })
           else
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_ok_late",
@@ -2580,7 +2580,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       #    still delivers full arguments via :tool_call_delta.
       whole_item_plug =
         sse_plug(
-          sse_oai("response.output_item.done", %{
+          sse_event("response.output_item.done", %{
             "type" => "response.output_item.done",
             "output_index" => 0,
             "item" => %{
@@ -2591,7 +2591,7 @@ defmodule Alloy.ReasoningAndEventsTest do
               "arguments" => "{\"text\":\"whole\"}"
             }
           }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_xai",
@@ -2637,7 +2637,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       # 2. Rejected interim header stays sticky and is NOT revived by later output_item.done.
       sticky_rej_plug =
         sse_plug(
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => 0,
             "item" => %{
@@ -2647,7 +2647,7 @@ defmodule Alloy.ReasoningAndEventsTest do
               "name" => ""
             }
           }) <>
-            sse_oai("response.output_item.done", %{
+            sse_event("response.output_item.done", %{
               "type" => "response.output_item.done",
               "output_index" => 0,
               "item" => %{
@@ -2658,7 +2658,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => "{\"text\":\"ok\"}"
               }
             }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_stick",
@@ -2708,11 +2708,11 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       text_plug =
         sse_plug(
-          sse_oai("response.output_text.delta", %{
+          sse_event("response.output_text.delta", %{
             "type" => "response.output_text.delta",
             "delta" => "hello"
           }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_ptel",
@@ -2780,7 +2780,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       #    duplicate arguments when output_item.done / response.completed arrives.
       idx_only_plug =
         sse_plug(
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => 0,
             "item" => %{
@@ -2790,12 +2790,12 @@ defmodule Alloy.ReasoningAndEventsTest do
               "name" => "echo"
             }
           }) <>
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "output_index" => 0,
               "delta" => "{\"x\":1}"
             }) <>
-            sse_oai("response.output_item.done", %{
+            sse_event("response.output_item.done", %{
               "type" => "response.output_item.done",
               "output_index" => 0,
               "item" => %{
@@ -2806,7 +2806,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => "{\"x\":1}"
               }
             }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_idx",
@@ -2893,7 +2893,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         sse =
           if n == 1 do
-            sse_oai("response.output_item.done", %{
+            sse_event("response.output_item.done", %{
               "type" => "response.output_item.done",
               "output_index" => 0,
               "item" => %{
@@ -2904,7 +2904,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => "{bad"
               }
             }) <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_bad_term",
@@ -2922,7 +2922,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 }
               })
           else
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_ok_term",
@@ -3001,7 +3001,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
           sse =
             if n == 1 do
-              sse_oai("response.output_item.done", %{
+              sse_event("response.output_item.done", %{
                 "type" => "response.output_item.done",
                 "output_index" => 0,
                 "item" => %{
@@ -3012,7 +3012,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                   "arguments" => bad_args
                 }
               }) <>
-                sse_oai("response.completed", %{
+                sse_event("response.completed", %{
                   "type" => "response.completed",
                   "response" => %{
                     "id" => "resp_bt",
@@ -3030,7 +3030,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                   }
                 })
             else
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_bt_ok",
@@ -3069,7 +3069,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       # Also verify fallback eligibility when primary returns malformed non-string arguments with max_retries: 0.
       fb_bad_plug =
         sse_plug(
-          sse_oai("response.output_item.done", %{
+          sse_event("response.output_item.done", %{
             "type" => "response.output_item.done",
             "output_index" => 0,
             "item" => %{
@@ -3080,7 +3080,7 @@ defmodule Alloy.ReasoningAndEventsTest do
               "arguments" => nil
             }
           }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_fb_bad",
@@ -3126,7 +3126,7 @@ defmodule Alloy.ReasoningAndEventsTest do
         done_chunk =
           if include_done?,
             do:
-              sse_oai("response.output_item.done", %{
+              sse_event("response.output_item.done", %{
                 "type" => "response.output_item.done",
                 "output_index" => 0,
                 "item" => item
@@ -3136,7 +3136,7 @@ defmodule Alloy.ReasoningAndEventsTest do
         map_args_plug =
           sse_plug(
             done_chunk <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_map",
@@ -3206,7 +3206,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
           sse =
             if n == 1 do
-              sse_oai("response.output_item.added", %{
+              sse_event("response.output_item.added", %{
                 "type" => "response.output_item.added",
                 "output_index" => 0,
                 "item" => %{
@@ -3217,7 +3217,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                   "arguments" => bad_args
                 }
               }) <>
-                sse_oai("response.failed", %{
+                sse_event("response.failed", %{
                   "type" => "response.failed",
                   "response" => %{
                     "status" => "failed",
@@ -3225,7 +3225,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                   }
                 })
             else
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_add_ok",
@@ -3391,7 +3391,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         sse =
           if n == 1 do
-            sse_ant("message_start", %{
+            sse_event("message_start", %{
               "type" => "message_start",
               "message" => %{
                 "id" => "m_neg",
@@ -3399,7 +3399,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "usage" => %{"input_tokens" => 1}
               }
             }) <>
-              sse_ant("content_block_start", %{
+              sse_event("content_block_start", %{
                 "type" => "content_block_start",
                 "index" => -1,
                 "content_block" => %{
@@ -3409,12 +3409,12 @@ defmodule Alloy.ReasoningAndEventsTest do
                   "input" => %{}
                 }
               }) <>
-              sse_ant("error", %{
+              sse_event("error", %{
                 "type" => "error",
                 "error" => %{"type" => "overloaded_error", "message" => "busy"}
               })
           else
-            sse_ant("message_start", %{
+            sse_event("message_start", %{
               "type" => "message_start",
               "message" => %{
                 "id" => "m_neg2",
@@ -3422,23 +3422,23 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "usage" => %{"input_tokens" => 1}
               }
             }) <>
-              sse_ant("content_block_start", %{
+              sse_event("content_block_start", %{
                 "type" => "content_block_start",
                 "index" => 0,
                 "content_block" => %{"type" => "text", "text" => ""}
               }) <>
-              sse_ant("content_block_delta", %{
+              sse_event("content_block_delta", %{
                 "type" => "content_block_delta",
                 "index" => 0,
                 "delta" => %{"type" => "text_delta", "text" => "ant neg recovered"}
               }) <>
-              sse_ant("content_block_stop", %{"type" => "content_block_stop", "index" => 0}) <>
-              sse_ant("message_delta", %{
+              sse_event("content_block_stop", %{"type" => "content_block_stop", "index" => 0}) <>
+              sse_event("message_delta", %{
                 "type" => "message_delta",
                 "delta" => %{"stop_reason" => "end_turn"},
                 "usage" => %{"output_tokens" => 1}
               }) <>
-              sse_ant("message_stop", %{"type" => "message_stop"})
+              sse_event("message_stop", %{"type" => "message_stop"})
           end
 
         conn
@@ -3531,6 +3531,10 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert :atomics.get(compat_neg_attempts, 1) == 2
       refute Enum.any?(drain_tagged(:compat_neg_ev), &(&1.event == :tool_call_delta))
+    end
+
+    test "OpenAI Responses preserves output_item.added prefix, handles item_id changes, and reconciles equal complete JSON" do
+      parent = self()
 
       # 6. OpenAI/xAI: non-empty arguments prefix in output_item.added is preserved once and
       #    combines with subsequent deltas without duplication on .done/.completed (both with
@@ -3557,23 +3561,23 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         added_prefix_plug =
           sse_plug(
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => added_item
             }) <>
-              sse_oai("response.function_call_arguments.delta", %{
+              sse_event("response.function_call_arguments.delta", %{
                 "type" => "response.function_call_arguments.delta",
                 "output_index" => 0,
                 "item_id" => "fc_pref",
                 "delta" => "1}"
               }) <>
-              sse_oai("response.output_item.done", %{
+              sse_event("response.output_item.done", %{
                 "type" => "response.output_item.done",
                 "output_index" => 0,
                 "item" => done_item
               }) <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_added_pref",
@@ -3634,17 +3638,17 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         prefix_done_plug =
           sse_plug(
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => added_item
             }) <>
-              sse_oai("response.output_item.done", %{
+              sse_event("response.output_item.done", %{
                 "type" => "response.output_item.done",
                 "output_index" => 0,
                 "item" => done_item
               }) <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_pref_nodelta",
@@ -3685,7 +3689,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       #    deltas must be suppressed instead of mis-indexed across calls.
       omit_id_done_plug =
         sse_plug(
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => 0,
             "item" => %{
@@ -3696,7 +3700,7 @@ defmodule Alloy.ReasoningAndEventsTest do
               "arguments" => ""
             }
           }) <>
-            sse_oai("response.output_item.done", %{
+            sse_event("response.output_item.done", %{
               "type" => "response.output_item.done",
               "output_index" => 0,
               "item" => %{
@@ -3706,7 +3710,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => "{\"x\":1}"
               }
             }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_omit_id",
@@ -3751,7 +3755,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       # Contradictory item_id / output_index delta across two calls must be suppressed.
       conflict_idx_plug =
         sse_plug(
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => 0,
             "item" => %{
@@ -3762,7 +3766,7 @@ defmodule Alloy.ReasoningAndEventsTest do
               "arguments" => ""
             }
           }) <>
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 1,
               "item" => %{
@@ -3773,25 +3777,25 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => ""
               }
             }) <>
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "item_id" => "fc_0",
               "output_index" => 1,
               "delta" => "{\"wrong\":true}"
             }) <>
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "item_id" => "fc_0",
               "output_index" => 0,
               "delta" => "{\"ok\":0}"
             }) <>
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "item_id" => "fc_1",
               "output_index" => 1,
               "delta" => "{\"ok\":1}"
             }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_conflict",
@@ -3862,13 +3866,13 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         reconcile_plug =
           sse_plug(
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "item_id" => "fc_reconcile",
               "output_index" => 0,
               "delta" => buffered_prefix
             }) <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_reconcile",
@@ -3903,82 +3907,6 @@ defmodule Alloy.ReasoningAndEventsTest do
         assert Jason.decode!(Enum.map_join(rec_deltas, & &1.arguments_delta)) == %{"x" => 1}
       end
 
-      # 10. OpenAI/xAI: already-emitted header + whitespace-formatted prefix reconciles cleanly
-      #     against both map-typed and compact-JSON authoritative arguments on .done and .completed.
-      for {include_done?, final_args} <- [
-            {false, %{"x" => 1}},
-            {true, %{"x" => 1}},
-            {false, "{\"x\":1}"},
-            {true, "{\"x\":1}"}
-          ] do
-        final_item = %{
-          "type" => "function_call",
-          "id" => "fc_ws_prefix",
-          "call_id" => "call_ws_prefix",
-          "name" => "echo",
-          "arguments" => final_args
-        }
-
-        done_chunk =
-          if include_done? do
-            sse_oai("response.output_item.done", %{
-              "type" => "response.output_item.done",
-              "output_index" => 0,
-              "item" => final_item
-            })
-          else
-            ""
-          end
-
-        ws_prefix_plug =
-          sse_plug(
-            sse_oai("response.output_item.added", %{
-              "type" => "response.output_item.added",
-              "output_index" => 0,
-              "item" => %{
-                "type" => "function_call",
-                "id" => "fc_ws_prefix",
-                "call_id" => "call_ws_prefix",
-                "name" => "echo",
-                "arguments" => "{\"x\": "
-              }
-            }) <>
-              done_chunk <>
-              sse_oai("response.completed", %{
-                "type" => "response.completed",
-                "response" => %{
-                  "id" => "resp_ws_prefix",
-                  "status" => "completed",
-                  "output" => [final_item],
-                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
-                }
-              })
-          )
-
-        {:ok, %{messages: [ws_msg]}} =
-          OpenAI.stream(
-            [Message.user("hi")],
-            [],
-            %{
-              api_key: "sk-oai",
-              model: "gpt-5.4",
-              req_options: [plug: ws_prefix_plug],
-              on_event: &send(parent, {:ws_ev, &1})
-            },
-            fn _ -> :ok end
-          )
-
-        assert [%{type: "tool_use", id: "call_ws_prefix", name: "echo", input: %{"x" => 1}}] =
-                 ws_msg.content
-
-        ws_deltas =
-          drain_tagged(:ws_ev)
-          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
-          |> Enum.map(fn {:tool_call_delta, p} -> p end)
-
-        assert Jason.decode!(Enum.map_join(ws_deltas, & &1.arguments_delta)) == %{"x" => 1}
-      end
-
       # 11. OpenAI/xAI: already-emitted complete JSON with extra whitespace reconciles as equal
       #     against map-typed completed arguments without emitting duplicate deltas.
       ws_complete_item = %{
@@ -3991,7 +3919,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       ws_complete_plug =
         sse_plug(
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => 0,
             "item" => %{
@@ -4002,7 +3930,7 @@ defmodule Alloy.ReasoningAndEventsTest do
               "arguments" => "{\"x\": 1}"
             }
           }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_ws_complete",
@@ -4035,6 +3963,10 @@ defmodule Alloy.ReasoningAndEventsTest do
         |> Enum.map(fn {:tool_call_delta, p} -> p end)
 
       assert Enum.map_join(wsc_deltas, & &1.arguments_delta) == "{\"x\": 1}"
+    end
+
+    test "OpenAI and OpenAICompat reject contradictory tool arguments and conflicting identities" do
+      parent = self()
 
       # 12. OpenAI/xAI: irreconcilable mismatch between already-emitted arguments and completed
       #     arguments fails with :malformed_reply instead of silently returning mismatched inputs
@@ -4055,7 +3987,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         delta_chunk =
           if is_binary(live_delta) do
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "item_id" => "fc_mismatch",
               "output_index" => 0,
@@ -4067,7 +3999,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         done_chunk =
           if include_done? do
-            sse_oai("response.output_item.done", %{
+            sse_event("response.output_item.done", %{
               "type" => "response.output_item.done",
               "output_index" => 0,
               "item" => mismatch_item
@@ -4078,7 +4010,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         mismatch_plug =
           sse_plug(
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -4091,7 +4023,7 @@ defmodule Alloy.ReasoningAndEventsTest do
             }) <>
               delta_chunk <>
               done_chunk <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_mismatch",
@@ -4150,7 +4082,7 @@ defmodule Alloy.ReasoningAndEventsTest do
           ] do
         id_conflict_plug =
           sse_plug(
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -4161,7 +4093,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => "{\"x\":1}"
               }
             }) <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_id_conflict",
@@ -4367,7 +4299,7 @@ defmodule Alloy.ReasoningAndEventsTest do
           ] do
         changed_id_plug =
           sse_plug(
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -4378,7 +4310,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => "{\"x\":1}"
               }
             }) <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_changed_item_id",
@@ -4409,6 +4341,10 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         assert Enum.map_join(cid_deltas, & &1.arguments_delta) == "{\"x\":1}"
       end
+    end
+
+    test "overflow recovery suppression, OwnedWorker pre-deadline, item_id rotation, and provider-level on_event" do
+      parent = self()
 
       # 16. Context-overflow recovery does NOT retry after streaming deltas (:tool_call_delta)
       #     have already been emitted to a subscriber, preventing duplicate/abandoned calls.
@@ -4430,7 +4366,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         sse =
           if attempt == 1 do
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -4441,7 +4377,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => "{\"x\":1}"
               }
             }) <>
-              sse_oai("response.failed", %{
+              sse_event("response.failed", %{
                 "type" => "response.failed",
                 "response" => %{
                   "id" => "resp_ov_1",
@@ -4453,7 +4389,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 }
               })
           else
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -4464,7 +4400,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => "{\"x\":2}"
               }
             }) <>
-              sse_oai("response.completed", %{
+              sse_event("response.completed", %{
                 "type" => "response.completed",
                 "response" => %{
                   "id" => "resp_ov_2",
@@ -4530,7 +4466,7 @@ defmodule Alloy.ReasoningAndEventsTest do
       #     matching args with no duplicate deltas, failing with :malformed_reply on conflict).
       alias_conflict_plug =
         sse_plug(
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => 0,
             "item" => %{
@@ -4541,7 +4477,7 @@ defmodule Alloy.ReasoningAndEventsTest do
               "arguments" => ""
             }
           }) <>
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -4552,13 +4488,13 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => ""
               }
             }) <>
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "item_id" => "fc_new",
               "output_index" => 0,
               "delta" => "{\"x\":1}"
             }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_alias_conflict",
@@ -4599,7 +4535,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       alias_match_plug =
         sse_plug(
-          sse_oai("response.output_item.added", %{
+          sse_event("response.output_item.added", %{
             "type" => "response.output_item.added",
             "output_index" => 0,
             "item" => %{
@@ -4610,7 +4546,7 @@ defmodule Alloy.ReasoningAndEventsTest do
               "arguments" => ""
             }
           }) <>
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -4621,13 +4557,13 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => ""
               }
             }) <>
-            sse_oai("response.function_call_arguments.delta", %{
+            sse_event("response.function_call_arguments.delta", %{
               "type" => "response.function_call_arguments.delta",
               "item_id" => "fc_new",
               "output_index" => 0,
               "delta" => "{\"x\":1}"
             }) <>
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_alias_match",
@@ -4679,7 +4615,7 @@ defmodule Alloy.ReasoningAndEventsTest do
 
         sse =
           if attempt == 1 do
-            sse_oai("response.output_item.added", %{
+            sse_event("response.output_item.added", %{
               "type" => "response.output_item.added",
               "output_index" => 0,
               "item" => %{
@@ -4690,7 +4626,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 "arguments" => "{\"x\":1}"
               }
             }) <>
-              sse_oai("response.failed", %{
+              sse_event("response.failed", %{
                 "type" => "response.failed",
                 "response" => %{
                   "id" => "resp_pcb_1",
@@ -4702,7 +4638,7 @@ defmodule Alloy.ReasoningAndEventsTest do
                 }
               })
           else
-            sse_oai("response.completed", %{
+            sse_event("response.completed", %{
               "type" => "response.completed",
               "response" => %{
                 "id" => "resp_pcb_2",
@@ -4741,6 +4677,10 @@ defmodule Alloy.ReasoningAndEventsTest do
         |> Enum.uniq()
 
       assert pcb_ids == ["call_pcb_1"]
+    end
+
+    test "deadline expiry during slow :turn_stop telemetry or :turn_end callback agrees with Result.status" do
+      parent = self()
 
       # 20. Deadline expiry during a slow [:alloy, :turn, :stop] telemetry handler OR a slow
       #     :turn_end :on_event callback routes the boundary timeout through turn lifecycle
@@ -4810,346 +4750,6 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert [%{turn: 1, payload: %{status: :running}}, %{turn: 2, payload: %{status: :error}}] =
                slow_cb_ends
 
-      # 21. OpenAI/xAI: multi-key map arguments (including nested maps and partial key prefixes)
-      #     reconcile cleanly against already-emitted prefixes whose key order differs from
-      #     Jason.encode!/1, across both .done and terminal-only .completed, with and without
-      #     an :on_event subscriber — while genuinely conflicting values still fail with
-      #     :malformed_reply when subscribed.
-      for {prefix, final_map} <- [
-            {"{\"z\":", %{"a" => 1, "z" => 2}},
-            {"{\"z\": 2, \"m\": {\"y\": ", %{"a" => 1, "m" => %{"x" => 10, "y" => 20}, "z" => 2}},
-            {"{\"ze", %{"alpha" => 1, "zeta" => 2}},
-            {"{\"z\":", %{"a" => 1, "z" => nil}}
-          ],
-          include_done? <- [false, true],
-          subscribed? <- [false, true] do
-        final_item = %{
-          "type" => "function_call",
-          "id" => "fc_map_order",
-          "call_id" => "call_map_order",
-          "name" => "echo",
-          "arguments" => final_map
-        }
-
-        done_chunk =
-          if include_done? do
-            sse_oai("response.output_item.done", %{
-              "type" => "response.output_item.done",
-              "output_index" => 0,
-              "item" => final_item
-            })
-          else
-            ""
-          end
-
-        map_order_plug =
-          sse_plug(
-            sse_oai("response.output_item.added", %{
-              "type" => "response.output_item.added",
-              "output_index" => 0,
-              "item" => %{
-                "type" => "function_call",
-                "id" => "fc_map_order",
-                "call_id" => "call_map_order",
-                "name" => "echo",
-                "arguments" => prefix
-              }
-            }) <>
-              done_chunk <>
-              sse_oai("response.completed", %{
-                "type" => "response.completed",
-                "response" => %{
-                  "id" => "resp_map_order",
-                  "status" => "completed",
-                  "output" => [final_item],
-                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
-                }
-              })
-          )
-
-        cfg =
-          %{
-            api_key: "sk-oai",
-            model: "gpt-5.4",
-            req_options: [plug: map_order_plug]
-          }
-          |> then(fn base ->
-            if subscribed?, do: Map.put(base, :on_event, &send(parent, {:mo_ev, &1})), else: base
-          end)
-
-        {:ok, %{messages: [mo_msg]}} =
-          OpenAI.stream([Message.user("hi")], [], cfg, fn _ -> :ok end)
-
-        assert [%{type: "tool_use", id: "call_map_order", name: "echo", input: ^final_map}] =
-                 mo_msg.content
-
-        if subscribed? do
-          mo_deltas =
-            drain_tagged(:mo_ev)
-            |> Enum.filter(&match?({:tool_call_delta, _}, &1))
-            |> Enum.map(fn {:tool_call_delta, p} -> p end)
-
-          assert Jason.decode!(Enum.map_join(mo_deltas, & &1.arguments_delta)) == final_map
-        end
-      end
-
-      bad_map_order_plug =
-        sse_plug(
-          sse_oai("response.output_item.added", %{
-            "type" => "response.output_item.added",
-            "output_index" => 0,
-            "item" => %{
-              "type" => "function_call",
-              "id" => "fc_map_bad",
-              "call_id" => "call_map_bad",
-              "name" => "echo",
-              "arguments" => "{\"z\":99,"
-            }
-          }) <>
-            sse_oai("response.completed", %{
-              "type" => "response.completed",
-              "response" => %{
-                "id" => "resp_map_bad",
-                "status" => "completed",
-                "output" => [
-                  %{
-                    "type" => "function_call",
-                    "id" => "fc_map_bad",
-                    "call_id" => "call_map_bad",
-                    "name" => "echo",
-                    "arguments" => %{"a" => 1, "z" => 2}
-                  }
-                ],
-                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
-              }
-            })
-        )
-
-      assert {:error, %Error{kind: :malformed_reply}} =
-               OpenAI.stream(
-                 [Message.user("hi")],
-                 [],
-                 %{
-                   api_key: "sk-oai",
-                   model: "gpt-5.4",
-                   req_options: [plug: bad_map_order_plug],
-                   on_event: &send(parent, {:mb_ev, &1})
-                 },
-                 fn _ -> :ok end
-               )
-
-      _ = drain_tagged(:mb_ev)
-
-      # 22. OpenAI/xAI: JSON token-level prefix reconciliation preserves Unicode escapes (\u00),
-      #     escaped slashes (\/), surrogate pairs, and exponent-form numbers (1e, 1e+, 1.5E-)
-      #     through both .done and .completed, with and without subscribers — while rejecting
-      #     conflicting exponent/escape values with :malformed_reply.
-      for {prefix, final_map} <- [
-            {~S({"x":"\u00), %{"x" => "é"}},
-            {~S({"x":"a\/), %{"x" => "a/b"}},
-            {~S({"x":"\uD83D\uDE), %{"x" => "😀"}},
-            {~S({"x":1e), %{"x" => 100}},
-            {~S({"x":1e+), %{"x" => 100}},
-            {~S({"x":1e+0), %{"x" => 100}},
-            {~S({"x":1e00), %{"x" => 100}},
-            {~S({"x":1e-0), %{"x" => 0.01}},
-            {~S({"x":0.1e), %{"x" => 1.0e308}},
-            {~S({"x":1.2), %{"x" => 1200}},
-            {~S({"x":1.2), %{"x" => 1.2e10}},
-            {~S({"x":1.2), %{"x" => 12_345}},
-            {~S({"x":1.), %{"x" => 1200}},
-            {~S({"x":0), %{"x" => 123}},
-            {~S({"x":0.00), %{"x" => 0.00001}},
-            {~S({"x":0.00000), %{"x" => 1.0e-10}},
-            {~S({"x":0.29), %{"x" => 0.3}},
-            {~S({"x":-0.29), %{"x" => -0.3}},
-            {~S({"x":0.29), %{"x" => 3.0}},
-            {~S({"x":2), %{"x" => 3.0}},
-            {~S({"x":9007199254740993.), %{"x" => 9_007_199_254_740_992.0}},
-            {~S({"x":9007199254740993), %{"x" => 9_007_199_254_740_992.0}},
-            {~S({"x":-9007199254740993.), %{"x" => -9_007_199_254_740_992.0}},
-            {~S({"x":1e-), %{"x" => 0.0}},
-            {~S({"x":1e), %{"x" => 0.0}},
-            {~S({"x":1e-4), %{"x" => 0.0}},
-            {~S({"x":1e-0), %{"x" => 0.0}},
-            {~S({"x":-1.5e-), %{"x" => 0.0}},
-            {~S({"x":1.), %{"x" => 0.0}},
-            {~S({"x":1), %{"x" => 0.0}},
-            {~S({"x":-), %{"x" => 0}},
-            {~S({"x":-), %{"x" => -42}},
-            {~S({"x":1.5E-), %{"x" => 0.015}},
-            {~S({"x":0e+), %{"x" => 0}},
-            {~S({"x":1.), %{"x" => 1}},
-            {~S({"x":10), %{"x" => 100}},
-            {~S({"a":tr), %{"a" => true, "b" => false, "c" => nil}},
-            {~S({"a":true,"b":fa), %{"a" => true, "b" => false, "c" => nil}},
-            {~S({"a":true,"b":false,"c":nu), %{"a" => true, "b" => false, "c" => nil}},
-            {~S({"arr":[1,), %{"arr" => [1, 2]}},
-            {~S({"arr":[1,2), %{"arr" => [1, 2]}},
-            {~S({"arr":[), %{"arr" => [1, 2]}},
-            {~S({"arr":[]), %{"arr" => [], "b" => 1}},
-            {~S({"a":"line1\n\t\r\b\f\"\\\/), %{"a" => "line1\n\t\r\b\f\"\\/end"}},
-            {"{\"a\":\"hi\\", %{"a" => "hi\n"}},
-            {"{\"a\":\"hi\\", %{"a" => "hi\"x"}},
-            {"{\"a\":\"hi\\", %{"a" => "hi\\x"}},
-            {"{\"a\":\"hi\\", %{"a" => "hi/x"}},
-            {"{\"a\":\"hi\\", %{"a" => "hi\tx"}},
-            {"{\"a\":\"hi\\", %{"a" => "hi\rx"}},
-            {"{\"a\":\"hi\\", %{"a" => "hi\bx"}},
-            {"{\"a\":\"hi\\", %{"a" => "hi\fx"}},
-            {"{\"a\":\"hi\\", %{"a" => "hié"}},
-            {~S({"a":"\uD83D\uDE00), %{"a" => "😀!"}},
-            {~S({"a":"\uD83D), %{"a" => "😀"}},
-            {"{\"a\":\"\\uD83D\\", %{"a" => "😀"}},
-            {~S({"a"), %{"a" => 1, "b" => 2}},
-            {~S({"a":1,), %{"a" => 1, "b" => 2}},
-            {~S({"a":1e2,"b":), %{"a" => 100, "b" => 2}}
-          ],
-          include_done? <- [false, true],
-          subscribed? <- [false, true] do
-        tok_item = %{
-          "type" => "function_call",
-          "id" => "fc_tok",
-          "call_id" => "call_tok",
-          "name" => "echo",
-          "arguments" => final_map
-        }
-
-        done_chunk =
-          if include_done? do
-            sse_oai("response.output_item.done", %{
-              "type" => "response.output_item.done",
-              "output_index" => 0,
-              "item" => tok_item
-            })
-          else
-            ""
-          end
-
-        tok_plug =
-          sse_plug(
-            sse_oai("response.output_item.added", %{
-              "type" => "response.output_item.added",
-              "output_index" => 0,
-              "item" => %{
-                "type" => "function_call",
-                "id" => "fc_tok",
-                "call_id" => "call_tok",
-                "name" => "echo",
-                "arguments" => ""
-              }
-            }) <>
-              sse_oai("response.function_call_arguments.delta", %{
-                "type" => "response.function_call_arguments.delta",
-                "item_id" => "fc_tok",
-                "output_index" => 0,
-                "delta" => prefix
-              }) <>
-              done_chunk <>
-              sse_oai("response.completed", %{
-                "type" => "response.completed",
-                "response" => %{
-                  "id" => "resp_tok",
-                  "status" => "completed",
-                  "output" => [tok_item],
-                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
-                }
-              })
-          )
-
-        cfg =
-          %{api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: tok_plug]}
-          |> then(fn base ->
-            if subscribed?, do: Map.put(base, :on_event, &send(parent, {:tok_ev, &1})), else: base
-          end)
-
-        {:ok, %{messages: [tok_msg]}} =
-          OpenAI.stream([Message.user("hi")], [], cfg, fn _ -> :ok end)
-
-        assert [%{type: "tool_use", id: "call_tok", name: "echo", input: ^final_map}] =
-                 tok_msg.content
-
-        if subscribed? do
-          tok_deltas =
-            drain_tagged(:tok_ev)
-            |> Enum.filter(&match?({:tool_call_delta, _}, &1))
-            |> Enum.map(fn {:tool_call_delta, p} -> p end)
-
-          assert Jason.decode!(Enum.map_join(tok_deltas, & &1.arguments_delta)) == final_map
-        end
-      end
-
-      for {bad_prefix, bad_map} <- [
-            {~S({"x":1e), %{"x" => 42}},
-            {~S({"x":1e+), %{"x" => 0.0}},
-            {~S({"x":1), %{"x" => 0}},
-            {~S({"x":1.), %{"x" => 0}},
-            {~S({"x":-1e), %{"x" => 100}},
-            {~S({"x":1e2 ), %{"x" => 42}},
-            {~S({"x":0e9), %{"x" => 1}},
-            {~S({"x":true ), %{"x" => false}},
-            {~S({"x":tr), %{"x" => false}},
-            {~S({"arr":[1]), %{"arr" => [1, 2]}},
-            {~S({"arr":[1,]), %{"arr" => [1]}},
-            {~S({"arr":[1,2,3]), %{"arr" => [1, 2]}},
-            {~S({"x":1}), %{"x" => 1, "y" => 2}},
-            {~S({"x":1,), %{"x" => 1}},
-            {~S({"unknown":1), %{"x" => 1}},
-            {~S({"x":"\q), %{"x" => "q"}},
-            {~S({"x":"\uZZZZ), %{"x" => "a"}},
-            {~S({"x":"\uDC00), %{"x" => "a"}},
-            {~S({"x":"\uD83D\u0041), %{"x" => "a"}},
-            {~S({"x":"\u0041), %{"x" => "B"}},
-            {"{\"x\":\"a\\", %{"x" => "a"}}
-          ] do
-        bad_exp_plug =
-          sse_plug(
-            sse_oai("response.output_item.added", %{
-              "type" => "response.output_item.added",
-              "output_index" => 0,
-              "item" => %{
-                "type" => "function_call",
-                "id" => "fc_bad_exp",
-                "call_id" => "call_bad_exp",
-                "name" => "echo",
-                "arguments" => bad_prefix
-              }
-            }) <>
-              sse_oai("response.completed", %{
-                "type" => "response.completed",
-                "response" => %{
-                  "id" => "resp_bad_exp",
-                  "status" => "completed",
-                  "output" => [
-                    %{
-                      "type" => "function_call",
-                      "id" => "fc_bad_exp",
-                      "call_id" => "call_bad_exp",
-                      "name" => "echo",
-                      "arguments" => bad_map
-                    }
-                  ],
-                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
-                }
-              })
-          )
-
-        assert {:error, %Error{kind: :malformed_reply}} =
-                 OpenAI.stream(
-                   [Message.user("hi")],
-                   [],
-                   %{
-                     api_key: "sk-oai",
-                     model: "gpt-5.4",
-                     req_options: [plug: bad_exp_plug],
-                     on_event: &send(parent, {:bexp_ev, &1})
-                   },
-                   fn _ -> :ok end
-                 )
-
-        _ = drain_tagged(:bexp_ev)
-      end
-
       # 23. Deadline expiry during [:alloy, :turn, :stop] telemetry when turn 1 was finalized
       #     as :max_turns rechecks before :turn_end so the single turn verdict is :error (no
       #     phantom turn 2); time spent inside the user's own final :turn_end callback does not
@@ -5216,86 +4816,6 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       assert [%{turn: 1, payload: %{status: :max_turns}}] =
                Enum.filter(mt_cb_events, &(&1.event == :turn_end))
-
-      # 24. Exhaustive split-point fuzz: every valid UTF-8 prefix of diverse RFC 8259 JSON
-      #     spellings (plain decimals, scientific notation, zero-padded exponents, escaped
-      #     strings, reordered keys, nested structures) reconciles cleanly against map-typed
-      #     terminal arguments without ever returning a spurious :malformed_reply.
-      fuzz_spellings = [
-        ~S({"z": 0.0000000001, "a": 1.2e3}),
-        ~S({"n": 1.2345E+04, "neg": -0.015, "zero": -0.0}),
-        ~S({"r": 0.29999999999999999, "nr": -0.29999999999999999, "t": 2.99999999999999999}),
-        ~S({"big": 9007199254740993.0, "nbig": -9007199254740993.0, "up": 9007199254740993.5}),
-        ~S({"uf": 1e-400, "ufz": 1e-0400, "nuf": -1.5e-400}),
-        ~S({"s": "a\/\u00e9\n\t\uD83D\uDE00", "b": true, "c": null}),
-        ~S({"arr": [0.00001, 1200, {"y": 1.5e-2, "x": false}]})
-      ]
-
-      for raw_json <- fuzz_spellings,
-          terminal_kind <- [:map, :normalized_json] do
-        expected = Jason.decode!(raw_json)
-        terminal_args = if terminal_kind == :map, do: expected, else: Jason.encode!(expected)
-        graphemes = String.graphemes(raw_json)
-
-        for cut <- 1..(length(graphemes) - 1) do
-          prefix = graphemes |> Enum.take(cut) |> Enum.join()
-
-          fuzz_plug =
-            sse_plug(
-              sse_oai("response.output_item.added", %{
-                "type" => "response.output_item.added",
-                "output_index" => 0,
-                "item" => %{
-                  "type" => "function_call",
-                  "id" => "fc_fuzz",
-                  "call_id" => "call_fuzz",
-                  "name" => "echo",
-                  "arguments" => prefix
-                }
-              }) <>
-                sse_oai("response.completed", %{
-                  "type" => "response.completed",
-                  "response" => %{
-                    "id" => "resp_fuzz",
-                    "status" => "completed",
-                    "output" => [
-                      %{
-                        "type" => "function_call",
-                        "id" => "fc_fuzz",
-                        "call_id" => "call_fuzz",
-                        "name" => "echo",
-                        "arguments" => terminal_args
-                      }
-                    ],
-                    "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
-                  }
-                })
-            )
-
-          {:ok, %{messages: [fuzz_msg]}} =
-            OpenAI.stream(
-              [Message.user("hi")],
-              [],
-              %{
-                api_key: "sk-oai",
-                model: "gpt-5.4",
-                req_options: [plug: fuzz_plug],
-                on_event: &send(parent, {:fz_ev, &1})
-              },
-              fn _ -> :ok end
-            )
-
-          assert [%{type: "tool_use", id: "call_fuzz", name: "echo", input: ^expected}] =
-                   fuzz_msg.content
-
-          fz_deltas =
-            drain_tagged(:fz_ev)
-            |> Enum.filter(&match?({:tool_call_delta, _}, &1))
-            |> Enum.map(fn {:tool_call_delta, p} -> p end)
-
-          assert Jason.decode!(Enum.map_join(fz_deltas, & &1.arguments_delta)) == expected
-        end
-      end
     end
   end
 
@@ -5335,8 +4855,7 @@ defmodule Alloy.ReasoningAndEventsTest do
     end
   end
 
-  defp sse_ant(event, payload), do: "event: #{event}\ndata: #{Jason.encode!(payload)}\n\n"
-  defp sse_oai(event, payload), do: "event: #{event}\ndata: #{Jason.encode!(payload)}\n\n"
+  defp sse_event(event, payload), do: "event: #{event}\ndata: #{Jason.encode!(payload)}\n\n"
 
   defp collect_events(acc \\ []) do
     receive do

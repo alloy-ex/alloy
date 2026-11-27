@@ -21,7 +21,6 @@
         included: [
           "lib/",
           "test/",
-          "examples/",
           "mix.exs",
           ".credo.exs"
         ],

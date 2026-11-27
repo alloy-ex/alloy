@@ -4,7 +4,6 @@ defmodule Alloy.Provider.OpenAI.Stream do
   # state machine. Shared by `Alloy.Provider.OpenAI` (and `Alloy.Provider.XAI`).
 
   alias Alloy.Provider.{Error, HTTP, OpenAI}
-  alias Alloy.Provider.OpenAI.JSONPrefix
 
   @terminal_events ["response.completed", "response.incomplete", "response.failed"]
 
@@ -416,7 +415,7 @@ defmodule Alloy.Provider.OpenAI.Stream do
         {:ok, "", emitted}
 
       true ->
-        JSONPrefix.reconcile(emitted, expected_input)
+        :conflict
     end
   end
 

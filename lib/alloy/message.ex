@@ -23,7 +23,7 @@ defmodule Alloy.Message do
   - `%{type: "document", mime_type: "application/pdf", file_id: "..."}` - Provider Files API document (origin-scoped)
 
   Alloy Core does not read, transcode, or base64-encode media. It expects callers
-  (e.g. Anvil connectors) to supply pre-encoded data or provider-specific URIs.
+  (e.g. your application) to supply pre-encoded data or provider-specific URIs.
 
   ### Reasoning and provider-specific blocks
 
