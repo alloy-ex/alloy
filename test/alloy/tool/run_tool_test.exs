@@ -500,11 +500,20 @@ defmodule Alloy.Tool.RunToolTest do
 
       state = init_state([no_arg])
 
-      # on_event: nil works and does not attach :on_tool_update; omitted :input defaults to %{}
-      assert {:ok, ok_block, _meta} =
-               Executor.run_tool(%{id: "p1", name: "ping"}, state, on_event: nil)
+      # on_event: nil and nil event coordination options use safe defaults without attaching :on_tool_update
+      assert {:ok, ok_block, ok_meta} =
+               Executor.run_tool(%{id: "p1", name: "ping"}, state,
+                 on_event: nil,
+                 event_subscriber?: nil,
+                 event_seq_ref: nil,
+                 event_correlation_id: nil,
+                 event_turn: nil
+               )
 
       assert ok_block.content == "pong"
+      assert is_binary(ok_meta.correlation_id) and byte_size(ok_meta.correlation_id) > 0
+      assert ok_meta.start_event_seq == 1
+      assert ok_meta.end_event_seq == 2
       assert_receive {:ping_ctx, %{}, false}
 
       # Explicit input: nil is preserved and rejected as non-object input
@@ -561,6 +570,30 @@ defmodule Alloy.Tool.RunToolTest do
 
       assert_raise ArgumentError, ~r/:on_event/, fn ->
         Executor.run_tool(call, state, on_event: :not_a_fn)
+      end
+
+      assert_raise ArgumentError, ~r/:event_subscriber\?/, fn ->
+        Executor.run_tool(call, state, event_subscriber?: :yes)
+      end
+
+      assert_raise ArgumentError, ~r/:event_seq_ref/, fn ->
+        Executor.run_tool(call, state, event_seq_ref: :not_a_ref)
+      end
+
+      assert_raise ArgumentError, ~r/:event_seq_ref/, fn ->
+        Executor.run_tool(call, state, event_seq_ref: make_ref())
+      end
+
+      assert_raise ArgumentError, ~r/:event_correlation_id/, fn ->
+        Executor.run_tool(call, state, event_correlation_id: "")
+      end
+
+      assert_raise ArgumentError, ~r/:event_correlation_id/, fn ->
+        Executor.run_tool(call, state, event_correlation_id: <<0xFF>>)
+      end
+
+      assert_raise ArgumentError, ~r/:event_turn/, fn ->
+        Executor.run_tool(call, state, event_turn: -1)
       end
     end
   end

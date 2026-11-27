@@ -56,16 +56,20 @@ defmodule Alloy.Tool.Executor do
   - `:tool_timeout` — positive integer ms overriding `state.config.tool_timeout`
   - `:run_deadline` — monotonic ms deadline; clamped to `state.run_deadline`
     when the outer state already carries a deadline
-  - `:cancel_token` — `Alloy.Cancel.t()` or `nil` (defaults to
-    `state.config.cancel_token`)
-  - `:parent_call_id` — optional non-empty `String.t()` attached as
+  - `:cancel_token` — `Alloy.Cancel.t()` or `nil`; combined with
+    `state.config.cancel_token` so passing `nil` or a child token never disarms
+    outer cancellation
+  - `:parent_call_id` — optional non-empty UTF-8 `String.t()` attached as
     `:parent_call_id` on emitted `:tool_start`, `:tool_update`, and `:tool_end`
     events, tool telemetry metadata, and returned tool-call metadata
-  - `:on_event` — `(event -> any())` invoked in the caller process
-  - `:event_subscriber?` — boolean enabling `:tool_update` streaming (defaults
-    to `Keyword.has_key?(opts, :on_event)`)
+  - `:on_event` — `(event -> any())` or `nil`, invoked in the caller process
+    with raw `{:tool_start | :tool_update | :tool_end, map()}` tuples (not
+    wrapped in `Alloy.Events` v1 envelopes and not rescued; pass
+    `&Alloy.Events.emit(event_opts, turn, &1)` to emit v1 envelopes)
+  - `:event_subscriber?` — boolean or `nil` enabling `:tool_update` streaming
+    (defaults to `is_function(opts[:on_event], 1)`)
   - `:event_seq_ref`, `:event_correlation_id`, `:event_turn` — event envelope
-    coordination options
+    coordination options (`nil` uses defaults)
   - `:tool_schemas` — precompiled validation schemas
 
   ## Returns
@@ -150,9 +154,13 @@ defmodule Alloy.Tool.Executor do
       end)
 
     raw_on_event = Keyword.get(opts, :on_event)
+    on_event = validate_on_event!(raw_on_event)
 
     emit_tool_updates? =
-      Keyword.get(opts, :event_subscriber?, is_function(raw_on_event, 1))
+      validate_event_subscriber!(
+        Keyword.get(opts, :event_subscriber?),
+        is_function(raw_on_event, 1)
+      )
 
     opt_cancel_token = validate_cancel_token!(Keyword.get(opts, :cancel_token))
     cancel_token = Cancel.combine(state.config.cancel_token, opt_cancel_token)
@@ -165,7 +173,9 @@ defmodule Alloy.Tool.Executor do
         (is_nil(opt_deadline) or state.run_deadline <= opt_deadline)
 
     parent_call_id = validate_parent_call_id!(Keyword.get(opts, :parent_call_id))
-    on_event = validate_on_event!(raw_on_event)
+    seq_ref = validate_event_seq_ref!(Keyword.get(opts, :event_seq_ref))
+    corr_id = validate_event_correlation_id!(Keyword.get(opts, :event_correlation_id))
+    turn = validate_event_turn!(Keyword.get(opts, :event_turn), state.turn)
 
     effective_state = %{
       state
@@ -186,9 +196,9 @@ defmodule Alloy.Tool.Executor do
       parent_call_id: parent_call_id,
       on_event: on_event,
       emit_tool_updates?: emit_tool_updates?,
-      seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
-      corr_id: Keyword.get(opts, :event_correlation_id, random_id()),
-      turn: Keyword.get(opts, :event_turn, state.turn)
+      seq_ref: seq_ref,
+      corr_id: corr_id,
+      turn: turn
     }
 
     {run, inline_tools}
@@ -259,6 +269,55 @@ defmodule Alloy.Tool.Executor do
 
   defp validate_on_event!(bad) do
     raise ArgumentError, ":on_event must be a 1-arity function or nil, got: #{inspect(bad)}"
+  end
+
+  defp validate_event_subscriber!(nil, default), do: default
+  defp validate_event_subscriber!(flag, _default) when is_boolean(flag), do: flag
+
+  defp validate_event_subscriber!(bad, _default) do
+    raise ArgumentError, ":event_subscriber? must be a boolean or nil, got: #{inspect(bad)}"
+  end
+
+  defp validate_event_seq_ref!(nil), do: :atomics.new(1, signed: false)
+
+  defp validate_event_seq_ref!(ref) do
+    case :atomics.info(ref) do
+      %{size: size} when size >= 1 ->
+        ref
+
+      _other ->
+        raise ArgumentError,
+              ":event_seq_ref must be an :atomics reference with at least 1 slot or nil, got: #{inspect(ref)}"
+    end
+  rescue
+    ArgumentError ->
+      reraise ArgumentError,
+              ":event_seq_ref must be an :atomics reference with at least 1 slot or nil, got: #{inspect(ref)}",
+              __STACKTRACE__
+  end
+
+  defp validate_event_correlation_id!(nil), do: random_id()
+
+  defp validate_event_correlation_id!(id) when is_binary(id) and byte_size(id) > 0 do
+    if String.valid?(id) do
+      id
+    else
+      raise ArgumentError,
+            ":event_correlation_id must be a non-empty UTF-8 string or nil, got: #{inspect(id)}"
+    end
+  end
+
+  defp validate_event_correlation_id!(bad) do
+    raise ArgumentError,
+          ":event_correlation_id must be a non-empty UTF-8 string or nil, got: #{inspect(bad)}"
+  end
+
+  defp validate_event_turn!(nil, default), do: default
+  defp validate_event_turn!(turn, _default) when is_integer(turn) and turn >= 0, do: turn
+
+  defp validate_event_turn!(bad, _default) do
+    raise ArgumentError,
+          ":event_turn must be a non-negative integer or nil, got: #{inspect(bad)}"
   end
 
   defp run_batches([], _run, _poll_steering, results_rev, metas_rev) do

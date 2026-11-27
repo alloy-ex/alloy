@@ -53,6 +53,9 @@ Composite tools and custom hosts that don't need batching can call
 `Alloy.Tool.Executor.run_tool/3` directly:
 
 ```elixir
+# `on_event` on Executor receives raw `{:tool_start | :tool_update | :tool_end, map()}`
+# tuples directly (not rescued). Pass `&Alloy.Events.emit(event_opts, turn, &1)` to
+# wrap them into v1 `Alloy.Events` envelopes with exception rescue.
 {:ok, result_block, meta} =
   Alloy.Tool.Executor.run_tool(
     %{id: "outer-1-sub-1", name: "read", input: %{"file_path" => "README.md"}},

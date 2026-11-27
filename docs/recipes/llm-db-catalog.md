@@ -30,38 +30,93 @@ Implementing the optional `c:Alloy.ModelCatalog.max_output_tokens/1`,
 callbacks lets your host query full model metadata uniformly through
 `Alloy.ModelCatalog.info/2`.
 
-Note that `LLMDB.Model` structs may contain nested structs or maps (which do
-not implement the `Access` behaviour), and `modalities` lives at the top level
-of the model entry alongside `capabilities`. Using `Map.get/2`-based helpers
-keeps the adapter safe across structs, maps, and boolean flags alike.
+Two important details when adapting `LLMDB.Model`:
+
+1. **Provider scoping:** Bare model IDs like `"claude-sonnet-4-6"` often appear
+   under multiple providers in `llm_db` with different context windows and
+   prices. Bind each Alloy provider run to a provider-scoped catalog module (for
+   example `MyApp.LlmDbCatalog.Anthropic`), and reject ambiguous bare lookups on
+   unscoped catalogs rather than silently picking another provider's limits.
+2. **Struct/map safety:** `LLMDB.Model` structs may contain nested structs or
+   maps (which do not implement `Access`), and `modalities` sits at the top
+   level alongside `capabilities`. Using `Map.get/2`-based helpers keeps the
+   adapter safe across structs, maps, and boolean flags alike.
 
 ```elixir
 defmodule MyApp.LlmDbCatalog do
+  @moduledoc """
+  Shared `Alloy.ModelCatalog` adapter backed by `LLMDB`.
+
+  Use directly with provider-qualified specs (`"anthropic:claude-sonnet-4-6"`),
+  or define thin provider-scoped modules for bare model IDs passed to Alloy
+  providers:
+
+      defmodule MyApp.LlmDbCatalog.Anthropic do
+        use MyApp.LlmDbCatalog, provider: :anthropic
+      end
+  """
+
   @behaviour Alloy.ModelCatalog
 
-  @impl true
-  def context_window(model) when is_binary(model) do
-    # Prefer the model's documented maximum input limit when LLMDB provides
-    # `limits.input` separately from the combined `limits.context` window
-    # (for example OpenAI's 400k total / 272k input split), falling back to
-    # `limits.context` for entries that only publish a single context limit.
-    entry = lookup(model)
+  defmacro __using__(opts) do
+    provider = Keyword.fetch!(opts, :provider)
 
-    positive_int(nested_get(entry, [:limits, :input])) ||
-      positive_int(nested_get(entry, [:limits, :context]))
+    quote bind_quoted: [provider: provider] do
+      @behaviour Alloy.ModelCatalog
+
+      @impl true
+      def context_window(model), do: MyApp.LlmDbCatalog.context_window_for(model, unquote(provider))
+
+      @impl true
+      def default_context_window, do: MyApp.LlmDbCatalog.default_context_window()
+
+      @impl true
+      def max_output_tokens(model),
+        do: MyApp.LlmDbCatalog.max_output_tokens_for(model, unquote(provider))
+
+      @impl true
+      def capabilities(model), do: MyApp.LlmDbCatalog.capabilities_for(model, unquote(provider))
+
+      @impl true
+      def pricing(model), do: MyApp.LlmDbCatalog.pricing_for(model, unquote(provider))
+    end
   end
+
+  @impl true
+  def context_window(model) when is_binary(model), do: context_window_for(model, nil)
 
   @impl true
   def default_context_window, do: 128_000
 
   @impl true
-  def max_output_tokens(model) when is_binary(model) do
-    positive_int(nested_get(lookup(model), [:limits, :output]))
-  end
+  def max_output_tokens(model) when is_binary(model), do: max_output_tokens_for(model, nil)
 
   @impl true
-  def capabilities(model) when is_binary(model) do
-    case lookup(model) do
+  def capabilities(model) when is_binary(model), do: capabilities_for(model, nil)
+
+  @impl true
+  def pricing(model) when is_binary(model), do: pricing_for(model, nil)
+
+  @doc false
+  def context_window_for(model, provider) when is_binary(model) do
+    # Prefer the model's documented maximum input limit when LLMDB provides
+    # `limits.input` separately from the combined `limits.context` window
+    # (for example OpenAI's 400k total / 272k input split), falling back to
+    # `limits.context` for entries that only publish a single context limit.
+    entry = lookup(model, provider)
+
+    positive_int(nested_get(entry, [:limits, :input])) ||
+      positive_int(nested_get(entry, [:limits, :context]))
+  end
+
+  @doc false
+  def max_output_tokens_for(model, provider) when is_binary(model) do
+    positive_int(nested_get(lookup(model, provider), [:limits, :output]))
+  end
+
+  @doc false
+  def capabilities_for(model, provider) when is_binary(model) do
+    case lookup(model, provider) do
       entry when is_map(entry) ->
         caps = Map.get(entry, :capabilities)
         input_modalities = List.wrap(nested_get(entry, [:modalities, :input]))
@@ -84,9 +139,9 @@ defmodule MyApp.LlmDbCatalog do
     end
   end
 
-  @impl true
-  def pricing(model) when is_binary(model) do
-    with entry when is_map(entry) <- lookup(model),
+  @doc false
+  def pricing_for(model, provider) when is_binary(model) do
+    with entry when is_map(entry) <- lookup(model, provider),
          cost when is_map(cost) <- Map.get(entry, :cost),
          input when is_number(input) <- Map.get(cost, :input),
          output when is_number(output) <- Map.get(cost, :output) do
@@ -98,25 +153,13 @@ defmodule MyApp.LlmDbCatalog do
     end
   end
 
-  # Resolves provider-qualified specs ("anthropic:claude-sonnet-4-6") directly.
-  # For bare model IDs ("claude-sonnet-4-6"), returns a match only when it is
-  # unambiguous across LLMDB providers (or when scoped to a single provider via
-  # `@provider`). Ambiguous bare IDs return `nil` so Alloy falls back to
-  # `default_context_window/0` rather than risking another provider's larger
-  # context window or billing rates.
-  #
-  # If your app knows which provider a run targets, define a provider-scoped
-  # catalog module (or set `@provider :anthropic`) and call
-  # `LLMDB.model(@provider, model)` directly.
-  @provider nil
-
-  defp lookup(model) do
+  defp lookup(model, provider) do
     case LLMDB.model(model) do
       {:ok, entry} ->
         entry
 
       _ ->
-        lookup_bare_model(model, @provider)
+        lookup_bare_model(model, provider)
     end
   end
 
@@ -184,26 +227,35 @@ defmodule MyApp.LlmDbCatalog do
   defp positive_int(limit) when is_integer(limit) and limit > 0, do: limit
   defp positive_int(_other), do: nil
 end
+
+defmodule MyApp.LlmDbCatalog.Anthropic do
+  use MyApp.LlmDbCatalog, provider: :anthropic
+end
 ```
 
 ## 3. Wire it into runs and cost estimation
 
-Pass `:model_catalog` to `Alloy.run/2` or `Alloy.stream/3` so compaction
-context budgeting uses your catalog:
+Pass a provider-scoped catalog module to `Alloy.run/2` or `Alloy.stream/3` so
+compaction context budgeting resolves bare model IDs unambiguously against the
+provider you are actually calling:
 
 ```elixir
 {:ok, result} =
   Alloy.run("Summarize the release notes",
     provider: {Alloy.Provider.Anthropic, api_key: key, model: "claude-sonnet-4-6"},
-    model_catalog: MyApp.LlmDbCatalog
+    model_catalog: MyApp.LlmDbCatalog.Anthropic
   )
 ```
 
 Query the full normalized snapshot (context window, max output tokens,
-capabilities, and pricing) via `Alloy.ModelCatalog.info/2`:
+capabilities, and pricing) via `Alloy.ModelCatalog.info/2` using either the
+provider-scoped catalog with a bare model ID or the unscoped catalog with a
+provider-qualified spec:
 
 ```elixir
-info = Alloy.ModelCatalog.info(MyApp.LlmDbCatalog, "claude-sonnet-4-6")
+info = Alloy.ModelCatalog.info(MyApp.LlmDbCatalog.Anthropic, "claude-sonnet-4-6")
+# Equivalent with a provider-qualified spec:
+# info = Alloy.ModelCatalog.info(MyApp.LlmDbCatalog, "anthropic:claude-sonnet-4-6")
 # => %{
 #   model: "claude-sonnet-4-6",
 #   context_window: 1_000_000,

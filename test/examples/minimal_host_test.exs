@@ -5,6 +5,7 @@ defmodule MinimalHostTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Agent.{Config, State}
+  alias Alloy.Cancel
   alias MinimalHost.{CodeMode, OutputCapture}
 
   defmodule Policy do
@@ -314,6 +315,101 @@ defmodule MinimalHostTest do
         )
       end
     end
+  end
+
+  test "clamps interpreter timeout to tighter outer state.run_deadline" do
+    parent = self()
+
+    slow =
+      tool("slow", fn _input, _context ->
+        send(parent, {:bounded_child, self()})
+        Process.sleep(:infinity)
+      end)
+
+    program = fn dispatch ->
+      _ignored = dispatch.(%{name: "slow", input: %{"value" => "wait"}})
+      :should_not_succeed
+    end
+
+    now = System.monotonic_time(:millisecond)
+    bounded_state = %{state([slow]) | run_deadline: now + 60}
+
+    {elapsed_us, result} =
+      :timer.tc(fn ->
+        CodeMode.run(program, bounded_state, Keyword.put(opts(), :timeout, 5_000))
+      end)
+
+    assert result == {:error, :timeout}
+    assert elapsed_us < 1_500_000
+    assert_receive {:bounded_child, child}
+    monitor = Process.monitor(child)
+    assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
+
+    # Pre-expired outer run_deadline returns {:error, :timeout} immediately without running program
+    expired_state = %{state([slow]) | run_deadline: now - 1}
+
+    assert {:error, :timeout} =
+             CodeMode.run(fn _ -> flunk("should not run") end, expired_state, opts())
+  end
+
+  test "honors cooperative :cancel_token during child calls and between dispatches" do
+    parent = self()
+
+    # 1. Cancel during child tool execution (via state.config.cancel_token)
+    outer_token = Cancel.new()
+
+    slow =
+      tool("slow", fn _input, _context ->
+        send(parent, {:cancel_child, self()})
+        Process.sleep(:infinity)
+      end)
+
+    state_with_cancel =
+      Config.from_opts(
+        provider: {Alloy.Provider.Test, %{}},
+        tools: [slow],
+        cancel_token: outer_token
+      )
+      |> State.init()
+
+    task =
+      Task.async(fn ->
+        CodeMode.run(
+          fn dispatch ->
+            _ignored = dispatch.(%{name: "slow", input: %{"value" => "wait"}})
+            :should_not_succeed
+          end,
+          state_with_cancel,
+          opts()
+        )
+      end)
+
+    assert_receive {:cancel_child, child}, 2_000
+    monitor = Process.monitor(child)
+    Cancel.cancel(outer_token)
+
+    assert {:error, :cancelled} = Task.await(task, 2_000)
+    assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
+
+    # 2. Cancel via opts[:cancel_token] while program sleeps between dispatches
+    inner_token = Cancel.new()
+
+    task2 =
+      Task.async(fn ->
+        CodeMode.run(
+          fn _dispatch ->
+            send(parent, :between_dispatches)
+            Process.sleep(5_000)
+            :too_late
+          end,
+          state([]),
+          Keyword.put(opts(), :cancel_token, inner_token)
+        )
+      end)
+
+    assert_receive :between_dispatches, 2_000
+    Cancel.cancel(inner_token)
+    assert {:error, :cancelled} = Task.await(task2, 2_000)
   end
 
   @tag :tmp_dir

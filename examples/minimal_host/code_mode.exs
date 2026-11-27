@@ -6,19 +6,22 @@ defmodule MinimalHost.CodeMode do
   connect a separately sandboxed interpreter to the dispatch capability. Single
   child calls route through `Alloy.Tool.Executor.run_tool/3` and multi-call
   batches route through `Alloy.Tool.Executor.execute_all/4`, preserving Alloy's
-  middleware, schema validation, deadlines, cooperative cancellation, and
+  middleware, schema validation, outer deadlines, cooperative cancellation, and
   native `:parent_call_id` event tagging.
   """
 
   alias Alloy.Agent.State
-  alias Alloy.{Message, Middleware}
+  alias Alloy.{Cancel, Message, Middleware}
   alias Alloy.Tool.Executor
+
+  @cancel_poll_ms 25
 
   @spec run((function() -> term()), State.t(), keyword()) :: {:ok, term()} | {:error, term()}
   def run(program, %State{} = state, opts) when is_function(program, 1) do
     timeout = Keyword.fetch!(opts, :timeout)
     max_calls = Keyword.fetch!(opts, :max_calls)
     parent = Keyword.fetch!(opts, :parent_call_id)
+    opt_cancel_token = Keyword.get(opts, :cancel_token)
 
     if not (is_integer(timeout) and timeout > 0 and is_integer(max_calls) and max_calls > 0 and
               is_binary(parent) and byte_size(parent) > 0 and String.valid?(parent)) do
@@ -26,13 +29,61 @@ defmodule MinimalHost.CodeMode do
             "positive timeout/max_calls and a non-empty UTF-8 parent_call_id are required"
     end
 
-    deadline = System.monotonic_time(:millisecond) + timeout
-    run_opts = Keyword.put(opts, :run_deadline, deadline)
-    task = Task.async(fn -> run_program(program, state, run_opts) end)
+    if not (is_nil(opt_cancel_token) or Cancel.valid?(opt_cancel_token)) do
+      raise ArgumentError, ":cancel_token must be an Alloy.Cancel token or nil"
+    end
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, result} -> result
-      _stopped -> {:error, :timeout}
+    cancel_token = Cancel.combine(state.config.cancel_token, opt_cancel_token)
+    now = System.monotonic_time(:millisecond)
+    script_deadline = now + timeout
+
+    deadline =
+      if is_integer(state.run_deadline),
+        do: min(state.run_deadline, script_deadline),
+        else: script_deadline
+
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        {:error, :cancelled}
+
+      now >= deadline ->
+        {:error, :timeout}
+
+      true ->
+        run_opts =
+          opts
+          |> Keyword.put(:run_deadline, deadline)
+          |> Keyword.put(:cancel_token, cancel_token)
+
+        task = Task.async(fn -> run_program(program, state, run_opts) end)
+        await_task(task, deadline, cancel_token)
+    end
+  end
+
+  defp await_task(task, deadline, cancel_token) do
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        _ = Task.shutdown(task, :brutal_kill)
+        {:error, :cancelled}
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        _ = Task.shutdown(task, :brutal_kill)
+        {:error, :timeout}
+
+      true ->
+        remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+        wait_ms = if cancel_token, do: min(remaining, @cancel_poll_ms), else: remaining
+
+        case Task.yield(task, wait_ms) do
+          {:ok, result} ->
+            result
+
+          {:exit, reason} ->
+            {:error, {:exit, reason}}
+
+          nil ->
+            await_task(task, deadline, cancel_token)
+        end
     end
   end
 
@@ -40,6 +91,8 @@ defmodule MinimalHost.CodeMode do
     key = make_ref()
     owner = self()
     script_name = Keyword.get(opts, :script_tool_name, "run_script")
+    deadline = Keyword.fetch!(opts, :run_deadline)
+    cancel_token = Keyword.get(opts, :cancel_token)
     state = %{state | tool_fns: Map.delete(state.tool_fns, script_name)}
     Process.put(key, {state, 0})
 
@@ -52,9 +105,10 @@ defmodule MinimalHost.CodeMode do
       end
 
       result = program.(dispatch)
-      check_interpreter_deadline!(Keyword.fetch!(opts, :run_deadline))
+      check_interpreter_limits!(deadline, cancel_token)
       {:ok, result}
     catch
+      :throw, :cancelled -> {:error, :cancelled}
       :throw, :timeout -> {:error, :timeout}
       kind, reason -> {:error, {kind, reason}}
     after
@@ -69,7 +123,8 @@ defmodule MinimalHost.CodeMode do
 
   defp dispatch(calls, key, opts) when is_list(calls) do
     deadline = Keyword.fetch!(opts, :run_deadline)
-    check_interpreter_deadline!(deadline)
+    cancel_token = Keyword.get(opts, :cancel_token)
+    check_interpreter_limits!(deadline, cancel_token)
 
     {state, used} = Process.get(key)
     total = used + length(calls)
@@ -97,18 +152,20 @@ defmodule MinimalHost.CodeMode do
     executor_opts = [
       parent_call_id: parent,
       run_deadline: deadline,
+      cancel_token: cancel_token,
       on_event: Keyword.get(opts, :on_event)
     ]
 
     with %State{} = ready <- Middleware.run(:after_tool_request, requested),
+         :ok <- check_interpreter_limits!(deadline, cancel_token),
          {:ok, results, metadata} <- run_child_calls(calls, ready, executor_opts),
-         :ok <- check_interpreter_deadline!(deadline),
+         :ok <- check_interpreter_limits!(deadline, cancel_token),
          %State{} = finished <-
            ready
            |> State.append_messages(results)
            |> State.append_tool_calls(metadata)
            |> then(&Middleware.run(:after_tool_execution, &1)) do
-      check_interpreter_deadline!(deadline)
+      check_interpreter_limits!(deadline, cancel_token)
       Process.put(key, {finished, total})
       %{results: results.content, metadata: metadata}
     else
@@ -116,11 +173,11 @@ defmodule MinimalHost.CodeMode do
     end
   end
 
-  defp check_interpreter_deadline!(deadline) do
-    if System.monotonic_time(:millisecond) >= deadline do
-      throw(:timeout)
-    else
-      :ok
+  defp check_interpreter_limits!(deadline, cancel_token) do
+    cond do
+      Cancel.cancelled?(cancel_token) -> throw(:cancelled)
+      System.monotonic_time(:millisecond) >= deadline -> throw(:timeout)
+      true -> :ok
     end
   end
 
