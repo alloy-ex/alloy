@@ -16,35 +16,49 @@ Runs given a `:cancel_token` (`Alloy.Cancel.new/0`) return
 `{:error, %Alloy.Result{status: :cancelled, error: :cancelled}}` when cancelled
 cooperatively.
 
-- **Exhaustive pattern matches:** `Alloy.Agent.State.status()`,
-  `Alloy.Result.status`, and `Alloy.Provider.Error.kind()` now include
+- **Exhaustive pattern matches & `result.error` type:** `t:Alloy.Agent.State.status/0`,
+  `Alloy.Result.status`, and `t:Alloy.Provider.Error.kind/0` now include
   `:cancelled`. Update any exhaustive `case` matches on run status, `:turn_end`
-  event status, `[:alloy, :run, :stop]` telemetry status, or `error.kind`.
+  event status, `[:alloy, :run, :stop]` telemetry status, or `error.kind`. Note
+  that `result.error` on `{:error, result}` is now the atom `:cancelled` rather
+  than a `String.t()` (any underlying `%Alloy.Provider.Error{kind: :cancelled}`
+  remains in `result.metadata.run.provider_error`), so callers passing
+  `result.error` directly to `String.*` helpers must handle `:cancelled`.
+- **Persistent Codex sessions after cancellation:** Callers using
+  `Alloy.Provider.Codex` with `persist_session: true` should rotate
+  `:session_generation` after a `:cancelled` run before starting new work so an
+  interrupted CLI session is not resumed in a partial state.
 - **Fail-closed middleware check:** `Alloy.Middleware.run_before_tool_call/2`
   now returns `:cancelled` when `state.config.cancel_token` is cancelled (while
   preserving explicit `{:block, reason}` verdicts). Callers invoking
   `run_before_tool_call/2` directly must handle `:cancelled`.
-- **Runtime provider config key:** When `:cancel_token` is set, Alloy injects
+- **Runtime provider config keys:** When `:cancel_token` is set, Alloy injects
   `:alloy_cancel_token` into the `provider_config` map passed to providers
-  (alongside `:alloy_request_deadline`). Custom providers using strict option
-  validators should tolerate unknown `:alloy_*` keys.
+  (alongside `:alloy_request_deadline`), and when top-level `:reasoning` is set,
+  Alloy injects normalized `:reasoning` (`%{effort: ..., display: ...}`). Custom
+  providers using strict option validators should tolerate unknown `:alloy_*`
+  keys and `:reasoning`.
 
-## 2. Dynamic `:api_key` callbacks & required `:origin_key`
+## 2. Dynamic `:api_key` callbacks, static key validation & required `:origin_key`
 
 Built-in HTTP providers (`Anthropic`, `OpenAI`, `XAI`, `Gemini`, `OpenAICompat`)
 now accept a 0-arity `:api_key` callback returning
 `String.t() | {:ok, String.t()} | {:error, term()}` resolved per HTTP attempt.
 
-- **Required `:origin_key`:** Using a function `:api_key` OR
-  `auth_scheme: :bearer` now **requires** a non-empty string `:origin_key` so
-  rotating credentials preserve account provenance across turns and
-  origin-scoped file attachments (`file_id` / Gemini File API URIs). Passing
+- **Required `:origin_key` (applies to every primary and fallback provider):**
+  `Alloy.Agent.Config` enforces `:origin_key` validation across **all**
+  primary and `:fallback_providers` configs — including custom providers.
+  Using a 0-arity `:api_key` function OR `auth_scheme: :bearer` (supported on
+  `Anthropic` and `Gemini` among built-ins) now **requires** a non-empty string
+  `:origin_key` so rotating credentials preserve account provenance across turns
+  and origin-scoped file attachments (`file_id` / Gemini File API URIs). Passing
   either without `:origin_key` raises `ArgumentError` at startup.
-- **Key validation:** Resolved API keys must be printable ASCII without CR/LF
-  characters; arbitrary callback failures map to non-retryable
-  `%Alloy.Provider.Error{kind: :auth}` with sanitized messages (explicit
-  `{:error, %Alloy.Provider.Error{}}` returns preserve allowlisted kinds,
-  including `:cancelled`, with diagnostic fields redacted).
+- **Key validation:** Both static string `:api_key` values and callback results
+  must be printable ASCII (`0x20..0x7E`, no CR/LF characters). Arbitrary
+  callback failures map to non-retryable `%Alloy.Provider.Error{kind: :auth}`
+  with sanitized messages (explicit `{:error, %Alloy.Provider.Error{}}` returns
+  preserve allowlisted kinds, including `:cancelled`, with diagnostic fields
+  redacted).
 
 ## 3. Portable `:reasoning` option
 
@@ -52,6 +66,13 @@ Pass `:reasoning` at the top level (`Alloy.run/2`, `Alloy.stream/3`,
 `Alloy.Agent.State.prepare/2`) or inside provider config:
 `nil | :off | :low | :medium | :high | :xhigh | %{effort: ..., display: ...}`.
 
+- **Global config validation (including custom providers):**
+  `Alloy.Agent.Config` validates and normalizes `:reasoning` on **every**
+  primary and fallback provider config at startup (and via `State.prepare/2`).
+  Custom providers that previously stored a custom non-portable `:reasoning`
+  value in their provider config will now raise `ArgumentError`; rename that
+  provider-specific option or accept the normalized `%{effort: ..., display: ...}`
+  map.
 - **Anthropic `reasoning: :off`:** Explicitly sends
   `%{"thinking" => %{"type" => "disabled"}}` (whereas `reasoning: nil` omits
   `"thinking"` as in v0.14). Explicit `"thinking"` inside `extra_body` still
@@ -61,7 +82,7 @@ Pass `:reasoning` at the top level (`Alloy.run/2`, `Alloy.stream/3`,
   `:google_search`, `:url_context`, and Gemini `:code_execution`) is stripped
   automatically on compaction summary requests.
 
-## 4. Uniform v1 streaming events (`docs/events.md`)
+## 4. Uniform v1 streaming events ([events.md](events.md))
 
 `Alloy.Events` v1 adds five additive event types:
 
@@ -82,15 +103,20 @@ event atoms. Note that `:thinking_delta`, `:tool_call_delta`, and
 `Alloy.stream/3` callers preserve retry/fallback resilience across non-text
 deltas.
 
-## 5. Stricter `OpenAIStream` tool-call validation & `Events.build_correlation_id/1`
+## 5. Stricter OpenAI / `OpenAIStream` tool-call validation & `Events.build_correlation_id/1`
 
-- `Alloy.Provider.OpenAIStream` and `Alloy.Provider.OpenAI` now enforce
-  stricter tool-call stream invariants: negative tool-call indices, conflicting
-  tool identities (`id` / `name` changes on the same slot), and contradictory
-  terminal tool arguments return non-retryable `:protocol_error` (or retryable
-  `:malformed_reply` on incomplete/corrupted argument JSON) rather than
-  silently corrupting tool calls.
-- `Alloy.Events.build_correlation_id/1` now requires non-empty valid UTF-8
+- **`Alloy.Provider.OpenAIStream` (Chat Completions streaming via `OpenAICompat`):**
+  Negative/malformed tool-call indices and conflicting tool identities
+  (`id` / `name` changes on the same slot) now return non-retryable
+  `:protocol_error`; non-empty invalid JSON or non-object tool arguments return
+  retryable `:malformed_reply` (with retries suppressed once any output has been
+  emitted to caller callbacks).
+- **`Alloy.Provider.OpenAI` (OpenAI / xAI Responses streaming):** Conflicting
+  streamed tool-call headers (`id` / `name` mismatches) and contradictory
+  completed tool arguments return `:malformed_reply` (retryable before output is
+  emitted; retry/fallback-suppressed once output has been emitted to caller
+  callbacks) instead of silently corrupting tool calls.
+- **`Alloy.Events.build_correlation_id/1`:** Now requires non-empty valid UTF-8
   strings for `context[:request_id]` and `context[:correlation_id]`; empty
   strings (`""`) or invalid UTF-8 fall back cleanly to a generated correlation
   ID instead of propagating invalid IDs to `Alloy.Tool.Executor`.
@@ -119,5 +145,5 @@ deltas.
   `c:Alloy.ModelCatalog.capabilities/1`, and `c:Alloy.ModelCatalog.pricing/1`
   callbacks plus `Alloy.ModelCatalog.info/1,2`. Minimal v0.14
   catalogs implementing only `context_window/1` continue to work unchanged (the
-  optional fields return `nil`). See `docs/recipes/llm-db-catalog.md` for a
-  provider-scoped `LLMDB` adapter.
+  optional fields return `nil`). See [llm-db-catalog.md](recipes/llm-db-catalog.md)
+  for a provider-scoped `LLMDB` adapter.

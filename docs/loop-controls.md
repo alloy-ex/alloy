@@ -92,11 +92,12 @@ def call(_hook, state), do: state
 ```
 
 `State.prepare/2` accepts `:tools`, `:messages`, `:system_prompt`, `:provider`,
-and `:output_schema`.
+`:output_schema`, and `:reasoning`.
 Changes persist for later turns. Tool definitions and dispatch mappings change
 together. A provider tuple can update the model or its request settings; derived
 model limits are refreshed, while explicit context limits remain unchanged.
-Changing provider configuration clears opaque provider state conservatively.
+Changing provider configuration clears opaque provider state conservatively,
+whereas updating only top-level `:reasoning` preserves live `provider_state`.
 Pass `provider_state:` in the new provider configuration to supply replacement
 state explicitly. Preparing unchanged provider configuration retains live state.
 

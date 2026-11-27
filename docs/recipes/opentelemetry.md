@@ -5,8 +5,9 @@ OpenTelemetry into its core dependencies. You can bridge them to OpenTelemetry
 (following the OpenTelemetry GenAI semantic conventions) in your application
 startup with ~115 lines of Elixir.
 
-When `:timeout_ms` is finite, Alloy's supervised HTTP/SSE and custom bash
-workers automatically propagate your process's OpenTelemetry context
+When `:timeout_ms` is finite or `:cancel_token` is set (including under
+`timeout_ms: :infinity`), Alloy's supervised HTTP/SSE and custom bash workers
+automatically propagate your process's OpenTelemetry context
 (`:"$__current_otel_ctx"`), so child Finch/HTTP spans stay parented under the
 active Alloy span.
 

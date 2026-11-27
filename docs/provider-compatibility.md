@@ -82,14 +82,16 @@ extra_body: %{
 ### Switching provider mid-conversation
 
 Each assistant message records its provider, model and origin: a hash of
-the provider module, `:api_url` and `:api_key`. Before every request,
-including to a fallback provider, `Alloy.Message.normalize_for/3` rewrites
-messages from a different origin, meaning another provider, endpoint or
-account:
+the provider module, `:api_url` and `:origin_key` (falling back to `:api_key`
+when `:origin_key` is not set). Before every request, including to a fallback
+provider, `Alloy.Message.normalize_for/3` rewrites messages from a different
+origin, meaning another provider, endpoint or account:
 
 - thinking becomes plain text, with signatures removed;
-- redacted thinking, raw OpenAI and xAI reasoning items, and Anthropic
-  server-tool records are dropped;
+- redacted thinking, raw OpenAI and xAI reasoning items, Gemini
+  `"gemini_part"` blocks, and Anthropic server-tool records are dropped;
+- foreign origin-scoped `file_id` documents and Gemini File API URIs are
+  omitted;
 - tool-call ids outside `[a-zA-Z0-9_-]{1,64}` are rewritten.
 
 Gemini receives Google's placeholder thought signature on the first tool
@@ -100,10 +102,9 @@ reasoning the new model can't use themselves, and Gemini says to resend it.
 Encrypted reasoning only ever goes back to the endpoint and credentials
 that issued it, since OpenAI ties it to the issuing organisation. Rotating
 an API key counts as a new origin, so earlier reasoning is then sent as
-text — unless you pass a stable `:origin_key` alongside a dynamic `:api_key`
-callback (`(-> String.t())` or `(-> {:ok, String.t()} | {:error, term()})`)
-representing the same tenant/account. Messages saved without their `origin`
-are sent unchanged.
+text — unless you pass a stable `:origin_key` (supported with both static
+string `:api_key` values and 0-arity `:api_key` callbacks) representing the
+same tenant/account. Messages saved without their `origin` are sent unchanged.
 
 Known limits:
 

@@ -11,8 +11,10 @@ fields) may change between minor versions.
 
 - `Alloy.stream/3` — pass `:on_event` in opts; the callback receives
   every envelope for the run.
-- `Alloy.run/2` — pass `:on_event` in opts; the callback receives every
-  envelope except text deltas, which only a streaming run produces.
+- `Alloy.run/2` — pass `:on_event` in opts; the callback receives lifecycle and
+  tool envelopes (`:turn_start`, `:turn_end`, `:tool_start`, `:tool_update`,
+  `:tool_end`), while streaming delta envelopes (`:text_delta`,
+  `:thinking_delta`, `:tool_call_delta`) are produced only by `Alloy.stream/3`.
 - `alloy_agent` — `AlloyAgent.Server` passes the same envelopes to its
   callers and PubSub subscribers.
 

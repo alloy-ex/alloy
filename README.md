@@ -61,7 +61,7 @@ application layer. The library stays small so those choices remain yours.
 
 - **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
 - **4 built-in tools** — read, write, edit, bash (with streaming `:tool_update` output) — plus inline tools (`Alloy.Tool.inline/1`) and reusable single-tool execution (`Alloy.Tool.Executor.run_tool/3`) with native `:parent_call_id`
-- **Multimodal & major-lab wire parity** — portable image URLs and PDF/document blocks (`data:`, `uri:`, or origin-scoped `file_id:`), dynamic 0-arity `:api_key` callbacks with `:origin_key` isolation, Anthropic `:cache` TTL / `:web_search`, OpenAI/xAI prompt cache keys, and Gemini `:cached_content`, `:google_search`, `:url_context`, and `:code_execution`
+- **Multimodal & major-lab wire parity** — portable image URLs and PDF/document blocks (`data:`, `uri:`, or origin-scoped `file_id:`), dynamic 0-arity `:api_key` callbacks with `:origin_key` isolation, Anthropic `:cache` TTL / `:web_search`, OpenAI/xAI prompt cache keys, and Gemini provider-config `:cached_content`, `:google_search`, `:url_context`, and `:code_execution` (note: top-level `code_execution: true` on `Alloy.run/2` applies to Anthropic only)
 - **Portable `:reasoning` & uniform v1 streaming** — single `:reasoning` knob across all 6 providers plus versioned `:turn_start`, `:turn_end`, `:text_delta`, `:thinking_delta`, `:tool_call_delta`, `:tool_start`, `:tool_update`, and `:tool_end` envelopes (`docs/events.md`)
 - **Interactive loop controls** — lock-free cooperative cancellation (`Alloy.Cancel`), mid-run `:steering` between tool batches, and completion `:follow_up` queues alongside `:output_schema`, `until_tool`, and `stop_after_tool`
 - **Middleware** — custom hooks, tool blocking, argument editing, result rewriting
@@ -533,8 +533,8 @@ logging, or custom metrics:
 | `[:alloy, :provider, :request]` | `duration_ms` | `provider`, `model`, `streaming`, `attempt`, `result` |
 | `[:alloy, :compaction, :cleared]` | `results_cleared`, `bytes_cleared` | `turn` |
 | `[:alloy, :compaction, :done]` | `messages_before`, `messages_after` | `turn` |
-| `[:alloy, :tool, :start]` | `event_seq` | `correlation_id`, `turn`, `tool_id`, `tool_name` |
-| `[:alloy, :tool, :stop]` | `event_seq`, `duration_ms` | `correlation_id`, `turn`, `tool_id`, `tool_name`, `error`, `start_event_seq` |
+| `[:alloy, :tool, :start]` | `event_seq` | `correlation_id`, `turn`, `tool_id`, `tool_name`, optional `parent_call_id` |
+| `[:alloy, :tool, :stop]` | `event_seq`, `duration_ms` | `correlation_id`, `turn`, `tool_id`, `tool_name`, `error`, `start_event_seq`, optional `parent_call_id` |
 | `[:alloy, :turn, :prompt_too_long_recovery]` | — | `turn`, `retry` |
 | `[:alloy, :event]` | `seq` | `v`, `event`, `correlation_id`, `turn` |
 
