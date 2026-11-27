@@ -241,7 +241,7 @@ defmodule Alloy.Agent.Config do
       reasoning: Alloy.Provider.normalize_reasoning!(Keyword.get(opts, :reasoning)),
       cancel_token:
         require_opt_shape!(
-          is_nil(cancel_token) or match?(%Cancel{ref: ref} when is_reference(ref), cancel_token),
+          is_nil(cancel_token) or Cancel.valid?(cancel_token),
           cancel_token,
           "cancel_token must be an Alloy.Cancel struct or nil"
         ),

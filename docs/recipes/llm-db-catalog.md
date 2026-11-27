@@ -30,15 +30,19 @@ Implementing the optional `c:Alloy.ModelCatalog.max_output_tokens/1`,
 callbacks lets your host query full model metadata uniformly through
 `Alloy.ModelCatalog.info/2`.
 
+Note that `LLMDB.Model` structs may contain nested structs or maps (which do
+not implement the `Access` behaviour), and `modalities` lives at the top level
+of the model entry alongside `capabilities`. Using `Map.get/2`-based helpers
+keeps the adapter safe across structs, maps, and boolean flags alike.
+
 ```elixir
 defmodule MyApp.LlmDbCatalog do
   @behaviour Alloy.ModelCatalog
 
   @impl true
   def context_window(model) when is_binary(model) do
-    with %{limits: %{context: limit}} when is_integer(limit) and limit > 0 <- lookup(model) do
-      limit
-    else
+    case nested_get(lookup(model), [:limits, :context]) do
+      limit when is_integer(limit) and limit > 0 -> limit
       _ -> nil
     end
   end
@@ -48,36 +52,46 @@ defmodule MyApp.LlmDbCatalog do
 
   @impl true
   def max_output_tokens(model) when is_binary(model) do
-    with %{limits: %{output: limit}} when is_integer(limit) and limit > 0 <- lookup(model) do
-      limit
-    else
+    case nested_get(lookup(model), [:limits, :output]) do
+      limit when is_integer(limit) and limit > 0 -> limit
       _ -> nil
     end
   end
 
   @impl true
   def capabilities(model) when is_binary(model) do
-    with %{capabilities: caps} when is_map(caps) <- lookup(model) do
-      %{
-        reasoning?: truthy?(get_in(caps, [:reasoning, :enabled]) || caps[:reasoning]),
-        vision?: :image in List.wrap(get_in(caps, [:modalities, :input])),
-        documents?: :pdf in List.wrap(get_in(caps, [:modalities, :input])),
-        tools?: truthy?(get_in(caps, [:tools, :enabled]) || caps[:tools]),
-        structured_output?: truthy?(get_in(caps, [:json, :schema]) || caps[:structured_output]),
-        prompt_caching?: truthy?(caps[:prompt_caching])
-      }
-    else
-      _ -> nil
+    case lookup(model) do
+      entry when is_map(entry) ->
+        caps = Map.get(entry, :capabilities)
+        input_modalities = List.wrap(nested_get(entry, [:modalities, :input]))
+
+        if is_map(caps) or input_modalities != [] do
+          %{
+            reasoning?: capability_enabled?(caps, :reasoning, :enabled),
+            vision?: :image in input_modalities,
+            documents?: :pdf in input_modalities,
+            tools?: capability_enabled?(caps, :tools, :enabled),
+            structured_output?:
+              capability_enabled?(caps, :json, :schema) or
+                capability_enabled?(caps, :structured_output, :enabled),
+            prompt_caching?: capability_enabled?(caps, :prompt_caching, :enabled)
+          }
+        end
+
+      _ ->
+        nil
     end
   end
 
   @impl true
   def pricing(model) when is_binary(model) do
-    with %{cost: %{input: input, output: output} = cost}
-         when is_number(input) and is_number(output) <- lookup(model) do
+    with entry when is_map(entry) <- lookup(model),
+         cost when is_map(cost) <- Map.get(entry, :cost),
+         input when is_number(input) <- Map.get(cost, :input),
+         output when is_number(output) <- Map.get(cost, :output) do
       %{input_per_million: input, output_per_million: output}
-      |> maybe_put(:cache_read_per_million, cost[:cache_read])
-      |> maybe_put(:cache_write_per_million, cost[:cache_write])
+      |> maybe_put(:cache_read_per_million, Map.get(cost, :cache_read))
+      |> maybe_put(:cache_write_per_million, Map.get(cost, :cache_write))
     else
       _ -> nil
     end
@@ -86,7 +100,7 @@ defmodule MyApp.LlmDbCatalog do
   # Supports either provider-qualified specs ("anthropic:claude-sonnet-4-6") or
   # bare model IDs ("claude-sonnet-4-6") as passed in Alloy provider configs.
   defp lookup(model) do
-    case LLMDb.model(model) do
+    case LLMDB.model(model) do
       {:ok, entry} ->
         entry
 
@@ -96,25 +110,40 @@ defmodule MyApp.LlmDbCatalog do
   end
 
   defp find_by_model_id(model_id) do
-    Enum.find_value(LLMDb.providers(), fn provider ->
-      case LLMDb.model(provider.id, model_id) do
+    Enum.find_value(LLMDB.providers(), fn provider ->
+      provider_id = if is_map(provider), do: Map.get(provider, :id), else: provider
+
+      case LLMDB.model(provider_id, model_id) do
         {:ok, entry} -> entry
         _ -> nil
       end
     end)
   end
 
+  defp nested_get(nil, _keys), do: nil
+  defp nested_get(value, []), do: value
+
+  defp nested_get(map, [key | rest]) when is_map(map) do
+    map |> Map.get(key) |> nested_get(rest)
+  end
+
+  defp nested_get(_other, _keys), do: nil
+
+  defp capability_enabled?(caps, key, nested_key) when is_map(caps) do
+    case Map.get(caps, key) do
+      true -> true
+      nested when is_map(nested) -> Map.get(nested, nested_key) == true
+      _ -> false
+    end
+  end
+
+  defp capability_enabled?(_caps, _key, _nested_key), do: false
+
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, val) when is_number(val), do: Map.put(map, key, val)
   defp maybe_put(map, _key, _other), do: map
-
-  defp truthy?(val), do: val == true
 end
 ```
-
-> Note: Check the exact struct field names for your installed `:llm_db` version
-> (for example `LLMDb.Model` fields under `:limits`, `:capabilities`, and
-> `:cost`).
 
 ## 3. Wire it into runs and cost estimation
 

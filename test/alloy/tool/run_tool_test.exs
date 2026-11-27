@@ -299,9 +299,27 @@ defmodule Alloy.Tool.RunToolTest do
                Executor.run_tool(call, bounded_state, run_deadline: now + 30_000)
 
       assert clamped_block.is_error == true
-      assert clamped_block.content =~ "run deadline"
+      assert clamped_block.content =~ "run deadline (120000ms) was reached"
 
-      # Already expired deadline returns nil meta and emits zero events
+      # Tighter opts[:run_deadline] omits misleading outer timeout_ms (120000ms)
+      assert {:ok, scoped_block, _meta} =
+               Executor.run_tool(call, state,
+                 run_deadline: System.monotonic_time(:millisecond) + 40
+               )
+
+      assert scoped_block.is_error == true
+      assert scoped_block.content == "Tool slow timed out because the run deadline was reached."
+      refute scoped_block.content =~ "120000ms"
+
+      assert {:ok, scoped_expired, nil} =
+               Executor.run_tool(call, state,
+                 run_deadline: System.monotonic_time(:millisecond) - 1
+               )
+
+      assert scoped_expired.content == "Not executed: Agent run deadline was reached"
+      refute scoped_expired.content =~ "120000ms"
+
+      # Already expired outer deadline returns nil meta and emits zero events
       parent = self()
       expired_state = %{state | run_deadline: now - 1}
 
@@ -309,7 +327,7 @@ defmodule Alloy.Tool.RunToolTest do
                Executor.run_tool(call, expired_state, on_event: &send(parent, {:ev, &1}))
 
       assert expired_block.is_error == true
-      assert expired_block.content =~ "Not executed"
+      assert expired_block.content =~ "Not executed: Agent run timed out after 120000ms"
       refute_received {:ev, _}
     end
 
@@ -377,10 +395,103 @@ defmodule Alloy.Tool.RunToolTest do
       assert cancel_meta.error =~ "was cancelled"
       assert_receive {:mid_ev, {:tool_start, %{id: "c2"}}}
       assert_receive {:mid_ev, {:tool_end, %{id: "c2"}}}
+
+      # 3. Outer state.config.cancel_token is preserved when opts passes cancel_token: nil
+      #    or a separate uncancelled child cancel_token (both pre-cancelled and mid-flight)
+      outer = Cancel.new()
+      inner = Cancel.new()
+      outer_state = init_state([blocking], cancel_token: outer)
+
+      task_outer =
+        Task.async(fn ->
+          Executor.run_tool(
+            %{id: "c3", name: "block_work", input: %{"value" => "x"}},
+            outer_state,
+            cancel_token: inner
+          )
+        end)
+
+      assert_receive {:worker, outer_worker_pid}, 2_000
+      outer_mon = Process.monitor(outer_worker_pid)
+      Cancel.cancel(outer)
+
+      assert {:ok, outer_cancel_block, _meta} = Task.await(task_outer, 2_000)
+      assert_receive {:DOWN, ^outer_mon, :process, ^outer_worker_pid, _reason}, 1_000
+      assert outer_cancel_block.is_error == true
+      assert outer_cancel_block.content =~ "was cancelled"
+      refute Cancel.cancelled?(inner)
+
+      # Explicit cancel_token: nil does not disarm an already-cancelled outer token
+      assert {:ok, nil_opt_block, nil} =
+               Executor.run_tool(
+                 %{id: "c4", name: "block_work", input: %{"value" => "x"}},
+                 outer_state,
+                 cancel_token: nil
+               )
+
+      assert nil_opt_block.is_error == true
+      assert nil_opt_block.content == "Not executed: Cancelled"
+
+      # Cancelling inner does not cancel outer
+      outer2 = Cancel.new()
+      inner2 = Cancel.new()
+      Cancel.cancel(inner2)
+      outer2_state = init_state([blocking], cancel_token: outer2)
+
+      assert {:ok, inner_cancel_block, nil} =
+               Executor.run_tool(
+                 %{id: "c5", name: "block_work", input: %{"value" => "x"}},
+                 outer2_state,
+                 cancel_token: inner2
+               )
+
+      assert inner_cancel_block.content == "Not executed: Cancelled"
+      refute Cancel.cancelled?(outer2)
     end
 
-    test "validates option shapes on invalid inputs" do
-      state = init_state([])
+    test "accepts on_event: nil, defaults omitted :input, and validates tool_call and option shapes" do
+      parent = self()
+
+      no_arg =
+        Tool.inline(
+          name: "ping",
+          description: "ping",
+          input_schema: %{type: "object", properties: %{}, required: []},
+          execute: fn input, ctx ->
+            send(parent, {:ping_ctx, input, Map.has_key?(ctx, :on_tool_update)})
+            {:ok, "pong"}
+          end
+        )
+
+      state = init_state([no_arg])
+
+      # on_event: nil works and does not attach :on_tool_update; omitted :input defaults to %{}
+      assert {:ok, ok_block, _meta} =
+               Executor.run_tool(%{id: "p1", name: "ping"}, state, on_event: nil)
+
+      assert ok_block.content == "pong"
+      assert_receive {:ping_ctx, %{}, false}
+
+      # Explicit input: nil is preserved and rejected as non-object input
+      assert {:ok, nil_input_block, _meta} =
+               Executor.run_tool(%{id: "p2", name: "ping", input: nil}, state)
+
+      assert nil_input_block.is_error == true
+      assert nil_input_block.content =~ "must be a JSON object"
+
+      # Missing or empty tool_call :id or :name raises ArgumentError
+      for bad_call <- [
+            %{name: "ping", input: %{}},
+            %{id: "", name: "ping", input: %{}},
+            %{id: <<0xFF>>, name: "ping", input: %{}},
+            %{id: "p3", input: %{}},
+            %{id: "p3", name: "", input: %{}}
+          ] do
+        assert_raise ArgumentError, ~r/tool_call :(id|name)/, fn ->
+          Executor.run_tool(bad_call, state)
+        end
+      end
+
       call = %{id: "v1", name: "x", input: %{}}
 
       assert_raise ArgumentError, ~r/:tool_fns/, fn ->
@@ -397,6 +508,12 @@ defmodule Alloy.Tool.RunToolTest do
 
       assert_raise ArgumentError, ~r/:cancel_token/, fn ->
         Executor.run_tool(call, state, cancel_token: :not_a_token)
+      end
+
+      assert_raise ArgumentError, ~r/:cancel_token/, fn ->
+        Executor.run_tool(call, state,
+          cancel_token: %Cancel{ref: :atomics.new(1, signed: false), parents: [:bad]}
+        )
       end
 
       assert_raise ArgumentError, ~r/:parent_call_id/, fn ->

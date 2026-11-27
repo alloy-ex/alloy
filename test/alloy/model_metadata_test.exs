@@ -254,6 +254,10 @@ defmodule Alloy.ModelMetadataTest do
       assert non_reasoning.reasoning? == false
       assert non_reasoning.tools? == true
 
+      non_reasoning_latest = ModelMetadata.capabilities("grok-4.20-non-reasoning-latest")
+      assert non_reasoning_latest.reasoning? == false
+      assert non_reasoning_latest.tools? == true
+
       assert ModelMetadata.capabilities("unknown-model") == nil
       assert ModelMetadata.capabilities("gpt-5-codex") == nil
     end
@@ -291,13 +295,25 @@ defmodule Alloy.ModelMetadataTest do
       assert %{input_per_million: 0.05, output_per_million: 0.4} =
                ModelMetadata.pricing("gpt-5-nano")
 
-      assert %{input_per_million: 1.25, output_per_million: 10.0} =
+      assert %{
+               input_per_million: 1.25,
+               output_per_million: 10.0,
+               cache_read_per_million: 0.125
+             } =
                ModelMetadata.pricing("models/gemini-2.5-pro")
 
-      assert %{input_per_million: 0.3, output_per_million: 2.5} =
+      assert %{
+               input_per_million: 0.3,
+               output_per_million: 2.5,
+               cache_read_per_million: 0.03
+             } =
                ModelMetadata.pricing("gemini-2.5-flash")
 
-      assert %{input_per_million: 0.1, output_per_million: 0.4} =
+      assert %{
+               input_per_million: 0.1,
+               output_per_million: 0.4,
+               cache_read_per_million: 0.01
+             } =
                ModelMetadata.pricing("gemini-2.5-flash-lite")
 
       assert ModelMetadata.pricing("unknown-model") == nil

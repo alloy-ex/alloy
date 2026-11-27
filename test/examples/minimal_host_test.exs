@@ -278,6 +278,38 @@ defmodule MinimalHostTest do
     assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
   end
 
+  test "interpreter timeout is terminal even if the program ignores the child timeout result" do
+    parent = self()
+
+    slow =
+      tool("slow", fn _input, _context ->
+        send(parent, {:slow_started, self()})
+        Process.sleep(:infinity)
+      end)
+
+    program = fn dispatch ->
+      _ignored = dispatch.(%{name: "slow", input: %{"value" => "wait"}})
+      :continued_after_timeout
+    end
+
+    assert {:error, :timeout} =
+             CodeMode.run(
+               program,
+               state([slow]),
+               Keyword.put(opts(), :timeout, 60)
+             )
+
+    assert_receive {:slow_started, child}
+    monitor = Process.monitor(child)
+    assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
+  end
+
+  test "rejects empty parent_call_id upfront" do
+    assert_raise ArgumentError, ~r/non-empty parent_call_id/, fn ->
+      CodeMode.run(fn _dispatch -> :ok end, state([]), Keyword.put(opts(), :parent_call_id, ""))
+    end
+  end
+
   @tag :tmp_dir
   test "failed producers leave no artifact and binary previews are display-safe", %{tmp_dir: dir} do
     File.chmod!(dir, 0o700)

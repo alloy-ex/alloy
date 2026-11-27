@@ -48,6 +48,121 @@ defmodule Alloy.ModelCatalogTest do
     def pricing(_), do: nil
   end
 
+  defmodule FakeLlmDbModel do
+    defstruct [:limits, :capabilities, :modalities, :cost]
+  end
+
+  defmodule FakeLlmDbLimits do
+    defstruct [:context, :output]
+  end
+
+  defmodule FakeLlmDbCost do
+    defstruct [:input, :output, :cache_read, :cache_write]
+  end
+
+  defmodule StructBackedLlmDbCatalog do
+    @behaviour Alloy.ModelCatalog
+
+    @entries %{
+      "nested-multimodal" => %FakeLlmDbModel{
+        limits: %FakeLlmDbLimits{context: 1_000_000, output: 128_000},
+        modalities: %{input: [:text, :image, :pdf], output: [:text]},
+        capabilities: %{
+          reasoning: %{enabled: true},
+          tools: %{enabled: true},
+          json: %{schema: true},
+          prompt_caching: true
+        },
+        cost: %FakeLlmDbCost{input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75}
+      },
+      "flat-booleans" => %FakeLlmDbModel{
+        limits: %FakeLlmDbLimits{context: 200_000, output: 64_000},
+        modalities: %{input: [:text, :image], output: [:text]},
+        capabilities: %{
+          reasoning: false,
+          tools: true,
+          structured_output: true,
+          prompt_caching: false
+        },
+        cost: %FakeLlmDbCost{input: 1.0, output: 5.0, cache_read: nil, cache_write: nil}
+      }
+    }
+
+    @impl true
+    def context_window(model) do
+      case nested_get(Map.get(@entries, model), [:limits, :context]) do
+        limit when is_integer(limit) and limit > 0 -> limit
+        _ -> nil
+      end
+    end
+
+    @impl true
+    def max_output_tokens(model) do
+      case nested_get(Map.get(@entries, model), [:limits, :output]) do
+        limit when is_integer(limit) and limit > 0 -> limit
+        _ -> nil
+      end
+    end
+
+    @impl true
+    def capabilities(model) do
+      case Map.get(@entries, model) do
+        entry when is_map(entry) ->
+          caps = Map.get(entry, :capabilities)
+          input_modalities = List.wrap(nested_get(entry, [:modalities, :input]))
+
+          %{
+            reasoning?: capability_enabled?(caps, :reasoning, :enabled),
+            vision?: :image in input_modalities,
+            documents?: :pdf in input_modalities,
+            tools?: capability_enabled?(caps, :tools, :enabled),
+            structured_output?:
+              capability_enabled?(caps, :json, :schema) or
+                capability_enabled?(caps, :structured_output, :enabled),
+            prompt_caching?: capability_enabled?(caps, :prompt_caching, :enabled)
+          }
+
+        _ ->
+          nil
+      end
+    end
+
+    @impl true
+    def pricing(model) do
+      with entry when is_map(entry) <- Map.get(@entries, model),
+           cost when is_map(cost) <- Map.get(entry, :cost),
+           input when is_number(input) <- Map.get(cost, :input),
+           output when is_number(output) <- Map.get(cost, :output) do
+        %{input_per_million: input, output_per_million: output}
+        |> maybe_put(:cache_read_per_million, Map.get(cost, :cache_read))
+        |> maybe_put(:cache_write_per_million, Map.get(cost, :cache_write))
+      else
+        _ -> nil
+      end
+    end
+
+    defp nested_get(nil, _keys), do: nil
+    defp nested_get(value, []), do: value
+
+    defp nested_get(map, [key | rest]) when is_map(map),
+      do: map |> Map.get(key) |> nested_get(rest)
+
+    defp nested_get(_other, _keys), do: nil
+
+    defp capability_enabled?(caps, key, nested_key) when is_map(caps) do
+      case Map.get(caps, key) do
+        true -> true
+        nested when is_map(nested) -> Map.get(nested, nested_key) == true
+        _ -> false
+      end
+    end
+
+    defp capability_enabled?(_caps, _key, _nested_key), do: false
+
+    defp maybe_put(map, _key, nil), do: map
+    defp maybe_put(map, key, val) when is_number(val), do: Map.put(map, key, val)
+  end
+
   defp opts(extra) do
     Keyword.merge(
       [provider: {Alloy.Provider.Test, model: "my-finetune-v3"}],
@@ -191,6 +306,50 @@ defmodule Alloy.ModelCatalogTest do
       assert_raise ArgumentError, ~r/:model_catalog must be a module/, fn ->
         Alloy.ModelCatalog.info(Enum, "gpt-5")
       end
+    end
+
+    test "struct-backed LLMDB-style adapter handles sibling modalities and boolean capability flags" do
+      nested = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog, "nested-multimodal")
+
+      assert nested == %{
+               model: "nested-multimodal",
+               context_window: 1_000_000,
+               max_output_tokens: 128_000,
+               capabilities: %{
+                 reasoning?: true,
+                 vision?: true,
+                 documents?: true,
+                 tools?: true,
+                 structured_output?: true,
+                 prompt_caching?: true
+               },
+               pricing: %{
+                 input_per_million: 3.0,
+                 output_per_million: 15.0,
+                 cache_read_per_million: 0.3,
+                 cache_write_per_million: 3.75
+               }
+             }
+
+      flat = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog, "flat-booleans")
+
+      assert flat == %{
+               model: "flat-booleans",
+               context_window: 200_000,
+               max_output_tokens: 64_000,
+               capabilities: %{
+                 reasoning?: false,
+                 vision?: true,
+                 documents?: false,
+                 tools?: true,
+                 structured_output?: true,
+                 prompt_caching?: false
+               },
+               pricing: %{
+                 input_per_million: 1.0,
+                 output_per_million: 5.0
+               }
+             }
     end
   end
 end

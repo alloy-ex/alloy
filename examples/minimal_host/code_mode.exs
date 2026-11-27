@@ -21,8 +21,9 @@ defmodule MinimalHost.CodeMode do
     parent = Keyword.fetch!(opts, :parent_call_id)
 
     if not (is_integer(timeout) and timeout > 0 and is_integer(max_calls) and max_calls > 0 and
-              is_binary(parent)) do
-      raise ArgumentError, "positive timeout/max_calls and a parent_call_id are required"
+              is_binary(parent) and byte_size(parent) > 0) do
+      raise ArgumentError,
+            "positive timeout/max_calls and a non-empty parent_call_id are required"
     end
 
     deadline = System.monotonic_time(:millisecond) + timeout
@@ -50,8 +51,11 @@ defmodule MinimalHost.CodeMode do
         dispatch(calls_or_call, key, opts)
       end
 
-      {:ok, program.(dispatch)}
+      result = program.(dispatch)
+      check_interpreter_deadline!(Keyword.fetch!(opts, :run_deadline))
+      {:ok, result}
     catch
+      :throw, :timeout -> {:error, :timeout}
       kind, reason -> {:error, {kind, reason}}
     after
       Process.delete(key)
@@ -64,6 +68,9 @@ defmodule MinimalHost.CodeMode do
   end
 
   defp dispatch(calls, key, opts) when is_list(calls) do
+    deadline = Keyword.fetch!(opts, :run_deadline)
+    check_interpreter_deadline!(deadline)
+
     {state, used} = Process.get(key)
     total = used + length(calls)
     if total > Keyword.fetch!(opts, :max_calls), do: throw(:call_limit)
@@ -87,24 +94,33 @@ defmodule MinimalHost.CodeMode do
         Message.assistant_blocks(Enum.map(calls, &Map.put(&1, :type, "tool_use")))
       )
 
-    executor_opts =
-      [
-        parent_call_id: parent,
-        run_deadline: Keyword.get(opts, :run_deadline)
-      ]
-      |> maybe_put_on_event(Keyword.get(opts, :on_event))
+    executor_opts = [
+      parent_call_id: parent,
+      run_deadline: deadline,
+      on_event: Keyword.get(opts, :on_event)
+    ]
 
     with %State{} = ready <- Middleware.run(:after_tool_request, requested),
          {:ok, results, metadata} <- run_child_calls(calls, ready, executor_opts),
+         :ok <- check_interpreter_deadline!(deadline),
          %State{} = finished <-
            ready
            |> State.append_messages(results)
            |> State.append_tool_calls(metadata)
            |> then(&Middleware.run(:after_tool_execution, &1)) do
+      check_interpreter_deadline!(deadline)
       Process.put(key, {finished, total})
       %{results: results.content, metadata: metadata}
     else
       {:halted, reason} -> throw({:halted, reason})
+    end
+  end
+
+  defp check_interpreter_deadline!(deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      throw(:timeout)
+    else
+      :ok
     end
   end
 
@@ -122,7 +138,4 @@ defmodule MinimalHost.CodeMode do
   defp run_child_calls(calls, ready, executor_opts) do
     Executor.execute_all(calls, ready.tool_fns, ready, executor_opts)
   end
-
-  defp maybe_put_on_event(opts, nil), do: opts
-  defp maybe_put_on_event(opts, on_event), do: Keyword.put(opts, :on_event, on_event)
 end

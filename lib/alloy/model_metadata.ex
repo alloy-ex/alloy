@@ -103,7 +103,7 @@ defmodule Alloy.ModelMetadata do
     # 2026-10-09. The slugs retired in
     # https://docs.x.ai/developers/migration/may-15-retirement now redirect
     # to other models, so they are left out.
-    {~r/^grok-4\.20-[a-z0-9-]*non-reasoning$/,
+    {~r/^grok-4\.20-[a-z0-9-]*non-reasoning(-[a-z0-9-]+)?$/,
      %{
        context_window: 1_000_000,
        max_output_tokens: 131_072,
@@ -200,19 +200,19 @@ defmodule Alloy.ModelMetadata do
      %{
        input_per_million: 1.25,
        output_per_million: 10.0,
-       cache_read_per_million: 0.31
+       cache_read_per_million: 0.125
      }},
     {~r/^(?:models\/)?gemini-2\.5-flash$/,
      %{
        input_per_million: 0.3,
        output_per_million: 2.5,
-       cache_read_per_million: 0.075
+       cache_read_per_million: 0.03
      }},
     {~r/^(?:models\/)?gemini-2\.5-flash-lite$/,
      %{
        input_per_million: 0.1,
        output_per_million: 0.4,
-       cache_read_per_million: 0.025
+       cache_read_per_million: 0.01
      }}
   ]
 

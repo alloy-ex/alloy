@@ -81,6 +81,7 @@ defmodule Alloy.Tool.Executor do
           {:ok, map(), map() | nil} | {:halted, String.t()}
   def run_tool(tool_call, %State{} = state, opts \\ [])
       when is_map(tool_call) and not is_struct(tool_call) and is_list(opts) do
+    normalized_call = validate_tool_call!(tool_call)
     tool_fns = Keyword.get(opts, :tool_fns, state.tool_fns)
 
     unless is_map(tool_fns) and not is_struct(tool_fns) do
@@ -90,7 +91,7 @@ defmodule Alloy.Tool.Executor do
 
     {run, _inline_tools} = build_run(tool_fns, state, opts)
 
-    with {:ok, [tagged]} <- tag_tool_calls(run.state, [tool_call]) do
+    with {:ok, [tagged]} <- tag_tool_calls(run.state, [normalized_call]) do
       [{result_block, meta}] = run_batch([tagged], run)
       {:ok, result_block, meta}
     end
@@ -148,17 +149,23 @@ defmodule Alloy.Tool.Executor do
         prepared
       end)
 
+    raw_on_event = Keyword.get(opts, :on_event)
+
     emit_tool_updates? =
-      Keyword.get(opts, :event_subscriber?, Keyword.has_key?(opts, :on_event))
+      Keyword.get(opts, :event_subscriber?, is_function(raw_on_event, 1))
 
-    cancel_token =
-      validate_cancel_token!(Keyword.get(opts, :cancel_token, state.config.cancel_token))
-
+    opt_cancel_token = validate_cancel_token!(Keyword.get(opts, :cancel_token))
+    cancel_token = Cancel.combine(state.config.cancel_token, opt_cancel_token)
     timeout = validate_tool_timeout!(Keyword.get(opts, :tool_timeout, state.config.tool_timeout))
     opt_deadline = validate_run_deadline!(Keyword.get(opts, :run_deadline))
     run_deadline = resolve_run_deadline(state.run_deadline, opt_deadline)
+
+    outer_deadline_governs? =
+      is_integer(state.run_deadline) and
+        (is_nil(opt_deadline) or state.run_deadline <= opt_deadline)
+
     parent_call_id = validate_parent_call_id!(Keyword.get(opts, :parent_call_id))
-    on_event = validate_on_event!(Keyword.get(opts, :on_event, fn _ -> :ok end))
+    on_event = validate_on_event!(raw_on_event)
 
     effective_state = %{
       state
@@ -174,6 +181,7 @@ defmodule Alloy.Tool.Executor do
       context: build_context(effective_state),
       timeout: timeout,
       run_deadline: run_deadline,
+      outer_deadline_governs?: outer_deadline_governs?,
       cancel_token: cancel_token,
       parent_call_id: parent_call_id,
       on_event: on_event,
@@ -184,6 +192,22 @@ defmodule Alloy.Tool.Executor do
     }
 
     {run, inline_tools}
+  end
+
+  defp validate_tool_call!(tool_call) do
+    id = Map.get(tool_call, :id)
+    name = Map.get(tool_call, :name)
+
+    unless is_binary(id) and byte_size(id) > 0 and String.valid?(id) do
+      raise ArgumentError, "tool_call :id must be a non-empty UTF-8 string, got: #{inspect(id)}"
+    end
+
+    unless is_binary(name) and byte_size(name) > 0 and String.valid?(name) do
+      raise ArgumentError,
+            "tool_call :name must be a non-empty UTF-8 string, got: #{inspect(name)}"
+    end
+
+    Map.put_new(tool_call, :input, %{})
   end
 
   defp resolve_run_deadline(nil, deadline), do: deadline
@@ -204,11 +228,14 @@ defmodule Alloy.Tool.Executor do
   end
 
   defp validate_cancel_token!(nil), do: nil
-  defp validate_cancel_token!(%Cancel{ref: ref} = token) when is_reference(ref), do: token
 
-  defp validate_cancel_token!(bad) do
-    raise ArgumentError,
-          ":cancel_token must be an Alloy.Cancel token or nil, got: #{inspect(bad)}"
+  defp validate_cancel_token!(token) do
+    if Cancel.valid?(token) do
+      token
+    else
+      raise ArgumentError,
+            ":cancel_token must be an Alloy.Cancel token or nil, got: #{inspect(token)}"
+    end
   end
 
   defp validate_parent_call_id!(nil), do: nil
@@ -220,10 +247,11 @@ defmodule Alloy.Tool.Executor do
           ":parent_call_id must be a non-empty string or nil, got: #{inspect(bad)}"
   end
 
+  defp validate_on_event!(nil), do: fn _ -> :ok end
   defp validate_on_event!(fun) when is_function(fun, 1), do: fun
 
   defp validate_on_event!(bad) do
-    raise ArgumentError, ":on_event must be a 1-arity function, got: #{inspect(bad)}"
+    raise ArgumentError, ":on_event must be a 1-arity function or nil, got: #{inspect(bad)}"
   end
 
   defp run_batches([], _run, _poll_steering, results_rev, metas_rev) do
@@ -830,7 +858,7 @@ defmodule Alloy.Tool.Executor do
   defp deadline_expired?(nil), do: false
   defp deadline_expired?(deadline), do: System.monotonic_time(:millisecond) >= deadline
 
-  defp deadline_skipped_message(run) do
+  defp deadline_skipped_message(%{outer_deadline_governs?: true} = run) do
     case run.state.config.timeout_ms do
       timeout_ms when is_integer(timeout_ms) ->
         "Not executed: Agent run timed out after #{timeout_ms}ms"
@@ -838,6 +866,10 @@ defmodule Alloy.Tool.Executor do
       _infinity ->
         "Not executed: Agent run deadline was reached"
     end
+  end
+
+  defp deadline_skipped_message(_run) do
+    "Not executed: Agent run deadline was reached"
   end
 
   defp deadline_skipped_outcome(run) do
@@ -993,7 +1025,7 @@ defmodule Alloy.Tool.Executor do
        "Check the input and try again.", nil}
   end
 
-  defp run_deadline_timeout_outcome(call, run) do
+  defp run_deadline_timeout_outcome(call, %{outer_deadline_governs?: true} = run) do
     detail =
       case run.state.config.timeout_ms do
         timeout_ms when is_integer(timeout_ms) -> " (#{timeout_ms}ms)"
@@ -1001,6 +1033,10 @@ defmodule Alloy.Tool.Executor do
       end
 
     {:error, "Tool #{call[:name]} timed out because the run deadline#{detail} was reached.", nil}
+  end
+
+  defp run_deadline_timeout_outcome(call, _run) do
+    {:error, "Tool #{call[:name]} timed out because the run deadline was reached.", nil}
   end
 
   defp finish(started, outcome, run) do
