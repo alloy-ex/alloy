@@ -104,7 +104,25 @@ defmodule Alloy.Provider.Error do
     "maximum prompt length"
   ]
 
+  @http_date_regex ~r/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}:\d{2}:\d{2}) GMT$/
+
+  @http_months %{
+    "Jan" => "01",
+    "Feb" => "02",
+    "Mar" => "03",
+    "Apr" => "04",
+    "May" => "05",
+    "Jun" => "06",
+    "Jul" => "07",
+    "Aug" => "08",
+    "Sep" => "09",
+    "Oct" => "10",
+    "Nov" => "11",
+    "Dec" => "12"
+  }
+
   @impl Exception
+  @spec message(t()) :: String.t()
   def message(%__MODULE__{type: type, message: message}) when is_binary(type),
     do: "#{type}: #{message}"
 
@@ -330,15 +348,9 @@ defmodule Alloy.Provider.Error do
   end
 
   defp http_date(value) do
-    pattern =
-      ~r/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}:\d{2}:\d{2}) GMT$/
-
-    case Regex.run(pattern, value) do
+    case Regex.run(@http_date_regex, value) do
       [_full, day, month, year, time] ->
-        month =
-          Enum.find_index(~w(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec), &(&1 == month)) + 1
-
-        iso = "#{year}-#{String.pad_leading(Integer.to_string(month), 2, "0")}-#{day}T#{time}Z"
+        iso = "#{year}-#{Map.fetch!(@http_months, month)}-#{day}T#{time}Z"
 
         case DateTime.from_iso8601(iso) do
           {:ok, datetime, 0} -> {:ok, datetime}

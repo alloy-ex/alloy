@@ -224,7 +224,7 @@ defmodule Alloy.Provider do
 
   def normalize_reasoning(other) do
     invalid_reasoning(
-      "Invalid :reasoning: expected nil, one of #{inspect(@reasoning_efforts)}, or %{effort: ..., display?: ...}, got #{Sanitize.inspect_bounded(other)}"
+      "Invalid :reasoning: expected nil, one of #{inspect(@reasoning_efforts)}, or %{effort: ..., display: ...}, got #{Sanitize.inspect_bounded(other)}"
     )
   end
 
@@ -238,6 +238,14 @@ defmodule Alloy.Provider do
       {:error, %Error{message: msg}} -> raise ArgumentError, msg
     end
   end
+
+  @doc false
+  @spec openai_reasoning_effort(reasoning_effort()) :: String.t()
+  def openai_reasoning_effort(:off), do: "none"
+  def openai_reasoning_effort(:low), do: "low"
+  def openai_reasoning_effort(:medium), do: "medium"
+  def openai_reasoning_effort(:high), do: "high"
+  def openai_reasoning_effort(:xhigh), do: "xhigh"
 
   defp invalid_reasoning(message), do: {:error, %Error{kind: :invalid_request, message: message}}
 end

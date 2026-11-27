@@ -57,50 +57,33 @@ defmodule Alloy.Provider.Retry do
     provider_config = maybe_put_cancel_token(provider_config, cancel_token)
 
     {result, chunks_emitted?} =
-      do_provider_call(
-        normalize_for(base_state, provider, provider_config),
-        provider,
-        provider_config,
-        streaming?,
-        on_chunk,
-        state.config.max_retries,
-        deadline
-      )
+      do_provider_call(%{
+        state: normalize_for(base_state, provider, provider_config),
+        provider: provider,
+        provider_config: provider_config,
+        streaming?: streaming?,
+        on_chunk: on_chunk,
+        retries_left: state.config.max_retries,
+        deadline: deadline
+      })
 
-    case result do
-      {:ok, _} = success ->
-        {success, base_messages, chunks_emitted?}
+    case classify_attempt_outcome(result, chunks_emitted?, cancel_token) do
+      {:ok, response, emitted?} ->
+        {{:ok, response}, base_messages, emitted?}
 
-      # Preserve explicit :cancelled errors (e.g. Codex resume rotation guidance)
-      # even when chunks were emitted; convert non-cancelled errors after cancel.
-      {:error, %Error{kind: :cancelled}} = error ->
-        {error, base_messages, chunks_emitted?}
+      {:halt_error, error, emitted?} ->
+        {error, base_messages, emitted?}
 
-      # Once any streamed output/event was emitted, never switch providers:
-      # mixing chunks from multiple providers in one stream breaks turn semantics.
-      {:error, _reason} = error when chunks_emitted? ->
-        if Cancel.cancelled?(cancel_token),
-          do: {{:error, cancelled_error()}, base_messages, true},
-          else: {error, base_messages, true}
-
-      # Do not spawn fallback workers against a supervisor that is shutting down.
-      {:error, %Error{kind: :shutdown}} = error ->
-        {error, base_messages, false}
-
-      {:error, _reason} = error ->
-        if Cancel.cancelled?(cancel_token) do
-          {{:error, cancelled_error()}, base_messages, false}
-        else
-          try_fallback_providers(
-            base_state,
-            provider_config,
-            primary_origin,
-            streaming?,
-            on_chunk,
-            deadline,
-            error
-          )
-        end
+      {:fallback, error} ->
+        try_fallback_providers(
+          base_state,
+          provider_config,
+          primary_origin,
+          streaming?,
+          on_chunk,
+          deadline,
+          error
+        )
     end
   end
 
@@ -209,93 +192,90 @@ defmodule Alloy.Provider.Retry do
             attributed_state = %{state | messages: attempt_messages}
 
             {result, chunks_emitted?} =
-              do_provider_call(
-                normalize_for(attributed_state, fb_provider, fb_provider_config),
-                fb_provider,
-                fb_provider_config,
-                fb_streaming?,
-                on_chunk,
-                state.config.max_retries,
-                deadline
-              )
+              do_provider_call(%{
+                state: normalize_for(attributed_state, fb_provider, fb_provider_config),
+                provider: fb_provider,
+                provider_config: fb_provider_config,
+                streaming?: fb_streaming?,
+                on_chunk: on_chunk,
+                retries_left: state.config.max_retries,
+                deadline: deadline
+              })
 
-            handle_fallback_result(
-              result,
-              chunks_emitted?,
+            handle_fallback_outcome(
+              classify_attempt_outcome(result, chunks_emitted?, cancel_token),
               fb_provider,
               fb_provider_config,
               primary_origin,
-              attempt_messages,
-              cancel_token
+              attempt_messages
             )
         end
       end
     )
   end
 
-  defp handle_fallback_result(
-         {:ok, response},
-         chunks_emitted?,
+  defp handle_fallback_outcome(
+         {:ok, response, emitted?},
          fb_provider,
          fb_provider_config,
          primary_origin,
-         attempt_messages,
-         _cancel_token
+         attempt_messages
        ) do
     isolated = isolate_fallback_state(response, fb_provider, fb_provider_config, primary_origin)
-    {:halt, {{:ok, isolated}, attempt_messages, chunks_emitted?}}
+    {:halt, {{:ok, isolated}, attempt_messages, emitted?}}
   end
 
-  defp handle_fallback_result(
+  defp handle_fallback_outcome(
+         {:halt_error, error, emitted?},
+         _fb_provider,
+         _fb_provider_config,
+         _primary_origin,
+         attempt_messages
+       ) do
+    {:halt, {error, attempt_messages, emitted?}}
+  end
+
+  defp handle_fallback_outcome(
+         {:fallback, error},
+         _fb_provider,
+         _fb_provider_config,
+         _primary_origin,
+         attempt_messages
+       ) do
+    {:cont, {error, attempt_messages, false}}
+  end
+
+  defp classify_attempt_outcome({:ok, response}, chunks_emitted?, _cancel_token) do
+    {:ok, response, chunks_emitted?}
+  end
+
+  # Preserve explicit :cancelled errors (e.g. Codex resume rotation guidance)
+  # even when chunks were emitted; convert non-cancelled errors after cancel.
+  defp classify_attempt_outcome(
          {:error, %Error{kind: :cancelled}} = error,
          chunks_emitted?,
-         _fb_provider,
-         _fb_provider_config,
-         _primary_origin,
-         attempt_messages,
          _cancel_token
        ) do
-    {:halt, {error, attempt_messages, chunks_emitted?}}
+    {:halt_error, error, chunks_emitted?}
   end
 
-  defp handle_fallback_result(
-         {:error, _} = error,
-         true,
-         _fb_provider,
-         _fb_provider_config,
-         _primary_origin,
-         attempt_messages,
-         cancel_token
-       ) do
+  # Once any streamed output/event was emitted, never switch providers:
+  # mixing chunks from multiple providers in one stream breaks turn semantics.
+  defp classify_attempt_outcome({:error, _reason} = error, true, cancel_token) do
     if Cancel.cancelled?(cancel_token),
-      do: {:halt, {{:error, cancelled_error()}, attempt_messages, true}},
-      else: {:halt, {error, attempt_messages, true}}
+      do: {:halt_error, {:error, cancelled_error()}, true},
+      else: {:halt_error, error, true}
   end
 
-  defp handle_fallback_result(
-         {:error, %Error{kind: :shutdown}} = error,
-         _chunks_emitted?,
-         _fb_provider,
-         _fb_provider_config,
-         _primary_origin,
-         attempt_messages,
-         _cancel_token
-       ) do
-    {:halt, {error, attempt_messages, false}}
+  # Do not spawn fallback workers against a supervisor that is shutting down.
+  defp classify_attempt_outcome({:error, %Error{kind: :shutdown}} = error, false, _cancel_token) do
+    {:halt_error, error, false}
   end
 
-  defp handle_fallback_result(
-         {:error, _} = error,
-         _chunks_emitted?,
-         _fb_provider,
-         _fb_provider_config,
-         _primary_origin,
-         attempt_messages,
-         cancel_token
-       ) do
+  defp classify_attempt_outcome({:error, _reason} = error, false, cancel_token) do
     if Cancel.cancelled?(cancel_token),
-      do: {:halt, {{:error, cancelled_error()}, attempt_messages, false}},
-      else: {:cont, {error, attempt_messages, false}}
+      do: {:halt_error, {:error, cancelled_error()}, false},
+      else: {:fallback, error}
   end
 
   defp isolate_fallback_state(response, fb_provider, fb_config, primary_origin) do
@@ -311,13 +291,12 @@ defmodule Alloy.Provider.Retry do
   end
 
   defp do_provider_call(
-         state,
-         provider,
-         provider_config,
-         streaming?,
-         on_chunk,
-         retries_left,
-         deadline
+         %{
+           state: state,
+           provider_config: provider_config,
+           streaming?: streaming?,
+           deadline: deadline
+         } = call_ctx
        ) do
     cancel_token = effective_cancel_token(state, provider_config)
 
@@ -328,28 +307,21 @@ defmodule Alloy.Provider.Retry do
         :expired ->
           {{:error, %Error{kind: :timeout, message: "Request deadline exceeded"}}, false}
 
-        {:ok, provider_config} ->
-          execute_provider_attempt(
-            state,
-            provider,
-            provider_config,
-            streaming?,
-            on_chunk,
-            retries_left,
-            deadline
-          )
+        {:ok, updated_config} ->
+          execute_provider_attempt(%{call_ctx | provider_config: updated_config})
       end
     end
   end
 
   defp execute_provider_attempt(
-         state,
-         provider,
-         provider_config,
-         streaming?,
-         on_chunk,
-         retries_left,
-         deadline
+         %{
+           state: state,
+           provider: provider,
+           provider_config: provider_config,
+           streaming?: streaming?,
+           on_chunk: on_chunk,
+           retries_left: retries_left
+         } = call_ctx
        ) do
     provider_start = System.monotonic_time(:millisecond)
 
@@ -373,16 +345,6 @@ defmodule Alloy.Provider.Retry do
         {{:ok, record_origin(response, provider, provider_config)}, chunks_emitted?}
 
       {:error, reason} when retries_left > 0 ->
-        call_ctx = %{
-          state: state,
-          provider: provider,
-          provider_config: provider_config,
-          streaming?: streaming?,
-          on_chunk: on_chunk,
-          retries_left: retries_left,
-          deadline: deadline
-        }
-
         maybe_retry_attempt(reason, chunks_emitted?, call_ctx)
 
       {:error, _reason} = error ->
@@ -435,15 +397,7 @@ defmodule Alloy.Provider.Retry do
           {{:error, cancelled_error()}, false}
 
         :ok ->
-          do_provider_call(
-            ctx.state,
-            ctx.provider,
-            ctx.provider_config,
-            ctx.streaming?,
-            ctx.on_chunk,
-            ctx.retries_left - 1,
-            ctx.deadline
-          )
+          do_provider_call(%{ctx | retries_left: ctx.retries_left - 1})
       end
     end
   end

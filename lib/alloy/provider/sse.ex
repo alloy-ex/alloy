@@ -116,14 +116,6 @@ defmodule Alloy.Provider.SSE do
   end
 
   @doc false
-  @spec apply_chunk(map(), String.t(), (map(), sse_event() -> map())) :: map()
-  def apply_chunk(acc, chunk, handle_event) do
-    {events, remaining} = process_chunk(acc.buffer, chunk)
-    acc = %{acc | buffer: remaining}
-    Enum.reduce(events, acc, &invoke_event_handler(&2, &1, handle_event))
-  end
-
-  @doc false
   @spec apply_chunk_until(
           map(),
           String.t(),
@@ -132,7 +124,7 @@ defmodule Alloy.Provider.SSE do
           Cancel.t() | nil
         ) ::
           {:ok, map()} | {:timeout, map()} | {:cancelled, map()}
-  def apply_chunk_until(acc, chunk, handle_event, deadline, cancel_token \\ nil)
+  def apply_chunk_until(acc, chunk, handle_event, deadline, cancel_token)
       when is_integer(deadline) or is_nil(deadline) do
     {events, remaining} = process_chunk(acc.buffer, chunk)
     acc = %{acc | buffer: remaining}
@@ -149,6 +141,12 @@ defmodule Alloy.Provider.SSE do
           {:cont, {:ok, invoke_event_handler(acc, event, handle_event)}}
       end
     end)
+  end
+
+  defp apply_chunk(acc, chunk, handle_event) do
+    {events, remaining} = process_chunk(acc.buffer, chunk)
+    acc = %{acc | buffer: remaining}
+    Enum.reduce(events, acc, &invoke_event_handler(&2, &1, handle_event))
   end
 
   defp invoke_event_handler(%{sse_handler_error: %Error{}} = acc, _event, _handle_event),

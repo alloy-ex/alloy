@@ -5,16 +5,22 @@ defmodule Alloy.Provider.HTTP do
   # turn deadline), and every failure turned into an Alloy.Provider.Error.
 
   alias Alloy.Cancel
-  alias Alloy.Internal.Sanitize
   alias Alloy.OwnedWorker
   alias Alloy.Provider
-  alias Alloy.Provider.{Error, SSE}
+  alias Alloy.Provider.{Auth, Error, SSE}
 
   @cancel_poll_ms 25
 
   @type headers :: [{String.t(), String.t()}]
 
-  @doc false
+  @type managed_result ::
+          {:ok, term()}
+          | :cancelled
+          | :expired
+          | :timeout
+          | {:shutdown, term()}
+          | {:worker_exit, term()}
+
   @spec request_opts(map()) :: keyword()
   def request_opts(config) when is_map(config) do
     [
@@ -23,16 +29,14 @@ defmodule Alloy.Provider.HTTP do
     ]
   end
 
-  @doc """
-  POSTs `body` as JSON. Returns the response body of a 200 response (raw binary
-  by default unless `:decode_body` is overridden in `req_options`; built-in
-  providers decode via `Alloy.Provider.decode_body/1`).
-
-  `opts` may carry `:deadline` (monotonic ms) to enforce an absolute wall-clock
-  bound even if the server trickles bytes slowly, and `:cancel_token`
-  (`Alloy.Cancel.t()`) for cooperative cancellation. Passing either requires
-  `Alloy.TaskSupervisor` to be running (started by the `:alloy` application).
-  """
+  # POSTs `body` as JSON. Returns the response body of a 200 response (raw binary
+  # by default unless `:decode_body` is overridden in `req_options`; built-in
+  # providers decode via `Alloy.Provider.decode_body/1`).
+  #
+  # `opts` may carry `:deadline` (monotonic ms) to enforce an absolute wall-clock
+  # bound even if the server trickles bytes slowly, and `:cancel_token`
+  # (`Alloy.Cancel.t()`) for cooperative cancellation. Passing either requires
+  # `Alloy.TaskSupervisor` to be running (started by the `:alloy` application).
   @spec post_json(String.t(), headers(), map(), keyword(), keyword()) ::
           {:ok, term()} | {:error, Error.t()}
   def post_json(url, headers, body, req_options, opts \\ []) do
@@ -51,18 +55,16 @@ defmodule Alloy.Provider.HTTP do
     end
   end
 
-  @doc """
-  POSTs `body` as JSON and feeds the SSE response through `handle_event`
-  (see `Alloy.Provider.SSE.req_stream_handler/2`). Returns the final
-  accumulator of a 200 response.
-
-  `req_options` may carry extra Req options such as `params:`.
-  `opts` may carry `:deadline` (monotonic ms) to enforce an absolute wall-clock
-  bound across stalled and trickling streams, and `:cancel_token`
-  (`Alloy.Cancel.t()`) for cooperative cancellation, while running
-  `handle_event` in the caller's process (requires `Alloy.TaskSupervisor` to be
-  running).
-  """
+  # POSTs `body` as JSON and feeds the SSE response through `handle_event`
+  # (see `Alloy.Provider.SSE.req_stream_handler/2`). Returns the final
+  # accumulator of a 200 response.
+  #
+  # `req_options` may carry extra Req options such as `params:`.
+  # `opts` may carry `:deadline` (monotonic ms) to enforce an absolute wall-clock
+  # bound across stalled and trickling streams, and `:cancel_token`
+  # (`Alloy.Cancel.t()`) for cooperative cancellation, while running
+  # `handle_event` in the caller's process (requires `Alloy.TaskSupervisor` to be
+  # running).
   @spec stream_sse(
           String.t(),
           headers(),
@@ -103,32 +105,26 @@ defmodule Alloy.Provider.HTTP do
     end
   end
 
-  @doc false
   @spec maybe_put(map(), term(), term()) :: map()
   def maybe_put(map, _key, nil), do: map
   def maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  @doc false
   @spec maybe_put_unless_empty_list(map(), term(), term()) :: map()
   def maybe_put_unless_empty_list(map, _key, value) when value in [nil, []], do: map
   def maybe_put_unless_empty_list(map, key, value), do: Map.put(map, key, value)
 
-  @doc false
   @spec maybe_put_unless_empty_map(map(), term(), term()) :: map()
   def maybe_put_unless_empty_map(map, _key, value) when value in [nil, %{}], do: map
   def maybe_put_unless_empty_map(map, key, value), do: Map.put(map, key, value)
 
-  @doc false
   @spec maybe_put_new(map(), term(), term()) :: map()
   def maybe_put_new(map, _key, nil), do: map
   def maybe_put_new(map, key, value), do: Map.put_new(map, key, value)
 
-  @doc false
   @spec non_neg_int(term()) :: non_neg_integer()
   def non_neg_int(n) when is_integer(n) and n >= 0, do: n
   def non_neg_int(_other), do: 0
 
-  @doc false
   @spec record_sticky_error(map(), Error.kind(), String.t()) :: map()
   def record_sticky_error(%{sticky_error: %Error{}} = acc, _kind, _message), do: acc
 
@@ -136,7 +132,6 @@ defmodule Alloy.Provider.HTTP do
     %{acc | sticky_error: %Error{kind: kind, message: message}}
   end
 
-  @doc false
   @spec stringify_extra_body(term()) :: map()
   def stringify_extra_body(extra_body) when is_map(extra_body) and not is_struct(extra_body) do
     Map.new(extra_body, fn
@@ -147,7 +142,6 @@ defmodule Alloy.Provider.HTTP do
 
   def stringify_extra_body(_), do: %{}
 
-  @doc false
   @spec merge_extra_body(map(), map(), String.t()) :: map()
   def merge_extra_body(body, extra_body, nested_key)
       when is_map(body) and is_map(extra_body) and is_binary(nested_key) do
@@ -165,7 +159,6 @@ defmodule Alloy.Provider.HTTP do
     end
   end
 
-  @doc false
   @spec join_url(String.t(), String.t()) :: String.t()
   def join_url(base_url, "") when is_binary(base_url), do: base_url
 
@@ -173,25 +166,26 @@ defmodule Alloy.Provider.HTTP do
     String.trim_trailing(base_url, "/") <> "/" <> String.trim_leading(path, "/")
   end
 
-  @doc false
-  @spec http_url?(term()) :: boolean()
-  def http_url?(uri) when is_binary(uri) do
+  @spec uri_with_scheme?(term(), [String.t()]) :: boolean()
+  def uri_with_scheme?(uri, schemes) when is_binary(uri) and is_list(schemes) do
     case URI.parse(uri) do
       %URI{scheme: scheme, host: host}
       when is_binary(scheme) and is_binary(host) and host != "" ->
-        String.downcase(scheme) in ["http", "https"]
+        String.downcase(scheme) in schemes
 
       _ ->
         false
     end
   end
 
-  def http_url?(_other), do: false
+  def uri_with_scheme?(_other, _schemes), do: false
+
+  @spec http_url?(term()) :: boolean()
+  def http_url?(uri), do: uri_with_scheme?(uri, ["http", "https"])
 
   # Account-scoped provider File API URIs look like ordinary HTTPS URLs but
   # require the uploading provider's credentials and fail if another provider
   # attempts to fetch them as public URLs.
-  @doc false
   @spec provider_file_uri?(term()) :: boolean()
   def provider_file_uri?(uri) when is_binary(uri) do
     case URI.parse(uri) do
@@ -208,200 +202,91 @@ defmodule Alloy.Provider.HTTP do
 
   def provider_file_uri?(_other), do: false
 
-  @doc false
-  @spec resolve_api_key(map()) :: {:ok, String.t()} | {:error, Error.t()}
-  def resolve_api_key(config) when is_map(config) do
-    case Map.get(config, :api_key) do
-      key when is_binary(key) ->
-        validate_api_key_bytes(key)
+  @spec public_http_url?(term()) :: boolean()
+  def public_http_url?(uri), do: http_url?(uri) and not provider_file_uri?(uri)
 
-      fun when is_function(fun, 0) ->
-        resolve_api_key_callback(
-          fun,
-          Map.get(config, :alloy_request_deadline),
-          Map.get(config, :alloy_cancel_token)
-        )
+  @spec decode_tool_arguments(term(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def decode_tool_arguments(args, name, opts \\ [])
 
-      nil ->
-        {:error, %Error{kind: :auth, message: "Missing :api_key in provider config"}}
+  def decode_tool_arguments("", _name, _opts), do: {:ok, %{}}
 
-      other ->
+  def decode_tool_arguments(args, name, opts) when is_binary(args) do
+    case Jason.decode(args) do
+      {:ok, input} when is_map(input) ->
+        {:ok, input}
+
+      {:ok, _non_map} ->
         {:error,
          %Error{
-           kind: :auth,
-           message: "Invalid :api_key in provider config: #{Sanitize.shape_summary(other)}"
-         }}
-    end
-  end
-
-  defp validate_api_key_bytes(key) do
-    if contains_invalid_header_byte?(key) do
-      {:error,
-       %Error{
-         kind: :auth,
-         message: "Invalid :api_key: contains non-ASCII or control bytes"
-       }}
-    else
-      {:ok, key}
-    end
-  end
-
-  # Mint's HTTP/1 encoder rejects bytes outside printable ASCII (0x20..0x7E)
-  # with {:invalid_header_value, name, value}; reject them upfront so secrets
-  # can never leak into transport error messages.
-  defp contains_invalid_header_byte?(<<>>), do: false
-  defp contains_invalid_header_byte?(<<b, _rest::binary>>) when b < 0x20 or b >= 0x7F, do: true
-
-  defp contains_invalid_header_byte?(<<_b, rest::binary>>),
-    do: contains_invalid_header_byte?(rest)
-
-  @doc false
-  @spec resolve_optional_api_key(map()) :: {:ok, String.t() | nil} | {:error, Error.t()}
-  def resolve_optional_api_key(config) when is_map(config) do
-    case Map.get(config, :api_key) do
-      nil -> {:ok, nil}
-      _present -> resolve_api_key(config)
-    end
-  end
-
-  defp resolve_api_key_callback(fun, deadline, cancel_token)
-       when is_integer(deadline) or not is_nil(cancel_token) do
-    cond do
-      Cancel.cancelled?(cancel_token) ->
-        cancelled_error("Request cancelled while resolving :api_key")
-
-      deadline_expired?(deadline) ->
-        {:error,
-         %Error{kind: :timeout, message: "Request exceeded deadline while resolving :api_key"}}
-
-      true ->
-        owner =
-          OwnedWorker.start(deadline, fn -> invoke_api_key_callback(fun) end,
-            cancel_token: cancel_token
-          )
-
-        case await_monitored_post(owner, deadline, cancel_token) do
-          {:ok, result} ->
-            maybe_override_cancelled(
-              result,
-              cancel_token,
-              "Request cancelled while resolving :api_key"
-            )
-
-          :cancelled ->
-            cancelled_error("Request cancelled while resolving :api_key")
-
-          {:shutdown, _reason} ->
-            shutdown_error()
-
-          {:worker_exit, reason} ->
-            {:error,
-             %Error{
-               kind: :auth,
-               message:
-                 "Dynamic :api_key callback exited: #{OwnedWorker.format_exit_reason(reason)}"
-             }}
-
-          :timeout ->
-            {:error,
-             %Error{
-               kind: :timeout,
-               message: "Dynamic :api_key callback exceeded request deadline"
-             }}
-        end
-    end
-  end
-
-  defp resolve_api_key_callback(fun, _no_deadline, nil), do: invoke_api_key_callback(fun)
-
-  defp invoke_api_key_callback(fun) do
-    case fun.() do
-      {:ok, key} when is_binary(key) and byte_size(key) > 0 ->
-        validate_api_key_bytes(key)
-
-      key when is_binary(key) and byte_size(key) > 0 ->
-        validate_api_key_bytes(key)
-
-      {:error, %Error{} = err} ->
-        safe_kind =
-          if err.kind in [
-               :auth,
-               :cancelled,
-               :timeout,
-               :rate_limited,
-               :overloaded,
-               :server_error,
-               :network,
-               :invalid_request,
-               :quota
-             ],
-             do: err.kind,
-             else: :auth
-
-        safe_status = if is_integer(err.status) and err.status > 0, do: err.status, else: nil
-
-        safe_retry_after =
-          if is_integer(err.retry_after_ms) and err.retry_after_ms >= 0,
-            do: err.retry_after_ms,
-            else: nil
-
-        {:error,
-         %Error{
-           kind: safe_kind,
-           status: safe_status,
-           retry_after_ms: safe_retry_after,
-           message: "Dynamic :api_key callback failed (#{safe_kind})"
+           kind: :malformed_reply,
+           message: "Tool call arguments for #{name} must be a JSON object"
          }}
 
       {:error, reason} ->
-        {:error,
-         %Error{
-           kind: :auth,
-           message: "Dynamic :api_key callback failed: #{Sanitize.shape_summary(reason)}"
-         }}
+        prefix = Keyword.get(opts, :message_prefix, "Invalid JSON in tool call arguments for")
 
-      other ->
-        {:error,
-         %Error{
-           kind: :auth,
-           message:
-             "Dynamic :api_key callback returned invalid value: #{Sanitize.shape_summary(other)}"
-         }}
+        message =
+          if Keyword.get(opts, :include_reason, false),
+            do: "#{prefix} #{name}: #{Exception.message(reason)}",
+            else: "#{prefix} #{name}"
+
+        {:error, %Error{kind: :malformed_reply, message: message}}
     end
-  rescue
-    exception ->
-      {:error,
-       %Error{
-         kind: :auth,
-         message: "Dynamic :api_key callback raised: #{inspect(exception.__struct__)}"
-       }}
-  catch
-    kind, reason ->
-      {:error,
-       %Error{
-         kind: :auth,
-         message: "Dynamic :api_key callback #{kind}: #{Sanitize.exit_summary(reason, :redact)}"
-       }}
   end
 
-  @doc false
+  def decode_tool_arguments(args, _name, _opts) when is_map(args) and not is_struct(args),
+    do: {:ok, args}
+
+  def decode_tool_arguments(_args, name, _opts) do
+    {:error,
+     %Error{
+       kind: :malformed_reply,
+       message: "Invalid tool call arguments payload for #{name}"
+     }}
+  end
+
+  @spec decode_truncated_arguments(term()) :: map()
+  def decode_truncated_arguments(""), do: %{}
+
+  def decode_truncated_arguments(args) when is_binary(args) do
+    case Jason.decode(args) do
+      {:ok, map} when is_map(map) -> map
+      _ -> %{}
+    end
+  end
+
+  def decode_truncated_arguments(args) when is_map(args) and not is_struct(args), do: args
+  def decode_truncated_arguments(_other), do: %{}
+
+  @spec truncated_tool_call_id(non_neg_integer()) :: String.t()
+  def truncated_tool_call_id(index) when is_integer(index) and index >= 0 do
+    "truncated_#{index}_#{System.unique_integer([:positive])}"
+  end
+
+  @spec map_ok(Enumerable.t(), (term() -> {:ok, term()} | {:error, term()})) ::
+          {:ok, [term()]} | {:error, term()}
+  def map_ok(enumerable, fun) when is_function(fun, 1) do
+    case Enum.reduce_while(enumerable, {:ok, []}, fn item, {:ok, acc} ->
+           case fun.(item) do
+             {:ok, value} -> {:cont, {:ok, [value | acc]}}
+             {:error, _} = err -> {:halt, err}
+           end
+         end) do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      {:error, _} = err -> err
+    end
+  end
+
+  @spec resolve_api_key(map()) :: {:ok, String.t()} | {:error, Error.t()}
+  defdelegate resolve_api_key(config), to: Auth
+
+  @spec resolve_optional_api_key(map()) :: {:ok, String.t() | nil} | {:error, Error.t()}
+  defdelegate resolve_optional_api_key(config), to: Auth
+
   @spec resolve_auth_scheme(map()) :: {:ok, :api_key | :bearer} | {:error, Error.t()}
-  def resolve_auth_scheme(config) when is_map(config) do
-    case Map.get(config, :auth_scheme, :api_key) do
-      scheme when scheme in [:api_key, :bearer] ->
-        {:ok, scheme}
+  defdelegate resolve_auth_scheme(config), to: Auth
 
-      other ->
-        {:error,
-         %Error{
-           kind: :invalid_request,
-           message:
-             "Invalid :auth_scheme: expected :api_key or :bearer, got #{Sanitize.shape_summary(other)}"
-         }}
-    end
-  end
-
-  @doc false
   @spec cache_adjusted_usage(
           non_neg_integer(),
           non_neg_integer(),
@@ -417,46 +302,79 @@ defmodule Alloy.Provider.HTTP do
     }
   end
 
+  @spec run_managed(integer() | nil, Cancel.t() | nil, (-> term())) :: managed_result()
+  def run_managed(deadline, cancel_token, fun)
+      when (is_integer(deadline) or is_nil(deadline)) and is_function(fun, 0) do
+    cond do
+      Cancel.cancelled?(cancel_token) ->
+        :cancelled
+
+      deadline_expired?(deadline) ->
+        :expired
+
+      true ->
+        owner = OwnedWorker.start(deadline, fun, cancel_token: cancel_token)
+        await_monitored_post(owner, deadline, cancel_token)
+    end
+  end
+
+  @spec cancelled_error(String.t()) :: {:error, Error.t()}
+  def cancelled_error(message) do
+    {:error, %Error{kind: :cancelled, message: message}}
+  end
+
+  @spec maybe_override_cancelled(
+          {:ok, term()} | {:error, Error.t()},
+          Cancel.t() | nil,
+          String.t()
+        ) :: {:ok, term()} | {:error, Error.t()}
+  def maybe_override_cancelled({:error, _} = err, cancel_token, message) do
+    if Cancel.cancelled?(cancel_token), do: cancelled_error(message), else: err
+  end
+
+  def maybe_override_cancelled(ok, _cancel_token, _message), do: ok
+
+  # Dedicated non-retryable :shutdown kind (never produced from provider
+  # payloads) so Retry neither retries nor spawns fallback workers against a
+  # shutting-down supervisor.
+  @spec shutdown_error() :: {:error, Error.t()}
+  def shutdown_error do
+    {:error,
+     %Error{
+       kind: :shutdown,
+       message: "HTTP request interrupted by shutdown"
+     }}
+  end
+
   defp post_json_managed(url, headers, body, req_options, deadline, cancel_token) do
     encoded_body = Jason.encode!(body)
 
-    cond do
-      Cancel.cancelled?(cancel_token) ->
+    case run_managed(deadline, cancel_token, fn ->
+           request_encoded(
+             url,
+             headers,
+             encoded_body,
+             maybe_clamp_receive_timeout(req_options, deadline)
+           )
+         end) do
+      {:ok, result} ->
+        maybe_override_cancelled(
+          decode_post_result(result),
+          cancel_token,
+          "Request cancelled"
+        )
+
+      :cancelled ->
         cancelled_error("Request cancelled")
 
-      deadline_expired?(deadline) ->
+      {:shutdown, _reason} ->
+        shutdown_error()
+
+      {:worker_exit, reason} ->
+        propagate_worker_exit(reason)
+
+      timeout when timeout in [:expired, :timeout] ->
         {:error, %Error{kind: :timeout, message: "Request exceeded deadline"}}
-
-      true ->
-        req_options = maybe_clamp_receive_timeout(req_options, deadline)
-
-        owner =
-          OwnedWorker.start(
-            deadline,
-            fn -> request_encoded(url, headers, encoded_body, req_options) end,
-            cancel_token: cancel_token
-          )
-
-        case await_monitored_post(owner, deadline, cancel_token) do
-          {:ok, result} ->
-            maybe_override_cancelled(
-              decode_post_result(result),
-              cancel_token,
-              "Request cancelled"
-            )
-
-          :cancelled ->
-            cancelled_error("Request cancelled")
-
-          {:shutdown, _reason} ->
-            shutdown_error()
-
-          {:worker_exit, reason} ->
-            propagate_worker_exit(reason)
-
-          :timeout ->
-            {:error, %Error{kind: :timeout, message: "Request exceeded deadline"}}
-        end
     end
   end
 
@@ -523,9 +441,7 @@ defmodule Alloy.Provider.HTTP do
             await_sse(sse, initial_acc)
           catch
             kind, reason ->
-              OwnedWorker.cancel(owner)
-              flush_task_reply(owner.ref)
-              flush_chunks(tag)
+              cleanup_sse_worker(owner, owner.ref, tag)
               :erlang.raise(kind, reason, __STACKTRACE__)
           end
 
@@ -678,9 +594,7 @@ defmodule Alloy.Provider.HTTP do
         case SSE.apply_chunk_until(acc, chunk, handle_event, deadline, cancel_token) do
           {:ok, %{sse_handler_error: %Error{} = error}} ->
             send(worker, {ack, :halt})
-            OwnedWorker.cancel(owner)
-            flush_task_reply(ref)
-            flush_chunks(tag)
+            cleanup_sse_worker(owner, ref, tag)
             {:error, error}
 
           {:ok, next_acc} ->
@@ -716,17 +630,19 @@ defmodule Alloy.Provider.HTTP do
   end
 
   defp abort_sse_timeout(owner, ref, tag) do
-    OwnedWorker.cancel(owner)
-    flush_task_reply(ref)
-    flush_chunks(tag)
+    cleanup_sse_worker(owner, ref, tag)
     {:error, %Error{kind: :timeout, message: "Stream exceeded request deadline"}}
   end
 
   defp abort_sse_cancelled(owner, ref, tag) do
+    cleanup_sse_worker(owner, ref, tag)
+    cancelled_error("Stream cancelled")
+  end
+
+  defp cleanup_sse_worker(owner, ref, tag) do
     OwnedWorker.cancel(owner)
     flush_task_reply(ref)
     flush_chunks(tag)
-    cancelled_error("Stream cancelled")
   end
 
   defp flush_task_reply(ref) do
@@ -762,27 +678,6 @@ defmodule Alloy.Provider.HTTP do
   defp maybe_clamp_receive_timeout(req_options, deadline) when is_integer(deadline) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 1)
     clamp_receive_timeout(req_options, remaining)
-  end
-
-  defp cancelled_error(message) do
-    {:error, %Error{kind: :cancelled, message: message}}
-  end
-
-  defp maybe_override_cancelled({:error, _} = err, cancel_token, message) do
-    if Cancel.cancelled?(cancel_token), do: cancelled_error(message), else: err
-  end
-
-  defp maybe_override_cancelled(ok, _cancel_token, _message), do: ok
-
-  # Dedicated non-retryable :shutdown kind (never produced from provider
-  # payloads) so Retry neither retries nor spawns fallback workers against a
-  # shutting-down supervisor.
-  defp shutdown_error do
-    {:error,
-     %Error{
-       kind: :shutdown,
-       message: "HTTP request interrupted by shutdown"
-     }}
   end
 
   defp worker_shutdown_reason?({:worker_crash, :exit, reason, _stacktrace}),
@@ -834,18 +729,11 @@ defmodule Alloy.Provider.HTTP do
 
   defp decode_post_result({:error, reason}), do: {:error, Error.from_transport(reason)}
 
-  defp decode_sse_result({:ok, %{status: 200} = resp}, initial_acc) do
-    case Map.get(resp.private, :sse_acc, initial_acc) do
-      %{sse_handler_error: %Error{} = error} -> {:error, error}
-      acc -> {:ok, acc}
-    end
+  defp decode_sse_result({:ok, %{status: 200} = resp} = result, initial_acc) do
+    finish_stream_result(result, Map.get(resp.private, :sse_acc, initial_acc))
   end
 
-  defp decode_sse_result({:ok, resp}, initial_acc),
-    do: {:error, Error.from_response(resp.status, resp.headers, error_body(resp, initial_acc))}
-
-  defp decode_sse_result({:error, reason}, _initial_acc),
-    do: {:error, Error.from_transport(reason)}
+  defp decode_sse_result(result, initial_acc), do: finish_stream_result(result, initial_acc)
 
   defp clamp_receive_timeout(req_options, remaining) do
     case Keyword.get(req_options, :receive_timeout) do

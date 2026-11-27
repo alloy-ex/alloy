@@ -1,8 +1,8 @@
 defmodule Alloy.Provider.HTTPTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Message
-  alias Alloy.Provider.{Error, HTTP, OpenAI, OpenAICompat, Retry, SSE}
+  alias Alloy.{Cancel, Message, Provider}
+  alias Alloy.Provider.{Auth, Error, HTTP, OpenAI, OpenAICompat, Retry, SSE}
 
   defmodule BackpressureAdapter do
     def run(req) do
@@ -1187,6 +1187,149 @@ defmodule Alloy.Provider.HTTPTest do
 
       refute HTTP.provider_file_uri?("https://example.com/v1beta/files/abc123")
       refute HTTP.provider_file_uri?("https://generativelanguage.googleapis.com/v1beta/models")
+    end
+
+    test "Auth.auth_header/3 and bounded callback cancellation/expiration work as expected" do
+      assert Auth.auth_header("secret", :api_key, "x-api-key") == {"x-api-key", "secret"}
+
+      assert Auth.auth_header("secret", :api_key, "x-goog-api-key") ==
+               {"x-goog-api-key", "secret"}
+
+      assert Auth.auth_header("secret", :bearer, "x-api-key") ==
+               {"authorization", "Bearer secret"}
+
+      assert {:error, %Error{kind: :auth, message: bad_type_msg}} =
+               Auth.resolve_api_key(%{api_key: 12_345})
+
+      assert bad_type_msg =~ "Invalid :api_key in provider config"
+
+      assert {:ok, "opt-key"} = Auth.resolve_optional_api_key(%{api_key: "opt-key"})
+
+      token = Cancel.new()
+      Cancel.cancel(token)
+
+      assert {:error, %Error{kind: :cancelled, message: cancel_msg}} =
+               Auth.resolve_api_key(%{
+                 api_key: fn -> flunk("callback must not run when already cancelled") end,
+                 alloy_cancel_token: token
+               })
+
+      assert cancel_msg == "Request cancelled while resolving :api_key"
+
+      past = System.monotonic_time(:millisecond) - 10
+
+      assert {:error, %Error{kind: :timeout, message: exp_msg}} =
+               Auth.resolve_api_key(%{
+                 api_key: fn -> flunk("callback must not run when deadline expired") end,
+                 alloy_request_deadline: past
+               })
+
+      assert exp_msg == "Request exceeded deadline while resolving :api_key"
+
+      future = System.monotonic_time(:millisecond) + 5_000
+
+      assert {:error, %Error{kind: :auth, message: kill_msg}} =
+               Auth.resolve_api_key(%{
+                 api_key: fn -> Process.exit(self(), :kill) end,
+                 alloy_request_deadline: future
+               })
+
+      assert kill_msg == "Dynamic :api_key callback exited: :killed"
+    end
+
+    test "shared wire helpers (URLs, tool argument decoding, truncated IDs, map_ok, reasoning effort)" do
+      assert HTTP.uri_with_scheme?("gs://my-bucket/file.pdf", ["gs"])
+      assert HTTP.uri_with_scheme?("GS://my-bucket/file.pdf", ["gs"])
+      refute HTTP.uri_with_scheme?("gs://", ["gs"])
+      refute HTTP.uri_with_scheme?("https://example.com/a.pdf", ["gs"])
+      refute HTTP.uri_with_scheme?(nil, ["gs"])
+      refute HTTP.uri_with_scheme?(123, ["http", "https"])
+
+      assert HTTP.public_http_url?("https://example.com/a.pdf")
+      assert HTTP.public_http_url?("http://localhost/a.pdf")
+      refute HTTP.public_http_url?("gs://bucket/a.pdf")
+      refute HTTP.public_http_url?(nil)
+
+      refute HTTP.public_http_url?(
+               "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+             )
+
+      assert {:ok, %{}} = HTTP.decode_tool_arguments("", "lookup")
+      assert {:ok, %{"q" => "elixir"}} = HTTP.decode_tool_arguments(~s({"q":"elixir"}), "lookup")
+      assert {:ok, %{"q" => "elixir"}} = HTTP.decode_tool_arguments(%{"q" => "elixir"}, "lookup")
+
+      assert {:error,
+              %Error{
+                kind: :malformed_reply,
+                message: "Tool call arguments for lookup must be a JSON object"
+              }} = HTTP.decode_tool_arguments("[1,2]", "lookup")
+
+      assert {:error,
+              %Error{
+                kind: :malformed_reply,
+                message: "Invalid JSON in tool call arguments for lookup"
+              }} = HTTP.decode_tool_arguments("{bad", "lookup")
+
+      assert {:error, %Error{kind: :malformed_reply, message: stream_msg}} =
+               HTTP.decode_tool_arguments("{bad", "lookup",
+                 message_prefix: "Invalid tool call JSON for",
+                 include_reason: true
+               )
+
+      assert stream_msg =~ "Invalid tool call JSON for lookup:"
+
+      assert {:error,
+              %Error{
+                kind: :malformed_reply,
+                message: "Invalid tool call arguments payload for lookup"
+              }} = HTTP.decode_tool_arguments(123, "lookup")
+
+      assert {:error, %Error{kind: :malformed_reply}} =
+               HTTP.decode_tool_arguments(%URI{}, "lookup")
+
+      assert HTTP.decode_truncated_arguments("") == %{}
+      assert HTTP.decode_truncated_arguments(~s({"k":"v"})) == %{"k" => "v"}
+      assert HTTP.decode_truncated_arguments("{cut_off") == %{}
+      assert HTTP.decode_truncated_arguments("[1,2]") == %{}
+      assert HTTP.decode_truncated_arguments(%{"k" => "v"}) == %{"k" => "v"}
+      assert HTTP.decode_truncated_arguments(nil) == %{}
+      assert HTTP.decode_truncated_arguments(%URI{}) == %{}
+
+      id1 = HTTP.truncated_tool_call_id(2)
+      id2 = HTTP.truncated_tool_call_id(2)
+      assert id1 =~ ~r/^truncated_2_\d+$/
+      assert id2 =~ ~r/^truncated_2_\d+$/
+      assert id1 != id2
+
+      assert {:ok, []} = HTTP.map_ok([], fn x -> {:ok, x} end)
+      assert {:ok, [2, 4, 6]} = HTTP.map_ok([1, 2, 3], fn x -> {:ok, x * 2} end)
+
+      test_pid = self()
+
+      assert {:error, :stop} =
+               HTTP.map_ok([1, 2, 3], fn
+                 2 ->
+                   {:error, :stop}
+
+                 n ->
+                   send(test_pid, {:visited, n})
+                   {:ok, n}
+               end)
+
+      assert_received {:visited, 1}
+      refute_received {:visited, 3}
+
+      assert Provider.openai_reasoning_effort(:off) == "none"
+      assert Provider.openai_reasoning_effort(:low) == "low"
+      assert Provider.openai_reasoning_effort(:medium) == "medium"
+      assert Provider.openai_reasoning_effort(:high) == "high"
+      assert Provider.openai_reasoning_effort(:xhigh) == "xhigh"
+
+      assert {:error, %Error{kind: :invalid_request, message: reasoning_msg}} =
+               Provider.normalize_reasoning(123)
+
+      assert reasoning_msg =~ "%{effort: ..., display: ...}"
+      refute reasoning_msg =~ "display?:"
     end
   end
 

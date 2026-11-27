@@ -15,6 +15,52 @@ defmodule Alloy.Provider.TestTest do
                 usage: %{input_tokens: 10, output_tokens: 5}
               }} = response
     end
+
+    test "text_response/2 attaches provider_state to the text response" do
+      response = TestProvider.text_response("Hello!", %{cursor: "c1"})
+
+      assert {:ok,
+              %{
+                stop_reason: :end_turn,
+                messages: [%Message{role: :assistant, content: "Hello!"}],
+                usage: %{input_tokens: 10, output_tokens: 5},
+                provider_state: %{cursor: "c1"}
+              }} = response
+    end
+  end
+
+  describe "slow_text_response/1,2" do
+    test "defaults to a 200ms delay tuple and sleeps before returning in complete/3 and stream/4" do
+      assert {:with_delay, 200,
+              {:ok, %{stop_reason: :end_turn, messages: [%Message{content: "Default"}]}}} =
+               TestProvider.slow_text_response("Default")
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.slow_text_response("Slow complete", 5),
+          TestProvider.slow_text_response("Hi", 5)
+        ])
+
+      config = %{agent_pid: pid}
+
+      started = System.monotonic_time(:millisecond)
+
+      assert {:ok, %{stop_reason: :end_turn, messages: [%Message{content: "Slow complete"}]}} =
+               TestProvider.complete([Message.user("go")], [], config)
+
+      assert System.monotonic_time(:millisecond) - started >= 5
+
+      test_pid = self()
+
+      assert {:ok, %{stop_reason: :end_turn, messages: [%Message{content: "Hi"}]}} =
+               TestProvider.stream([Message.user("go")], [], config, fn chunk ->
+                 send(test_pid, {:chunk, chunk})
+                 :ok
+               end)
+
+      assert_received {:chunk, "H"}
+      assert_received {:chunk, "i"}
+    end
   end
 
   describe "tool_use_response/1" do
