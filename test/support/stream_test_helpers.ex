@@ -17,24 +17,9 @@ defmodule Alloy.StreamTestHelpers do
     "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{"content" => text}, "finish_reason" => nil}]})}\n\n"
   end
 
-  @doc "Build an SSE data line that starts a tool call with the given index, id, and name."
-  def sse_tool_call_start(index, id, name) do
-    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{"tool_calls" => [%{"index" => index, "id" => id, "type" => "function", "function" => %{"name" => name, "arguments" => ""}}]}, "finish_reason" => nil}]})}\n\n"
-  end
-
-  @doc "Build an SSE data line that appends arguments to an in-progress tool call."
-  def sse_tool_call_args(index, args) do
-    "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{"tool_calls" => [%{"index" => index, "function" => %{"arguments" => args}}]}, "finish_reason" => nil}]})}\n\n"
-  end
-
   @doc "Build an SSE data line that signals stream completion with the given finish reason."
   def sse_finish(reason) do
     "data: #{Jason.encode!(%{"id" => "test", "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => reason}]})}\n\n"
-  end
-
-  @doc "Build an SSE data line carrying usage token counts (OpenAI stream_options format)."
-  def sse_usage(prompt, completion) do
-    "data: #{Jason.encode!(%{"id" => "test", "choices" => [], "usage" => %{"prompt_tokens" => prompt, "completion_tokens" => completion}})}\n\n"
   end
 
   # ── Plug Builders ─────────────────────────────────────────────────────────

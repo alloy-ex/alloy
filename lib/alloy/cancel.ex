@@ -48,7 +48,14 @@ defmodule Alloy.Cancel do
     :atomics.get(ref, 1) != 0 or Enum.any?(parents, &cancelled?/1)
   end
 
-  @doc false
+  @doc """
+  Combines two optional cancellation tokens into a token that is cancelled when
+  either `outer` or `inner` is cancelled.
+
+  Cancelling the returned token cancels `inner` without mutating `outer`, while
+  cancelling `outer` propagates to the combined token. Returns `nil` when both
+  arguments are `nil`.
+  """
   @spec combine(t() | nil, t() | nil) :: t() | nil
   def combine(nil, inner), do: inner
   def combine(outer, nil), do: outer
@@ -62,11 +69,10 @@ defmodule Alloy.Cancel do
     %__MODULE__{ref: inner_ref, parents: parents}
   end
 
-  defp leaf_tokens(%__MODULE__{ref: ref, parents: parents}) do
-    [%__MODULE__{ref: ref} | Enum.flat_map(parents, &leaf_tokens/1)]
-  end
-
-  @doc false
+  @doc """
+  Returns `true` if `term` is a valid `Alloy.Cancel` token backed by live
+  `:atomics` references (including any combined parent tokens).
+  """
   @spec valid?(term()) :: boolean()
   def valid?(%__MODULE__{ref: ref, parents: parents}) when is_list(parents) do
     valid_atomics_ref?(ref) and Enum.all?(parents, &valid?/1)
@@ -74,9 +80,15 @@ defmodule Alloy.Cancel do
 
   def valid?(_other), do: false
 
-  defp valid_atomics_ref?(ref) do
+  @doc false
+  @spec valid_atomics_ref?(term()) :: boolean()
+  def valid_atomics_ref?(ref) do
     match?(%{size: size} when size >= 1, :atomics.info(ref))
   rescue
     ArgumentError -> false
+  end
+
+  defp leaf_tokens(%__MODULE__{ref: ref, parents: parents}) do
+    [%__MODULE__{ref: ref} | Enum.flat_map(parents, &leaf_tokens/1)]
   end
 end

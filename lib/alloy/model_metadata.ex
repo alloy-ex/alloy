@@ -251,12 +251,8 @@ defmodule Alloy.ModelMetadata do
   """
   @impl Alloy.ModelCatalog
   @spec context_window(String.t()) :: pos_integer() | nil
-  def context_window(model_name) when is_binary(model_name) do
-    case match_family(model_name) do
-      %{context_window: limit} -> limit
-      nil -> nil
-    end
-  end
+  def context_window(model_name) when is_binary(model_name),
+    do: family_field(model_name, :context_window)
 
   @doc """
   Returns the known context window limit for a model name, consulting
@@ -308,12 +304,8 @@ defmodule Alloy.ModelMetadata do
   """
   @impl Alloy.ModelCatalog
   @spec max_output_tokens(String.t()) :: pos_integer() | nil
-  def max_output_tokens(model_name) when is_binary(model_name) do
-    case match_family(model_name) do
-      %{max_output_tokens: limit} -> limit
-      nil -> nil
-    end
-  end
+  def max_output_tokens(model_name) when is_binary(model_name),
+    do: family_field(model_name, :max_output_tokens)
 
   @doc """
   Returns capability flags for a built-in model family
@@ -321,12 +313,8 @@ defmodule Alloy.ModelMetadata do
   """
   @impl Alloy.ModelCatalog
   @spec capabilities(String.t()) :: Alloy.ModelCatalog.capabilities() | nil
-  def capabilities(model_name) when is_binary(model_name) do
-    case match_family(model_name) do
-      %{capabilities: caps} -> caps
-      nil -> nil
-    end
-  end
+  def capabilities(model_name) when is_binary(model_name),
+    do: family_field(model_name, :capabilities)
 
   @doc """
   Returns indicative base-tier reference pricing (USD per million tokens) for
@@ -344,6 +332,13 @@ defmodule Alloy.ModelMetadata do
     Enum.find_value(@pricing_entries, fn {pattern, rates} ->
       if Regex.match?(pattern, model_name), do: rates
     end)
+  end
+
+  defp family_field(model_name, key) do
+    case match_family(model_name) do
+      %{^key => value} -> value
+      nil -> nil
+    end
   end
 
   defp match_family(model_name) do

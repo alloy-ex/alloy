@@ -32,9 +32,9 @@ defmodule Alloy.Events do
     opts
     |> Keyword.put(:on_event, on_event)
     |> Keyword.put(:event_subscriber?, has_subscriber?)
-    |> put_new_lazy(:event_seq_ref, fn -> :atomics.new(1, signed: false) end)
-    |> put_new_lazy(:event_error_logged_ref, fn -> :atomics.new(1, signed: false) end)
-    |> put_new_lazy(:event_correlation_id, fn -> build_correlation_id(state) end)
+    |> Keyword.put_new_lazy(:event_seq_ref, fn -> :atomics.new(1, signed: false) end)
+    |> Keyword.put_new_lazy(:event_error_logged_ref, fn -> :atomics.new(1, signed: false) end)
+    |> Keyword.put_new_lazy(:event_correlation_id, fn -> build_correlation_id(state) end)
   end
 
   @doc """
@@ -159,13 +159,5 @@ defmodule Alloy.Events do
 
   defp next_event_seq(ref) do
     :atomics.add_get(ref, 1, 1)
-  end
-
-  defp put_new_lazy(opts, key, producer) when is_list(opts) and is_function(producer, 0) do
-    if Keyword.has_key?(opts, key) do
-      opts
-    else
-      Keyword.put(opts, key, producer.())
-    end
   end
 end

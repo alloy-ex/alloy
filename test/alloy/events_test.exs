@@ -199,13 +199,13 @@ defmodule Alloy.EventsTest do
     test "rescues raising on_event callbacks (logging once per run) and still fires telemetry" do
       ref = make_ref()
       handler = "events-rescue-#{inspect(ref)}"
-      test_pid = self()
+      correlation_id = "c1-#{inspect(ref)}"
 
       :telemetry.attach(
         handler,
         [:alloy, :event],
-        fn _ev, _m, meta, _ -> send(test_pid, {:telemetry_event, meta.event}) end,
-        nil
+        &__MODULE__.forward_telemetry_event/4,
+        {self(), correlation_id}
       )
 
       on_exit(fn -> :telemetry.detach(handler) end)
@@ -214,7 +214,7 @@ defmodule Alloy.EventsTest do
         Events.normalize_opts(
           build_state(),
           on_event: fn _ -> raise "ui exploded" end,
-          event_correlation_id: "c1"
+          event_correlation_id: correlation_id
         )
 
       log =
@@ -246,4 +246,12 @@ defmodule Alloy.EventsTest do
       refute log =~ "SECRET_EVENT_PAYLOAD_TOKEN"
     end
   end
+
+  @doc false
+  def forward_telemetry_event(_ev, _m, %{correlation_id: cid} = meta, {test_pid, cid})
+      when test_pid == self() do
+    send(test_pid, {:telemetry_event, meta.event})
+  end
+
+  def forward_telemetry_event(_ev, _m, _meta, _cfg), do: :ok
 end

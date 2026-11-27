@@ -509,4 +509,138 @@ defmodule Alloy.MessageTest do
       assert hd(norm_local_res.content).tool_use_id == call.id
     end
   end
+
+  describe "Alloy.Message.Validator" do
+    alias Alloy.Message.Validator
+
+    test "accepts valid string and block messages across all supported block types" do
+      messages = [
+        Message.user("hello"),
+        %Message{
+          role: :assistant,
+          provider: Alloy.Provider.Anthropic,
+          model: "claude-sonnet-5-5",
+          origin: "orig-1",
+          content: [
+            %{type: "text", text: "hi", refusal: false, phase: "final", signature: "sig"},
+            %{
+              type: "thinking",
+              thinking: "hmm",
+              signature: "s",
+              thought_signature: "ts",
+              source: "x"
+            },
+            %{type: "redacted_thinking", data: "opaque"},
+            %{
+              type: "tool_use",
+              id: "call_1",
+              name: "read",
+              input: %{"path" => "mix.exs", "nested" => [1, true, nil, 2.5]},
+              caller: %{"type" => "direct"}
+            }
+          ]
+        },
+        Message.tool_results([
+          %{type: "tool_result", tool_use_id: "call_1", content: "ok", is_error: false}
+        ]),
+        %Message{
+          role: :user,
+          content: [
+            %{type: "image", mime_type: "image/png", data: "abc"},
+            %{type: "image", url: "https://example.com/a.png", mime_type: "image/png"},
+            %{type: "audio", mime_type: "audio/mp3", data: "abc"},
+            %{type: "video", mime_type: "video/mp4", data: "abc"},
+            %{type: "document", mime_type: "application/pdf", data: "abc", filename: "a.pdf"},
+            %{
+              type: "document",
+              mime_type: "application/pdf",
+              uri: "https://example.com/a.pdf",
+              title: "A"
+            },
+            %{type: "document", mime_type: "application/pdf", file_id: "file_1", origin: "orig-1"}
+          ]
+        }
+      ]
+
+      assert {:ok, ^messages} = Validator.poll_callback(:follow_up, fn _ -> messages end, :state)
+    end
+
+    test "rejects malformed messages, invalid blocks, non-JSON values, and broken tool pairing" do
+      assert {:error, msg} = Validator.validate_callback_messages(:steering, :not_a_list)
+      assert msg =~ "steering callback returned invalid messages"
+      assert msg =~ ":not_a_list"
+
+      assert {:error, msg} = Validator.validate_callback_messages(:follow_up, [%{role: :user}])
+      assert msg =~ "follow_up callback returned invalid messages"
+
+      orphan = [Message.tool_results([Message.tool_result_block("missing_id", "ok")])]
+
+      assert {:error, "steering callback returned messages with invalid tool pairing"} =
+               Validator.validate_callback_messages(:steering, orphan)
+
+      refute Validator.valid_message?(%Message{role: :system, content: "hi"})
+      refute Validator.valid_message?(%Message{role: :user, content: []})
+      refute Validator.valid_message?(%Message{role: :user, content: <<0xFF>>})
+      refute Validator.valid_message?(%Message{role: :user, content: "hi", model: 123})
+
+      refute Validator.valid_block?(:not_a_map)
+      refute Validator.valid_block?(%Message{role: :user, content: "x"})
+      refute Validator.valid_block?(%{type: "unknown"})
+      refute Validator.valid_block?(%{type: "text", text: "ok", refusal: "yes"})
+      refute Validator.valid_block?(%{type: "text", text: "ok", extra: self()})
+      refute Validator.valid_block?(%{type: "tool_use", id: "", name: "x", input: %{}})
+      refute Validator.valid_block?(%{type: "tool_use", id: "1", name: "x", input: %URI{}})
+
+      refute Validator.valid_block?(%{
+               type: "tool_use",
+               id: "1",
+               name: "x",
+               input: %{},
+               caller: []
+             })
+
+      refute Validator.valid_block?(%{
+               type: "tool_use",
+               id: "1",
+               name: "x",
+               input: %{"a" => [1 | 2]}
+             })
+
+      refute Validator.valid_block?(%{type: "tool_result", tool_use_id: "", content: "ok"})
+      refute Validator.valid_block?(%{type: "image", mime_type: "image/png", data: "a", url: "b"})
+      refute Validator.valid_block?(%{type: "image"})
+      refute Validator.valid_block?(%{type: "audio", mime_type: "audio/mp3", data: "a", url: "b"})
+
+      refute Validator.valid_block?(%{
+               type: "document",
+               mime_type: "application/pdf",
+               data: "a",
+               uri: "b"
+             })
+
+      refute Validator.valid_block?(%{type: "document", mime_type: "application/pdf"})
+    end
+
+    test "rescues exceptions and catches throws/exits with redaction" do
+      assert {:error, err} =
+               Validator.poll_callback(
+                 :steering,
+                 fn _ -> raise KeyError, key: :token, term: %{secret: "sk-leak"} end,
+                 :state
+               )
+
+      assert err == "steering callback failed (KeyError)"
+      refute err =~ "sk-leak"
+
+      assert {:error, err} =
+               Validator.poll_callback(
+                 :follow_up,
+                 fn _ -> throw(%{secret: "sk-throw-leak"}) end,
+                 :state
+               )
+
+      assert err == "follow_up callback throw: unexpected map"
+      refute err =~ "sk-throw-leak"
+    end
+  end
 end

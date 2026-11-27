@@ -1925,14 +1925,13 @@ defmodule Alloy.OutputSchemaTest do
     end
 
     test "OpenAICompat extracts array-of-parts refusal blocks in complete and stream and run_span emits telemetry_span_context" do
-      test_pid = self()
       handler_id = "run-span-ctx-#{System.unique_integer([:positive])}"
 
       :telemetry.attach_many(
         handler_id,
         [[:alloy, :run, :start], [:alloy, :run, :stop]],
-        fn event, _m, meta, _cfg -> send(test_pid, {:run_span, event, meta}) end,
-        nil
+        &__MODULE__.forward_run_span/4,
+        self()
       )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -2312,4 +2311,11 @@ defmodule Alloy.OutputSchemaTest do
                )
     end
   end
+
+  @doc false
+  def forward_run_span(event, _measurements, metadata, test_pid) when test_pid == self() do
+    send(test_pid, {:run_span, event, metadata})
+  end
+
+  def forward_run_span(_event, _measurements, _metadata, _test_pid), do: :ok
 end

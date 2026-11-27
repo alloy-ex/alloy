@@ -543,4 +543,27 @@ defmodule Alloy.Agent.ConfigTest do
       end
     end
   end
+
+  describe "Inspect implementation" do
+    test "redacts provider_config, fallback_providers, and context" do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, api_key: "sk-primary-secret"},
+          fallback_providers: [{Alloy.Provider.Test, api_key: "sk-fallback-secret"}],
+          context: %{db_password: "ctx-secret-password"},
+          max_turns: 9
+        )
+
+      inspected = inspect(config)
+
+      assert inspected =~ "#Alloy.Agent.Config<"
+      assert inspected =~ "max_turns: 9"
+      refute inspected =~ "sk-primary-secret"
+      refute inspected =~ "sk-fallback-secret"
+      refute inspected =~ "ctx-secret-password"
+      refute inspected =~ "provider_config:"
+      refute inspected =~ "fallback_providers:"
+      refute inspected =~ "context:"
+    end
+  end
 end

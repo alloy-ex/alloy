@@ -170,13 +170,7 @@ defmodule Alloy.Agent.Config do
   def from_opts(opts) when is_list(opts) do
     validate_option_names!(opts)
     {provider_mod, provider_config} = parse_provider(opts[:provider])
-
-    provider_config =
-      provider_config
-      |> normalize_provider_config()
-      |> reject_removed!(provider_mod)
-      |> validate_provider_auth!(provider_mod)
-      |> validate_provider_reasoning!()
+    provider_config = prepare_provider_config!(provider_config, provider_mod)
 
     model_metadata_overrides = normalize_model_metadata_overrides(opts[:model_metadata_overrides])
 
@@ -496,13 +490,7 @@ defmodule Alloy.Agent.Config do
   @spec with_provider(t(), module() | {module(), keyword() | map()}) :: t()
   def with_provider(%__MODULE__{} = config, provider) do
     {provider_mod, provider_config} = parse_provider(provider)
-
-    provider_config =
-      provider_config
-      |> normalize_provider_config()
-      |> reject_removed!(provider_mod)
-      |> validate_provider_auth!(provider_mod)
-      |> validate_provider_reasoning!()
+    provider_config = prepare_provider_config!(provider_config, provider_mod)
 
     max_tokens =
       if config.max_tokens_explicit? do
@@ -516,7 +504,7 @@ defmodule Alloy.Agent.Config do
       end
 
     compaction =
-      %{
+      Map.merge(config.compaction, %{
         reserve_tokens:
           resolve_compaction_field(
             config.compaction.reserve_tokens,
@@ -529,9 +517,6 @@ defmodule Alloy.Agent.Config do
             config.compaction_explicit.keep_recent_tokens,
             default_keep_recent_tokens(max_tokens)
           ),
-        fallback: config.compaction.fallback,
-        clear_tool_results: config.compaction.clear_tool_results,
-        keep_recent_tool_results: config.compaction.keep_recent_tool_results,
         summary_system_prompt:
           Map.get(
             config.compaction,
@@ -540,7 +525,7 @@ defmodule Alloy.Agent.Config do
           ),
         summary_prompt:
           Map.get(config.compaction, :summary_prompt, Compactor.default_summary_prompt())
-      }
+      })
 
     %{
       config
@@ -555,13 +540,15 @@ defmodule Alloy.Agent.Config do
 
   defp parse_fallback_provider(entry) do
     {mod, cfg} = parse_provider_entry(entry, "fallback provider", %{})
+    {mod, prepare_provider_config!(cfg, mod)}
+  end
 
-    {mod,
-     cfg
-     |> normalize_provider_config()
-     |> reject_removed!(mod)
-     |> validate_provider_auth!(mod)
-     |> validate_provider_reasoning!()}
+  defp prepare_provider_config!(provider_config, provider_mod) do
+    provider_config
+    |> normalize_provider_config()
+    |> reject_removed!(provider_mod)
+    |> validate_provider_auth!(provider_mod)
+    |> validate_provider_reasoning!()
   end
 
   defp parse_provider_entry({mod, cfg}, _label, _default)
@@ -589,7 +576,6 @@ defmodule Alloy.Agent.Config do
   defp normalize_model_metadata_overrides(overrides) when is_list(overrides),
     do: Map.new(overrides)
 
-  defp normalize_model_metadata_overrides(nil), do: %{}
   defp normalize_model_metadata_overrides(_), do: %{}
 
   defp resolve_max_tokens(
@@ -634,42 +620,45 @@ defmodule Alloy.Agent.Config do
       keep_recent_tokens: Map.has_key?(compaction, :keep_recent_tokens)
     }
 
-    fallback =
-      compaction
-      |> Map.get(:fallback, :truncate)
-      |> validate_compaction_fallback()
+    fallback = Map.get(compaction, :fallback, :truncate)
+    clear_tool_results = Map.get(compaction, :clear_tool_results, true)
+
+    summary_system_prompt =
+      Map.get(compaction, :summary_system_prompt, Compactor.default_summary_system_prompt())
+
+    summary_prompt = Map.get(compaction, :summary_prompt, Compactor.default_summary_prompt())
 
     resolved = %{
       reserve_tokens:
         if(explicit.reserve_tokens,
-          do: validate_compaction_tokens!(compaction.reserve_tokens, :reserve_tokens),
+          do: validate_pos_integer!(compaction.reserve_tokens, :reserve_tokens),
           else: default_reserve_tokens(max_tokens)
         ),
       keep_recent_tokens:
         if(explicit.keep_recent_tokens,
-          do: validate_compaction_tokens!(compaction.keep_recent_tokens, :keep_recent_tokens),
+          do: validate_pos_integer!(compaction.keep_recent_tokens, :keep_recent_tokens),
           else: default_keep_recent_tokens(max_tokens)
         ),
-      fallback: fallback,
+      fallback:
+        require_opt!(fallback == :truncate, fallback, "compaction fallback must be :truncate"),
       clear_tool_results:
-        compaction
-        |> Map.get(:clear_tool_results, true)
-        |> validate_clear_tool_results!(),
+        require_opt!(
+          is_boolean(clear_tool_results),
+          clear_tool_results,
+          "clear_tool_results must be a boolean"
+        ),
       keep_recent_tool_results:
         compaction
         |> Map.get(:keep_recent_tool_results, 3)
-        |> validate_keep_recent_tool_results!(),
+        |> validate_non_neg_integer!(:keep_recent_tool_results),
       summary_system_prompt:
-        compaction
-        |> Map.get(
-          :summary_system_prompt,
-          Compactor.default_summary_system_prompt()
-        )
-        |> validate_compaction_prompt!(:summary_system_prompt),
+        require_opt!(
+          is_binary(summary_system_prompt),
+          summary_system_prompt,
+          "summary_system_prompt must be a string"
+        ),
       summary_prompt:
-        compaction
-        |> Map.get(:summary_prompt, Compactor.default_summary_prompt())
-        |> validate_compaction_prompt!(:summary_prompt)
+        require_opt!(is_binary(summary_prompt), summary_prompt, "summary_prompt must be a string")
     }
 
     {resolved, explicit}
@@ -686,7 +675,7 @@ defmodule Alloy.Agent.Config do
 
   defp normalize_compaction(other) do
     raise ArgumentError,
-          "compaction must be a keyword list or map, got: #{inspect(other)}"
+          "compaction must be a keyword list or map, got: #{Sanitize.inspect_bounded(other)}"
   end
 
   defp normalize_compaction_map(map) do
@@ -699,48 +688,16 @@ defmodule Alloy.Agent.Config do
 
   defp compaction_key!(key) do
     case Map.fetch(@compaction_keys_by_name, key) do
-      {:ok, known} -> known
-      :error -> raise ArgumentError, "unsupported compaction option: #{inspect(key)}"
+      {:ok, known} ->
+        known
+
+      :error ->
+        raise ArgumentError, "unsupported compaction option: #{Sanitize.inspect_bounded(key)}"
     end
   end
 
   defp resolve_compaction_field(current_value, true, _default_value), do: current_value
   defp resolve_compaction_field(_current_value, false, default_value), do: default_value
-
-  defp validate_compaction_tokens!(value, _field) when is_integer(value) and value > 0, do: value
-
-  defp validate_compaction_tokens!(value, field) do
-    raise ArgumentError,
-          "#{field} must be a positive integer, got: #{inspect(value)}"
-  end
-
-  defp validate_keep_recent_tool_results!(value) when is_integer(value) and value >= 0, do: value
-
-  defp validate_keep_recent_tool_results!(value) do
-    raise ArgumentError,
-          "keep_recent_tool_results must be a non-negative integer, got: #{inspect(value)}"
-  end
-
-  defp validate_clear_tool_results!(value) when is_boolean(value), do: value
-
-  defp validate_clear_tool_results!(value) do
-    raise ArgumentError,
-          "clear_tool_results must be a boolean, got: #{inspect(value)}"
-  end
-
-  defp validate_compaction_prompt!(value, _field) when is_binary(value), do: value
-
-  defp validate_compaction_prompt!(value, field) do
-    raise ArgumentError,
-          "#{field} must be a string, got: #{inspect(value)}"
-  end
-
-  defp validate_compaction_fallback(:truncate), do: :truncate
-
-  defp validate_compaction_fallback(other) do
-    raise ArgumentError,
-          "compaction fallback must be :truncate, got: #{inspect(other)}"
-  end
 
   defp default_reserve_tokens(max_tokens) do
     min(16_384, max(1, div(max_tokens, 10)))

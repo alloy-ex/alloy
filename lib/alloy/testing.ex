@@ -186,11 +186,8 @@ defmodule Alloy.Testing do
   @spec tool_calls(State.t() | map()) :: [map()]
   def tool_calls(%{messages: messages}) do
     Enum.flat_map(messages, fn
-      %Message{role: :assistant, content: blocks} when is_list(blocks) ->
-        Enum.filter(blocks, &(&1[:type] == "tool_use"))
-
-      _ ->
-        []
+      %Message{role: :assistant} = msg -> Message.tool_calls(msg)
+      _ -> []
     end)
   end
 

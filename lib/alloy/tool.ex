@@ -103,7 +103,6 @@ defmodule Alloy.Tool do
 
   Context is a map that may contain:
   - `:working_directory` - base path for file operations
-  - `:config` - agent config struct
   - `:allowed_paths` - list of allowed directory prefixes for file access
   - `:on_tool_update` - injected 1-arity callback `(String.t() -> :ok)` when
     running inside `Alloy.Tool.Executor`; call via `Map.get(context, :on_tool_update)`

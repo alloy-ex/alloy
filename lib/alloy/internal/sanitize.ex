@@ -81,8 +81,6 @@ defmodule Alloy.Internal.Sanitize do
   `RuntimeError` messages.
   """
   @spec exception_parts(Exception.t(), pos_integer()) :: {String.t(), String.t() | nil}
-  def exception_parts(exception, max_bytes \\ 500)
-
   def exception_parts(%RuntimeError{message: msg}, max_bytes)
       when is_binary(msg) and is_integer(max_bytes) and max_bytes > 0 do
     {"RuntimeError", cap_bytes(msg, max_bytes)}
@@ -97,6 +95,19 @@ defmodule Alloy.Internal.Sanitize do
   end
 
   def exception_parts(%mod{}, _max_bytes), do: {inspect(mod), nil}
+
+  @doc """
+  Formats a bounded, value-safe exception header as `"(Module)"` or
+  `"(Module) detail"` so diagnostic headers include the module name once
+  without prefix-stripping real `RuntimeError` messages.
+  """
+  @spec exception_header(Exception.t(), pos_integer()) :: String.t()
+  def exception_header(exception, max_bytes) do
+    case exception_parts(exception, max_bytes) do
+      {mod_name, nil} -> "(#{mod_name})"
+      {mod_name, detail} -> "(#{mod_name}) #{detail}"
+    end
+  end
 
   @doc """
   Returns a bounded, value-safe summary for a caught `:error`, `:exit`, or

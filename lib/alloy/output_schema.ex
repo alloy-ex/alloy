@@ -128,14 +128,7 @@ defmodule Alloy.OutputSchema do
     if wrapper_map?(spec) do
       normalize_wrapper!(spec)
     else
-      {normalized, resolved} = normalize_schema!(spec, @default_name)
-
-      %__MODULE__{
-        name: @default_name,
-        schema: normalized,
-        strict: true,
-        resolved: {:cached, {@default_name, normalized, true}, resolved}
-      }
+      build_schema!(spec, @default_name, true)
     end
   end
 
@@ -214,18 +207,22 @@ defmodule Alloy.OutputSchema do
     validate_strict!(strict)
 
     if is_map(raw_schema) and not is_struct(raw_schema) and map_size(raw_schema) > 0 do
-      {normalized, resolved} = normalize_schema!(raw_schema, name)
-
-      %__MODULE__{
-        name: name,
-        schema: normalized,
-        strict: strict,
-        resolved: {:cached, {name, normalized, strict}, resolved}
-      }
+      build_schema!(raw_schema, name, strict)
     else
       raise ArgumentError,
             "output_schema :schema must be a non-empty JSON Schema map, got: #{Sanitize.inspect_bounded(raw_schema)}"
     end
+  end
+
+  defp build_schema!(raw_schema, name, strict) do
+    {normalized, resolved} = normalize_schema!(raw_schema, name)
+
+    %__MODULE__{
+      name: name,
+      schema: normalized,
+      strict: strict,
+      resolved: {:cached, {name, normalized, strict}, resolved}
+    }
   end
 
   defp fetch_unique_key!(map, atom_key, string_key, default) do
@@ -245,16 +242,13 @@ defmodule Alloy.OutputSchema do
     end
   end
 
-  defp validate_name!(name) when is_binary(name) do
-    unless Regex.match?(@name_pattern, name) do
-      raise ArgumentError,
-            "output_schema :name must match ^[a-zA-Z0-9_-]{1,64}$, got: #{Sanitize.inspect_bounded(name)}"
-    end
-  end
-
   defp validate_name!(name) do
-    raise ArgumentError,
-          "output_schema :name must be a string matching ^[a-zA-Z0-9_-]{1,64}$, got: #{Sanitize.inspect_bounded(name)}"
+    unless is_binary(name) and Regex.match?(@name_pattern, name) do
+      detail = if is_binary(name), do: "must match", else: "must be a string matching"
+
+      raise ArgumentError,
+            "output_schema :name #{detail} ^[a-zA-Z0-9_-]{1,64}$, got: #{Sanitize.inspect_bounded(name)}"
+    end
   end
 
   defp validate_strict!(strict) when is_boolean(strict), do: :ok

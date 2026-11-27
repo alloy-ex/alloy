@@ -23,6 +23,7 @@ defmodule Alloy.Agent.State do
 
   alias Alloy.Agent.Config
   alias Alloy.{Message, OutputSchema, Usage}
+  alias Alloy.Provider.Error
   alias Alloy.Tool.Registry
 
   @type status :: :idle | :running | :completed | :error | :max_turns | :halted | :cancelled
@@ -48,6 +49,7 @@ defmodule Alloy.Agent.State do
           agent_id: String.t()
         }
 
+  @derive {Inspect, except: [:tool_schema_cache]}
   @enforce_keys [:config]
   defstruct [
     :config,
@@ -251,6 +253,20 @@ defmodule Alloy.Agent.State do
   def merge_run_metadata(%__MODULE__{} = state, metadata) when is_map(metadata) do
     %{state | run_metadata: Map.merge(state.run_metadata, metadata)}
   end
+
+  @doc false
+  @spec cancel(t()) :: t()
+  def cancel(%__MODULE__{} = state) do
+    %{state | status: :cancelled, error: :cancelled}
+  end
+
+  @doc false
+  @spec put_provider_error(t(), term()) :: t()
+  def put_provider_error(%__MODULE__{} = state, %Error{} = error) do
+    merge_run_metadata(state, %{provider_error: error})
+  end
+
+  def put_provider_error(%__MODULE__{} = state, _reason), do: state
 
   @doc """
   Return the conversation history in chronological order, the same as

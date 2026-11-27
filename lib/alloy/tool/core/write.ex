@@ -3,7 +3,7 @@ defmodule Alloy.Tool.Core.Write do
   Built-in tool: write files, creating parent directories as needed.
 
   Overwrites the target file completely. Parent directories are created
-  automatically via `File.mkdir_p!/1`. Paths are resolved against the
+  automatically via `File.mkdir_p/1`. Paths are resolved against the
   agent's `:working_directory` context.
 
   ## Usage

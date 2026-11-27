@@ -14,6 +14,10 @@ defmodule Alloy.Tool.Validation do
 
   @literal_keywords ~w(const enum default examples)
   @schema_map_keywords ~w(properties patternProperties definitions $defs dependencies dependentSchemas)
+  @invalid_schema_errors [
+    ExJsonSchema.Schema.InvalidReferenceError,
+    ExJsonSchema.Schema.InvalidSchemaError
+  ]
   @max_output_validation_errors 10
   @max_output_validation_bytes 1_000
 
@@ -77,10 +81,7 @@ defmodule Alloy.Tool.Validation do
 
               :fallback
 
-            error.__struct__ in [
-              ExJsonSchema.Schema.InvalidReferenceError,
-              ExJsonSchema.Schema.InvalidSchemaError
-            ] ->
+            error.__struct__ in @invalid_schema_errors ->
               reraise ArgumentError,
                       "Invalid output_schema #{inspect(name)}: #{Exception.message(error)}",
                       __STACKTRACE__
@@ -99,19 +100,14 @@ defmodule Alloy.Tool.Validation do
       :error ->
         :ok
 
-      {:ok, dialect} when is_binary(dialect) ->
-        if String.trim(dialect) != "" do
-          :ok
-        else
+      {:ok, dialect} ->
+        unless is_binary(dialect) and String.trim(dialect) != "" do
           raise ArgumentError,
-                "Invalid output_schema #{inspect(name)}: \"$schema\" must be a non-empty string, " <>
+                ~s(Invalid output_schema #{inspect(name)}: "$schema" must be a non-empty string, ) <>
                   "got: #{Sanitize.inspect_bounded(dialect)}"
         end
 
-      {:ok, bad_dialect} ->
-        raise ArgumentError,
-              "Invalid output_schema #{inspect(name)}: \"$schema\" must be a non-empty string, " <>
-                "got: #{Sanitize.inspect_bounded(bad_dialect)}"
+        :ok
     end
   end
 
@@ -184,30 +180,23 @@ defmodule Alloy.Tool.Validation do
       end
   end
 
-  defp rescue_schema_error(%{__struct__: mod} = error, :output)
-       when mod in [
-              ExJsonSchema.Schema.InvalidReferenceError,
-              ExJsonSchema.Schema.InvalidSchemaError
-            ],
-       do: {:ok, "Invalid output_schema: #{Exception.message(error)}"}
-
-  defp rescue_schema_error(%{__struct__: mod} = error, {:tool, name})
-       when mod in [
-              ExJsonSchema.Schema.InvalidReferenceError,
-              ExJsonSchema.Schema.InvalidSchemaError
-            ],
-       do: {:ok, "Invalid schema for #{name}: #{Exception.message(error)}"}
+  defp rescue_schema_error(%{__struct__: mod} = error, target)
+       when mod in @invalid_schema_errors,
+       do: {:ok, format_schema_error(target, Exception.message(error))}
 
   defp rescue_schema_error(%{__struct__: ExJsonSchema.Schema.MissingJsonDecoderError}, :output),
     do: {:ok, missing_json_decoder_message()}
 
   defp rescue_schema_error(
          %{__struct__: ExJsonSchema.Schema.MissingJsonDecoderError},
-         {:tool, name}
+         {:tool, _name} = target
        ),
-       do: {:ok, "Invalid schema for #{name}: #{missing_json_decoder_message()}"}
+       do: {:ok, format_schema_error(target, missing_json_decoder_message())}
 
   defp rescue_schema_error(_error, _target), do: :reraise
+
+  defp format_schema_error(:output, message), do: "Invalid output_schema: #{message}"
+  defp format_schema_error({:tool, name}, message), do: "Invalid schema for #{name}: #{message}"
 
   defp missing_json_decoder_message do
     "Schema uses contentMediaType \"application/json\", which requires " <>
@@ -348,11 +337,7 @@ defmodule Alloy.Tool.Validation do
     do: value
 
   defp normalize_node!(map, resolved, scope, skipped?, subject) when is_map(map) do
-    if skipped? and has_nested_id?(map) do
-      raise ArgumentError,
-            "#{schema_subject(subject, :do_not)} support $id/id inside properties named const/enum/default/examples"
-    end
-
+    reject_nested_id!(map, skipped?, subject)
     next_scope = advance_scope_only(map, scope)
     normalize_map_entries!(map, resolved, next_scope, skipped?, subject)
   end
@@ -388,11 +373,7 @@ defmodule Alloy.Tool.Validation do
   end
 
   defp normalize_schema_map!(map, resolved, scope, skipped?, subject) do
-    if skipped? and has_nested_id?(map) do
-      raise ArgumentError,
-            "#{schema_subject(subject, :do_not)} support $id/id inside properties named const/enum/default/examples"
-    end
-
+    reject_nested_id!(map, skipped?, subject)
     next_scope = advance_scope_only(map, scope)
 
     Map.new(map, fn
@@ -407,6 +388,15 @@ defmodule Alloy.Tool.Validation do
          )}
     end)
   end
+
+  defp reject_nested_id!(map, true, subject) do
+    if has_nested_id?(map) do
+      raise ArgumentError,
+            "#{schema_subject(subject, :do_not)} support $id/id inside properties named const/enum/default/examples"
+    end
+  end
+
+  defp reject_nested_id!(_map, false, _subject), do: :ok
 
   # Mirrors advance_scope_only/2: a sibling $ref takes precedence over $id/id.
   defp has_nested_id?(%{"$ref" => ref}) when is_binary(ref) or is_struct(ref), do: false

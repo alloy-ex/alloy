@@ -10,7 +10,7 @@ defmodule Alloy.OwnedWorker do
   # `:trap_exit` would not receive an explicit kill in that edge case.)
 
   alias Alloy.Cancel
-  alias Alloy.Internal.Sanitize
+  alias Alloy.Internal.{Deadline, Sanitize}
 
   @worker_kill_timeout_ms 1_000
   @cancel_timeout_ms 1_500
@@ -41,7 +41,7 @@ defmodule Alloy.OwnedWorker do
               Process.demonitor(caller_ref, [:flush])
               :cancelled
 
-            deadline_expired?(deadline) ->
+            Deadline.expired?(deadline) ->
               Process.demonitor(caller_ref, [:flush])
               :timeout
 
@@ -84,7 +84,7 @@ defmodule Alloy.OwnedWorker do
       Cancel.cancelled?(cancel_token) ->
         send(owner, {done_ref, :cancelled})
 
-      deadline_expired?(deadline) ->
+      Deadline.expired?(deadline) ->
         send(owner, {done_ref, :timeout})
 
       true ->
@@ -128,7 +128,8 @@ defmodule Alloy.OwnedWorker do
       kill_worker(worker)
       :cancelled
     else
-      wait_ms = next_wait_ms(deadline, cancel_token)
+      wait_ms =
+        Deadline.next_wait_ms(deadline, if(cancel_token, do: @cancel_poll_ms, else: :infinity))
 
       receive do
         {^done_ref, reply} ->
@@ -158,7 +159,7 @@ defmodule Alloy.OwnedWorker do
               kill_worker(worker)
               :cancelled
 
-            deadline_expired?(deadline) ->
+            Deadline.expired?(deadline) ->
               Process.demonitor(caller_ref, [:flush])
               kill_worker(worker)
               :timeout
@@ -169,18 +170,6 @@ defmodule Alloy.OwnedWorker do
       end
     end
   end
-
-  defp deadline_expired?(nil), do: false
-  defp deadline_expired?(deadline), do: deadline <= System.monotonic_time(:millisecond)
-
-  defp next_wait_ms(nil, nil), do: :infinity
-  defp next_wait_ms(nil, _cancel_token), do: @cancel_poll_ms
-
-  defp next_wait_ms(deadline, nil),
-    do: max(deadline - System.monotonic_time(:millisecond), 0)
-
-  defp next_wait_ms(deadline, _cancel_token),
-    do: min(max(deadline - System.monotonic_time(:millisecond), 0), @cancel_poll_ms)
 
   defp await_worker_exit(worker) do
     receive do

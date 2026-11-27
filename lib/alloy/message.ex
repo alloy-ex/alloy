@@ -554,26 +554,13 @@ defmodule Alloy.Message do
 
   # Files API IDs and account-scoped provider file URIs belong strictly to the
   # provider account that uploaded them.
-  defp foreign_block(%{type: "document", file_id: _}, ids), do: {[], ids}
-
-  defp foreign_block(%{type: "document", uri: uri} = block, ids) do
-    if HTTP.provider_file_uri?(uri) do
+  defp foreign_block(%{type: type} = block, ids) when type in @portable_blocks do
+    if origin_scoped_file_block?(block) do
       {[], ids}
     else
       {[Map.drop(block, @signature_keys)], ids}
     end
   end
-
-  defp foreign_block(%{type: "image", url: url} = block, ids) do
-    if HTTP.provider_file_uri?(url) do
-      {[], ids}
-    else
-      {[Map.drop(block, @signature_keys)], ids}
-    end
-  end
-
-  defp foreign_block(%{type: type} = block, ids) when type in @portable_blocks,
-    do: {[Map.drop(block, @signature_keys)], ids}
 
   defp foreign_block(_block, ids), do: {[], ids}
 

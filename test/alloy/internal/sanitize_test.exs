@@ -88,6 +88,30 @@ defmodule Alloy.Internal.SanitizeTest do
     end
   end
 
+  describe "exception_header/2" do
+    test "formats bounded headers with module name once and redacts structural payloads" do
+      assert Sanitize.exception_header(%RuntimeError{message: "boom"}, 500) ==
+               "(RuntimeError) boom"
+
+      long_msg = "boom " <> String.duplicate("🎉", 20)
+      capped_header = Sanitize.exception_header(%RuntimeError{message: long_msg}, 12)
+      assert String.starts_with?(capped_header, "(RuntimeError) boom ")
+      assert String.valid?(capped_header)
+
+      assert Sanitize.exception_header(%ArgumentError{message: "argument error"}, 500) ==
+               "(ArgumentError) argument error"
+
+      assert Sanitize.exception_header(%ArgumentError{message: "secret sk-123"}, 500) ==
+               "(ArgumentError)"
+
+      assert Sanitize.exception_header(%KeyError{key: :db_url, term: %{api_key: "sk-123"}}, 500) ==
+               "(KeyError) key :db_url not found"
+
+      assert Sanitize.exception_header(%MatchError{term: %{api_key: "sk-match"}}, 500) ==
+               "(MatchError)"
+    end
+  end
+
   describe "exit_summary/2 and crash_summary/4" do
     test "unwraps stacktrace and OTP call-exit wrappers without leaking terms or args" do
       stack = [{MyMod, :run, 1, [file: ~c"a.ex", line: 1]}]
