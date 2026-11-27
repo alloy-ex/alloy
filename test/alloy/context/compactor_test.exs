@@ -1202,7 +1202,7 @@ defmodule Alloy.Context.CompactorTest do
           {:compacted, _} = Compactor.maybe_compact(key_error_state)
         end)
 
-      assert key_log =~ "on_compaction callback crashed (KeyError)"
+      assert key_log =~ "on_compaction callback crashed (KeyError): key :missing_field not found"
       refute key_log =~ "sk-secret-compactor-key"
 
       silent_server =

@@ -83,7 +83,7 @@ defmodule Alloy.Provider.OpenAICompat do
 
   alias Alloy.Internal.Sanitize
   alias Alloy.{Message, OutputSchema, Provider}
-  alias Alloy.Provider.{Error, HTTP, OpenAIStream}
+  alias Alloy.Provider.{Auth, Error, HTTP, OpenAIStream}
 
   @default_chat_path "/v1/chat/completions"
 
@@ -113,7 +113,7 @@ defmodule Alloy.Provider.OpenAICompat do
           {:ok, Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     with {:ok, body} <- build_request_body(messages, tool_defs, config),
-         {:ok, api_key} <- HTTP.resolve_optional_api_key(config),
+         {:ok, api_key} <- Auth.resolve_optional_api_key(config),
          {:ok, resp_body} <-
            HTTP.post_json(
              chat_url(config),
@@ -122,7 +122,7 @@ defmodule Alloy.Provider.OpenAICompat do
              Map.get(config, :req_options, []),
              HTTP.request_opts(config)
            ),
-         {:ok, decoded} <- Provider.decode_body(resp_body) do
+         {:ok, decoded} <- HTTP.decode_response_body(resp_body) do
       parse_response(decoded)
     end
   end
@@ -132,7 +132,7 @@ defmodule Alloy.Provider.OpenAICompat do
           {:ok, Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     with {:ok, body} <- build_request_body(messages, tool_defs, config),
-         {:ok, api_key} <- HTTP.resolve_optional_api_key(config) do
+         {:ok, api_key} <- Auth.resolve_optional_api_key(config) do
       body =
         if config[:stream_options] == false,
           do: Map.put(body, "stream_options", false),

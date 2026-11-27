@@ -1192,5 +1192,59 @@ defmodule Alloy.Provider.OpenAICompatTest do
       assert_received {:stream_headers, sh}
       assert {"authorization", "Bearer dyn-compat-key"} in sh
     end
+
+    test "returns :unknown error for pre-decoded non-map HTTP 200 JSON bodies" do
+      for raw_json <- ["[]", "123", "true", "null"] do
+        plug = fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(200, raw_json)
+        end
+
+        assert {:error, %Error{kind: :unknown, message: message}} =
+                 OpenAICompat.complete([Message.user("Hi")], [], %{
+                   api_url: "http://localhost",
+                   model: "m",
+                   req_options: [plug: plug, retry: false, decode_body: true]
+                 })
+
+        assert message =~ "Unexpected chat completion payload"
+      end
+    end
+
+    test "drops map-valued arguments to empty map under truncated length finish_reason" do
+      plug = fn conn ->
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "length",
+              "message" => %{
+                "role" => "assistant",
+                "tool_calls" => [
+                  %{
+                    "id" => "c1",
+                    "type" => "function",
+                    "function" => %{"name" => "search", "arguments" => %{"q" => "kept"}}
+                  }
+                ]
+              }
+            }
+          ]
+        })
+      end
+
+      assert {:ok,
+              %{
+                stop_reason: :max_tokens,
+                messages: [
+                  %Message{content: [%{type: "tool_use", id: "c1", name: "search", input: %{}}]}
+                ]
+              }} =
+               OpenAICompat.complete([Message.user("Hi")], [], %{
+                 api_url: "http://localhost",
+                 model: "m",
+                 req_options: [plug: plug, retry: false]
+               })
+    end
   end
 end

@@ -88,7 +88,7 @@ defmodule Alloy.Provider.OpenAI do
 
   alias Alloy.Internal.Sanitize
   alias Alloy.{Message, OutputSchema, Provider}
-  alias Alloy.Provider.{Error, HTTP}
+  alias Alloy.Provider.{Auth, Error, HTTP}
   alias Alloy.Provider.OpenAI.Stream, as: ResponsesStream
 
   @default_api_url "https://api.openai.com"
@@ -127,7 +127,7 @@ defmodule Alloy.Provider.OpenAI do
           {:ok, Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     with {:ok, body} <- build_request_body(messages, tool_defs, config),
-         {:ok, api_key} <- HTTP.resolve_api_key(config),
+         {:ok, api_key} <- Auth.resolve_api_key(config),
          {:ok, resp_body} <-
            HTTP.post_json(
              responses_url(config),
@@ -136,7 +136,7 @@ defmodule Alloy.Provider.OpenAI do
              Map.get(config, :req_options, []),
              HTTP.request_opts(config)
            ),
-         {:ok, decoded} <- Provider.decode_body(resp_body) do
+         {:ok, decoded} <- HTTP.decode_response_body(resp_body) do
       parse_response(decoded)
     end
   end
@@ -146,7 +146,7 @@ defmodule Alloy.Provider.OpenAI do
           {:ok, Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     with {:ok, body} <- build_request_body(messages, tool_defs, config),
-         {:ok, api_key} <- HTTP.resolve_api_key(config) do
+         {:ok, api_key} <- Auth.resolve_api_key(config) do
       ResponsesStream.stream(
         responses_url(config),
         headers(config, api_key),
@@ -158,7 +158,7 @@ defmodule Alloy.Provider.OpenAI do
   end
 
   @doc false
-  @spec parse_response(map()) :: {:ok, Provider.completion_response()} | {:error, Error.t()}
+  @spec parse_response(term()) :: {:ok, Provider.completion_response()} | {:error, Error.t()}
   def parse_response(%{"status" => "failed"} = resp), do: {:error, Error.from_body(resp)}
 
   def parse_response(%{"output" => output} = resp) when is_list(output) do
@@ -245,13 +245,19 @@ defmodule Alloy.Provider.OpenAI do
 
       body =
         %{"model" => config.model, "input" => input_items}
-        |> HTTP.maybe_put("max_output_tokens", Map.get(config, :max_tokens))
-        |> HTTP.maybe_put("previous_response_id", Map.get(config, :previous_response_id))
-        |> HTTP.maybe_put("store", Map.get(config, :store))
+        |> HTTP.maybe_put_unless_empty_list("max_output_tokens", Map.get(config, :max_tokens))
+        |> HTTP.maybe_put_unless_empty_list(
+          "previous_response_id",
+          Map.get(config, :previous_response_id)
+        )
+        |> HTTP.maybe_put_unless_empty_list("store", Map.get(config, :store))
         |> HTTP.maybe_put_unless_empty_list("include", Map.get(config, :include))
         |> maybe_put_reasoning_include(config)
         |> HTTP.maybe_put_unless_empty_list("tool_choice", Map.get(config, :tool_choice))
-        |> HTTP.maybe_put("parallel_tool_calls", Map.get(config, :parallel_tool_calls))
+        |> HTTP.maybe_put_unless_empty_list(
+          "parallel_tool_calls",
+          Map.get(config, :parallel_tool_calls)
+        )
         |> maybe_put_non_empty_string("prompt_cache_key", Map.get(config, :prompt_cache_key))
         |> maybe_put_non_empty_string(
           "prompt_cache_retention",
@@ -553,7 +559,12 @@ defmodule Alloy.Provider.OpenAI do
         _ -> "truncated"
       end
 
-    input = HTTP.decode_truncated_arguments(Map.get(call, "arguments", ""))
+    input =
+      case HTTP.decode_tool_arguments(Map.get(call, "arguments", ""), name) do
+        {:ok, map} -> map
+        {:error, _} -> %{}
+      end
+
     {:ok, [%{type: "tool_use", id: id, name: name, input: input}]}
   end
 
@@ -642,22 +653,20 @@ defmodule Alloy.Provider.OpenAI do
   # Alloy.Usage follows Anthropic: input_tokens excludes cache reads and
   # writes, which have their own fields. OpenAI counts both inside
   # input_tokens, so they are taken out here.
-  defp parse_usage(usage) when is_map(usage) do
-    details =
-      case usage["input_tokens_details"] do
-        map when is_map(map) -> map
-        _ -> %{}
-      end
+  defp parse_usage(%{} = usage) do
+    details = usage["input_tokens_details"] || %{}
+    cache_read = details["cached_tokens"] || 0
+    cache_write = details["cache_write_tokens"] || 0
 
     HTTP.cache_adjusted_usage(
-      HTTP.non_neg_int(usage["input_tokens"]),
-      HTTP.non_neg_int(usage["output_tokens"]),
-      HTTP.non_neg_int(details["cached_tokens"]),
-      HTTP.non_neg_int(details["cache_write_tokens"])
+      usage["input_tokens"] || 0,
+      usage["output_tokens"] || 0,
+      cache_read,
+      cache_write
     )
   end
 
-  defp parse_usage(_other), do: parse_usage(%{})
+  defp parse_usage(nil), do: parse_usage(%{})
 
   defp provider_state_from_response(%{"id" => id}) when is_binary(id) and id != "" do
     %{response_id: id}
@@ -672,7 +681,7 @@ defmodule Alloy.Provider.OpenAI do
       :server_side_tool_usage,
       Map.get(resp, "server_side_tool_usage")
     )
-    |> HTTP.maybe_put(:stop_details, stop_details(resp))
+    |> HTTP.maybe_put_unless_empty_list(:stop_details, stop_details(resp))
   end
 
   defp stop_details(%{"status" => "incomplete"} = resp), do: resp["incomplete_details"]

@@ -1287,11 +1287,20 @@ defmodule Alloy.Provider.HTTPTest do
       assert {:error, %Error{kind: :malformed_reply}} =
                HTTP.decode_tool_arguments(%URI{}, "lookup")
 
+      assert {:ok, %{"k" => "v"}} = HTTP.decode_response_body(~s({"k":"v"}))
+      assert {:error, %Error{kind: :protocol_error}} = HTTP.decode_response_body("[]")
+      assert {:error, %Error{kind: :malformed_reply}} = HTTP.decode_response_body("{bad")
+      assert {:ok, %{"k" => "v"}} = HTTP.decode_response_body(%{"k" => "v"})
+      assert {:ok, []} = HTTP.decode_response_body([])
+      assert {:ok, 123} = HTTP.decode_response_body(123)
+      assert {:ok, true} = HTTP.decode_response_body(true)
+      assert {:ok, nil} = HTTP.decode_response_body(nil)
+
       assert HTTP.decode_truncated_arguments("") == %{}
       assert HTTP.decode_truncated_arguments(~s({"k":"v"})) == %{"k" => "v"}
       assert HTTP.decode_truncated_arguments("{cut_off") == %{}
       assert HTTP.decode_truncated_arguments("[1,2]") == %{}
-      assert HTTP.decode_truncated_arguments(%{"k" => "v"}) == %{"k" => "v"}
+      assert HTTP.decode_truncated_arguments(%{"k" => "v"}) == %{}
       assert HTTP.decode_truncated_arguments(nil) == %{}
       assert HTTP.decode_truncated_arguments(%URI{}) == %{}
 

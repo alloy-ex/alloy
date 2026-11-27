@@ -109,6 +109,18 @@ defmodule Alloy.Internal.SanitizeTest do
 
       assert Sanitize.exception_header(%MatchError{term: %{api_key: "sk-match"}}, 500) ==
                "(MatchError)"
+
+      assert Sanitize.exception_header(%RuntimeError{message: "boom"}, 500, ": ") ==
+               "(RuntimeError): boom"
+
+      assert Sanitize.exception_header(
+               %KeyError{key: :missing_field, term: %{api_key: "sk-123"}},
+               500,
+               ": "
+             ) == "(KeyError): key :missing_field not found"
+
+      assert Sanitize.exception_header(%MatchError{term: %{api_key: "sk-match"}}, 500, ": ") ==
+               "(MatchError)"
     end
   end
 

@@ -5,6 +5,7 @@ defmodule Alloy.Provider.HTTP do
   # turn deadline), and every failure turned into an Alloy.Provider.Error.
 
   alias Alloy.Cancel
+  alias Alloy.Internal.Deadline
   alias Alloy.OwnedWorker
   alias Alloy.Provider
   alias Alloy.Provider.{Auth, Error, SSE}
@@ -31,7 +32,7 @@ defmodule Alloy.Provider.HTTP do
 
   # POSTs `body` as JSON. Returns the response body of a 200 response (raw binary
   # by default unless `:decode_body` is overridden in `req_options`; built-in
-  # providers decode via `Alloy.Provider.decode_body/1`).
+  # providers decode raw binaries via `decode_response_body/1`).
   #
   # `opts` may carry `:deadline` (monotonic ms) to enforce an absolute wall-clock
   # bound even if the server trickles bytes slowly, and `:cancel_token`
@@ -246,17 +247,21 @@ defmodule Alloy.Provider.HTTP do
      }}
   end
 
-  @spec decode_truncated_arguments(term()) :: map()
-  def decode_truncated_arguments(""), do: %{}
+  # Decodes raw binary HTTP 200 bodies via `Alloy.Provider.decode_body/1` while
+  # passing pre-decoded terms (e.g. from `req_options: [decode_body: true]`)
+  # straight through so each provider's `parse_response/1` handles them.
+  @spec decode_response_body(term()) :: {:ok, term()} | {:error, Error.t()}
+  def decode_response_body(body) when is_binary(body), do: Provider.decode_body(body)
+  def decode_response_body(body), do: {:ok, body}
 
-  def decode_truncated_arguments(args) when is_binary(args) do
+  @spec decode_truncated_arguments(term()) :: map()
+  def decode_truncated_arguments(args) when is_binary(args) and args != "" do
     case Jason.decode(args) do
       {:ok, map} when is_map(map) -> map
       _ -> %{}
     end
   end
 
-  def decode_truncated_arguments(args) when is_map(args) and not is_struct(args), do: args
   def decode_truncated_arguments(_other), do: %{}
 
   @spec truncated_tool_call_id(non_neg_integer()) :: String.t()
@@ -309,7 +314,7 @@ defmodule Alloy.Provider.HTTP do
       Cancel.cancelled?(cancel_token) ->
         :cancelled
 
-      deadline_expired?(deadline) ->
+      Deadline.expired?(deadline) ->
         :expired
 
       true ->
@@ -394,7 +399,7 @@ defmodule Alloy.Provider.HTTP do
       Cancel.cancelled?(cancel_token) ->
         cancelled_error("Stream cancelled")
 
-      deadline_expired?(deadline) ->
+      Deadline.expired?(deadline) ->
         {:error, %Error{kind: :timeout, message: "Stream exceeded request deadline"}}
 
       true ->
@@ -498,7 +503,7 @@ defmodule Alloy.Provider.HTTP do
         flush_task_reply(ref)
         :cancelled
 
-      deadline_expired?(deadline) ->
+      Deadline.expired?(deadline) ->
         OwnedWorker.cancel(owner)
         flush_task_reply(ref)
         :timeout
@@ -586,7 +591,7 @@ defmodule Alloy.Provider.HTTP do
         send(worker, {ack, :halt})
         abort_sse_cancelled(owner, ref, tag)
 
-      deadline_expired?(deadline) ->
+      Deadline.expired?(deadline) ->
         send(worker, {ack, :halt})
         abort_sse_timeout(owner, ref, tag)
 
@@ -621,7 +626,7 @@ defmodule Alloy.Provider.HTTP do
       Cancel.cancelled?(cancel_token) ->
         abort_sse_cancelled(owner, ref, tag)
 
-      deadline_expired?(deadline) ->
+      Deadline.expired?(deadline) ->
         abort_sse_timeout(owner, ref, tag)
 
       true ->
@@ -661,22 +666,13 @@ defmodule Alloy.Provider.HTTP do
     end
   end
 
-  defp deadline_expired?(nil), do: false
-  defp deadline_expired?(deadline), do: System.monotonic_time(:millisecond) >= deadline
-
-  defp next_wait_ms(nil, nil), do: :infinity
-  defp next_wait_ms(nil, _cancel_token), do: @cancel_poll_ms
-
-  defp next_wait_ms(deadline, nil),
-    do: max(deadline - System.monotonic_time(:millisecond), 0)
-
-  defp next_wait_ms(deadline, _cancel_token),
-    do: min(max(deadline - System.monotonic_time(:millisecond), 0), @cancel_poll_ms)
+  defp next_wait_ms(deadline, nil), do: Deadline.next_wait_ms(deadline, :infinity)
+  defp next_wait_ms(deadline, _cancel_token), do: Deadline.next_wait_ms(deadline, @cancel_poll_ms)
 
   defp maybe_clamp_receive_timeout(req_options, nil), do: req_options
 
   defp maybe_clamp_receive_timeout(req_options, deadline) when is_integer(deadline) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 1)
+    remaining = max(Deadline.remaining_ms(deadline), 1)
     clamp_receive_timeout(req_options, remaining)
   end
 

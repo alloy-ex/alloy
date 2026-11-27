@@ -765,34 +765,100 @@ defmodule Alloy.Provider.OpenAITest do
       assert result.usage.input_tokens == 0
       assert result.usage.output_tokens == 0
     end
+  end
 
-    test "tolerates malformed non-map usage, non-map details, and negative or string counts" do
-      for bad_usage <- [
-            "not-a-map",
-            %{
-              "input_tokens" => "bad",
-              "output_tokens" => -5,
-              "input_tokens_details" => "not-a-map"
-            },
-            %{
-              "input_tokens" => 10,
-              "output_tokens" => 4,
-              "input_tokens_details" => %{"cached_tokens" => -3, "cache_write_tokens" => "bad"}
-            }
-          ] do
-        body =
-          response_payload([assistant_text_item("ok")])
-          |> Map.put("usage", bad_usage)
+  describe "complete/3 edge-case preservation" do
+    test "returns :unknown error for pre-decoded non-map HTTP 200 JSON bodies" do
+      for raw_json <- ["[]", "123", "true", "null"] do
+        plug = fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(200, raw_json)
+        end
 
-        config = config_with_response(%{status: 200, body: Jason.encode!(body)})
-        assert {:ok, %{usage: usage}} = OpenAI.complete([Message.user("Hi")], [], config)
-        assert is_integer(usage.input_tokens) and usage.input_tokens >= 0
-        assert is_integer(usage.output_tokens) and usage.output_tokens >= 0
-        assert is_integer(usage.cache_read_input_tokens) and usage.cache_read_input_tokens >= 0
+        config = %{
+          api_key: "sk-test-key",
+          model: "gpt-5.2",
+          req_options: [plug: plug, retry: false, decode_body: true]
+        }
 
-        assert is_integer(usage.cache_creation_input_tokens) and
-                 usage.cache_creation_input_tokens >= 0
+        assert {:error, %Alloy.Provider.Error{kind: :unknown, message: message}} =
+                 OpenAI.complete([Message.user("Hi")], [], config)
+
+        assert message =~ "Unexpected OpenAI response payload"
       end
+    end
+
+    test "omits empty-list request options and stop_details" do
+      config =
+        config_that_captures_request()
+        |> Map.merge(%{
+          max_tokens: [],
+          previous_response_id: [],
+          store: [],
+          parallel_tool_calls: []
+        })
+
+      assert {:ok, _} = OpenAI.complete([Message.user("Hi")], [], config)
+      assert_received {:request_body, raw_body}
+      decoded = Jason.decode!(raw_body)
+
+      refute Map.has_key?(decoded, "max_output_tokens")
+      refute Map.has_key?(decoded, "previous_response_id")
+      refute Map.has_key?(decoded, "store")
+      refute Map.has_key?(decoded, "parallel_tool_calls")
+
+      resp_config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "resp_inc",
+              "status" => "incomplete",
+              "incomplete_details" => [],
+              "output" => [assistant_text_item("partial")],
+              "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+            })
+        })
+
+      assert {:ok, %{response_metadata: metadata}} =
+               OpenAI.complete([Message.user("Hi")], [], resp_config)
+
+      refute Map.has_key?(metadata, :stop_details)
+    end
+
+    test "retains map-valued arguments on truncated Responses function calls" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "resp_trunc",
+              "status" => "incomplete",
+              "incomplete_details" => %{"reason" => "max_output_tokens"},
+              "output" => [
+                %{
+                  "type" => "function_call",
+                  "call_id" => "call_1",
+                  "name" => "search",
+                  "arguments" => %{"q" => "kept"}
+                }
+              ],
+              "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+            })
+        })
+
+      assert {:ok,
+              %{
+                stop_reason: :max_tokens,
+                messages: [
+                  %Message{
+                    content: [%{type: "tool_use", id: "call_1", name: "search", input: input}]
+                  }
+                ]
+              }} = OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert input == %{"q" => "kept"}
     end
   end
 

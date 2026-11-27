@@ -21,12 +21,22 @@ defmodule Alloy.CancelTest do
   end
 
   describe "combine/2" do
-    test "handles nil operands" do
-      token = Cancel.new()
+    test "handles nil operands and returns the non-nil token directly" do
+      outer = Cancel.new()
+      inner = Cancel.new()
 
       assert Cancel.combine(nil, nil) == nil
-      assert Cancel.combine(nil, token) == token
-      assert Cancel.combine(token, nil) == token
+      assert Cancel.combine(nil, inner) == inner
+      assert Cancel.combine(outer, nil) == outer
+
+      combined_outer = Cancel.combine(outer, nil)
+      Cancel.cancel(combined_outer)
+      assert Cancel.cancelled?(outer)
+
+      shared = Cancel.new()
+      combined_shared = Cancel.combine(shared, shared)
+      Cancel.cancel(combined_shared)
+      assert Cancel.cancelled?(shared)
     end
 
     test "propagates outer cancellation without mutating outer when inner is cancelled" do

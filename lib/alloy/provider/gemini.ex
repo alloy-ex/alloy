@@ -156,7 +156,7 @@ defmodule Alloy.Provider.Gemini do
              Map.get(config, :req_options, []),
              HTTP.request_opts(config)
            ),
-         {:ok, decoded} <- Provider.decode_body(resp_body) do
+         {:ok, decoded} <- HTTP.decode_response_body(resp_body) do
       parse_response(decoded)
     end
   end
@@ -874,8 +874,8 @@ defmodule Alloy.Provider.Gemini do
 
   defp build_response_metadata(resp, candidate) do
     %{}
-    |> HTTP.maybe_put(:finish_reason, candidate["finishReason"])
-    |> HTTP.maybe_put(:finish_message, candidate["finishMessage"])
+    |> HTTP.maybe_put_unless_empty_map(:finish_reason, candidate["finishReason"])
+    |> HTTP.maybe_put_unless_empty_map(:finish_message, candidate["finishMessage"])
     |> HTTP.maybe_put_unless_empty_map(:prompt_feedback, resp["promptFeedback"])
     |> HTTP.maybe_put_unless_empty_map(
       :grounding_metadata,

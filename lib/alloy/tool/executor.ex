@@ -597,16 +597,13 @@ defmodule Alloy.Tool.Executor do
   end
 
   defp task_deadline(%{run_deadline: run_deadline, timeout: timeout}) do
-    case Deadline.remaining_ms(run_deadline) do
-      0 ->
-        :expired
+    now = System.monotonic_time(:millisecond)
 
-      remaining when remaining < timeout ->
-        {run_deadline, true}
-
-      _remaining ->
-        tool_deadline = System.monotonic_time(:millisecond) + timeout
-        {Deadline.min(tool_deadline, run_deadline), run_deadline < tool_deadline}
+    if run_deadline <= now do
+      :expired
+    else
+      tool_deadline = now + timeout
+      {min(tool_deadline, run_deadline), run_deadline < tool_deadline}
     end
   end
 

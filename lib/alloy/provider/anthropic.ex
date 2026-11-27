@@ -179,7 +179,7 @@ defmodule Alloy.Provider.Anthropic do
              Map.get(config, :req_options, []),
              HTTP.request_opts(config)
            ),
-         {:ok, decoded} <- Provider.decode_body(resp_body) do
+         {:ok, decoded} <- HTTP.decode_response_body(resp_body) do
       parse_response(decoded)
     end
   end

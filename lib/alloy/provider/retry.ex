@@ -10,7 +10,7 @@ defmodule Alloy.Provider.Retry do
 
   alias Alloy.Agent.State
   alias Alloy.Cancel
-  alias Alloy.Internal.Sanitize
+  alias Alloy.Internal.{Deadline, Sanitize}
   alias Alloy.Message
   alias Alloy.Provider.Error
 
@@ -168,13 +168,11 @@ defmodule Alloy.Provider.Retry do
       state.config.fallback_providers,
       {last_error, state.messages, false},
       fn {fb_provider, fb_config}, {acc_err, messages_acc, _emitted?} ->
-        now = System.monotonic_time(:millisecond)
-
         cond do
           Cancel.cancelled?(cancel_token) ->
             {:halt, {{:error, cancelled_error()}, messages_acc, false}}
 
-          is_integer(deadline) and deadline - now <= 0 ->
+          Deadline.expired?(deadline) ->
             {:halt, {acc_err, messages_acc, false}}
 
           true ->
@@ -423,8 +421,8 @@ defmodule Alloy.Provider.Retry do
   defp retry_budget_exhausted?(nil, backoff), do: backoff > @max_unbounded_retry_delay_ms
 
   defp retry_budget_exhausted?(deadline, backoff) when is_integer(deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
-    remaining <= 0 or remaining < backoff
+    remaining = Deadline.remaining_ms(deadline)
+    remaining == 0 or remaining < backoff
   end
 
   defp retry_after_ms(%Error{retry_after_ms: ms}) when is_integer(ms), do: ms
@@ -443,18 +441,17 @@ defmodule Alloy.Provider.Retry do
   end
 
   defp sleep_until(target_ms, cancel_token) do
-    remaining = target_ms - System.monotonic_time(:millisecond)
+    if Cancel.cancelled?(cancel_token) do
+      :cancelled
+    else
+      case Deadline.next_wait_ms(target_ms, @cancel_poll_ms) do
+        0 ->
+          :ok
 
-    cond do
-      Cancel.cancelled?(cancel_token) ->
-        :cancelled
-
-      remaining <= 0 ->
-        :ok
-
-      true ->
-        Process.sleep(min(remaining, @cancel_poll_ms))
-        sleep_until(target_ms, cancel_token)
+        wait_ms ->
+          Process.sleep(wait_ms)
+          sleep_until(target_ms, cancel_token)
+      end
     end
   end
 

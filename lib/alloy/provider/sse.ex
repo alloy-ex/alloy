@@ -12,7 +12,7 @@ defmodule Alloy.Provider.SSE do
   """
 
   alias Alloy.Cancel
-  alias Alloy.Internal.Sanitize
+  alias Alloy.Internal.{Deadline, Sanitize}
   alias Alloy.Provider.Error
 
   require Logger
@@ -134,7 +134,7 @@ defmodule Alloy.Provider.SSE do
         Cancel.cancelled?(cancel_token) ->
           {:halt, {:cancelled, acc}}
 
-        is_integer(deadline) and System.monotonic_time(:millisecond) >= deadline ->
+        Deadline.expired?(deadline) ->
           {:halt, {:timeout, acc}}
 
         true ->

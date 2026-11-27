@@ -1315,6 +1315,43 @@ defmodule Alloy.Provider.GeminiTest do
                Gemini.complete([Message.user("Hi")], [], config)
     end
 
+    test "returns :unknown error for pre-decoded non-map HTTP 200 JSON bodies" do
+      for raw_json <- ["[]", "123", "true", "null"] do
+        plug = fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(200, raw_json)
+        end
+
+        config = %{
+          api_key: "gem-test-key",
+          model: "gemini-2.5-flash",
+          req_options: [plug: plug, retry: false, decode_body: true]
+        }
+
+        assert {:error, %Error{kind: :unknown, message: message}} =
+                 Gemini.complete([Message.user("Hi")], [], config)
+
+        assert message =~ "Unexpected Gemini response payload"
+      end
+    end
+
+    test "omits empty-map finishReason and finishMessage metadata" do
+      payload = %{
+        "candidates" => [
+          %{
+            "content" => %{"parts" => [%{"text" => "ok"}]},
+            "finishReason" => %{},
+            "finishMessage" => %{}
+          }
+        ]
+      }
+
+      assert {:ok, %{response_metadata: metadata}} = complete_with(payload)
+      refute Map.has_key?(metadata, :finish_reason)
+      refute Map.has_key?(metadata, :finish_message)
+    end
+
     test "rejects cut-off stream with null finishReason and supports extra_body" do
       chunk = %{
         "candidates" => [

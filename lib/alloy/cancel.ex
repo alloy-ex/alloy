@@ -52,9 +52,16 @@ defmodule Alloy.Cancel do
   Combines two optional cancellation tokens into a token that is cancelled when
   either `outer` or `inner` is cancelled.
 
-  Cancelling the returned token cancels `inner` without mutating `outer`, while
-  cancelling `outer` propagates to the combined token. Returns `nil` when both
-  arguments are `nil`.
+  When either argument is `nil`, the other argument is returned directly
+  (`combine(nil, nil)` returns `nil`, `combine(outer, nil)` returns `outer`,
+  and `combine(nil, inner)` returns `inner`), so cancelling the returned token
+  mutates and cancels that token.
+
+  When both arguments are non-nil tokens, returns a combined token backed by
+  `inner` with `outer` attached as a parent: cancelling `outer` propagates to
+  the combined token without mutating `inner`, while cancelling the returned
+  token cancels `inner` without mutating `outer` (unless `outer` and `inner`
+  share an underlying reference).
   """
   @spec combine(t() | nil, t() | nil) :: t() | nil
   def combine(nil, inner), do: inner

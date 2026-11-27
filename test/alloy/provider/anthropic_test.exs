@@ -859,6 +859,28 @@ defmodule Alloy.Provider.AnthropicTest do
 
       assert Exception.message(reason) =~ "overloaded"
     end
+
+    test "returns :unknown error for pre-decoded non-map HTTP 200 JSON bodies" do
+      for raw_json <- ["[]", "123", "true", "null"] do
+        plug = fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(200, raw_json)
+        end
+
+        config = %{
+          api_key: "sk-ant-test-key",
+          model: "claude-sonnet-4-6",
+          max_tokens: 4096,
+          req_options: [plug: plug, retry: false, decode_body: true]
+        }
+
+        assert {:error, %Error{kind: :unknown, message: message}} =
+                 Anthropic.complete([Message.user("Hi")], [], config)
+
+        assert message =~ "Unexpected Anthropic response payload"
+      end
+    end
   end
 
   describe "complete/3 with cache: true" do
