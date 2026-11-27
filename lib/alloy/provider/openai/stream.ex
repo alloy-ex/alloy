@@ -4,6 +4,7 @@ defmodule Alloy.Provider.OpenAI.Stream do
   # state machine. Shared by `Alloy.Provider.OpenAI` (and `Alloy.Provider.XAI`).
 
   alias Alloy.Provider.{Error, HTTP, OpenAI}
+  alias Alloy.Provider.OpenAI.JSONPrefix
 
   @terminal_events ["response.completed", "response.incomplete", "response.failed"]
 
@@ -415,51 +416,9 @@ defmodule Alloy.Provider.OpenAI.Stream do
         {:ok, "", emitted}
 
       true ->
-        reconcile_formatted_prefix(emitted, args, expected_input)
+        JSONPrefix.reconcile(emitted, expected_input)
     end
   end
-
-  defp reconcile_formatted_prefix(_emitted, "", _expected_input), do: :conflict
-
-  defp reconcile_formatted_prefix(emitted, args, expected_input) do
-    with {:ok, suffix} <- match_json_prefix(emitted, args, :outside),
-         combined = emitted <> suffix,
-         true <- json_equal?(combined, expected_input) do
-      {:ok, suffix, combined}
-    else
-      _ -> :conflict
-    end
-  end
-
-  defp match_json_prefix(<<>>, args, _state), do: {:ok, args}
-
-  defp match_json_prefix(<<b, e_rest::binary>>, args, :outside)
-       when b in [?\s, ?\t, ?\n, ?\r],
-       do: match_json_prefix(e_rest, args, :outside)
-
-  defp match_json_prefix(emitted, <<b, a_rest::binary>>, :outside)
-       when b in [?\s, ?\t, ?\n, ?\r],
-       do: match_json_prefix(emitted, a_rest, :outside)
-
-  defp match_json_prefix(<<?", e_rest::binary>>, <<?", a_rest::binary>>, :outside),
-    do: match_json_prefix(e_rest, a_rest, :in_string)
-
-  defp match_json_prefix(<<b, e_rest::binary>>, <<b, a_rest::binary>>, :outside),
-    do: match_json_prefix(e_rest, a_rest, :outside)
-
-  defp match_json_prefix(<<?\\, e_rest::binary>>, <<?\\, a_rest::binary>>, :in_string),
-    do: match_json_prefix(e_rest, a_rest, :in_escape)
-
-  defp match_json_prefix(<<?", e_rest::binary>>, <<?", a_rest::binary>>, :in_string),
-    do: match_json_prefix(e_rest, a_rest, :outside)
-
-  defp match_json_prefix(<<b, e_rest::binary>>, <<b, a_rest::binary>>, :in_string),
-    do: match_json_prefix(e_rest, a_rest, :in_string)
-
-  defp match_json_prefix(<<b, e_rest::binary>>, <<b, a_rest::binary>>, :in_escape),
-    do: match_json_prefix(e_rest, a_rest, :in_string)
-
-  defp match_json_prefix(_emitted, _args, _state), do: :mismatch
 
   defp json_equal?(json, expected) do
     case Jason.decode(json) do

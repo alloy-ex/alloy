@@ -102,8 +102,9 @@ PubSub, OAuth token storage, UI, and scripting VMs outside core.
 - Superseding the deferral in ADR 0001 / ADR 0002, extract
   `Alloy.Tool.Executor.run_tool/3` sharing the exact internal pipeline as
   `execute_all/4` (middleware, validation, supervised timeout/cancellation,
-  redaction, and caller-process events with optional `:parent_call_id`). Update
-  the Code Mode recipe to route nested calls through `Executor.run_tool/3`.
+  redaction, and caller-process events with optional `:parent_call_id`).
+  *(Note: the standalone Code Mode recipe was later retired; usage is now
+  documented directly on `Alloy.Tool.Executor.run_tool/3`.)*
 
 ### 5. Optional `Alloy.ModelCatalog` Metadata
 - Retain `c:context_window/1` as the sole required callback and add optional

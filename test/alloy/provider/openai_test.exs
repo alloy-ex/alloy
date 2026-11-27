@@ -7,6 +7,7 @@ defmodule Alloy.Provider.OpenAITest do
   alias Alloy.Message
   alias Alloy.Provider.Error
   alias Alloy.Provider.OpenAI
+  alias Alloy.Provider.OpenAI.JSONPrefix
   alias Alloy.Provider.OpenAI.Stream, as: ResponsesStream
 
   defmodule SwitchToOpenAIMiddleware do
@@ -1820,6 +1821,70 @@ defmodule Alloy.Provider.OpenAITest do
       decoded_resumed = Jason.decode!(resumed_body)
       refute Map.has_key?(decoded_resumed, "prompt_cache_key")
       refute Map.has_key?(decoded_resumed, "prompt_cache_retention")
+    end
+  end
+
+  describe "OpenAI.JSONPrefix" do
+    test "reconciles objects, lists, literals, strings, escapes, and numbers" do
+      cases = [
+        {~s({"a": 1, "b":), %{"a" => 1, "b" => [true, false, nil]}},
+        {~s({"key": "hel), %{"key" => "hello\n\t\"\\/"}},
+        {~s({"ch": "\\), %{"ch" => "\b\f\r"}},
+        {~s({"emoji": "\\uD83D\\uDE), %{"emoji" => "😀"}},
+        {~s({"u": "\\u00), %{"u" => "A"}},
+        {~s({"items": [1, ), %{"items" => [1, 2, 3]}},
+        {~s({"items": [), %{"items" => []}},
+        {~s({"flag": tr), %{"flag" => true}},
+        {~s({"none": nu), %{"none" => nil}},
+        {~s({"neg": -), %{"neg" => -42}},
+        {~s({"zero": -), %{"zero" => 0}},
+        {~s({"exp": 1e), %{"exp" => 100}},
+        {~s({"small": 1e-0), %{"small" => 0.001}},
+        {~s({"tiny": 1e-), %{"tiny" => 0.0}},
+        {~s({"round": 0.29), %{"round" => 0.3}},
+        {~s({"partial_k), %{"partial_key" => "v", "other" => 1}}
+      ]
+
+      for {prefix, expected} <- cases do
+        assert {:ok, suffix, combined} = JSONPrefix.reconcile(prefix, expected)
+        assert combined == prefix <> suffix
+        assert Jason.decode!(combined) == expected
+      end
+    end
+
+    test "reconciles every UTF-8 split point across diverse RFC 8259 JSON spellings" do
+      spellings = [
+        ~S({"z": 0.0000000001, "a": 1.2e3}),
+        ~S({"n": 1.2345E+04, "neg": -0.015, "zero": -0.0}),
+        ~S({"r": 0.29999999999999999, "nr": -0.29999999999999999, "t": 2.99999999999999999}),
+        ~S({"big": 9007199254740993.0, "nbig": -9007199254740993.0, "up": 9007199254740993.5}),
+        ~S({"uf": 1e-400, "ufz": 1e-0400, "nuf": -1.5e-400}),
+        ~S({"s": "a\/\u00e9\n\t\uD83D\uDE00", "b": true, "c": null}),
+        ~S({"arr": [0.00001, 1200, {"y": 1.5e-2, "x": false}]})
+      ]
+
+      for raw_json <- spellings do
+        expected = Jason.decode!(raw_json)
+        graphemes = String.graphemes(raw_json)
+
+        for cut <- 1..(length(graphemes) - 1) do
+          prefix = graphemes |> Enum.take(cut) |> Enum.join()
+          assert {:ok, suffix, combined} = JSONPrefix.reconcile(prefix, expected)
+          assert combined == prefix <> suffix
+          assert Jason.decode!(combined) == expected
+        end
+      end
+    end
+
+    test "returns :conflict and :error for mismatched or invalid JSON prefixes" do
+      assert :conflict = JSONPrefix.reconcile(~s({"a": 2}), %{"a" => 1})
+      assert :conflict = JSONPrefix.reconcile(~s({"a": 1, }), %{"a" => 1})
+      assert :conflict = JSONPrefix.reconcile(~s([1, 2, ), [1, 2])
+      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\x"}), %{"s" => "x"})
+      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\uDC00"}), %{"s" => "x"})
+      assert :conflict = JSONPrefix.reconcile(~s({"n": -), %{"n" => 5})
+      assert :conflict = JSONPrefix.reconcile(~s({"b": tr), %{"b" => false})
+      assert :error = JSONPrefix.complete(%{"a" => 1}, ~s({"a": 1} trailing))
     end
   end
 

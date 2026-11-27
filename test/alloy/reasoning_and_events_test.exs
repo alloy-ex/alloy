@@ -4817,6 +4817,195 @@ defmodule Alloy.ReasoningAndEventsTest do
       assert [%{turn: 1, payload: %{status: :max_turns}}] =
                Enum.filter(mt_cb_events, &(&1.event == :turn_end))
     end
+
+    test "OpenAI Responses semantic JSON prefix reconciliation preserves map order, escapes, numbers, and empty terminal" do
+      parent = self()
+
+      # 1. Whitespace-formatted prefix reconciled across output_item.done + response.completed
+      #    (both JSON string and map-typed terminal arguments) without duplicating deltas.
+      for {terminal_args, expected} <- [
+            {~s({"x":1}), %{"x" => 1}},
+            {%{"x" => 1}, %{"x" => 1}}
+          ] do
+        done_plug =
+          sse_plug(
+            sse_event("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_ws",
+                "call_id" => "call_ws",
+                "name" => "echo",
+                "arguments" => ~s({"x": )
+              }
+            }) <>
+              sse_event("response.output_item.done", %{
+                "type" => "response.output_item.done",
+                "output_index" => 0,
+                "item" => %{
+                  "type" => "function_call",
+                  "id" => "fc_ws",
+                  "call_id" => "call_ws",
+                  "name" => "echo",
+                  "arguments" => terminal_args
+                }
+              }) <>
+              sse_event("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_ws",
+                  "status" => "completed",
+                  "output" => [
+                    %{
+                      "type" => "function_call",
+                      "id" => "fc_ws",
+                      "call_id" => "call_ws",
+                      "name" => "echo",
+                      "arguments" => terminal_args
+                    }
+                  ],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        assert {:ok, %{messages: [msg]}} =
+                 OpenAI.stream(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_key: "sk-oai",
+                     model: "gpt-5.4",
+                     req_options: [plug: done_plug],
+                     on_event: &send(parent, {:ws_ev, &1})
+                   },
+                   fn _ -> :ok end
+                 )
+
+        assert [%{type: "tool_use", id: "call_ws", name: "echo", input: ^expected}] = msg.content
+
+        deltas =
+          drain_tagged(:ws_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p.arguments_delta end)
+
+        assert Jason.decode!(Enum.join(deltas)) == expected
+      end
+
+      # 2. Equivalent JSON prefixes (reordered map keys, Unicode/slash/surrogate escapes,
+      #    scientific notation, and `{` with empty terminal `""` -> %{}) reconcile cleanly.
+      reconcile_cases = [
+        {~s({"z":), %{"a" => 1, "z" => 2}, %{"a" => 1, "z" => 2}},
+        {~S({"x":"\u00), %{"x" => "é"}, %{"x" => "é"}},
+        {~S({"x":"a\/), %{"x" => "a/b"}, %{"x" => "a/b"}},
+        {~S({"e":"\uD83D\uDE), %{"e" => "😀"}, %{"e" => "😀"}},
+        {~s({"x":1e), %{"x" => 100}, %{"x" => 100}},
+        {"{", "", %{}}
+      ]
+
+      for {prefix, terminal_args, expected} <- reconcile_cases do
+        plug =
+          sse_plug(
+            sse_event("response.output_item.added", %{
+              "type" => "response.output_item.added",
+              "output_index" => 0,
+              "item" => %{
+                "type" => "function_call",
+                "id" => "fc_sem",
+                "call_id" => "call_sem",
+                "name" => "echo",
+                "arguments" => prefix
+              }
+            }) <>
+              sse_event("response.completed", %{
+                "type" => "response.completed",
+                "response" => %{
+                  "id" => "resp_sem",
+                  "status" => "completed",
+                  "output" => [
+                    %{
+                      "type" => "function_call",
+                      "id" => "fc_sem",
+                      "call_id" => "call_sem",
+                      "name" => "echo",
+                      "arguments" => terminal_args
+                    }
+                  ],
+                  "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+                }
+              })
+          )
+
+        assert {:ok, %{messages: [msg]}} =
+                 OpenAI.stream(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_key: "sk-oai",
+                     model: "gpt-5.4",
+                     req_options: [plug: plug],
+                     on_event: &send(parent, {:sem_ev, &1})
+                   },
+                   fn _ -> :ok end
+                 )
+
+        assert [%{type: "tool_use", id: "call_sem", name: "echo", input: ^expected}] = msg.content
+
+        deltas =
+          drain_tagged(:sem_ev)
+          |> Enum.filter(&match?({:tool_call_delta, _}, &1))
+          |> Enum.map(fn {:tool_call_delta, p} -> p.arguments_delta end)
+
+        assert Jason.decode!(Enum.join(deltas)) == expected
+      end
+
+      # 3. Mismatched partial prefix against map-typed terminal fails closed with :malformed_reply.
+      bad_plug =
+        sse_plug(
+          sse_event("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_bad_map",
+              "call_id" => "call_bad_map",
+              "name" => "echo",
+              "arguments" => ~s({"z":99,)
+            }
+          }) <>
+            sse_event("response.completed", %{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_bad_map",
+                "status" => "completed",
+                "output" => [
+                  %{
+                    "type" => "function_call",
+                    "id" => "fc_bad_map",
+                    "call_id" => "call_bad_map",
+                    "name" => "echo",
+                    "arguments" => %{"a" => 1, "z" => 2}
+                  }
+                ],
+                "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+              }
+            })
+        )
+
+      assert {:error, %Alloy.Provider.Error{kind: :malformed_reply}} =
+               OpenAI.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "sk-oai",
+                   model: "gpt-5.4",
+                   req_options: [plug: bad_plug],
+                   on_event: fn _ -> :ok end
+                 },
+                 fn _ -> :ok end
+               )
+    end
   end
 
   defp wait_until_dead(os_pid, timeout_ms) do
