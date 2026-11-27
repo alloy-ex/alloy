@@ -75,7 +75,7 @@ defmodule MyApp.LlmDbCatalog do
             structured_output?:
               capability_enabled?(caps, :json, :schema) or
                 capability_enabled?(caps, :structured_output, :enabled),
-            prompt_caching?: capability_enabled?(caps, :prompt_caching, :enabled)
+            prompt_caching?: prompt_caching_enabled?(caps)
           }
         end
 
@@ -139,6 +139,19 @@ defmodule MyApp.LlmDbCatalog do
   end
 
   defp capability_enabled?(_caps, _key, _nested_key), do: false
+
+  defp prompt_caching_enabled?(caps) when is_map(caps) do
+    case Map.get(caps, :caching) do
+      caching when is_map(caching) ->
+        Map.get(caching, :type) in ["implicit", "explicit", :implicit, :explicit] or
+          Map.get(caching, :enabled) == true
+
+      _ ->
+        false
+    end
+  end
+
+  defp prompt_caching_enabled?(_caps), do: false
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, val) when is_number(val), do: Map.put(map, key, val)

@@ -71,9 +71,20 @@ defmodule Alloy.ModelCatalogTest do
           reasoning: %{enabled: true},
           tools: %{enabled: true},
           json: %{schema: true},
-          prompt_caching: true
+          caching: %{type: "explicit"}
         },
         cost: %FakeLlmDbCost{input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75}
+      },
+      "implicit-caching" => %FakeLlmDbModel{
+        limits: %FakeLlmDbLimits{context: 200_000, input: nil, output: 64_000},
+        modalities: %{input: [:text, :image], output: [:text]},
+        capabilities: %{
+          reasoning: true,
+          tools: true,
+          json: %{schema: true},
+          caching: %{type: "implicit"}
+        },
+        cost: %FakeLlmDbCost{input: 1.25, output: 10.0, cache_read: 0.125, cache_write: nil}
       },
       "flat-booleans" => %FakeLlmDbModel{
         limits: %FakeLlmDbLimits{context: 200_000, input: nil, output: 64_000},
@@ -81,8 +92,7 @@ defmodule Alloy.ModelCatalogTest do
         capabilities: %{
           reasoning: false,
           tools: true,
-          structured_output: true,
-          prompt_caching: false
+          structured_output: true
         },
         cost: %FakeLlmDbCost{input: 1.0, output: 5.0, cache_read: nil, cache_write: nil}
       }
@@ -116,7 +126,7 @@ defmodule Alloy.ModelCatalogTest do
             structured_output?:
               capability_enabled?(caps, :json, :schema) or
                 capability_enabled?(caps, :structured_output, :enabled),
-            prompt_caching?: capability_enabled?(caps, :prompt_caching, :enabled)
+            prompt_caching?: prompt_caching_enabled?(caps)
           }
 
         _ ->
@@ -155,6 +165,19 @@ defmodule Alloy.ModelCatalogTest do
     end
 
     defp capability_enabled?(_caps, _key, _nested_key), do: false
+
+    defp prompt_caching_enabled?(caps) when is_map(caps) do
+      case Map.get(caps, :caching) do
+        caching when is_map(caching) ->
+          Map.get(caching, :type) in ["implicit", "explicit", :implicit, :explicit] or
+            Map.get(caching, :enabled) == true
+
+        _ ->
+          false
+      end
+    end
+
+    defp prompt_caching_enabled?(_caps), do: false
 
     defp maybe_put(map, _key, nil), do: map
     defp maybe_put(map, key, val) when is_number(val), do: Map.put(map, key, val)
@@ -330,6 +353,10 @@ defmodule Alloy.ModelCatalogTest do
                  cache_write_per_million: 3.75
                }
              }
+
+      implicit = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog, "implicit-caching")
+      assert implicit.context_window == 200_000
+      assert implicit.capabilities.prompt_caching? == true
 
       flat = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog, "flat-booleans")
 
