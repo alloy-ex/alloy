@@ -231,12 +231,8 @@ defmodule Alloy.Tool.RunToolTest do
       :telemetry.attach_many(
         handler_id,
         [[:alloy, :tool, :start], [:alloy, :tool, :stop]],
-        fn event, _measurements, metadata, _config ->
-          if metadata[:tool_id] == "child_1" do
-            send(caller, {:telemetry, event, metadata})
-          end
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {caller, "child_1"}
       )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -707,4 +703,17 @@ defmodule Alloy.Tool.RunToolTest do
       end
     end
   end
+
+  @doc false
+  def forward_tool_telemetry(
+        event,
+        _measurements,
+        %{tool_id: tool_id} = metadata,
+        {caller, tool_id}
+      )
+      when caller == self() do
+    send(caller, {:telemetry, event, metadata})
+  end
+
+  def forward_tool_telemetry(_event, _measurements, _metadata, _config), do: :ok
 end

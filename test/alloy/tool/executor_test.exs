@@ -183,18 +183,13 @@ defmodule Alloy.Tool.ExecutorTest do
           Alloy.Testing.text_response("done")
         ])
 
-      test_pid = self()
       stop_handler_id = "tool-sanitize-telemetry-#{inspect(make_ref())}"
 
       :telemetry.attach(
         stop_handler_id,
         [:alloy, :tool, :stop],
-        fn _event, _measurements, metadata, _config ->
-          if metadata.tool_name == "strict_clause" do
-            send(test_pid, {:tool_stop_sanitized, metadata})
-          end
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop_sanitized, tool_name: "strict_clause"}
       )
 
       try do
@@ -217,7 +212,7 @@ defmodule Alloy.Tool.ExecutorTest do
         refute log =~ "ctx-secret-999"
         refute log =~ "input-secret-888"
 
-        assert_received {:tool_stop_sanitized, stop_meta}
+        assert_received {:tool_stop_sanitized, [:alloy, :tool, :stop], _measurements, stop_meta}
         assert is_binary(stop_meta.error)
         refute stop_meta.error =~ "ctx-secret-999"
         refute stop_meta.error =~ "input-secret-888"
@@ -241,18 +236,13 @@ defmodule Alloy.Tool.ExecutorTest do
           Alloy.Testing.text_response("done")
         ])
 
-      test_pid = self()
       stop_handler_id = "tool-keyerror-telemetry-#{inspect(make_ref())}"
 
       :telemetry.attach(
         stop_handler_id,
         [:alloy, :tool, :stop],
-        fn _event, _measurements, metadata, _config ->
-          if metadata.tool_name == "fetch_missing_key" do
-            send(test_pid, {:tool_stop_key_error, metadata})
-          end
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop_key_error, tool_name: "fetch_missing_key"}
       )
 
       try do
@@ -285,7 +275,7 @@ defmodule Alloy.Tool.ExecutorTest do
         assert log =~ "Tool fetch_missing_key crashed"
         refute log =~ "ctx-keyerror-secret-777"
 
-        assert_received {:tool_stop_key_error, stop_meta}
+        assert_received {:tool_stop_key_error, [:alloy, :tool, :stop], _measurements, stop_meta}
         assert stop_meta.error =~ "KeyError"
         refute stop_meta.error =~ "ctx-keyerror-secret-777"
       after
@@ -296,17 +286,13 @@ defmodule Alloy.Tool.ExecutorTest do
     test "exception telemetry keeps full stacktrace while model-visible result is short" do
       state = build_state([CrashingTool])
       tool_call = %{id: "call_crash", name: "crasher", type: "tool_use", input: %{}}
-      test_pid = self()
-
       stop_handler_id = "tool-error-telemetry-#{inspect(make_ref())}"
 
       :telemetry.attach(
         stop_handler_id,
         [:alloy, :tool, :stop],
-        fn _event, _measurements, metadata, _config ->
-          send(test_pid, {:tool_stop, metadata})
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop, []}
       )
 
       try do
@@ -319,7 +305,9 @@ defmodule Alloy.Tool.ExecutorTest do
           refute block.content =~ "\n"
         end)
 
-        assert_receive {:tool_stop, %{tool_name: "crasher", error: error}}
+        assert_receive {:tool_stop, [:alloy, :tool, :stop], _measurements,
+                        %{tool_name: "crasher", error: error}}
+
         assert error =~ "boom!"
         assert error =~ "lib/alloy/tool/executor.ex"
       after
@@ -359,16 +347,13 @@ defmodule Alloy.Tool.ExecutorTest do
     @tag capture_log: true
     test "process exits from linked Task.await KeyError and GenServer.call timeout never leak context secrets" do
       secret = "sk-exit-path-secret-999"
-      test_pid = self()
       handler_id = "executor-exit-leak-#{System.unique_integer([:positive])}"
 
       :telemetry.attach(
         handler_id,
         [:alloy, :tool, :stop],
-        fn _event, _measurements, metadata, _cfg ->
-          send(test_pid, {:tool_stop, metadata})
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop, []}
       )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -423,7 +408,7 @@ defmodule Alloy.Tool.ExecutorTest do
       refute call_meta.error =~ secret
 
       for _ <- 1..2 do
-        assert_receive {:tool_stop, meta}
+        assert_receive {:tool_stop, [:alloy, :tool, :stop], _measurements, meta}
         refute to_string(meta.error) =~ secret
       end
     end
@@ -965,10 +950,8 @@ defmodule Alloy.Tool.ExecutorTest do
       :telemetry.attach(
         handler_id,
         [:alloy, :tool, :stop],
-        fn _event, measurements, metadata, _config ->
-          send(test_pid, {:tool_stop, measurements, metadata})
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop, []}
       )
 
       try do
@@ -986,7 +969,7 @@ defmodule Alloy.Tool.ExecutorTest do
         assert meta.start_event_seq == start_seq
         assert meta.duration_ms >= 50
 
-        assert_received {:tool_stop, %{duration_ms: duration_ms},
+        assert_received {:tool_stop, [:alloy, :tool, :stop], %{duration_ms: duration_ms},
                          %{tool_id: "c_slow", start_event_seq: ^start_seq}}
 
         assert duration_ms >= 50
@@ -1000,27 +983,21 @@ defmodule Alloy.Tool.ExecutorTest do
       call = %{id: "call_telemetry", name: "success", type: "tool_use", input: %{}}
       seq_ref = :atomics.new(1, signed: false)
       correlation = "corr-telemetry"
-      test_pid = self()
-
       start_handler_id = "test-tool-start-#{inspect(make_ref())}"
       stop_handler_id = "test-tool-stop-#{inspect(make_ref())}"
 
       :telemetry.attach(
         start_handler_id,
         [:alloy, :tool, :start],
-        fn event, measurements, metadata, _config ->
-          send(test_pid, {:telemetry_event, event, measurements, metadata})
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :telemetry_event, correlation_id: correlation}
       )
 
       :telemetry.attach(
         stop_handler_id,
         [:alloy, :tool, :stop],
-        fn event, measurements, metadata, _config ->
-          send(test_pid, {:telemetry_event, event, measurements, metadata})
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :telemetry_event, correlation_id: correlation}
       )
 
       try do
@@ -1057,6 +1034,16 @@ defmodule Alloy.Tool.ExecutorTest do
   end
 
   # --- Helpers ---
+
+  @doc false
+  def forward_tool_telemetry(event, measurements, metadata, {test_pid, tag, filters})
+      when test_pid == self() do
+    if Enum.all?(filters, fn {k, v} -> Map.get(metadata, k) == v end) do
+      send(test_pid, {tag, event, measurements, metadata})
+    end
+  end
+
+  def forward_tool_telemetry(_event, _measurements, _metadata, _config), do: :ok
 
   defp build_state(tools, opts \\ []) do
     config = %Config{

@@ -98,7 +98,9 @@ defmodule Alloy.MixProject do
       main: "Alloy",
       source_url: @source_url,
       source_ref: "v#{@version}",
+      skip_undefined_reference_warnings_on: ["CHANGELOG.md"],
       extras: [
+        "CHANGELOG.md",
         "docs/upgrading-to-0.16.md",
         "docs/upgrading-to-0.14.md",
         "docs/upgrading-to-0.13.md",
@@ -115,7 +117,7 @@ defmodule Alloy.MixProject do
       ],
       groups_for_extras: [
         Guides:
-          ~r{docs/(upgrading-to-0\.(13|14|16)|events|provider-compatibility|loop-controls)\.md|livebooks/.*},
+          ~r{docs/(upgrading-to-[^/]+|events|provider-compatibility|loop-controls)\.md|livebooks/.*},
         Recipes: ~r{docs/recipes/.*}
       ],
       groups_for_modules: [
@@ -142,7 +144,9 @@ defmodule Alloy.MixProject do
           Alloy.Provider.Gemini,
           Alloy.Provider.OpenAI,
           Alloy.Provider.OpenAICompat,
+          Alloy.Provider.OpenAIStream,
           Alloy.Provider.Retry,
+          Alloy.Provider.SSE,
           Alloy.Provider.Test,
           Alloy.Provider.XAI
         ],

@@ -7,10 +7,8 @@ defmodule Alloy.Message.Validator do
   alias Alloy.Internal.Sanitize
   alias Alloy.{Message, Transcript}
 
-  @doc """
-  Invokes a 1-arity message callback (such as `:steering` or `:follow_up`),
-  validating its returned messages and redacting crashes or invalid payloads.
-  """
+  # Invokes a 1-arity message callback (such as `:steering` or `:follow_up`),
+  # validating its returned messages and redacting crashes or invalid payloads.
   @spec poll_callback(atom() | String.t(), (term() -> term()), term()) ::
           {:ok, [Message.t()]} | {:error, String.t()}
   def poll_callback(name, callback, state) when is_function(callback, 1) do
@@ -23,10 +21,8 @@ defmodule Alloy.Message.Validator do
       {:error, "#{name} callback #{kind}: #{Sanitize.exit_summary(reason, :redact)}"}
   end
 
-  @doc """
-  Validates a message list returned by a named callback, checking every message
-  and content block shape plus transcript tool pairing.
-  """
+  # Validates a message list returned by a named callback, checking every
+  # message and content block shape plus transcript tool pairing.
   @spec validate_callback_messages(atom() | String.t(), term()) ::
           {:ok, [Message.t()]} | {:error, String.t()}
   def validate_callback_messages(name, msgs) when is_list(msgs) do
@@ -48,11 +44,9 @@ defmodule Alloy.Message.Validator do
      "#{name} callback returned invalid messages: expected a list of Alloy.Message structs, got #{Sanitize.shape_summary(other)}"}
   end
 
-  @doc """
-  Returns `true` when `message` is a well-formed `Alloy.Message` struct with
-  valid metadata and content (valid UTF-8 string or non-empty list of valid
-  JSON-compatible content blocks).
-  """
+  # Returns `true` when `message` is a well-formed `Alloy.Message` struct with
+  # valid metadata and content (valid UTF-8 string or non-empty list of valid
+  # JSON-compatible content blocks).
   @spec valid_message?(term()) :: boolean()
   def valid_message?(%Message{role: role, content: content} = msg)
       when role in [:user, :assistant] do
@@ -65,10 +59,8 @@ defmodule Alloy.Message.Validator do
 
   def valid_message?(_other), do: false
 
-  @doc """
-  Returns `true` when `block` is a plain JSON-compatible content block map
-  matching one of Alloy's supported block schemas.
-  """
+  # Returns `true` when `block` is a plain JSON-compatible content block map
+  # matching one of Alloy's supported block schemas.
   @spec valid_block?(term()) :: boolean()
   def valid_block?(block) when is_map(block) and not is_struct(block) do
     json_compatible?(block) and

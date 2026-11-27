@@ -1300,6 +1300,7 @@ Code that uses only `Alloy.run/2`, `Alloy.stream/3`, tools, providers, messages,
 - Interactive REPL via `mix alloy`
 - Deterministic test provider for full TDD workflows
 
+[0.16.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.16.0
 [0.14.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.14.0
 [0.13.0]: https://github.com/alloy-ex/alloy/releases/tag/v0.13.0
 [0.12.5]: https://github.com/alloy-ex/alloy/releases/tag/v0.12.5

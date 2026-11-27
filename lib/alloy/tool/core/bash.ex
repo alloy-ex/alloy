@@ -81,10 +81,9 @@ defmodule Alloy.Tool.Core.Bash do
 
   @behaviour Alloy.Tool
 
-  alias Alloy.Internal.Sanitize
+  alias Alloy.Internal.{Deadline, Sanitize}
   alias Alloy.{OSProcess, OwnedWorker}
-
-  require Logger
+  alias Alloy.Tool.Core.Bash.OutputWorker
 
   @typedoc """
   A custom command executor. Receives the shell command string and the working
@@ -267,10 +266,6 @@ defmodule Alloy.Tool.Core.Bash do
     }
   end
 
-  @output_worker_max_chunks 128
-  @output_worker_max_bytes 262_144
-  @output_flush_grace_ms 250
-
   defp run_port(bash, opts, timeout, caller, callbacks) do
     # Trapping exits lets a supervisor shutdown stop the shell process group too.
     Process.flag(:trap_exit, true)
@@ -285,7 +280,7 @@ defmodule Alloy.Tool.Core.Bash do
         exit(reason)
     after
       0 ->
-        output_worker = start_output_worker(callbacks.bash_on_output)
+        output_worker = OutputWorker.start(callbacks.bash_on_output)
 
         try do
           port = Port.open({:spawn_executable, bash}, opts)
@@ -311,7 +306,7 @@ defmodule Alloy.Tool.Core.Bash do
           end
         catch
           kind, reason ->
-            kill_output_worker(output_worker)
+            OutputWorker.kill(output_worker)
             :erlang.raise(kind, reason, __STACKTRACE__)
         after
           Process.demonitor(caller_ref, [:flush])
@@ -332,29 +327,29 @@ defmodule Alloy.Tool.Core.Bash do
   # The deadline is absolute and checked before each receive, so a steady
   # stream of output can't postpone the timeout.
   defp collect(run, output) do
-    case run.deadline - System.monotonic_time(:millisecond) do
+    case Deadline.remaining_ms(run.deadline) do
       remaining when remaining > 0 -> receive_output(run, output, remaining)
-      _expired -> time_out(run, output)
+      0 -> time_out(run, output)
     end
   end
 
   defp receive_output(%{port: port, caller_ref: caller_ref} = run, output, remaining) do
-    worker_mon_ref = output_worker_ref(run.output_worker)
+    worker_mon_ref = OutputWorker.monitor_ref(run.output_worker)
 
     receive do
       {^port, {:data, data}} ->
         utf8_carry = emit_utf8_update(run.on_tool_update, run.utf8_carry, data)
-        dispatch_bash_on_output(run.output_worker, data)
+        OutputWorker.dispatch(run.output_worker, data)
         collect(%{run | utf8_carry: utf8_carry}, append(output, data))
 
       {:DOWN, ^worker_mon_ref, :process, _pid, reason} when is_reference(worker_mon_ref) ->
-        log_output_worker_exit(reason)
+        OutputWorker.log_exit(reason)
         collect(%{run | output_worker: nil}, output)
 
       {^port, {:exit_status, status}} ->
         flush_utf8_carry(run.on_tool_update, run.utf8_carry)
 
-        case flush_output_worker(run.output_worker, run.caller_ref, run.deadline) do
+        case OutputWorker.flush(run.output_worker, run.caller_ref, run.deadline) do
           :ok ->
             {:exited, status, render(output)}
 
@@ -370,12 +365,12 @@ defmodule Alloy.Tool.Core.Bash do
 
       {:DOWN, ^caller_ref, :process, _pid, _reason} ->
         OSProcess.signal_group(run.os_pid, "KILL")
-        kill_output_worker(run.output_worker)
+        OutputWorker.kill(run.output_worker)
         :caller_down
 
       {:EXIT, from, reason} when is_pid(from) ->
         OSProcess.signal_group(run.os_pid, "KILL")
-        kill_output_worker(run.output_worker)
+        OutputWorker.kill(run.output_worker)
         Process.demonitor(caller_ref, [:flush])
         exit(reason)
     after
@@ -385,188 +380,9 @@ defmodule Alloy.Tool.Core.Bash do
 
   defp time_out(run, output) do
     OSProcess.signal_group(run.os_pid, "KILL")
-    kill_output_worker(run.output_worker)
+    OutputWorker.kill(run.output_worker)
     flush_utf8_carry(run.on_tool_update, run.utf8_carry)
     {:timeout, render(output)}
-  end
-
-  # Runs :bash_on_output in its own supervised worker paired with a lightweight
-  # owner-monitoring watcher under Alloy.TaskSupervisor so even a blocked
-  # callback is killed immediately if run_port crashes or is brutally killed.
-  # Bounds queued chunks/bytes via atomics and logs once per command if chunks
-  # are dropped under backpressure or cut off by the post-exit flush grace cap.
-  defp start_output_worker(nil), do: nil
-
-  defp start_output_worker(fun) when is_function(fun, 1) do
-    owner = self()
-    # Slot 1: queued chunks, Slot 2: queued bytes, Slot 3: drop warning logged?
-    budget = :atomics.new(3, signed: false)
-    ready_ref = make_ref()
-
-    case Task.Supervisor.start_child(Alloy.TaskSupervisor, fn ->
-           Process.flag(:trap_exit, true)
-           owner_ref = Process.monitor(owner)
-           worker_pid = spawn_link(fn -> output_worker_loop(fun, budget, false) end)
-
-           send(owner, {:output_worker_ready, ready_ref, worker_pid})
-
-           receive do
-             {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
-               Process.exit(worker_pid, :kill)
-
-             {:EXIT, ^worker_pid, _reason} ->
-               Process.demonitor(owner_ref, [:flush])
-
-             {:EXIT, _supervisor_or_linked, _reason} ->
-               Process.exit(worker_pid, :kill)
-               Process.demonitor(owner_ref, [:flush])
-           end
-         end) do
-      {:ok, watcher} ->
-        watcher_ref = Process.monitor(watcher)
-
-        receive do
-          {:output_worker_ready, ^ready_ref, worker_pid} ->
-            Process.demonitor(watcher_ref, [:flush])
-            mon_ref = Process.monitor(worker_pid)
-            {worker_pid, mon_ref, budget}
-
-          {:DOWN, ^watcher_ref, :process, ^watcher, _reason} ->
-            nil
-        end
-
-      {:error, reason} ->
-        exit({:output_worker_start_failed, reason})
-    end
-  end
-
-  defp output_worker_loop(fun, budget, logged?) do
-    receive do
-      {:chunk, data} ->
-        :atomics.sub(budget, 1, 1)
-        :atomics.sub(budget, 2, byte_size(data))
-        next_logged? = invoke_bash_on_output(fun, data, logged?)
-        output_worker_loop(fun, budget, next_logged?)
-
-      {:flush, from, ref} ->
-        send(from, {:output_worker_flushed, ref})
-        :ok
-    end
-  end
-
-  defp invoke_bash_on_output(fun, data, logged?) do
-    fun.(data)
-    logged?
-  rescue
-    exception ->
-      if not logged? do
-        sanitized_trace = Sanitize.stacktrace(__STACKTRACE__)
-
-        Logger.warning(
-          "[Alloy.Tool.Core.Bash] :bash_on_output callback failed (#{Sanitize.exception_summary(exception, 500)}); command continues (further failures suppressed).\n" <>
-            Exception.format_stacktrace(sanitized_trace)
-        )
-      end
-
-      true
-  catch
-    :throw, value ->
-      exit({:shutdown, {:callback_exit, Sanitize.exit_summary({:nocatch, value}, :redact)}})
-
-    :exit, :normal ->
-      exit(:normal)
-
-    :exit, reason ->
-      exit({:shutdown, {:callback_exit, Sanitize.exit_summary(reason, :redact)}})
-  end
-
-  defp dispatch_bash_on_output(nil, _data), do: :ok
-
-  defp dispatch_bash_on_output({pid, _ref, budget}, data) do
-    size = byte_size(data)
-    chunks = :atomics.add_get(budget, 1, 1)
-    bytes = :atomics.add_get(budget, 2, size)
-
-    if chunks <= @output_worker_max_chunks and bytes <= @output_worker_max_bytes do
-      send(pid, {:chunk, data})
-      :ok
-    else
-      :atomics.sub(budget, 1, 1)
-      :atomics.sub(budget, 2, size)
-      log_output_drop_once(budget, "backpressure queue limit reached")
-      :ok
-    end
-  end
-
-  defp flush_output_worker(nil, _caller_ref, _deadline), do: :ok
-
-  defp flush_output_worker({pid, mon_ref, budget} = worker, caller_ref, deadline) do
-    flush_ref = make_ref()
-    send(pid, {:flush, self(), flush_ref})
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
-    grace = min(remaining, @output_flush_grace_ms)
-
-    receive do
-      {:output_worker_flushed, ^flush_ref} ->
-        Process.demonitor(mon_ref, [:flush])
-        :ok
-
-      {:DOWN, ^mon_ref, :process, ^pid, reason} ->
-        log_output_worker_exit(reason)
-        :ok
-
-      {:DOWN, ^caller_ref, :process, _pid, _reason} ->
-        kill_output_worker(worker)
-        :caller_down
-
-      {:EXIT, from, reason} when is_pid(from) ->
-        kill_output_worker(worker)
-        {:exit, reason}
-    after
-      grace ->
-        kill_output_worker(worker)
-        log_output_drop_once(budget, "post-exit flush grace window (#{grace}ms) elapsed")
-        :ok
-    end
-  end
-
-  defp log_output_drop_once(budget, reason) do
-    if :atomics.compare_exchange(budget, 3, 0, 1) == :ok do
-      Logger.warning(
-        "[Alloy.Tool.Core.Bash] :bash_on_output dropped queued output (#{reason}); further drops for this command suppressed."
-      )
-    end
-
-    :ok
-  end
-
-  defp log_output_worker_exit(:normal), do: :ok
-
-  defp log_output_worker_exit({:shutdown, {:callback_exit, summary}}) when is_binary(summary) do
-    Logger.warning(
-      "[Alloy.Tool.Core.Bash] :bash_on_output callback worker exited (#{summary}); command continues without further callback output."
-    )
-
-    :ok
-  end
-
-  defp log_output_worker_exit(reason) do
-    Logger.warning(
-      "[Alloy.Tool.Core.Bash] :bash_on_output callback worker exited (#{Sanitize.exit_summary(reason, :redact)}); command continues without further callback output."
-    )
-
-    :ok
-  end
-
-  defp output_worker_ref({_pid, mon_ref, _budget}), do: mon_ref
-  defp output_worker_ref(nil), do: nil
-
-  defp kill_output_worker(nil), do: :ok
-
-  defp kill_output_worker({pid, mon_ref, _budget}) do
-    Process.exit(pid, :kill)
-    Process.demonitor(mon_ref, [:flush])
-    :ok
   end
 
   # Carries incomplete trailing multibyte UTF-8 sequences across port chunks so
