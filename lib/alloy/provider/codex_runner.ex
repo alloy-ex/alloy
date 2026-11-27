@@ -5,7 +5,7 @@ defmodule Alloy.Provider.CodexRunner do
   # test-runner execution.
 
   alias Alloy.Cancel
-  alias Alloy.Internal.Sanitize
+  alias Alloy.Internal.{Deadline, Sanitize}
   alias Alloy.{OSProcess, OwnedWorker}
   alias Alloy.Provider.Error
 
@@ -246,7 +246,7 @@ defmodule Alloy.Provider.CodexRunner do
       Cancel.cancelled?(cancel_token) ->
         shutdown_cancelled_task(task, tag)
 
-      deadline <= System.monotonic_time(:millisecond) ->
+      Deadline.expired?(deadline) ->
         _ = Task.shutdown(task)
         flush_chunks(tag)
         nil
@@ -271,11 +271,10 @@ defmodule Alloy.Provider.CodexRunner do
     end
   end
 
-  defp next_wait_ms(deadline, nil),
-    do: max(deadline - System.monotonic_time(:millisecond), 0)
+  defp next_wait_ms(deadline, nil), do: Deadline.next_wait_ms(deadline, :infinity)
 
   defp next_wait_ms(deadline, _cancel_token),
-    do: min(max(deadline - System.monotonic_time(:millisecond), 0), @cancel_poll_ms)
+    do: Deadline.next_wait_ms(deadline, @cancel_poll_ms)
 
   defp deliver_chunk(task, tag, on_chunk, text) do
     on_chunk.(text)
@@ -426,7 +425,7 @@ defmodule Alloy.Provider.CodexRunner do
   defp maybe_override_cancelled(ok, _cancel_token), do: ok
 
   defp check_deadline(deadline, timeout) do
-    if deadline <= System.monotonic_time(:millisecond),
+    if Deadline.expired?(deadline),
       do: {:error, timed_out(timeout)},
       else: :ok
   end
@@ -536,7 +535,7 @@ defmodule Alloy.Provider.CodexRunner do
         :ok = stop(run)
         {:error, cancelled_error()}
 
-      run.deadline <= System.monotonic_time(:millisecond) ->
+      Deadline.expired?(run.deadline) ->
         time_out(run)
 
       true ->

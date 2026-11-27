@@ -10,7 +10,8 @@ defmodule Alloy.Provider.Anthropic do
   Required:
   - `:api_key` - Anthropic API key string, or a 0-arity callback returning
     `String.t() | {:ok, String.t()} | {:error, term()}` invoked per HTTP
-    attempt (inside a deadline-bounded worker when `:timeout_ms` is finite).
+    attempt (inside a bounded worker when `:timeout_ms` is finite or
+    `:cancel_token` is set).
     When passing a callback via `Alloy.run/2`, also set `:origin_key` to a
     stable non-empty string for account isolation.
   - `:model` - Model name (e.g., "claude-opus-4-6",
@@ -45,7 +46,7 @@ defmodule Alloy.Provider.Anthropic do
   - `:cache` - `true` / `"5m"` / `%{ttl: "5m"}` for 5-minute ephemeral prompt
     caching, `"1h"` / `%{ttl: "1h"}` for 1-hour TTL, or `false` (default)
   - `:reasoning` - portable reasoning config (`nil | :off | :low | :medium |
-    :high | :xhigh | %{effort: ..., display?: :summarized | :omitted}`). `:off`
+    :high | :xhigh | %{effort: ..., display: :summarized | :omitted}`). `:off`
     sends `thinking: %{"type" => "disabled"}` (note: models that cannot disable
     thinking reject `"disabled"`, so pass `reasoning: nil` or override via
     `:extra_body`); `:low`..`:xhigh` send `thinking: %{"type" => "adaptive"}`
@@ -63,9 +64,11 @@ defmodule Alloy.Provider.Anthropic do
     normalized envelope map:
       - `%{v: 1, seq:, correlation_id:, turn:, ts_ms:, event: :text_delta, payload: text}`
       - `%{v: 1, seq:, correlation_id:, turn:, ts_ms:, event: :thinking_delta, payload: text}`
+      - `%{v: 1, seq:, correlation_id:, turn:, ts_ms:, event: :tool_call_delta, payload: %{id:, index:, name:, arguments_delta:}}`
     Pass it as the `:on_event` option of `Alloy.stream/3`.
     Note: direct callers of `Alloy.Provider.Anthropic.stream/4` (without Turn)
-    receive provider-native tuples (for example `{:thinking_delta, text}`).
+    receive provider-native tuples (for example `{:thinking_delta, text}` and
+    `{:tool_call_delta, %{id:, index:, name:, arguments_delta:}}`).
   - `:code_execution` - `true` adds the server-side code execution tool
     (`code_execution_20260521`)
 
@@ -117,7 +120,9 @@ defmodule Alloy.Provider.Anthropic do
 
   alias Alloy.Internal.Sanitize
   alias Alloy.{Message, OutputSchema}
-  alias Alloy.Provider.{Error, HTTP}
+  alias Alloy.Provider
+  alias Alloy.Provider.Anthropic.Stream, as: AnthropicStream
+  alias Alloy.Provider.{Auth, Error, HTTP}
 
   @default_api_url "https://api.anthropic.com"
   @default_api_version "2023-06-01"
@@ -160,12 +165,12 @@ defmodule Alloy.Provider.Anthropic do
         }
 
   @impl true
-  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
-          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
+  @spec complete([Message.t()], [Provider.tool_def()], config()) ::
+          {:ok, Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    with {:ok, auth_scheme} <- HTTP.resolve_auth_scheme(config),
+    with {:ok, auth_scheme} <- Auth.resolve_auth_scheme(config),
          {:ok, body} <- build_request_body(messages, tool_defs, config),
-         {:ok, api_key} <- HTTP.resolve_api_key(config),
+         {:ok, api_key} <- Auth.resolve_api_key(config),
          {:ok, resp_body} <-
            HTTP.post_json(
              messages_url(config),
@@ -173,8 +178,9 @@ defmodule Alloy.Provider.Anthropic do
              body,
              Map.get(config, :req_options, []),
              HTTP.request_opts(config)
-           ) do
-      parse_response(resp_body)
+           ),
+         {:ok, decoded} <- Provider.decode_body(resp_body) do
+      parse_response(decoded)
     end
   end
 
@@ -186,458 +192,32 @@ defmodule Alloy.Provider.Anthropic do
   as `complete/3` once the stream finishes.
   """
   @impl true
-  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
-          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
+  @spec stream([Message.t()], [Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     on_event = Map.get(config, :on_event, fn _ -> :ok end)
 
-    initial_acc = %{
-      buffer: "",
-      error: nil,
-      sticky_error: nil,
-      tool_json_error: nil,
-      message: %{},
-      content_blocks: %{},
-      open_tool_blocks: %{},
-      input_json_buffers: %{},
-      on_chunk: on_chunk,
-      on_event: on_event
-    }
-
-    with {:ok, auth_scheme} <- HTTP.resolve_auth_scheme(config),
+    with {:ok, auth_scheme} <- Auth.resolve_auth_scheme(config),
          {:ok, body} <- build_request_body(messages, tool_defs, config),
-         {:ok, api_key} <- HTTP.resolve_api_key(config),
+         {:ok, api_key} <- Auth.resolve_api_key(config),
          body = Map.put(body, "stream", true),
          {:ok, sse_acc} <-
            HTTP.stream_sse(
              messages_url(config),
              build_headers(config, api_key, auth_scheme, body),
              body,
-             initial_acc,
-             &handle_sse_raw_event/2,
+             AnthropicStream.initial_acc(on_chunk, on_event),
+             &AnthropicStream.handle_raw_event/2,
              Map.get(config, :req_options, []),
              HTTP.request_opts(config)
-           ) do
-      build_stream_response(sse_acc)
+           ),
+         {:ok, raw_message} <- AnthropicStream.assemble_message(sse_acc) do
+      message_response(raw_message)
     end
   end
 
   defp messages_url(config),
     do: HTTP.join_url(Map.get(config, :api_url, @default_api_url), "/v1/messages")
-
-  @known_sse_events [
-    "message_start",
-    "content_block_start",
-    "content_block_delta",
-    "content_block_stop",
-    "message_delta",
-    "message_stop",
-    "error",
-    "ping"
-  ]
-
-  # Once a fatal protocol error is recorded, ignore subsequent events without
-  # emitting chunks/events (so Retry can still retry if nothing was streamed
-  # yet), except "error" (API error takes precedence) and "message_delta" (so
-  # stop_reason: "refusal" still bypasses retries).
-  defp handle_sse_raw_event(%{sticky_error: %Error{}} = acc, %{event: event_type, data: data})
-       when event_type in ["error", "message_delta"] do
-    case Jason.decode(data) do
-      {:ok, parsed} when is_map(parsed) -> handle_sse_event(acc, event_type, parsed)
-      _ -> acc
-    end
-  end
-
-  defp handle_sse_raw_event(%{sticky_error: %Error{}} = acc, _event), do: acc
-
-  # Bridge from SSE module's raw events to Anthropic's typed event handler.
-  # Known Anthropic SSE events carry a JSON object payload; undecodable or
-  # non-object data is recorded as a sticky protocol error. Unknown future
-  # event types are ignored forward-compatibly.
-  defp handle_sse_raw_event(acc, %{event: event_type, data: data})
-       when event_type in @known_sse_events do
-    case Jason.decode(data) do
-      {:ok, parsed} when is_map(parsed) ->
-        handle_sse_event(acc, event_type, parsed)
-
-      {:ok, _non_map} ->
-        record_protocol_error(
-          acc,
-          "Malformed payload in Anthropic SSE #{event_type} event"
-        )
-
-      {:error, _} ->
-        record_malformed_error(
-          acc,
-          "Malformed JSON in Anthropic SSE #{event_type} event"
-        )
-    end
-  end
-
-  defp handle_sse_raw_event(acc, _event), do: acc
-
-  defp handle_sse_event(acc, "message_start", %{"message" => msg}) when is_map(msg) do
-    %{acc | message: msg}
-  end
-
-  defp handle_sse_event(acc, "message_start", _event) do
-    record_protocol_error(acc, "Invalid message_start payload in Anthropic SSE stream")
-  end
-
-  defp handle_sse_event(acc, "content_block_start", %{
-         "index" => index,
-         "content_block" => block
-       })
-       when is_integer(index) and index >= 0 and is_map(block) do
-    case validate_start_block(block) do
-      {:ok, normalized} ->
-        acc =
-          acc
-          |> put_in([Access.key(:content_blocks), index], normalized)
-          |> Map.update!(:input_json_buffers, &Map.delete(&1, index))
-          |> Map.update!(:open_tool_blocks, &Map.delete(&1, index))
-
-        if tool_use_block?(normalized) do
-          if normalized["type"] == "tool_use" do
-            acc.on_event.(
-              {:tool_call_delta,
-               %{
-                 id: normalized["id"],
-                 index: index,
-                 name: normalized["name"],
-                 arguments_delta: ""
-               }}
-            )
-          end
-
-          %{acc | open_tool_blocks: Map.put(acc.open_tool_blocks, index, true)}
-        else
-          acc
-        end
-
-      :error ->
-        record_protocol_error(
-          acc,
-          "Invalid content_block_start block at index #{index} in Anthropic SSE stream"
-        )
-    end
-  end
-
-  defp handle_sse_event(acc, "content_block_start", _event) do
-    record_protocol_error(acc, "Invalid content_block_start payload in Anthropic SSE stream")
-  end
-
-  defp handle_sse_event(acc, "content_block_delta", %{
-         "index" => index,
-         "delta" => %{"type" => "thinking_delta", "thinking" => text}
-       })
-       when is_integer(index) and index >= 0 and is_binary(text) do
-    case Map.get(acc.content_blocks, index) do
-      %{"type" => "thinking", "thinking" => existing} = current when is_binary(existing) ->
-        acc.on_event.({:thinking_delta, text})
-        put_in(acc.content_blocks[index], Map.put(current, "thinking", existing <> text))
-
-      _mismatch ->
-        record_protocol_error(acc, "Mismatched thinking_delta for content block #{index}")
-    end
-  end
-
-  defp handle_sse_event(acc, "content_block_delta", %{
-         "index" => index,
-         "delta" => %{"type" => "signature_delta", "signature" => sig}
-       })
-       when is_integer(index) and index >= 0 and is_binary(sig) do
-    case Map.get(acc.content_blocks, index) do
-      %{"type" => "thinking"} = current ->
-        case Map.get(current, "signature") do
-          nil ->
-            put_in(acc.content_blocks[index], Map.put(current, "signature", sig))
-
-          existing when is_binary(existing) ->
-            put_in(acc.content_blocks[index], Map.put(current, "signature", existing <> sig))
-
-          _invalid ->
-            record_protocol_error(acc, "Invalid thinking block signature at index #{index}")
-        end
-
-      _mismatch ->
-        record_protocol_error(acc, "Mismatched signature_delta for content block #{index}")
-    end
-  end
-
-  defp handle_sse_event(acc, "content_block_delta", %{
-         "index" => index,
-         "delta" => %{"type" => "text_delta", "text" => text}
-       })
-       when is_integer(index) and index >= 0 and is_binary(text) do
-    case Map.get(acc.content_blocks, index) do
-      %{"type" => "text", "text" => existing} = current when is_binary(existing) ->
-        # :text_delta on_event is emitted by Turn.wrapped_chunk universally.
-        acc.on_chunk.(text)
-        put_in(acc.content_blocks[index], Map.put(current, "text", existing <> text))
-
-      _mismatch ->
-        record_protocol_error(acc, "Mismatched text_delta for content block #{index}")
-    end
-  end
-
-  defp handle_sse_event(acc, "content_block_delta", %{
-         "index" => index,
-         "delta" => %{"type" => "input_json_delta", "partial_json" => json}
-       })
-       when is_integer(index) and index >= 0 and is_binary(json) do
-    current = Map.get(acc.content_blocks, index)
-
-    cond do
-      tool_use_block?(current) and Map.has_key?(acc.open_tool_blocks, index) ->
-        if current["type"] == "tool_use" and json != "" do
-          acc.on_event.(
-            {:tool_call_delta,
-             %{
-               id: current["id"],
-               index: index,
-               name: current["name"],
-               arguments_delta: json
-             }}
-          )
-        end
-
-        current_buffer = Map.get(acc.input_json_buffers, index, "")
-
-        %{
-          acc
-          | input_json_buffers: Map.put(acc.input_json_buffers, index, current_buffer <> json)
-        }
-
-      tool_use_block?(current) ->
-        record_protocol_error(
-          acc,
-          "Unexpected input_json_delta after content_block_stop for content block #{index}"
-        )
-
-      true ->
-        record_protocol_error(acc, "Mismatched input_json_delta for content block #{index}")
-    end
-  end
-
-  defp handle_sse_event(acc, "content_block_delta", %{
-         "index" => index,
-         "delta" => %{"type" => delta_type}
-       })
-       when is_integer(index) and index >= 0 and is_binary(delta_type) and
-              delta_type not in [
-                "input_json_delta",
-                "text_delta",
-                "thinking_delta",
-                "signature_delta"
-              ] do
-    # Forward-compatible: ignore unknown extension delta types (e.g. citations_delta).
-    acc
-  end
-
-  defp handle_sse_event(acc, "content_block_delta", %{
-         "delta" => %{"type" => delta_type}
-       })
-       when delta_type in ["input_json_delta", "text_delta", "thinking_delta", "signature_delta"] do
-    record_protocol_error(acc, "Invalid #{delta_type} payload in Anthropic SSE stream")
-  end
-
-  defp handle_sse_event(acc, "content_block_delta", _event) do
-    record_protocol_error(acc, "Invalid content_block_delta payload in Anthropic SSE stream")
-  end
-
-  defp handle_sse_event(acc, "content_block_stop", %{"index" => index})
-       when is_integer(index) and index >= 0 do
-    acc = %{acc | open_tool_blocks: Map.delete(acc.open_tool_blocks, index)}
-
-    case Map.get(acc.input_json_buffers, index) do
-      nil ->
-        acc
-
-      "" ->
-        Map.put(acc, :input_json_buffers, Map.delete(acc.input_json_buffers, index))
-
-      json_str when is_binary(json_str) ->
-        current = Map.get(acc.content_blocks, index, %{})
-        buffers = Map.delete(acc.input_json_buffers, index)
-
-        case Jason.decode(json_str) do
-          {:ok, input} when is_map(input) ->
-            acc
-            |> put_in([Access.key(:content_blocks), index], Map.put(current, "input", input))
-            |> Map.put(:input_json_buffers, buffers)
-
-          {:ok, _non_map} ->
-            name = Map.get(current, "name", "unknown")
-
-            acc
-            |> Map.put(:input_json_buffers, buffers)
-            |> record_tool_json_error("Tool call arguments for #{name} must be a JSON object")
-
-          {:error, _reason} ->
-            name = Map.get(current, "name", "unknown")
-
-            acc
-            |> Map.put(:input_json_buffers, buffers)
-            |> record_tool_json_error("Invalid JSON in tool call arguments for #{name}")
-        end
-    end
-  end
-
-  defp handle_sse_event(acc, "content_block_stop", _event) do
-    record_protocol_error(acc, "Invalid content_block_stop payload in Anthropic SSE stream")
-  end
-
-  # The delta carries the message's final top-level fields (stop_reason,
-  # stop_details, container). Its usage is cumulative, so it replaces the
-  # message_start counts rather than adding to them.
-  defp handle_sse_event(acc, "message_delta", %{"delta" => delta} = event) when is_map(delta) do
-    case Map.get(event, "usage") do
-      nil ->
-        message = put_present(acc.message, delta)
-        %{acc | message: message}
-
-      event_usage when is_map(event_usage) ->
-        usage = put_present(Map.get(acc.message, "usage", %{}), event_usage)
-        message = acc.message |> put_present(delta) |> Map.put("usage", usage)
-        %{acc | message: message}
-
-      _invalid ->
-        record_protocol_error(acc, "Invalid message_delta usage in Anthropic SSE stream")
-    end
-  end
-
-  defp handle_sse_event(acc, "message_delta", _event) do
-    record_protocol_error(acc, "Invalid message_delta payload in Anthropic SSE stream")
-  end
-
-  # Retry retries a retryable error only when no output was streamed yet.
-  defp handle_sse_event(acc, "error", event), do: %{acc | error: Error.from_body(event)}
-
-  defp handle_sse_event(acc, _event_type, _data), do: acc
-
-  defp validate_start_block(%{"type" => "text", "text" => text} = block) when is_binary(text),
-    do: {:ok, block}
-
-  defp validate_start_block(%{"type" => "text"}), do: :error
-
-  defp validate_start_block(%{"type" => "thinking", "thinking" => thinking} = block)
-       when is_binary(thinking) do
-    case Map.get(block, "signature") do
-      sig when is_nil(sig) or is_binary(sig) -> {:ok, block}
-      _invalid -> :error
-    end
-  end
-
-  defp validate_start_block(%{"type" => "thinking"}), do: :error
-
-  defp validate_start_block(%{"type" => type, "id" => id, "name" => name} = block)
-       when is_binary(type) and is_binary(id) and id != "" and is_binary(name) and name != "" do
-    if tool_use_block?(block) do
-      case Map.fetch(block, "input") do
-        :error -> {:ok, Map.put(block, "input", %{})}
-        {:ok, input} when is_map(input) -> {:ok, block}
-        {:ok, _invalid} -> :error
-      end
-    else
-      {:ok, block}
-    end
-  end
-
-  defp validate_start_block(block) do
-    if tool_use_block?(block), do: :error, else: {:ok, block}
-  end
-
-  defp tool_use_block?(%{"type" => "tool_use"}), do: true
-
-  defp tool_use_block?(%{"type" => type}) when is_binary(type),
-    do: String.ends_with?(type, "_tool_use")
-
-  defp tool_use_block?(_block), do: false
-
-  defp record_protocol_error(acc, message),
-    do: HTTP.record_sticky_error(acc, :protocol_error, message)
-
-  defp record_malformed_error(acc, message),
-    do: HTTP.record_sticky_error(acc, :malformed_reply, message)
-
-  defp record_tool_json_error(%{tool_json_error: %Error{}} = acc, _message), do: acc
-
-  defp record_tool_json_error(acc, message) do
-    %{acc | tool_json_error: %Error{kind: :malformed_reply, message: message}}
-  end
-
-  # A null in a later event means "not reported here", not "reset".
-  defp put_present(map, updates) do
-    Map.merge(map, Map.reject(updates, fn {_key, value} -> is_nil(value) end))
-  end
-
-  # "refusal" is handled ahead of this list because refused output is discarded.
-  @incomplete_tool_exempt_stop_reasons ["max_tokens", "model_context_window_exceeded"]
-
-  defp build_stream_response(%{error: %Error{} = error}), do: {:error, error}
-
-  # Refusal discards output, so partial blocks or trailing stream anomalies do not trigger retries.
-  defp build_stream_response(%{message: %{"stop_reason" => "refusal"}} = acc) do
-    assemble_stream_response(acc)
-  end
-
-  defp build_stream_response(%{sticky_error: %Error{} = error}), do: {:error, error}
-
-  defp build_stream_response(%{
-         message: %{"stop_reason" => stop_reason},
-         tool_json_error: %Error{} = error
-       })
-       when is_binary(stop_reason) and
-              stop_reason not in @incomplete_tool_exempt_stop_reasons do
-    {:error, error}
-  end
-
-  defp build_stream_response(
-         %{
-           message: %{"stop_reason" => stop_reason},
-           open_tool_blocks: open,
-           input_json_buffers: buffers
-         } = acc
-       )
-       when is_binary(stop_reason) and
-              stop_reason not in @incomplete_tool_exempt_stop_reasons and
-              (map_size(open) > 0 or map_size(buffers) > 0) do
-    index = (Map.keys(open) ++ Map.keys(buffers)) |> Enum.min()
-    name = acc.content_blocks |> Map.get(index, %{}) |> Map.get("name", "unknown")
-
-    {:error,
-     %Error{
-       kind: :malformed_reply,
-       message: "Incomplete tool call arguments for #{name} (missing content_block_stop)"
-     }}
-  end
-
-  defp build_stream_response(%{message: %{"stop_reason" => stop_reason}} = acc)
-       when is_binary(stop_reason) do
-    assemble_stream_response(acc)
-  end
-
-  # Only the final message_delta carries a stop_reason, so a stream that ends
-  # without one was cut off and its content is incomplete.
-  defp build_stream_response(_acc) do
-    {:error,
-     %Error{
-       kind: :network,
-       message: "Anthropic stream ended before a stop_reason was received"
-     }}
-  end
-
-  defp assemble_stream_response(acc) do
-    content =
-      acc.content_blocks
-      |> Enum.sort_by(fn {index, _block} -> index end)
-      |> Enum.map(fn {_index, block} -> block end)
-
-    acc.message
-    |> Map.put("content", content)
-    |> message_response()
-  end
 
   # --- Request Building ---
 
@@ -645,7 +225,7 @@ defmodule Alloy.Provider.Anthropic do
     reject_extended_thinking!(config)
 
     with {:ok, cache_control} <- normalize_cache(config),
-         {:ok, reasoning} <- Alloy.Provider.normalize_reasoning(Map.get(config, :reasoning)) do
+         {:ok, reasoning} <- Provider.normalize_reasoning(Map.get(config, :reasoning)) do
       body = %{
         "model" => config.model,
         "max_tokens" => Map.get(config, :max_tokens, @default_max_tokens),
@@ -806,7 +386,7 @@ defmodule Alloy.Provider.Anthropic do
   defp web_search_tools(%{web_search: cfg}) when is_map(cfg) and not is_struct(cfg) do
     [
       cfg
-      |> Alloy.Provider.stringify_keys()
+      |> Provider.stringify_keys()
       |> Map.put_new("type", @web_search_tool_type)
       |> Map.put_new("name", "web_search")
     ]
@@ -816,7 +396,7 @@ defmodule Alloy.Provider.Anthropic do
 
   # Anthropic runs these tools itself, so they are sent exactly as given.
   defp server_tools(config),
-    do: config |> Map.get(:server_tools, []) |> Alloy.Provider.stringify_keys()
+    do: config |> Map.get(:server_tools, []) |> Provider.stringify_keys()
 
   # Reusing the container keeps code execution state between turns, and the
   # API rejects a continuation of a pending programmatic tool call without it.
@@ -848,14 +428,11 @@ defmodule Alloy.Provider.Anthropic do
     betas = Enum.map(user_betas, fn {_name, value} -> value end) ++ required_betas(body)
 
     [
-      auth_header(api_key, auth_scheme),
+      Auth.auth_header(api_key, auth_scheme, "x-api-key"),
       {"anthropic-version", Map.get(config, :api_version, @default_api_version)},
       {"content-type", "application/json"}
     ] ++ beta_header(betas) ++ other_headers
   end
-
-  defp auth_header(api_key, :bearer), do: {"authorization", "Bearer #{api_key}"}
-  defp auth_header(api_key, :api_key), do: {"x-api-key", api_key}
 
   # Code execution, memory, tool search and tool use examples went GA on
   # 2026-02-17 and need no header; context editing and Files API require betas.
@@ -1018,7 +595,7 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp format_content_block(%{type: "image", url: url}) when is_binary(url) do
-    if HTTP.http_url?(url) and not HTTP.provider_file_uri?(url) do
+    if HTTP.public_http_url?(url) do
       %{"type" => "image", "source" => %{"type" => "url", "url" => url}}
     else
       %{"type" => "text", "text" => "[Unsupported image URL scheme for Anthropic provider]"}
@@ -1033,15 +610,10 @@ defmodule Alloy.Provider.Anthropic do
 
   defp format_content_block(%{type: "document", mime_type: "application/pdf", data: data} = block)
        when is_binary(data) do
-    %{
-      "type" => "document",
-      "source" => %{
-        "type" => "base64",
-        "media_type" => "application/pdf",
-        "data" => data
-      }
-    }
-    |> HTTP.maybe_put("title", block[:title] || block[:filename])
+    document_block(
+      %{"type" => "base64", "media_type" => "application/pdf", "data" => data},
+      block
+    )
   end
 
   defp format_content_block(%{type: "document", mime_type: "text/plain", data: data} = block)
@@ -1049,15 +621,10 @@ defmodule Alloy.Provider.Anthropic do
     case Base.decode64(data, ignore: :whitespace) do
       {:ok, decoded} ->
         if String.valid?(decoded) do
-          %{
-            "type" => "document",
-            "source" => %{
-              "type" => "text",
-              "media_type" => "text/plain",
-              "data" => decoded
-            }
-          }
-          |> HTTP.maybe_put("title", block[:title] || block[:filename])
+          document_block(
+            %{"type" => "text", "media_type" => "text/plain", "data" => decoded},
+            block
+          )
         else
           unsupported_inline_document_notice("text/plain")
         end
@@ -1074,27 +641,13 @@ defmodule Alloy.Provider.Anthropic do
 
   defp format_content_block(%{type: "document", file_id: file_id} = block)
        when is_binary(file_id) do
-    %{
-      "type" => "document",
-      "source" => %{
-        "type" => "file",
-        "file_id" => file_id
-      }
-    }
-    |> HTTP.maybe_put("title", block[:title] || block[:filename])
+    document_block(%{"type" => "file", "file_id" => file_id}, block)
   end
 
   defp format_content_block(%{type: "document", mime_type: "application/pdf", uri: uri} = block)
        when is_binary(uri) do
-    if HTTP.http_url?(uri) and not HTTP.provider_file_uri?(uri) do
-      %{
-        "type" => "document",
-        "source" => %{
-          "type" => "url",
-          "url" => uri
-        }
-      }
-      |> HTTP.maybe_put("title", block[:title] || block[:filename])
+    if HTTP.public_http_url?(uri) do
+      document_block(%{"type" => "url", "url" => uri}, block)
     else
       %{
         "type" => "text",
@@ -1121,6 +674,11 @@ defmodule Alloy.Provider.Anthropic do
   defp format_content_block(block) when is_map(block) do
     # Pass through any other block types as-is, converting atom keys to strings
     Map.new(block, fn {k, v} -> {to_string(k), v} end)
+  end
+
+  defp document_block(source, block) do
+    %{"type" => "document", "source" => source}
+    |> HTTP.maybe_put("title", block[:title] || block[:filename])
   end
 
   defp unsupported_inline_document_notice(mime_type) do
@@ -1152,7 +710,7 @@ defmodule Alloy.Provider.Anthropic do
     %{
       "name" => name,
       "description" => desc,
-      "input_schema" => Alloy.Provider.stringify_keys(schema)
+      "input_schema" => Provider.stringify_keys(schema)
     }
     |> HTTP.maybe_put("strict", if(Map.get(def_map, :strict) == true, do: true))
     |> HTTP.maybe_put("input_examples", if(is_list(input_examples), do: input_examples))
@@ -1169,13 +727,6 @@ defmodule Alloy.Provider.Anthropic do
   defp allowed_caller(caller), do: to_string(caller)
 
   # --- Response Parsing ---
-
-  defp parse_response(body) when is_binary(body) do
-    case Alloy.Provider.decode_body(body) do
-      {:ok, decoded} -> parse_response(decoded)
-      {:error, _} = err -> err
-    end
-  end
 
   defp parse_response(%{"type" => "message"} = resp), do: message_response(resp)
 
@@ -1239,18 +790,7 @@ defmodule Alloy.Provider.Anthropic do
   end
 
   defp parse_content_blocks(blocks, _stop_reason) when is_list(blocks) do
-    result =
-      Enum.reduce_while(blocks, {:ok, []}, fn block, {:ok, acc} ->
-        case parse_content_block(block) do
-          {:ok, parsed} -> {:cont, {:ok, [parsed | acc]}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
-
-    case result do
-      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
-      {:error, _} = err -> err
-    end
+    HTTP.map_ok(blocks, &parse_content_block/1)
   end
 
   defp parse_content_blocks(_non_list, _stop_reason) do

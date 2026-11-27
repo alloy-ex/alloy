@@ -279,6 +279,31 @@ defmodule Alloy.Provider.GeminiTest do
       end
     end
 
+    test "resolves tool_result names with latest-message and earliest-block precedence" do
+      messages = [
+        Message.assistant_blocks([
+          %{type: "tool_use", id: "dup", name: "old_tool", input: %{}}
+        ]),
+        Message.assistant_blocks([
+          %{type: "tool_use", id: "dup", name: "first_in_latest", input: %{}},
+          %{type: "tool_use", id: "dup", name: "second_in_latest", input: %{}}
+        ]),
+        Message.tool_results([
+          Message.tool_result_block("dup", "ok"),
+          Message.tool_result_block("missing", "ok")
+        ])
+      ]
+
+      Gemini.complete(messages, [], config_that_captures_request())
+      assert_received {:request_body, body}
+      response = body |> Jason.decode!() |> Map.fetch!("contents") |> List.last()
+
+      assert [
+               %{"functionResponse" => %{"id" => "dup", "name" => "first_in_latest"}},
+               %{"functionResponse" => %{"id" => "missing", "name" => "unknown_tool"}}
+             ] = response["parts"]
+    end
+
     test "formats thinking blocks back into Gemini thought parts" do
       config = config_that_captures_request()
 

@@ -22,6 +22,11 @@ defmodule Alloy.Provider.Codex do
     the user config, including its MCP servers and plugins.
   - `:config_overrides` - `key=value` strings passed to `codex exec` as
     `-c` flags, for example `[~s(model_reasoning_effort="high")]`
+  - `:reasoning` - Portable reasoning config (`nil | :off | :low | :medium |
+    :high | :xhigh | %{effort: ..., display: :summarized | :omitted}`). Maps
+    `:effort` to a `-c model_reasoning_effort="..."` override (`:off` maps to
+    `"none"`). An explicit `model_reasoning_effort` entry in `:config_overrides`
+    takes precedence.
   - `:tmp_dir` - Parent for the provider's temp working directory
     (default: `System.tmp_dir!/0`)
   - `:timeout_ms` - Timeout for a single `codex exec` invocation
@@ -110,6 +115,7 @@ defmodule Alloy.Provider.Codex do
 
   alias Alloy.Internal.Sanitize
   alias Alloy.{Message, OutputSchema}
+  alias Alloy.Provider
   alias Alloy.Provider.{CodexRunner, CodexSession, Error, HTTP}
 
   @output_truncation 4_000
@@ -178,12 +184,12 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp run_completion(messages, tool_defs, config) do
-    with {:ok, reasoning} <- Alloy.Provider.normalize_reasoning(Map.get(config, :reasoning)),
+    with {:ok, reasoning} <- Provider.normalize_reasoning(Map.get(config, :reasoning)),
          config = Map.put(config, :reasoning, reasoning),
          {:ok, codex_home} <- codex_home(config),
-         :ok <- validate_session_workdir(config, codex_home) do
+         :ok <- validate_session_workdir(config) do
       scope = session_scope(config, codex_home, tool_defs)
-      plan = session_plan(config, codex_home, messages, scope)
+      plan = session_plan(config, messages, scope)
       config = Map.put(config, :alloy_codex_plan, plan)
       prompt = session_prompt(plan, messages, tool_defs, config)
 
@@ -266,8 +272,8 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp validate_session_workdir(%{persist_session: true} = config, home) do
-    if ephemeral_home?(config, home) or
+  defp validate_session_workdir(%{persist_session: true} = config) do
+    if ephemeral_home?(config) or
          (is_binary(config[:workdir]) and File.dir?(config.workdir)) do
       :ok
     else
@@ -279,12 +285,12 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp validate_session_workdir(_config, _home), do: :ok
+  defp validate_session_workdir(_config), do: :ok
 
-  defp ephemeral_home?(config, _home), do: Map.get(config, :profile) not in [nil, ""]
+  defp ephemeral_home?(config), do: Map.get(config, :profile) not in [nil, ""]
 
-  defp session_plan(%{persist_session: true} = config, home, messages, scope) do
-    if ephemeral_home?(config, home) do
+  defp session_plan(%{persist_session: true} = config, messages, scope) do
+    if ephemeral_home?(config) do
       {:fresh, :ephemeral}
     else
       CodexSession.plan(
@@ -295,7 +301,7 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp session_plan(_config, _home, _messages, _scope), do: {:fresh, :ephemeral}
+  defp session_plan(_config, _messages, _scope), do: {:fresh, :ephemeral}
 
   defp session_prompt({:resume, _id, count}, messages, tools, config) do
     "Continue the recorded conversation. Only new transcript messages follow.\n" <>
@@ -504,21 +510,13 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp parse_tool_blocks(text, tool_calls) do
-    tool_calls
-    |> Enum.with_index(1)
-    |> Enum.reduce_while([], fn {tool_call, index}, acc ->
-      case build_tool_block(tool_call, index) do
-        {:ok, block} -> {:cont, [block | acc]}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> finalize_reduced_tool_blocks(text)
+    case tool_calls
+         |> Enum.with_index(1)
+         |> HTTP.map_ok(fn {tool_call, index} -> build_tool_block(tool_call, index) end) do
+      {:ok, blocks} -> finalize_tool_blocks(text, blocks)
+      {:error, _} = err -> err
+    end
   end
-
-  defp finalize_reduced_tool_blocks({:error, _} = err, _text), do: err
-
-  defp finalize_reduced_tool_blocks(blocks, text),
-    do: finalize_tool_blocks(text, Enum.reverse(blocks))
 
   defp build_tool_block(tool_call, index) when is_map(tool_call) do
     with {:ok, call_id} <- tool_call_id(tool_call, index),
@@ -727,7 +725,7 @@ defmodule Alloy.Provider.Codex do
   # total even if Alloy adds a new block type the Codex provider hasn't
   # learned yet. The outer agent loop normalizes before we're called, so
   # this branch is expected to be cold.
-  defp serialize_block(block), do: Alloy.Provider.stringify_keys(block)
+  defp serialize_block(block), do: Provider.stringify_keys(block)
 
   defp serialize_tool_def(%{name: name, description: description, input_schema: input_schema}) do
     %{
@@ -754,7 +752,7 @@ defmodule Alloy.Provider.Codex do
         if Enum.any?(overrides, &reasoning_effort_override?/1) do
           overrides
         else
-          overrides ++ [~s(model_reasoning_effort="#{codex_reasoning_effort(effort)}")]
+          overrides ++ [~s(model_reasoning_effort="#{Provider.openai_reasoning_effort(effort)}")]
         end
 
       _nil ->
@@ -769,12 +767,6 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp reasoning_effort_override?(_other), do: false
-
-  defp codex_reasoning_effort(:off), do: "none"
-  defp codex_reasoning_effort(:low), do: "low"
-  defp codex_reasoning_effort(:medium), do: "medium"
-  defp codex_reasoning_effort(:high), do: "high"
-  defp codex_reasoning_effort(:xhigh), do: "xhigh"
 
   defp session_args({:fresh, :ephemeral}),
     do: ~w(exec --json --skip-git-repo-check --ephemeral --ignore-rules --sandbox read-only)
