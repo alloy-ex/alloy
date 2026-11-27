@@ -842,7 +842,8 @@ defmodule Alloy.Tool.ExecutorTest do
                  on_event: on_event,
                  event_seq_ref: seq_ref,
                  event_correlation_id: "corr-1",
-                 event_turn: 5
+                 event_turn: 5,
+                 parent_call_id: "parent_1"
                )
 
       assert block.tool_use_id == "call_1"
@@ -853,6 +854,7 @@ defmodule Alloy.Tool.ExecutorTest do
       assert meta.input == %{"x" => 1}
       assert meta.error == nil
       assert meta.correlation_id == "corr-1"
+      assert meta.parent_call_id == "parent_1"
       assert is_integer(meta.duration_ms)
       assert meta.duration_ms >= 0
       assert is_integer(meta.start_event_seq)
@@ -866,7 +868,8 @@ defmodule Alloy.Tool.ExecutorTest do
                           name: "success",
                           input: %{"x" => 1},
                           event_seq: 1,
-                          correlation_id: "corr-1"
+                          correlation_id: "corr-1",
+                          parent_call_id: "parent_1"
                         }}}
 
       assert_received {:event,
@@ -878,6 +881,7 @@ defmodule Alloy.Tool.ExecutorTest do
                           event_seq: 2,
                           start_event_seq: 1,
                           correlation_id: "corr-1",
+                          parent_call_id: "parent_1",
                           duration_ms: _,
                           error: nil
                         }}}

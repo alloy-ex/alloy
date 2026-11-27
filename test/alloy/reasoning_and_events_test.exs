@@ -68,6 +68,17 @@ defmodule Alloy.ReasoningAndEventsTest do
     def call(_hook, state), do: state
   end
 
+  defmodule ShrinkOverflowMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:on_context_overflow, state) do
+      %{state | messages: [Alloy.Message.user("shrunk")]}
+    end
+
+    def call(_hook, state), do: state
+  end
+
   defmodule CaptureReasoningProvider do
     @behaviour Alloy.Provider
 
@@ -4348,17 +4359,6 @@ defmodule Alloy.ReasoningAndEventsTest do
 
       # 1. Context-overflow recovery does NOT retry after streaming deltas (:tool_call_delta)
       #     have already been emitted to a subscriber, preventing duplicate/abandoned calls.
-      defmodule ShrinkOverflowMiddleware do
-        @behaviour Alloy.Middleware
-
-        @impl true
-        def call(:on_context_overflow, state) do
-          %{state | messages: [Alloy.Message.user("shrunk")]}
-        end
-
-        def call(_hook, state), do: state
-      end
-
       req_count = :atomics.new(1, signed: false)
 
       overflow_after_delta_plug = fn conn ->
@@ -4960,7 +4960,8 @@ defmodule Alloy.ReasoningAndEventsTest do
         assert Jason.decode!(Enum.join(deltas)) == expected
       end
 
-      # 3. Mismatched partial prefix against map-typed terminal fails closed with :malformed_reply.
+      # 3. Mismatched partial prefix against map-typed terminal fails closed with :malformed_reply
+      #    when subscribed, while unsubscribed callers accept authoritative terminal arguments.
       bad_plug =
         sse_plug(
           sse_event("response.output_item.added", %{
@@ -5003,6 +5004,23 @@ defmodule Alloy.ReasoningAndEventsTest do
                    req_options: [plug: bad_plug],
                    on_event: fn _ -> :ok end
                  },
+                 fn _ -> :ok end
+               )
+
+      assert {:ok,
+              %{
+                messages: [
+                  %Message{
+                    content: [
+                      %{type: "tool_use", id: "call_bad_map", input: %{"a" => 1, "z" => 2}}
+                    ]
+                  }
+                ]
+              }} =
+               OpenAI.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{api_key: "sk-oai", model: "gpt-5.4", req_options: [plug: bad_plug]},
                  fn _ -> :ok end
                )
     end
