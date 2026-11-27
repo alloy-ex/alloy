@@ -304,9 +304,15 @@ defmodule MinimalHostTest do
     assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
   end
 
-  test "rejects empty parent_call_id upfront" do
-    assert_raise ArgumentError, ~r/non-empty parent_call_id/, fn ->
-      CodeMode.run(fn _dispatch -> :ok end, state([]), Keyword.put(opts(), :parent_call_id, ""))
+  test "rejects empty or invalid UTF-8 parent_call_id upfront" do
+    for bad_parent <- ["", <<0xFF>>] do
+      assert_raise ArgumentError, ~r/non-empty UTF-8 parent_call_id/, fn ->
+        CodeMode.run(
+          fn _dispatch -> :ok end,
+          state([]),
+          Keyword.put(opts(), :parent_call_id, bad_parent)
+        )
+      end
     end
   end
 

@@ -53,7 +53,7 @@ defmodule Alloy.ModelCatalogTest do
   end
 
   defmodule FakeLlmDbLimits do
-    defstruct [:context, :output]
+    defstruct [:context, :input, :output]
   end
 
   defmodule FakeLlmDbCost do
@@ -65,7 +65,7 @@ defmodule Alloy.ModelCatalogTest do
 
     @entries %{
       "nested-multimodal" => %FakeLlmDbModel{
-        limits: %FakeLlmDbLimits{context: 1_000_000, output: 128_000},
+        limits: %FakeLlmDbLimits{context: 400_000, input: 272_000, output: 128_000},
         modalities: %{input: [:text, :image, :pdf], output: [:text]},
         capabilities: %{
           reasoning: %{enabled: true},
@@ -76,7 +76,7 @@ defmodule Alloy.ModelCatalogTest do
         cost: %FakeLlmDbCost{input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75}
       },
       "flat-booleans" => %FakeLlmDbModel{
-        limits: %FakeLlmDbLimits{context: 200_000, output: 64_000},
+        limits: %FakeLlmDbLimits{context: 200_000, input: nil, output: 64_000},
         modalities: %{input: [:text, :image], output: [:text]},
         capabilities: %{
           reasoning: false,
@@ -90,18 +90,15 @@ defmodule Alloy.ModelCatalogTest do
 
     @impl true
     def context_window(model) do
-      case nested_get(Map.get(@entries, model), [:limits, :context]) do
-        limit when is_integer(limit) and limit > 0 -> limit
-        _ -> nil
-      end
+      entry = Map.get(@entries, model)
+
+      positive_int(nested_get(entry, [:limits, :input])) ||
+        positive_int(nested_get(entry, [:limits, :context]))
     end
 
     @impl true
     def max_output_tokens(model) do
-      case nested_get(Map.get(@entries, model), [:limits, :output]) do
-        limit when is_integer(limit) and limit > 0 -> limit
-        _ -> nil
-      end
+      positive_int(nested_get(Map.get(@entries, model), [:limits, :output]))
     end
 
     @impl true
@@ -161,6 +158,9 @@ defmodule Alloy.ModelCatalogTest do
 
     defp maybe_put(map, _key, nil), do: map
     defp maybe_put(map, key, val) when is_number(val), do: Map.put(map, key, val)
+
+    defp positive_int(limit) when is_integer(limit) and limit > 0, do: limit
+    defp positive_int(_other), do: nil
   end
 
   defp opts(extra) do
@@ -313,7 +313,7 @@ defmodule Alloy.ModelCatalogTest do
 
       assert nested == %{
                model: "nested-multimodal",
-               context_window: 1_000_000,
+               context_window: 272_000,
                max_output_tokens: 128_000,
                capabilities: %{
                  reasoning?: true,

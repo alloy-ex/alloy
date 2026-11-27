@@ -447,6 +447,41 @@ defmodule Alloy.Tool.RunToolTest do
 
       assert inner_cancel_block.content == "Not executed: Cancelled"
       refute Cancel.cancelled?(outer2)
+
+      # 4. Overlapping composite tokens preserve parent chains (pre-cancelled and mid-flight)
+      token_a = Cancel.new()
+      token_b = Cancel.new()
+      composite = Cancel.combine(token_b, token_a)
+      state_a = init_state([blocking], cancel_token: token_a)
+
+      task_overlap =
+        Task.async(fn ->
+          Executor.run_tool(
+            %{id: "c6", name: "block_work", input: %{"value" => "x"}},
+            state_a,
+            cancel_token: composite
+          )
+        end)
+
+      assert_receive {:worker, overlap_worker_pid}, 2_000
+      overlap_mon = Process.monitor(overlap_worker_pid)
+      Cancel.cancel(token_b)
+
+      assert {:ok, overlap_cancel_block, _meta} = Task.await(task_overlap, 2_000)
+      assert_receive {:DOWN, ^overlap_mon, :process, ^overlap_worker_pid, _reason}, 1_000
+      assert overlap_cancel_block.is_error == true
+      assert overlap_cancel_block.content =~ "was cancelled"
+      refute Cancel.cancelled?(token_a)
+
+      # Pre-cancelled parent on overlapping composite token also short-circuits before start
+      assert {:ok, overlap_pre_block, nil} =
+               Executor.run_tool(
+                 %{id: "c7", name: "block_work", input: %{"value" => "x"}},
+                 state_a,
+                 cancel_token: composite
+               )
+
+      assert overlap_pre_block.content == "Not executed: Cancelled"
     end
 
     test "accepts on_event: nil, defaults omitted :input, and validates tool_call and option shapes" do
@@ -518,6 +553,10 @@ defmodule Alloy.Tool.RunToolTest do
 
       assert_raise ArgumentError, ~r/:parent_call_id/, fn ->
         Executor.run_tool(call, state, parent_call_id: "")
+      end
+
+      assert_raise ArgumentError, ~r/:parent_call_id/, fn ->
+        Executor.run_tool(call, state, parent_call_id: <<0xFF>>)
       end
 
       assert_raise ArgumentError, ~r/:on_event/, fn ->

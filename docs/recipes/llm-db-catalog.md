@@ -41,10 +41,14 @@ defmodule MyApp.LlmDbCatalog do
 
   @impl true
   def context_window(model) when is_binary(model) do
-    case nested_get(lookup(model), [:limits, :context]) do
-      limit when is_integer(limit) and limit > 0 -> limit
-      _ -> nil
-    end
+    # Prefer the model's documented maximum input limit when LLMDB provides
+    # `limits.input` separately from the combined `limits.context` window
+    # (for example OpenAI's 400k total / 272k input split), falling back to
+    # `limits.context` for entries that only publish a single context limit.
+    entry = lookup(model)
+
+    positive_int(nested_get(entry, [:limits, :input])) ||
+      positive_int(nested_get(entry, [:limits, :context]))
   end
 
   @impl true
@@ -52,10 +56,7 @@ defmodule MyApp.LlmDbCatalog do
 
   @impl true
   def max_output_tokens(model) when is_binary(model) do
-    case nested_get(lookup(model), [:limits, :output]) do
-      limit when is_integer(limit) and limit > 0 -> limit
-      _ -> nil
-    end
+    positive_int(nested_get(lookup(model), [:limits, :output]))
   end
 
   @impl true
@@ -142,6 +143,9 @@ defmodule MyApp.LlmDbCatalog do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, val) when is_number(val), do: Map.put(map, key, val)
   defp maybe_put(map, _key, _other), do: map
+
+  defp positive_int(limit) when is_integer(limit) and limit > 0, do: limit
+  defp positive_int(_other), do: nil
 end
 ```
 

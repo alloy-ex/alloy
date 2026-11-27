@@ -258,6 +258,10 @@ defmodule Alloy.ModelMetadataTest do
       assert non_reasoning_latest.reasoning? == false
       assert non_reasoning_latest.tools? == true
 
+      assert ModelMetadata.capabilities("gpt-5.2").structured_output? == true
+      assert ModelMetadata.capabilities("gpt-5.2-pro").structured_output? == false
+      assert ModelMetadata.capabilities("gpt-5.2-pro-2025-12-11").structured_output? == false
+
       assert ModelMetadata.capabilities("unknown-model") == nil
       assert ModelMetadata.capabilities("gpt-5-codex") == nil
     end

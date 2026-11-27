@@ -21,9 +21,9 @@ defmodule MinimalHost.CodeMode do
     parent = Keyword.fetch!(opts, :parent_call_id)
 
     if not (is_integer(timeout) and timeout > 0 and is_integer(max_calls) and max_calls > 0 and
-              is_binary(parent) and byte_size(parent) > 0) do
+              is_binary(parent) and byte_size(parent) > 0 and String.valid?(parent)) do
       raise ArgumentError,
-            "positive timeout/max_calls and a non-empty parent_call_id are required"
+            "positive timeout/max_calls and a non-empty UTF-8 parent_call_id are required"
     end
 
     deadline = System.monotonic_time(:millisecond) + timeout

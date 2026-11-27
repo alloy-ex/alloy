@@ -85,6 +85,12 @@ defmodule Alloy.ModelMetadata do
        max_output_tokens: 128_000,
        capabilities: @full_capabilities
      }},
+    {~r/^gpt-5\.2-pro(-\d{4}-\d{2}-\d{2})?$/,
+     %{
+       context_window: 272_000,
+       max_output_tokens: 128_000,
+       capabilities: Map.put(@full_capabilities, :structured_output?, false)
+     }},
     {~r/^gpt-5(-mini|-nano|\.1|\.2(-pro)?|\.3-codex|\.4-(mini|nano)|\.6-cyber)?(-\d{4}-\d{2}-\d{2})?$/,
      %{
        context_window: 272_000,

@@ -240,11 +240,18 @@ defmodule Alloy.Tool.Executor do
 
   defp validate_parent_call_id!(nil), do: nil
 
-  defp validate_parent_call_id!(id) when is_binary(id) and byte_size(id) > 0, do: id
+  defp validate_parent_call_id!(id) when is_binary(id) and byte_size(id) > 0 do
+    if String.valid?(id) do
+      id
+    else
+      raise ArgumentError,
+            ":parent_call_id must be a non-empty UTF-8 string or nil, got: #{inspect(id)}"
+    end
+  end
 
   defp validate_parent_call_id!(bad) do
     raise ArgumentError,
-          ":parent_call_id must be a non-empty string or nil, got: #{inspect(bad)}"
+          ":parent_call_id must be a non-empty UTF-8 string or nil, got: #{inspect(bad)}"
   end
 
   defp validate_on_event!(nil), do: fn _ -> :ok end
