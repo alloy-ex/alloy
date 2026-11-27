@@ -5,8 +5,9 @@ defmodule Alloy.Provider.OpenAIStream do
   Used by `Alloy.Provider.OpenAICompat` for Chat Completions providers
   such as DeepSeek, Mistral, OpenRouter, Gemini, and Ollama.
   The native OpenAI and xAI providers use Responses API parsing instead.
-  Each compatible provider calls `stream/5` with its
-  own URL and headers; this module handles SSE parsing and response
+  Each compatible provider calls `stream/5` or `stream/6` with its own URL,
+  headers, and optional streaming options (`:on_event`, `:deadline`,
+  `:cancel_token`); this module handles SSE parsing and response
   normalization.
 
   ## OpenAI Streaming Format
@@ -15,9 +16,10 @@ defmodule Alloy.Provider.OpenAIStream do
       data: {"choices":[{"index":0,"delta":{"tool_calls":[...]}}]}
       data: [DONE]
 
-  Text deltas are emitted via `on_chunk`. Tool call argument deltas
-  are accumulated silently. The final response has the same shape as
-  `complete/3`.
+  Text deltas are emitted via `on_chunk`. Reasoning deltas (`{:thinking_delta,
+  text}`) and tool call argument deltas (`{:tool_call_delta, event}`) are
+  emitted via `:on_event` while being accumulated into the final response,
+  which has the same shape as `complete/3`.
   """
 
   alias Alloy.Message
@@ -84,6 +86,71 @@ defmodule Alloy.Provider.OpenAIStream do
   end
 
   @doc false
+  # Shared with OpenAICompat so streaming and non-streaming Chat Completions
+  # responses assemble assistant content blocks in the exact same order.
+  @spec assemble_content_blocks(
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          [Message.content_block()]
+        ) :: [Message.content_block()]
+  def assemble_content_blocks(reasoning, content_thinking, text, refusal, tool_blocks) do
+    reasoning_blocks =
+      if reasoning != "", do: [%{type: "thinking", thinking: reasoning}], else: []
+
+    content_thinking_blocks =
+      if content_thinking != "",
+        do: [%{type: "thinking", thinking: content_thinking, source: "content_part"}],
+        else: []
+
+    text_blocks = if text != "", do: [%{type: "text", text: text}], else: []
+
+    refusal_blocks =
+      if refusal != "", do: [%{type: "text", text: refusal, refusal: true}], else: []
+
+    reasoning_blocks ++ content_thinking_blocks ++ text_blocks ++ refusal_blocks ++ tool_blocks
+  end
+
+  @doc false
+  # Shared with OpenAICompat to build lenient placeholder tool_use blocks when
+  # finish_reason is "length" so Turn abandons truncated calls cleanly.
+  @spec build_truncated_tool_call(
+          non_neg_integer(),
+          term(),
+          term(),
+          term(),
+          String.t() | nil
+        ) :: Message.content_block()
+  def build_truncated_tool_call(index, raw_id, raw_name, raw_args, thought_signature) do
+    id =
+      if is_binary(raw_id) and raw_id != "",
+        do: raw_id,
+        else: HTTP.truncated_tool_call_id(index)
+
+    name = if is_binary(raw_name) and raw_name != "", do: raw_name, else: "truncated"
+
+    block = %{
+      type: "tool_use",
+      id: id,
+      name: name,
+      input: HTTP.decode_truncated_arguments(raw_args)
+    }
+
+    if is_binary(thought_signature),
+      do: Map.put(block, :thought_signature, thought_signature),
+      else: block
+  end
+
+  @doc false
+  # Shared optional string validator for Chat Completions fields
+  # ("reasoning_content", "refusal").
+  @spec validate_optional_string(term(), String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def validate_optional_string(nil, _msg), do: {:ok, ""}
+  def validate_optional_string(text, _msg) when is_binary(text), do: {:ok, text}
+  def validate_optional_string(_invalid, msg), do: {:error, msg}
+
+  @doc false
   # Extracts text and thinking text from Chat Completions content fields,
   # supporting both string content and structured part lists (e.g. Mistral
   # Magistral reasoning models) while rejecting malformed present shapes.
@@ -106,6 +173,19 @@ defmodule Alloy.Provider.OpenAIStream do
 
   def extract_content_parts(_invalid),
     do: {:error, "Invalid content in Chat Completions payload"}
+
+  @doc false
+  # Preserve Gemini 3.x thought signatures for multi-turn tool calls while
+  # validating nested extension shapes instead of crashing get_in/2.
+  @spec extract_thought_signature(map()) :: {:ok, String.t() | nil} | {:error, String.t()}
+  def extract_thought_signature(tc) when is_map(tc) do
+    case Map.fetch(tc, "extra_content") do
+      :error -> {:ok, nil}
+      {:ok, nil} -> {:ok, nil}
+      {:ok, extra} when is_map(extra) -> extract_google_thought_signature(extra)
+      {:ok, _invalid} -> {:error, "Invalid extra_content in Chat Completions tool call"}
+    end
+  end
 
   defp extract_content_part(%{"type" => "text", "text" => text}) when is_binary(text),
     do: {:ok, :text, text}
@@ -237,14 +317,9 @@ defmodule Alloy.Provider.OpenAIStream do
     record_protocol_error(acc, "Invalid choices in Chat Completions SSE chunk")
   end
 
-  # Usage event: either no choices key, or empty choices list.
-  # This clause is ordered BEFORE the catch-all to handle both shapes
-  # reliably — some providers send usage alongside empty choices, others
-  # send it as a top-level-only event.
-  defp process_event(acc, %{"choices" => [], "usage" => usage}) when is_map(usage) do
-    %{acc | usage: usage}
-  end
-
+  # Usage event: handles both empty choices (`"choices" => []`) and top-level
+  # usage-only chunks; ordered before the catch-all after non-empty / invalid
+  # choices clauses have already matched.
   defp process_event(acc, %{"usage" => usage}) when is_map(usage) do
     %{acc | usage: usage}
   end
@@ -257,12 +332,12 @@ defmodule Alloy.Provider.OpenAIStream do
     with {:ok, text, content_thinking, content_refusal} <-
            extract_content_parts(Map.get(delta, "content")),
          {:ok, reasoning} <-
-           validate_optional_delta_text(
+           validate_optional_string(
              Map.get(delta, "reasoning_content"),
              "Invalid delta reasoning_content in Chat Completions SSE chunk"
            ),
          {:ok, refusal} <-
-           validate_optional_delta_text(
+           validate_optional_string(
              Map.get(delta, "refusal"),
              "Invalid delta refusal in Chat Completions SSE chunk"
            ) do
@@ -309,10 +384,6 @@ defmodule Alloy.Provider.OpenAIStream do
     end
   end
 
-  defp validate_optional_delta_text(nil, _msg), do: {:ok, ""}
-  defp validate_optional_delta_text(text, _msg) when is_binary(text), do: {:ok, text}
-  defp validate_optional_delta_text(_invalid, msg), do: {:error, msg}
-
   defp put_choice_finish_reason(acc, %{"finish_reason" => reason}) when is_binary(reason),
     do: %{acc | finish_reason: reason}
 
@@ -336,19 +407,6 @@ defmodule Alloy.Provider.OpenAIStream do
 
   defp accumulate_tool_calls(acc, _invalid) do
     {record_protocol_error(acc, "Invalid tool_calls delta in Chat Completions SSE chunk"), []}
-  end
-
-  @doc false
-  # Preserve Gemini 3.x thought signatures for multi-turn tool calls while
-  # validating nested extension shapes instead of crashing get_in/2.
-  @spec extract_thought_signature(map()) :: {:ok, String.t() | nil} | {:error, String.t()}
-  def extract_thought_signature(tc) when is_map(tc) do
-    case Map.fetch(tc, "extra_content") do
-      :error -> {:ok, nil}
-      {:ok, nil} -> {:ok, nil}
-      {:ok, extra} when is_map(extra) -> extract_google_thought_signature(extra)
-      {:ok, _invalid} -> {:error, "Invalid extra_content in Chat Completions tool call"}
-    end
   end
 
   defp extract_google_thought_signature(extra) do
@@ -388,7 +446,13 @@ defmodule Alloy.Provider.OpenAIStream do
             emitted_header?: false
           })
 
-        with {:ok, existing} <- merge_tool_call_id(existing, Map.fetch(tc_delta, "id")),
+        with {:ok, existing} <-
+               merge_string_field(
+                 existing,
+                 :id,
+                 Map.fetch(tc_delta, "id"),
+                 "tool call id in Chat Completions SSE chunk"
+               ),
              {:ok, sig} <- extract_thought_signature(tc_delta),
              with_sig = if(sig, do: %{existing | thought_signature: sig}, else: existing),
              {:ok, updated, args_delta} <-
@@ -417,22 +481,24 @@ defmodule Alloy.Provider.OpenAIStream do
   end
 
   # Some providers (DeepInfra) repeat "id": null on every later chunk of the
-  # same call; only a real id may set it, while non-string/non-nil or
-  # conflicting ids fail fast.
-  defp merge_tool_call_id(existing, :error), do: {:ok, existing}
-  defp merge_tool_call_id(existing, {:ok, nil}), do: {:ok, existing}
-  defp merge_tool_call_id(existing, {:ok, ""}), do: {:ok, existing}
+  # same call; only a real non-empty string may set a field, while non-string
+  # or conflicting values fail fast.
+  defp merge_string_field(existing, _field, :error, _label), do: {:ok, existing}
+  defp merge_string_field(existing, _field, {:ok, nil}, _label), do: {:ok, existing}
+  defp merge_string_field(existing, _field, {:ok, ""}, _label), do: {:ok, existing}
 
-  defp merge_tool_call_id(%{id: existing_id}, {:ok, id})
-       when is_binary(id) and is_binary(existing_id) and existing_id != "" and id != existing_id do
-    {:error, "Conflicting tool call id in Chat Completions SSE chunk"}
+  defp merge_string_field(existing, field, {:ok, value}, label) when is_binary(value) do
+    case Map.fetch!(existing, field) do
+      current when is_binary(current) and current != "" and current != value ->
+        {:error, "Conflicting #{label}"}
+
+      _ ->
+        {:ok, Map.put(existing, field, value)}
+    end
   end
 
-  defp merge_tool_call_id(existing, {:ok, id}) when is_binary(id),
-    do: {:ok, %{existing | id: id}}
-
-  defp merge_tool_call_id(_existing, {:ok, _invalid}),
-    do: {:error, "Invalid tool call id in Chat Completions SSE chunk"}
+  defp merge_string_field(_existing, _field, {:ok, _invalid}, label),
+    do: {:error, "Invalid #{label}"}
 
   defp maybe_emit_tool_call_delta(%{id: id, name: name} = updated, _index, _args_delta, events)
        when not is_binary(id) or id == "" or not is_binary(name) or name == "" do
@@ -506,29 +572,19 @@ defmodule Alloy.Provider.OpenAIStream do
   defp merge_function_delta(existing, {:ok, nil}), do: {:ok, existing, ""}
 
   defp merge_function_delta(existing, {:ok, func}) when is_map(func) do
-    with {:ok, with_name} <- merge_function_name(existing, Map.fetch(func, "name")) do
+    with {:ok, with_name} <-
+           merge_string_field(
+             existing,
+             :name,
+             Map.fetch(func, "name"),
+             "function name in Chat Completions tool call delta"
+           ) do
       merge_function_args(with_name, Map.fetch(func, "arguments"))
     end
   end
 
   defp merge_function_delta(_existing, {:ok, _invalid}),
     do: {:error, "Invalid function payload in Chat Completions tool call delta"}
-
-  defp merge_function_name(existing, :error), do: {:ok, existing}
-  defp merge_function_name(existing, {:ok, nil}), do: {:ok, existing}
-  defp merge_function_name(existing, {:ok, ""}), do: {:ok, existing}
-
-  defp merge_function_name(%{name: existing_name}, {:ok, name})
-       when is_binary(name) and is_binary(existing_name) and existing_name != "" and
-              name != existing_name do
-    {:error, "Conflicting function name in Chat Completions tool call delta"}
-  end
-
-  defp merge_function_name(existing, {:ok, name}) when is_binary(name),
-    do: {:ok, %{existing | name: name}}
-
-  defp merge_function_name(_existing, {:ok, _invalid}),
-    do: {:error, "Invalid function name in Chat Completions tool call delta"}
 
   defp merge_function_args(existing, :error), do: {:ok, existing, ""}
 
@@ -562,130 +618,82 @@ defmodule Alloy.Provider.OpenAIStream do
   end
 
   defp build_response(acc) do
-    reasoning_blocks =
-      if acc.reasoning_content != "",
-        do: [%{type: "thinking", thinking: acc.reasoning_content}],
-        else: []
-
-    content_thinking_blocks =
-      if acc.content_thinking != "",
-        do: [%{type: "thinking", thinking: acc.content_thinking, source: "content_part"}],
-        else: []
-
-    text_blocks = if acc.content != "", do: [%{type: "text", text: acc.content}], else: []
-
-    refusal_blocks =
-      if acc.refusal != "", do: [%{type: "text", text: acc.refusal, refusal: true}], else: []
-
-    prefix_blocks = reasoning_blocks ++ content_thinking_blocks ++ text_blocks ++ refusal_blocks
-
     case build_streamed_tool_blocks(acc.tool_calls, acc.finish_reason) do
+      {:ok, tool_blocks} ->
+        blocks =
+          assemble_content_blocks(
+            acc.reasoning_content,
+            acc.content_thinking,
+            acc.content,
+            acc.refusal,
+            tool_blocks
+          )
+
+        {:ok, completion_response(blocks, acc.finish_reason, acc.usage)}
+
       {:error, reason} ->
         {:error, reason}
-
-      tool_blocks ->
-        {:ok, completion_response(prefix_blocks ++ tool_blocks, acc.finish_reason, acc.usage)}
     end
   end
 
   # Refused output is discarded by the loop; do not fail with a retryable
   # :malformed_reply on partial tool calls cut off by content filtering.
-  defp build_streamed_tool_blocks(_tool_calls, "content_filter"), do: []
+  defp build_streamed_tool_blocks(_tool_calls, "content_filter"), do: {:ok, []}
 
   # Under finish_reason: "length", tool-call JSON (or id/name) may be cut off
   # mid-stream. Keep the truncated tool_use block(s) with input: %{} so Turn
   # sees stop_reason: :max_tokens and abandons them cleanly with its max_tokens
   # error instead of retrying a deterministic truncation.
   defp build_streamed_tool_blocks(tool_calls, "length") do
-    tool_calls
-    |> Enum.sort_by(fn {index, _} -> index end)
-    |> Enum.map(fn {index, tc} ->
-      id =
-        if is_binary(tc.id) and tc.id != "",
-          do: tc.id,
-          else: "truncated_#{index}_#{System.unique_integer([:positive])}"
+    blocks =
+      tool_calls
+      |> Enum.sort_by(fn {index, _} -> index end)
+      |> Enum.map(fn {index, tc} ->
+        build_truncated_tool_call(
+          index,
+          tc.id,
+          tc.name,
+          tc.arguments_buffer,
+          tc.thought_signature
+        )
+      end)
 
-      name = if is_binary(tc.name) and tc.name != "", do: tc.name, else: "truncated"
-
-      input =
-        case tc.arguments_buffer do
-          "" ->
-            %{}
-
-          args ->
-            case Jason.decode(args) do
-              {:ok, map} when is_map(map) -> map
-              _ -> %{}
-            end
-        end
-
-      block = %{type: "tool_use", id: id, name: name, input: input}
-
-      if is_binary(tc.thought_signature),
-        do: Map.put(block, :thought_signature, tc.thought_signature),
-        else: block
-    end)
+    {:ok, blocks}
   end
 
   defp build_streamed_tool_blocks(tool_calls, _finish_reason) do
-    result =
-      tool_calls
-      |> Enum.sort_by(fn {index, _} -> index end)
-      |> Enum.reduce_while([], fn {_index, tc}, blocks ->
-        if is_binary(tc.id) and tc.id != "" and is_binary(tc.name) and tc.name != "" do
-          decode_streamed_tool_block(tc, blocks)
-        else
-          {:halt,
-           {:error,
-            %Error{
-              kind: :protocol_error,
-              message: "Malformed streamed tool call: missing id or function name"
-            }}}
-        end
-      end)
+    tool_calls
+    |> Enum.sort_by(fn {index, _} -> index end)
+    |> HTTP.map_ok(fn {_index, tc} -> decode_streamed_tool_block(tc) end)
+  end
 
-    case result do
-      {:error, _} = err -> err
-      blocks -> Enum.reverse(blocks)
+  defp decode_streamed_tool_block(%{id: id, name: name} = tc)
+       when is_binary(id) and id != "" and is_binary(name) and name != "" do
+    # Treat empty buffer as an empty-input tool call (no-arg tools send "" not "{}").
+    # Treat non-empty invalid JSON or non-object JSON as :malformed_reply.
+    with {:ok, input} <-
+           HTTP.decode_tool_arguments(
+             tc.arguments_buffer,
+             name,
+             message_prefix: "Invalid tool call JSON for",
+             include_reason: true
+           ) do
+      block = %{type: "tool_use", id: id, name: name, input: input}
+
+      {:ok,
+       if(is_binary(tc.thought_signature),
+         do: Map.put(block, :thought_signature, tc.thought_signature),
+         else: block
+       )}
     end
   end
 
-  defp decode_streamed_tool_block(tc, blocks) do
-    # Treat empty buffer as an empty-input tool call (no-arg tools send "" not "{}").
-    # Treat non-empty invalid JSON or non-object JSON as :malformed_reply.
-    input_result =
-      case tc.arguments_buffer do
-        "" -> {:ok, %{}}
-        args -> Jason.decode(args)
-      end
-
-    case input_result do
-      {:ok, input} when is_map(input) ->
-        block = %{type: "tool_use", id: tc.id, name: tc.name, input: input}
-
-        block =
-          if is_binary(tc.thought_signature),
-            do: Map.put(block, :thought_signature, tc.thought_signature),
-            else: block
-
-        {:cont, [block | blocks]}
-
-      {:ok, _non_map} ->
-        {:halt,
-         {:error,
-          %Error{
-            kind: :malformed_reply,
-            message: "Tool call arguments for #{tc.name} must be a JSON object"
-          }}}
-
-      {:error, reason} ->
-        {:halt,
-         {:error,
-          %Error{
-            kind: :malformed_reply,
-            message: "Invalid tool call JSON for #{tc.name}: #{Exception.message(reason)}"
-          }}}
-    end
+  defp decode_streamed_tool_block(_tc) do
+    {:error,
+     %Error{
+       kind: :protocol_error,
+       message: "Malformed streamed tool call: missing id or function name"
+     }}
   end
 
   defp stop_reason("length", _blocks), do: :max_tokens

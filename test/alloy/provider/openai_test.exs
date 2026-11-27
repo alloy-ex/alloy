@@ -7,6 +7,8 @@ defmodule Alloy.Provider.OpenAITest do
   alias Alloy.Message
   alias Alloy.Provider.Error
   alias Alloy.Provider.OpenAI
+  alias Alloy.Provider.OpenAI.JSONPrefix
+  alias Alloy.Provider.OpenAI.Stream, as: ResponsesStream
 
   defmodule SwitchToOpenAIMiddleware do
     @behaviour Alloy.Middleware
@@ -762,6 +764,35 @@ defmodule Alloy.Provider.OpenAITest do
       assert result.stop_reason == :end_turn
       assert result.usage.input_tokens == 0
       assert result.usage.output_tokens == 0
+    end
+
+    test "tolerates malformed non-map usage, non-map details, and negative or string counts" do
+      for bad_usage <- [
+            "not-a-map",
+            %{
+              "input_tokens" => "bad",
+              "output_tokens" => -5,
+              "input_tokens_details" => "not-a-map"
+            },
+            %{
+              "input_tokens" => 10,
+              "output_tokens" => 4,
+              "input_tokens_details" => %{"cached_tokens" => -3, "cache_write_tokens" => "bad"}
+            }
+          ] do
+        body =
+          response_payload([assistant_text_item("ok")])
+          |> Map.put("usage", bad_usage)
+
+        config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+        assert {:ok, %{usage: usage}} = OpenAI.complete([Message.user("Hi")], [], config)
+        assert is_integer(usage.input_tokens) and usage.input_tokens >= 0
+        assert is_integer(usage.output_tokens) and usage.output_tokens >= 0
+        assert is_integer(usage.cache_read_input_tokens) and usage.cache_read_input_tokens >= 0
+
+        assert is_integer(usage.cache_creation_input_tokens) and
+                 usage.cache_creation_input_tokens >= 0
+      end
     end
   end
 
@@ -1679,6 +1710,101 @@ defmodule Alloy.Provider.OpenAITest do
       decoded_resumed = Jason.decode!(resumed_body)
       refute Map.has_key?(decoded_resumed, "prompt_cache_key")
       refute Map.has_key?(decoded_resumed, "prompt_cache_retention")
+    end
+  end
+
+  describe "OpenAI.JSONPrefix" do
+    test "reconciles objects, lists, literals, strings, escapes, and numbers" do
+      cases = [
+        {~s({"a": 1, "b":), %{"a" => 1, "b" => [true, false, nil]}},
+        {~s({"key": "hel), %{"key" => "hello\n\t\"\\/"}},
+        {~s({"ch": "\\), %{"ch" => "\b\f\r"}},
+        {~s({"emoji": "\\uD83D\\uDE), %{"emoji" => "😀"}},
+        {~s({"u": "\\u00), %{"u" => "A"}},
+        {~s({"items": [1, ), %{"items" => [1, 2, 3]}},
+        {~s({"items": [), %{"items" => []}},
+        {~s({"flag": tr), %{"flag" => true}},
+        {~s({"none": nu), %{"none" => nil}},
+        {~s({"neg": -), %{"neg" => -42}},
+        {~s({"zero": -), %{"zero" => 0}},
+        {~s({"exp": 1e), %{"exp" => 100}},
+        {~s({"small": 1e-0), %{"small" => 0.001}},
+        {~s({"tiny": 1e-), %{"tiny" => 0.0}},
+        {~s({"round": 0.29), %{"round" => 0.3}},
+        {~s({"partial_k), %{"partial_key" => "v", "other" => 1}}
+      ]
+
+      for {prefix, expected} <- cases do
+        assert {:ok, suffix, combined} = JSONPrefix.reconcile(prefix, expected)
+        assert combined == prefix <> suffix
+        assert Jason.decode!(combined) == expected
+      end
+    end
+
+    test "returns :conflict and :error for mismatched or invalid JSON prefixes" do
+      assert :conflict = JSONPrefix.reconcile(~s({"a": 2}), %{"a" => 1})
+      assert :conflict = JSONPrefix.reconcile(~s({"a": 1, }), %{"a" => 1})
+      assert :conflict = JSONPrefix.reconcile(~s([1, 2, ), [1, 2])
+      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\x"}), %{"s" => "x"})
+      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\uDC00"}), %{"s" => "x"})
+      assert :conflict = JSONPrefix.reconcile(~s({"n": -), %{"n" => 5})
+      assert :conflict = JSONPrefix.reconcile(~s({"b": tr), %{"b" => false})
+      assert :error = JSONPrefix.complete(%{"a" => 1}, ~s({"a": 1} trailing))
+    end
+  end
+
+  describe "OpenAI.Stream direct unit coverage" do
+    test "emits reasoning deltas and reconciles streamed function call deltas" do
+      test_pid = self()
+
+      chunks = [
+        sse_response_event("response.reasoning_summary_text.delta", %{"delta" => "Thinking..."}),
+        sse_response_event("response.output_item.added", %{
+          "output_index" => 0,
+          "item" => %{
+            "type" => "function_call",
+            "id" => "fc_1",
+            "call_id" => "call_1",
+            "name" => "read"
+          }
+        }),
+        sse_response_event("response.function_call_arguments.delta", %{
+          "item_id" => "fc_1",
+          "output_index" => 0,
+          "delta" => ~s({"path": )
+        }),
+        sse_response_completed([
+          function_call_item("call_1", "read", ~s({"path":"mix.exs"}))
+        ]),
+        "data: [DONE]\n\n"
+      ]
+
+      Req.Test.stub(__MODULE__, sse_chunks_plug(chunks))
+
+      config = %{
+        api_key: "sk-test",
+        model: "gpt-5.4",
+        on_event: fn ev -> send(test_pid, {:ev, ev}) end,
+        req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+      }
+
+      assert {:ok, response} =
+               ResponsesStream.stream(
+                 "https://api.openai.com/v1/responses",
+                 [{"authorization", "Bearer sk-test"}],
+                 %{"model" => "gpt-5.4", "input" => []},
+                 fn _ -> :ok end,
+                 config
+               )
+
+      assert response.stop_reason == :tool_use
+      assert_received {:ev, {:thinking_delta, "Thinking..."}}
+
+      assert_received {:ev,
+                       {:tool_call_delta, %{id: "call_1", name: "read", arguments_delta: ""}}}
+
+      assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s({"path": )}}}
+      assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s("mix.exs"})}}}
     end
   end
 

@@ -1173,6 +1173,54 @@ defmodule Alloy.Provider.OpenAIStreamTest do
     end
   end
 
+  describe "shared Chat Completions wire helpers" do
+    test "assemble_content_blocks/5 orders thinking, content_part thinking, text, refusal, and tool blocks" do
+      tool = %{type: "tool_use", id: "c1", name: "ping", input: %{}}
+
+      assert OpenAIStream.assemble_content_blocks("r1", "r2", "hi", "nope", [tool]) == [
+               %{type: "thinking", thinking: "r1"},
+               %{type: "thinking", thinking: "r2", source: "content_part"},
+               %{type: "text", text: "hi"},
+               %{type: "text", text: "nope", refusal: true},
+               tool
+             ]
+
+      assert OpenAIStream.assemble_content_blocks("", "", "", "", []) == []
+    end
+
+    test "build_truncated_tool_call/5 normalizes missing metadata, partial JSON, and thought signatures" do
+      fallback = OpenAIStream.build_truncated_tool_call(2, "", nil, ~s({"cut), nil)
+
+      assert %{type: "tool_use", id: "truncated_2_" <> _, name: "truncated", input: %{}} =
+               fallback
+
+      refute Map.has_key?(fallback, :thought_signature)
+
+      preserved =
+        OpenAIStream.build_truncated_tool_call(
+          0,
+          "call_1",
+          "read",
+          ~s({"path":"mix.exs"}),
+          "sig-1"
+        )
+
+      assert preserved == %{
+               type: "tool_use",
+               id: "call_1",
+               name: "read",
+               input: %{"path" => "mix.exs"},
+               thought_signature: "sig-1"
+             }
+    end
+
+    test "validate_optional_string/2 accepts nil and binaries and rejects other types" do
+      assert OpenAIStream.validate_optional_string(nil, "bad") == {:ok, ""}
+      assert OpenAIStream.validate_optional_string("ok", "bad") == {:ok, "ok"}
+      assert OpenAIStream.validate_optional_string(123, "bad") == {:error, "bad"}
+    end
+  end
+
   # ── Helpers ──────────────────────────────────────────────────────────
 
   defp collect_stream(chunks, opts) do
@@ -1180,16 +1228,8 @@ defmodule Alloy.Provider.OpenAIStreamTest do
     on_chunk = fn chunk -> send(test_pid, {:chunk, chunk}) end
 
     result = stream_with_sse_chunks(chunks, on_chunk, opts)
-    collected = collect_messages([])
+    collected = Alloy.StreamTestHelpers.collect_messages([])
 
     {collected, result}
-  end
-
-  defp collect_messages(acc) do
-    receive do
-      {:chunk, chunk} -> collect_messages(acc ++ [chunk])
-    after
-      100 -> acc
-    end
   end
 end

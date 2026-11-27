@@ -281,14 +281,6 @@ defmodule Alloy.StreamingTest do
 
     fun.(on_chunk)
 
-    collect_messages([])
-  end
-
-  defp collect_messages(acc) do
-    receive do
-      {:chunk, chunk} -> collect_messages(acc ++ [chunk])
-    after
-      100 -> acc
-    end
+    Alloy.StreamTestHelpers.collect_messages([])
   end
 end

@@ -38,6 +38,10 @@ defmodule Alloy.Provider.OpenAICompat do
     default applies
   - `:system_prompt` - System prompt string
   - `:chat_path` - Path to completions endpoint (default: "/v1/chat/completions")
+  - `:reasoning` - Portable reasoning config (`nil | :off | :low | :medium |
+    :high | :xhigh | %{effort: ..., display: :summarized | :omitted}`). Maps
+    `:effort` onto `reasoning_effort` (`:off` sends `"none"`). Explicit
+    `:extra_body` takes precedence.
   - `:extra_headers` - Additional headers as `[{name, value}]`
   - `:extra_body` - Additional body fields, merged last
   - `:stream_options` - Set to `false` to omit usage-request options from
@@ -78,7 +82,7 @@ defmodule Alloy.Provider.OpenAICompat do
   @behaviour Alloy.Provider
 
   alias Alloy.Internal.Sanitize
-  alias Alloy.{Message, OutputSchema}
+  alias Alloy.{Message, OutputSchema, Provider}
   alias Alloy.Provider.{Error, HTTP, OpenAIStream}
 
   @default_chat_path "/v1/chat/completions"
@@ -91,22 +95,22 @@ defmodule Alloy.Provider.OpenAICompat do
   @type config :: %{
           required(:api_url) => String.t(),
           required(:model) => String.t(),
-          optional(:api_key) => Alloy.Provider.api_key(),
+          optional(:api_key) => Provider.api_key(),
           optional(:origin_key) => String.t(),
           optional(:max_tokens) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:chat_path) => String.t(),
           optional(:extra_headers) => [{String.t(), String.t()}],
           optional(:extra_body) => map(),
-          optional(:reasoning) => Alloy.Provider.reasoning(),
+          optional(:reasoning) => Provider.reasoning(),
           optional(:on_event) => (term() -> :ok),
           optional(:stream_options) => false,
           optional(:req_options) => keyword()
         }
 
   @impl true
-  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
-          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
+  @spec complete([Message.t()], [Provider.tool_def()], config()) ::
+          {:ok, Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
     with {:ok, body} <- build_request_body(messages, tool_defs, config),
          {:ok, api_key} <- HTTP.resolve_optional_api_key(config),
@@ -117,14 +121,15 @@ defmodule Alloy.Provider.OpenAICompat do
              body,
              Map.get(config, :req_options, []),
              HTTP.request_opts(config)
-           ) do
-      parse_response(resp_body)
+           ),
+         {:ok, decoded} <- Provider.decode_body(resp_body) do
+      parse_response(decoded)
     end
   end
 
   @impl true
-  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
-          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
+  @spec stream([Message.t()], [Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
     with {:ok, body} <- build_request_body(messages, tool_defs, config),
          {:ok, api_key} <- HTTP.resolve_optional_api_key(config) do
@@ -166,7 +171,7 @@ defmodule Alloy.Provider.OpenAICompat do
   # --- Request Building ---
 
   defp build_request_body(messages, tool_defs, config) do
-    with {:ok, reasoning} <- Alloy.Provider.normalize_reasoning(Map.get(config, :reasoning)) do
+    with {:ok, reasoning} <- Provider.normalize_reasoning(Map.get(config, :reasoning)) do
       openai_messages = build_messages(messages, config)
 
       body =
@@ -186,16 +191,7 @@ defmodule Alloy.Provider.OpenAICompat do
   defp maybe_put_reasoning(body, nil), do: body
 
   defp maybe_put_reasoning(body, %{effort: effort}) do
-    effort_str =
-      case effort do
-        :off -> "none"
-        :low -> "low"
-        :medium -> "medium"
-        :high -> "high"
-        :xhigh -> "xhigh"
-      end
-
-    Map.put(body, "reasoning_effort", effort_str)
+    Map.put(body, "reasoning_effort", Provider.openai_reasoning_effort(effort))
   end
 
   defp maybe_put_output_schema(body, config) do
@@ -307,7 +303,7 @@ defmodule Alloy.Provider.OpenAICompat do
     do: %{"type" => "image_url", "image_url" => %{"url" => "data:#{mime};base64,#{data}"}}
 
   defp format_user_content_block(%{type: "image", url: url}) when is_binary(url) do
-    if HTTP.http_url?(url) and not HTTP.provider_file_uri?(url) do
+    if HTTP.public_http_url?(url) do
       %{"type" => "image_url", "image_url" => %{"url" => url}}
     else
       %{"type" => "text", "text" => "[Unsupported image URL scheme for OpenAICompat provider]"}
@@ -320,7 +316,7 @@ defmodule Alloy.Provider.OpenAICompat do
     function = %{
       "name" => name,
       "description" => desc,
-      "parameters" => Alloy.Provider.stringify_keys(schema)
+      "parameters" => Provider.stringify_keys(schema)
     }
 
     function =
@@ -332,13 +328,6 @@ defmodule Alloy.Provider.OpenAICompat do
   end
 
   # --- Response Parsing ---
-
-  defp parse_response(body) when is_binary(body) do
-    case Alloy.Provider.decode_body(body) do
-      {:ok, decoded} -> parse_response(decoded)
-      {:error, _} = err -> err
-    end
-  end
 
   defp parse_response(%{"error" => error} = resp) when is_map(error) or is_binary(error) do
     {:error, Error.from_body(resp)}
@@ -374,32 +363,29 @@ defmodule Alloy.Provider.OpenAICompat do
 
   defp parse_message_to_blocks(message, finish_reason) when is_map(message) do
     with {:ok, reasoning_field} <-
-           parse_optional_string_field(Map.get(message, "reasoning_content"), "reasoning_content"),
+           OpenAIStream.validate_optional_string(
+             Map.get(message, "reasoning_content"),
+             "Invalid reasoning_content in Chat Completions response"
+           ),
          {:ok, refusal_field} <-
-           parse_optional_string_field(Map.get(message, "refusal"), "refusal"),
+           OpenAIStream.validate_optional_string(
+             Map.get(message, "refusal"),
+             "Invalid refusal in Chat Completions response"
+           ),
          {:ok, content_text, content_thinking, content_refusal} <-
-           parse_message_content(Map.get(message, "content")),
+           OpenAIStream.extract_content_parts(Map.get(message, "content")),
          {:ok, tool_blocks} <- parse_tool_calls(Map.get(message, "tool_calls"), finish_reason) do
-      reasoning_blocks =
-        if reasoning_field != "",
-          do: [%{type: "thinking", thinking: reasoning_field}],
-          else: []
-
-      content_thinking_blocks =
-        if content_thinking != "",
-          do: [%{type: "thinking", thinking: content_thinking, source: "content_part"}],
-          else: []
-
-      text_blocks = if content_text != "", do: [%{type: "text", text: content_text}], else: []
-      combined_refusal = content_refusal <> refusal_field
-
-      refusal_blocks =
-        if combined_refusal != "",
-          do: [%{type: "text", text: combined_refusal, refusal: true}],
-          else: []
-
       {:ok,
-       reasoning_blocks ++ content_thinking_blocks ++ text_blocks ++ refusal_blocks ++ tool_blocks}
+       OpenAIStream.assemble_content_blocks(
+         reasoning_field,
+         content_thinking,
+         content_text,
+         content_refusal <> refusal_field,
+         tool_blocks
+       )}
+    else
+      {:error, %Error{} = err} -> {:error, err}
+      {:error, msg} -> {:error, %Error{kind: :protocol_error, message: msg}}
     end
   end
 
@@ -411,35 +397,17 @@ defmodule Alloy.Provider.OpenAICompat do
      }}
   end
 
-  defp parse_optional_string_field(nil, _field), do: {:ok, ""}
-  defp parse_optional_string_field(text, _field) when is_binary(text), do: {:ok, text}
-
-  defp parse_optional_string_field(_invalid, field) do
-    {:error,
-     %Error{
-       kind: :protocol_error,
-       message: "Invalid #{field} in Chat Completions response"
-     }}
-  end
-
-  defp parse_message_content(content) do
-    case OpenAIStream.extract_content_parts(content) do
-      {:ok, text, thinking, refusal} -> {:ok, text, thinking, refusal}
-      {:error, msg} -> {:error, %Error{kind: :protocol_error, message: msg}}
-    end
-  end
-
   defp parse_tool_calls(_tool_calls, "content_filter"), do: {:ok, []}
   defp parse_tool_calls(nil, _finish_reason), do: {:ok, []}
 
   defp parse_tool_calls(tool_calls, "length") when is_list(tool_calls) do
     tool_calls
     |> Enum.with_index()
-    |> map_tool_calls(fn {tc, idx} -> parse_truncated_tool_call(tc, idx) end)
+    |> HTTP.map_ok(fn {tc, idx} -> parse_truncated_tool_call(tc, idx) end)
   end
 
   defp parse_tool_calls(tool_calls, _finish_reason) when is_list(tool_calls) do
-    map_tool_calls(tool_calls, &parse_tool_call/1)
+    HTTP.map_ok(tool_calls, &parse_tool_call/1)
   end
 
   defp parse_tool_calls(_invalid, _finish_reason) do
@@ -450,50 +418,23 @@ defmodule Alloy.Provider.OpenAICompat do
      }}
   end
 
-  defp map_tool_calls(items, parser) do
-    case Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
-           case parser.(item) do
-             {:ok, block} -> {:cont, {:ok, [block | acc]}}
-             {:error, _} = err -> {:halt, err}
-           end
-         end) do
-      {:ok, blocks} -> {:ok, Enum.reverse(blocks)}
-      {:error, _} = err -> err
-    end
-  end
-
   defp parse_truncated_tool_call(tc, idx) when is_map(tc) do
     with {:ok, func} <- fetch_optional_map(tc, "function", "Malformed tool call function"),
          {:ok, name} <- fetch_optional_string(func, "name", "truncated") do
-      id =
-        if is_binary(tc["id"]) and tc["id"] != "",
-          do: tc["id"],
-          else: "truncated_#{idx}_#{System.unique_integer([:positive])}"
-
-      # Truncated tool calls under finish_reason: "length" are always abandoned
-      # by Turn on :max_tokens; fall back to %{} if arguments are missing,
-      # cut-off JSON, or non-string/non-object.
-      input =
-        case Map.get(func, "arguments") do
-          args when is_binary(args) and args != "" ->
-            case Jason.decode(args) do
-              {:ok, map} when is_map(map) -> map
-              _ -> %{}
-            end
-
-          _ ->
-            %{}
-        end
-
-      block = %{type: "tool_use", id: id, name: name, input: input}
-
-      block =
+      sig =
         case OpenAIStream.extract_thought_signature(tc) do
-          {:ok, sig} when is_binary(sig) -> Map.put(block, :thought_signature, sig)
-          _ -> block
+          {:ok, value} when is_binary(value) -> value
+          _ -> nil
         end
 
-      {:ok, block}
+      {:ok,
+       OpenAIStream.build_truncated_tool_call(
+         idx,
+         tc["id"],
+         name,
+         Map.get(func, "arguments"),
+         sig
+       )}
     end
   end
 
@@ -527,7 +468,7 @@ defmodule Alloy.Provider.OpenAICompat do
     args_result =
       case Map.fetch(func, "arguments") do
         :error -> {:ok, %{}}
-        {:ok, args} -> decode_tool_arguments(args, name)
+        {:ok, args} -> HTTP.decode_tool_arguments(args, name)
       end
 
     with {:ok, input} <- args_result,
@@ -546,35 +487,5 @@ defmodule Alloy.Provider.OpenAICompat do
        kind: :protocol_error,
        message: "Malformed tool call: missing valid id or function definition"
      }}
-  end
-
-  defp decode_tool_arguments("", _name), do: {:ok, %{}}
-
-  defp decode_tool_arguments(args, name) when is_binary(args) do
-    case Jason.decode(args) do
-      {:ok, input} when is_map(input) ->
-        {:ok, input}
-
-      {:ok, _non_map} ->
-        {:error,
-         %Error{
-           kind: :malformed_reply,
-           message: "Tool call arguments for #{name} must be a JSON object"
-         }}
-
-      {:error, _} ->
-        {:error,
-         %Error{
-           kind: :malformed_reply,
-           message: "Invalid JSON in tool call arguments for #{name}"
-         }}
-    end
-  end
-
-  defp decode_tool_arguments(args, _name) when is_map(args), do: {:ok, args}
-
-  defp decode_tool_arguments(_args, name) do
-    {:error,
-     %Error{kind: :malformed_reply, message: "Invalid tool call arguments payload for #{name}"}}
   end
 end
