@@ -113,6 +113,7 @@ defmodule Alloy.LoopControlsTest do
     assert meta.structured_data == %{safe: true}
   end
 
+  @tag :ex_json_schema
   test "schema validation rejects invalid types without invoking the tool" do
     state = state(tools: [tool()], tool_validation: :schema)
 
@@ -124,6 +125,7 @@ defmodule Alloy.LoopControlsTest do
     refute_receive {:executed, _}
   end
 
+  @tag :ex_json_schema
   test "schema cache drops removed or disabled tools" do
     alias Alloy.Tool.Validation
     tools = %{"submit" => tool(), "other" => tool(name: "other")}
@@ -134,6 +136,7 @@ defmodule Alloy.LoopControlsTest do
     assert {%{}, %{}} = Validation.prepare(tools, :required, cache)
   end
 
+  @tag :ex_json_schema
   test "schema changes under the same name invalidate cached validation" do
     alias Alloy.Tool.Validation
     original = tool()
@@ -161,6 +164,7 @@ defmodule Alloy.LoopControlsTest do
     end
   end
 
+  @tag :ex_json_schema
   test "prepared tools invalidate the live loop cache without leaking it into results" do
     owner = self()
     original = tool()
@@ -213,6 +217,7 @@ defmodule Alloy.LoopControlsTest do
     assert_receive {:executed, %{"value" => "1"}}
   end
 
+  @tag :ex_json_schema
   test "schema validation checks bounds, extra properties, nested schemas, and local references" do
     nested =
       tool(
@@ -247,6 +252,7 @@ defmodule Alloy.LoopControlsTest do
     assert_receive {:executed, %{"value" => [1]}}
   end
 
+  @tag :ex_json_schema
   test "schema validation runs on the final middleware-edited arguments" do
     state = state(tools: [tool()], middleware: [Edit], tool_validation: :schema)
 
@@ -256,6 +262,7 @@ defmodule Alloy.LoopControlsTest do
     assert_receive {:executed, %{"value" => 2}}
   end
 
+  @tag :ex_json_schema
   test "schema validation rejects ambiguous atom and string keys before side effects" do
     state = state(tools: [tool()], tool_validation: :schema)
     input = %{"value" => 1, :value => "invalid"}
@@ -267,6 +274,7 @@ defmodule Alloy.LoopControlsTest do
     refute_receive {:executed, _}
   end
 
+  @tag :ex_json_schema
   test "remote schema references are rejected before tool execution" do
     state =
       state(
@@ -279,6 +287,82 @@ defmodule Alloy.LoopControlsTest do
     end
 
     refute_receive {:executed, _}
+  end
+
+  @tag :ex_json_schema
+  test "remote schema references fail before the first provider request" do
+    owner = self()
+    {:ok, provider} = TestProvider.start_link([TestProvider.tool_use_response([call()])])
+
+    assert_raise ArgumentError, ~r/local \$ref/, fn ->
+      Alloy.run("go",
+        provider: {RecordingProvider, owner: owner, agent_pid: provider},
+        tools: [tool(input_schema: %{"$ref" => "https://example.invalid/schema"})],
+        tool_validation: :schema
+      )
+    end
+
+    refute_receive {:request, _, _, _}
+  end
+
+  @tag :ex_json_schema
+  test "tool properties literally named $ref are accepted by local_refs check" do
+    ref_prop_tool =
+      tool(
+        input_schema: %{
+          type: "object",
+          properties: %{
+            "$ref" => %{type: "string"}
+          },
+          required: ["$ref"]
+        }
+      )
+
+    state = state(tools: [ref_prop_tool], tool_validation: :schema)
+
+    assert {:ok, %{content: [block]}, _} =
+             Executor.execute_all(
+               [call(%{"$ref" => "https://example.invalid/data"})],
+               state.tool_fns,
+               state,
+               []
+             )
+
+    refute Map.get(block, :is_error, false)
+
+    assert_receive {:executed, %{"$ref" => "https://example.invalid/data"}}
+  end
+
+  @tag :ex_json_schema
+  test "schema validation refreshes when :after_tool_request swaps tools" do
+    original = tool()
+
+    stricter = %{
+      original
+      | input_schema: put_in(original.input_schema, [:properties, :value, :type], "string")
+    }
+
+    swap = fn state -> State.prepare(state, tools: [stricter]) end
+
+    {:ok, provider} =
+      TestProvider.start_link([
+        TestProvider.tool_use_response([call(%{"value" => 1})]),
+        TestProvider.text_response("done")
+      ])
+
+    assert {:ok, result} =
+             Alloy.run("go",
+               provider: {TestProvider, agent_pid: provider},
+               tools: [original],
+               tool_validation: :schema,
+               middleware: [Hooks],
+               context: %{hooks: %{after_tool_request: swap}}
+             )
+
+    refute_receive {:executed, _}
+    assert [%{error: error}] = result.tool_calls
+    assert is_binary(error)
+    assert error =~ "value"
   end
 
   test "result replacements cannot turn failed execution into success" do
@@ -708,5 +792,58 @@ defmodule Alloy.LoopControlsTest do
     assert_receive {:started, second}
     send(second, :release)
     assert {:ok, _, _} = Task.await(task)
+  end
+
+  test "stop_after_tool still completes when after_tool_execution appends a user message" do
+    append_note = fn state ->
+      %{state | messages: state.messages ++ [Message.user("audit note")]}
+    end
+
+    {:ok, provider} =
+      TestProvider.start_link([
+        TestProvider.tool_use_response([call()]),
+        TestProvider.text_response("unexpected second turn")
+      ])
+
+    assert {:ok, result} =
+             Alloy.run("go",
+               provider: {TestProvider, agent_pid: provider},
+               tools: [tool()],
+               stop_after_tool: "submit",
+               middleware: [Hooks],
+               context: %{hooks: %{after_tool_execution: append_note}}
+             )
+
+    assert result.turns == 1
+    assert result.text == "answer"
+    assert result.metadata.final_tool.name == "submit"
+  end
+
+  test "invalid middleware return values raise descriptive ArgumentError" do
+    bad_after = fn _state -> {:halt, "stop"} end
+
+    state =
+      state(
+        tools: [tool()],
+        middleware: [Hooks],
+        context: %{hooks: %{after_tool_call: bad_after}}
+      )
+
+    assert_raise ArgumentError, ~r/unsupported value.*:after_tool_call/, fn ->
+      Executor.execute_all([call()], state.tool_fns, state, [])
+    end
+
+    bad_before = fn _state -> {:result, %{}} end
+
+    state_before =
+      state(
+        tools: [tool()],
+        middleware: [Hooks],
+        context: %{hooks: %{before_tool_call: bad_before}}
+      )
+
+    assert_raise ArgumentError, ~r/unsupported value.*:before_tool_call/, fn ->
+      Executor.execute_all([call()], state_before.tool_fns, state_before, [])
+    end
   end
 end

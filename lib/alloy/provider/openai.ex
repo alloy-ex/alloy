@@ -10,10 +10,20 @@ defmodule Alloy.Provider.OpenAI do
   ## Config
 
   Required:
-  - `:api_key` - OpenAI API key
+  - `:api_key` - OpenAI API key string, or a 0-arity callback returning
+    `String.t() | {:ok, String.t()} | {:error, term()}` invoked per HTTP
+    attempt (inside a bounded worker when `:timeout_ms` is finite or
+    `:cancel_token` is set).
+    When passing a callback via `Alloy.run/2`, also set `:origin_key` to a
+    stable non-empty string for account isolation.
   - `:model` - Model name (e.g., "gpt-6-astra", "gpt-6.1-sol", "gpt-5.4")
 
   Optional:
+  - `:origin_key` - Account identifier used for cross-origin provenance hashing
+    (required for function `:api_key`; recommended for static keys when
+    persisting transcripts with file attachments across key rotation)
+  - `:prompt_cache_key` - Optional cache routing key for Responses prompt caching
+  - `:prompt_cache_retention` - Optional cache retention policy (e.g. `"in_memory"`, `"24h"`)
   - `:max_tokens` - Max output tokens, reasoning tokens included. Omitted
     unless set, so the model's own limit applies: a small cap can leave a
     reasoning model with no tokens for its answer
@@ -29,10 +39,17 @@ defmodule Alloy.Provider.OpenAI do
   - `:parallel_tool_calls` - Whether the provider may issue tool calls in parallel
   - `:previous_response_id` - Continue a stored response (see "Chaining
     responses" below)
+  - `:reasoning` - Portable reasoning config (`nil | :off | :low | :medium |
+    :high | :xhigh | %{effort: ..., display: :summarized | :omitted}`). Maps
+    `:effort` onto `reasoning.effort` (`:off` sends `"none"`) and
+    `display: :summarized` (when effort is not `:off`) onto
+    `reasoning.summary: "auto"`. Explicit `:extra_body` takes precedence.
   - `:built_in_tools` - provider-native tool definitions to append to custom
     function tools
   - `:web_search` - `true` or a config map to append a `web_search` tool
   - `:x_search` - `true` or a config map to append an `x_search` tool
+  - `:extra_headers` - Additional headers as `[{name, value}]`
+  - `:extra_body` - Additional request body fields, merged last
   - `:req_options` - Additional options passed to Req
 
   ## Conversation state
@@ -70,132 +87,238 @@ defmodule Alloy.Provider.OpenAI do
 
   @behaviour Alloy.Provider
 
-  alias Alloy.Message
-  alias Alloy.Provider.{Error, HTTP}
+  alias Alloy.Internal.Sanitize
+  alias Alloy.{Message, OutputSchema, Provider}
+  alias Alloy.Provider.{Auth, Error, HTTP}
+  alias Alloy.Provider.OpenAI.Stream, as: ResponsesStream
 
   @default_api_url "https://api.openai.com"
-  @terminal_events ["response.completed", "response.incomplete", "response.failed"]
 
   @typedoc """
   Configuration for the OpenAI provider. See the module doc for field
   semantics.
   """
   @type config :: %{
-          required(:api_key) => String.t(),
+          required(:api_key) => Provider.api_key(),
           required(:model) => String.t(),
           optional(:max_tokens) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:api_url) => String.t(),
+          optional(:origin_key) => String.t(),
           optional(:provider_state) => map(),
           optional(:store) => boolean(),
           optional(:include) => [String.t()],
           optional(:tool_choice) => String.t() | map(),
           optional(:parallel_tool_calls) => boolean(),
           optional(:previous_response_id) => String.t(),
+          optional(:prompt_cache_key) => String.t(),
+          optional(:prompt_cache_retention) => String.t(),
+          optional(:reasoning) => Provider.reasoning(),
+          optional(:on_event) => (term() -> :ok),
           optional(:built_in_tools) => [map()],
           optional(:web_search) => boolean() | map(),
           optional(:x_search) => boolean() | map(),
+          optional(:extra_headers) => [{String.t(), String.t()}],
+          optional(:extra_body) => map(),
           optional(:req_options) => keyword()
         }
 
   @impl true
-  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
-          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
+  @spec complete([Message.t()], [Provider.tool_def()], config()) ::
+          {:ok, Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
-    body = build_request_body(messages, tool_defs, config)
-
-    with {:ok, resp_body} <-
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- Auth.resolve_api_key(config),
+         {:ok, resp_body} <-
            HTTP.post_json(
              responses_url(config),
-             headers(config),
+             headers(config, api_key),
              body,
-             Map.get(config, :req_options, [])
-           ) do
-      parse_response(resp_body)
+             Map.get(config, :req_options, []),
+             HTTP.request_opts(config)
+           ),
+         {:ok, decoded} <- HTTP.decode_response_body(resp_body) do
+      parse_response(decoded)
     end
   end
 
   @impl true
-  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
-          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
+  @spec stream([Message.t()], [Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
-    body =
-      messages
-      |> build_request_body(tool_defs, config)
-      |> Map.put("stream", true)
-
-    initial_acc = %{
-      buffer: "",
-      response: nil,
-      stream_error: nil,
-      on_chunk: on_chunk
-    }
-
-    with {:ok, acc} <-
-           HTTP.stream_sse(
-             responses_url(config),
-             headers(config),
-             body,
-             initial_acc,
-             &handle_stream_event/2,
-             Map.get(config, :req_options, [])
-           ) do
-      build_stream_response(acc)
+    with {:ok, body} <- build_request_body(messages, tool_defs, config),
+         {:ok, api_key} <- Auth.resolve_api_key(config) do
+      ResponsesStream.stream(
+        responses_url(config),
+        headers(config, api_key),
+        body,
+        on_chunk,
+        config
+      )
     end
   end
 
-  defp responses_url(config), do: "#{Map.get(config, :api_url, @default_api_url)}/v1/responses"
+  @doc false
+  @spec parse_response(term()) :: {:ok, Provider.completion_response()} | {:error, Error.t()}
+  def parse_response(%{"status" => "failed"} = resp), do: {:error, Error.from_body(resp)}
 
-  defp headers(config) do
-    [{"authorization", "Bearer #{config.api_key}"}, {"content-type", "application/json"}]
+  def parse_response(%{"output" => output} = resp) when is_list(output) do
+    provider_state = provider_state_from_response(resp)
+    mode = parse_output_mode(resp)
+
+    case parse_output_to_blocks(output, mode) do
+      {:ok, content_blocks} ->
+        stop_reason = parse_stop_reason(resp, content_blocks)
+
+        alloy_msg = %Message{
+          role: :assistant,
+          content: content_blocks
+        }
+
+        {:ok,
+         %{
+           stop_reason: stop_reason,
+           messages: [alloy_msg],
+           usage: parse_usage(resp["usage"]),
+           provider_state: provider_state,
+           response_metadata: response_metadata_from_response(resp)
+         }}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  def parse_response(%{"output_text" => text} = resp) when is_binary(text) do
+    provider_state = provider_state_from_response(resp)
+
+    content_blocks =
+      case text do
+        "" -> []
+        _ -> [%{type: "text", text: text}]
+      end
+
+    {:ok,
+     %{
+       stop_reason: :end_turn,
+       messages: [%Message{role: :assistant, content: content_blocks}],
+       usage: parse_usage(resp["usage"]),
+       provider_state: provider_state,
+       response_metadata: response_metadata_from_response(resp)
+     }}
+  end
+
+  def parse_response(%{"error" => error} = resp) when is_map(error) or is_binary(error) do
+    {:error, Error.from_body(resp)}
+  end
+
+  def parse_response(resp) do
+    {:error,
+     %Error{
+       message: "Unexpected OpenAI response payload: #{Sanitize.inspect_bounded(resp)}"
+     }}
+  end
+
+  @doc false
+  @spec parse_output_mode(map()) :: :refusal | :truncated | :normal
+  def parse_output_mode(%{
+        "status" => "incomplete",
+        "incomplete_details" => %{"reason" => "content_filter"}
+      }),
+      do: :refusal
+
+  def parse_output_mode(%{"status" => "incomplete"}), do: :truncated
+  def parse_output_mode(_resp), do: :normal
+
+  defp responses_url(config),
+    do: HTTP.join_url(Map.get(config, :api_url, @default_api_url), "/v1/responses")
+
+  defp headers(config, api_key) do
+    [{"authorization", "Bearer #{api_key}"}, {"content-type", "application/json"}] ++
+      Map.get(config, :extra_headers, [])
   end
 
   # --- Request Building ---
 
   defp build_request_body(messages, tool_defs, config) do
-    input_items = build_input_items(messages, config)
+    with {:ok, reasoning} <- Provider.normalize_reasoning(Map.get(config, :reasoning)) do
+      input_items = build_input_items(messages, config)
 
-    body =
-      %{"model" => config.model, "input" => input_items}
-      |> maybe_put_optional_request_field("max_output_tokens", Map.get(config, :max_tokens))
-      |> maybe_put_optional_request_field(
-        "previous_response_id",
-        Map.get(config, :previous_response_id)
-      )
-      |> maybe_put_optional_request_field("store", Map.get(config, :store))
-      |> maybe_put_optional_request_field("include", Map.get(config, :include))
-      |> maybe_put_reasoning_include(config)
-      |> maybe_put_optional_request_field("tool_choice", Map.get(config, :tool_choice))
-      |> maybe_put_optional_request_field(
-        "parallel_tool_calls",
-        Map.get(config, :parallel_tool_calls)
-      )
+      body =
+        %{"model" => config.model, "input" => input_items}
+        |> HTTP.maybe_put_unless_empty_list("max_output_tokens", Map.get(config, :max_tokens))
+        |> HTTP.maybe_put_unless_empty_list(
+          "previous_response_id",
+          Map.get(config, :previous_response_id)
+        )
+        |> HTTP.maybe_put_unless_empty_list("store", Map.get(config, :store))
+        |> HTTP.maybe_put_unless_empty_list("include", Map.get(config, :include))
+        |> maybe_put_reasoning_include(config)
+        |> HTTP.maybe_put_unless_empty_list("tool_choice", Map.get(config, :tool_choice))
+        |> HTTP.maybe_put_unless_empty_list(
+          "parallel_tool_calls",
+          Map.get(config, :parallel_tool_calls)
+        )
+        |> maybe_put_non_empty_string("prompt_cache_key", Map.get(config, :prompt_cache_key))
+        |> maybe_put_non_empty_string(
+          "prompt_cache_retention",
+          Map.get(config, :prompt_cache_retention)
+        )
 
-    tools =
-      Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
+      tools = Enum.map(tool_defs, &format_tool_def/1) ++ built_in_tools(config)
 
-    body =
-      case tools do
-        [] -> body
-        defs -> Map.put(body, "tools", defs)
-      end
+      body =
+        body
+        |> HTTP.maybe_put_unless_empty_list("tools", tools)
+        |> maybe_put_output_schema(config)
+        |> maybe_put_reasoning(reasoning)
 
-    # Merge extra_body LAST so caller can override any field (#18)
-    Map.merge(body, stringify_extra_body(Map.get(config, :extra_body, %{})))
+      # Merge extra_body LAST so caller can override any field (#18), preserving
+      # sibling keys inside "text" (e.g. verbosity alongside format).
+      {:ok,
+       HTTP.merge_extra_body(
+         body,
+         HTTP.stringify_extra_body(Map.get(config, :extra_body, %{})),
+         "text"
+       )}
+    end
   end
 
-  defp stringify_extra_body(extra_body) when is_map(extra_body) do
-    Map.new(extra_body, fn
-      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
-      {key, value} -> {key, value}
-    end)
+  defp maybe_put_reasoning(body, nil), do: body
+
+  defp maybe_put_reasoning(body, %{effort: effort, display: display}) do
+    reasoning =
+      %{"effort" => Provider.openai_reasoning_effort(effort)}
+      |> then(fn map ->
+        if effort != :off and display == :summarized,
+          do: Map.put(map, "summary", "auto"),
+          else: map
+      end)
+
+    Map.put(body, "reasoning", reasoning)
   end
 
-  defp stringify_extra_body(_), do: %{}
+  defp maybe_put_non_empty_string(body, key, value) when is_binary(value) and value != "",
+    do: Map.put(body, key, value)
 
-  defp maybe_put_optional_request_field(body, _key, nil), do: body
-  defp maybe_put_optional_request_field(body, _key, value) when value == [], do: body
-  defp maybe_put_optional_request_field(body, key, value), do: Map.put(body, key, value)
+  defp maybe_put_non_empty_string(body, _key, _other), do: body
+
+  defp maybe_put_output_schema(body, config) do
+    case Map.get(config, :output_schema) do
+      nil ->
+        body
+
+      %OutputSchema{name: name, schema: schema, strict: strict} ->
+        Map.put(body, "text", %{
+          "format" => %{
+            "type" => "json_schema",
+            "name" => name,
+            "schema" => schema,
+            "strict" => strict
+          }
+        })
+    end
+  end
 
   defp maybe_put_reasoning_include(body, config) do
     if stateless_reasoning_echo?(config) do
@@ -221,12 +344,8 @@ defmodule Alloy.Provider.OpenAI do
   defp maybe_append_built_in_tool(tools, _type, false), do: tools
   defp maybe_append_built_in_tool(tools, type, true), do: tools ++ [%{"type" => type}]
 
-  defp maybe_append_built_in_tool(tools, "web_search", config) when is_map(config) do
-    tools ++ [normalize_web_search_tool(config)]
-  end
-
   defp maybe_append_built_in_tool(tools, type, config) when is_map(config) do
-    tools ++ [Map.put(Alloy.Provider.stringify_keys(config), "type", type)]
+    tools ++ [Map.put(Provider.stringify_keys(config), "type", type)]
   end
 
   defp normalize_built_in_tools(tools) when is_list(tools) do
@@ -235,14 +354,9 @@ defmodule Alloy.Provider.OpenAI do
 
   defp normalize_built_in_tools(_), do: []
 
-  defp normalize_built_in_tool(%{"type" => _type} = tool), do: Alloy.Provider.stringify_keys(tool)
-
-  defp normalize_built_in_tool(%{type: _type} = tool), do: Alloy.Provider.stringify_keys(tool)
-
-  defp normalize_web_search_tool(config) do
-    config
-    |> Alloy.Provider.stringify_keys()
-    |> Map.put("type", "web_search")
+  defp normalize_built_in_tool(tool)
+       when is_map(tool) and (is_map_key(tool, "type") or is_map_key(tool, :type)) do
+    Provider.stringify_keys(tool)
   end
 
   defp build_input_items(messages, config) do
@@ -306,12 +420,39 @@ defmodule Alloy.Provider.OpenAI do
     %{"type" => "input_image", "image_url" => "data:#{mime_type};base64,#{data}"}
   end
 
-  defp format_user_content_block(%{type: "audio", mime_type: mime_type}) do
+  defp format_user_content_block(%{type: "image", url: url}) when is_binary(url) do
+    if HTTP.public_http_url?(url) do
+      %{"type" => "input_image", "image_url" => url}
+    else
+      unsupported_media_notice("image")
+    end
+  end
+
+  defp format_user_content_block(%{type: type, mime_type: mime_type})
+       when type in ["audio", "video"] do
     unsupported_media_notice(mime_type)
   end
 
-  defp format_user_content_block(%{type: "video", mime_type: mime_type}) do
-    unsupported_media_notice(mime_type)
+  defp format_user_content_block(%{type: "document", mime_type: mime_type, data: data} = block)
+       when is_binary(mime_type) and is_binary(data) do
+    %{
+      "type" => "input_file",
+      "filename" => block[:filename] || block[:title] || default_document_filename(mime_type),
+      "file_data" => "data:#{mime_type};base64,#{data}"
+    }
+  end
+
+  defp format_user_content_block(%{type: "document", file_id: file_id})
+       when is_binary(file_id) do
+    %{"type" => "input_file", "file_id" => file_id}
+  end
+
+  defp format_user_content_block(%{type: "document", uri: uri} = block) when is_binary(uri) do
+    if HTTP.public_http_url?(uri) do
+      %{"type" => "input_file", "file_url" => uri}
+    else
+      unsupported_media_notice(Map.get(block, :mime_type, "document"))
+    end
   end
 
   defp format_user_content_block(%{type: "document", mime_type: mime_type}) do
@@ -320,10 +461,16 @@ defmodule Alloy.Provider.OpenAI do
 
   defp format_user_content_block(_block), do: nil
 
+  defp default_document_filename("application/pdf"), do: "document.pdf"
+  defp default_document_filename("text/plain"), do: "document.txt"
+  defp default_document_filename("text/markdown"), do: "document.md"
+  defp default_document_filename("text/csv"), do: "document.csv"
+  defp default_document_filename(_mime_type), do: "document"
+
   defp format_assistant_block(%{type: "text", text: text} = block, _stateless?)
        when is_binary(text) and text != "" do
     [
-      maybe_put_optional_request_field(
+      HTTP.maybe_put_unless_empty_list(
         %{"role" => "assistant", "content" => text},
         "phase",
         block[:phase]
@@ -354,7 +501,7 @@ defmodule Alloy.Provider.OpenAI do
       "type" => "function",
       "name" => name,
       "description" => desc,
-      "parameters" => Alloy.Provider.stringify_keys(schema)
+      "parameters" => Provider.stringify_keys(schema)
     }
 
     if Map.get(def_map, :strict) == true, do: Map.put(tool, "strict", true), else: tool
@@ -369,165 +516,106 @@ defmodule Alloy.Provider.OpenAI do
     }
   end
 
-  # --- Streaming ---
-
-  defp handle_stream_event(acc, %{data: "[DONE]"}), do: acc
-
-  defp handle_stream_event(acc, %{event: event_name, data: data}) do
-    case Jason.decode(data) do
-      {:ok, parsed} ->
-        event_type = event_name || Map.get(parsed, "type")
-        process_stream_event(acc, event_type, parsed)
-
-      {:error, _} ->
-        acc
-    end
-  end
-
-  defp process_stream_event(acc, "response.output_text.delta", %{"delta" => delta})
-       when is_binary(delta) and delta != "" do
-    acc.on_chunk.(delta)
-    acc
-  end
-
-  # Every terminal event carries the whole response, and parse_response/1
-  # reads its status, so completed, incomplete and failed share one path.
-  defp process_stream_event(acc, event_type, %{"response" => response})
-       when event_type in @terminal_events and is_map(response) do
-    %{acc | response: response}
-  end
-
-  # The documented event is flat ({"type": "error", "code", "message"});
-  # some compatible servers nest the details under "error".
-  defp process_stream_event(acc, "error", %{"error" => %{}} = payload) do
-    %{acc | stream_error: Error.from_body(payload)}
-  end
-
-  defp process_stream_event(acc, "error", payload) do
-    %{acc | stream_error: Error.from_body(%{"error" => payload})}
-  end
-
-  defp process_stream_event(acc, _event_type, _payload), do: acc
-
-  defp build_stream_response(%{stream_error: %Error{} = error}), do: {:error, error}
-
-  defp build_stream_response(%{response: response}) when is_map(response),
-    do: parse_response(response)
-
-  # Without a terminal event the connection was cut mid-response; returning
-  # the text received so far would pass off a fragment as a complete answer.
-  defp build_stream_response(_acc) do
-    {:error,
-     %Error{kind: :network, message: "Responses stream ended before the response completed"}}
-  end
-
   # --- Response Parsing ---
 
-  defp parse_response(body) when is_binary(body) do
-    case Alloy.Provider.decode_body(body) do
-      {:ok, decoded} -> parse_response(decoded)
-      {:error, _} = err -> err
-    end
-  end
-
-  defp parse_response(%{"status" => "failed"} = resp), do: {:error, Error.from_body(resp)}
-
-  defp parse_response(%{"output" => output} = resp) when is_list(output) do
-    provider_state = provider_state_from_response(resp)
-
-    case parse_output_to_blocks(output) do
-      {:ok, content_blocks} ->
-        stop_reason = parse_stop_reason(resp, content_blocks)
-
-        alloy_msg = %Message{
-          role: :assistant,
-          content: content_blocks
-        }
-
-        {:ok,
-         %{
-           stop_reason: stop_reason,
-           messages: [alloy_msg],
-           usage: parse_usage(resp["usage"]),
-           provider_state: provider_state,
-           response_metadata: response_metadata_from_response(resp)
-         }}
-
-      {:error, _} = err ->
-        err
-    end
-  end
-
-  defp parse_response(%{"output_text" => text} = resp) when is_binary(text) do
-    provider_state = provider_state_from_response(resp)
-
-    content_blocks =
-      case text do
-        "" -> []
-        _ -> [%{type: "text", text: text}]
-      end
-
-    {:ok,
-     %{
-       stop_reason: :end_turn,
-       messages: [%Message{role: :assistant, content: content_blocks}],
-       usage: parse_usage(resp["usage"]),
-       provider_state: provider_state,
-       response_metadata: response_metadata_from_response(resp)
-     }}
-  end
-
-  defp parse_response(%{"error" => error} = resp) when is_map(error) or is_binary(error) do
-    {:error, Error.from_body(resp)}
-  end
-
-  defp parse_response(resp) do
-    {:error, %Error{message: "Unexpected OpenAI response payload: #{inspect(resp)}"}}
-  end
-
-  defp parse_output_to_blocks(output) do
+  defp parse_output_to_blocks(output, mode) do
     result =
-      Enum.reduce_while(output, {:ok, []}, fn item, {:ok, acc} ->
-        case parse_output_item(item) do
-          {:ok, blocks} -> {:cont, {:ok, [blocks | acc]}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
+      output
+      |> Enum.with_index()
+      |> HTTP.map_ok(fn {item, idx} -> parse_output_item(item, idx, mode) end)
 
     case result do
-      {:ok, nested} -> {:ok, nested |> Enum.reverse() |> List.flatten()}
+      {:ok, nested} -> {:ok, List.flatten(nested)}
       error -> error
     end
   end
 
   defp parse_output_item(
-         %{"type" => "message", "role" => "assistant", "content" => content} = item
+         %{"type" => "message", "role" => "assistant", "content" => content} = item,
+         _idx,
+         _mode
        )
        when is_list(content) or is_binary(content) do
     {:ok, content |> parse_assistant_content() |> Enum.map(&put_phase(&1, item["phase"]))}
   end
 
-  defp parse_output_item(%{"type" => "function_call", "name" => name} = call) do
-    case decode_function_call_arguments(call) do
-      {:ok, input} ->
-        {:ok, [%{type: "tool_use", id: call["call_id"] || call["id"], name: name, input: input}]}
+  # Refused output is discarded by the loop; drop partial function calls so the
+  # refusal reaches Turn without triggering retries.
+  defp parse_output_item(%{"type" => "function_call"}, _idx, :refusal), do: {:ok, []}
 
-      {:error, _} = err ->
-        err
+  # Under status: "incomplete" (e.g. max_output_tokens), a function_call may be
+  # cut off mid-JSON or before id/name arrived. Parse leniently so Turn sees
+  # stop_reason: :max_tokens and abandons the call cleanly instead of retrying
+  # a deterministic truncation.
+  defp parse_output_item(%{"type" => "function_call"} = call, idx, :truncated) do
+    id =
+      case call["call_id"] || call["id"] do
+        value when is_binary(value) and value != "" -> value
+        _ -> HTTP.truncated_tool_call_id(idx)
+      end
+
+    name =
+      case call["name"] do
+        value when is_binary(value) and value != "" -> value
+        _ -> "truncated"
+      end
+
+    input =
+      case HTTP.decode_tool_arguments(Map.get(call, "arguments", ""), name) do
+        {:ok, map} -> map
+        {:error, _} -> %{}
+      end
+
+    {:ok, [%{type: "tool_use", id: id, name: name, input: input}]}
+  end
+
+  defp parse_output_item(%{"type" => "function_call"} = call, _idx, :normal) do
+    with {:ok, id} <- fetch_function_call_id(call),
+         {:ok, name} <- fetch_function_call_name(call),
+         {:ok, input} <- HTTP.decode_tool_arguments(Map.get(call, "arguments", ""), name) do
+      {:ok, [%{type: "tool_use", id: id, name: name, input: input}]}
     end
   end
 
-  defp parse_output_item(%{"type" => "reasoning"} = item) do
+  defp parse_output_item(%{"type" => "reasoning"} = item, _idx, _mode) do
     {:ok, [%{type: "reasoning", raw: item}]}
   end
 
   # Built-in tool calls (web search, code interpreter, MCP), compaction items
   # and types added later are kept whole, so a stateless replay sends the
   # complete output back as the API expects.
-  defp parse_output_item(%{"type" => _type} = item),
+  defp parse_output_item(%{"type" => _type} = item, _idx, _mode),
     do: {:ok, [%{type: "output_item", raw: item}]}
 
-  defp parse_output_item(_item), do: {:ok, []}
+  defp parse_output_item(_item, _idx, _mode), do: {:ok, []}
+
+  defp fetch_function_call_id(call) do
+    case call["call_id"] || call["id"] do
+      id when is_binary(id) and id != "" ->
+        {:ok, id}
+
+      _missing ->
+        {:error,
+         %Error{
+           kind: :protocol_error,
+           message: "OpenAI function_call missing non-empty call_id/id"
+         }}
+    end
+  end
+
+  defp fetch_function_call_name(call) do
+    case call["name"] do
+      name when is_binary(name) and name != "" ->
+        {:ok, name}
+
+      _missing ->
+        {:error,
+         %Error{
+           kind: :protocol_error,
+           message: "OpenAI function_call missing non-empty name"
+         }}
+    end
+  end
 
   defp parse_assistant_content(""), do: []
   defp parse_assistant_content(text) when is_binary(text), do: [%{type: "text", text: text}]
@@ -539,10 +627,10 @@ defmodule Alloy.Provider.OpenAI do
         [%{type: "text", text: text} |> maybe_put_annotations(item["annotations"])]
 
       %{"type" => "refusal", "refusal" => text} when is_binary(text) and text != "" ->
-        [%{type: "text", text: text}]
+        [%{type: "text", text: text, refusal: true}]
 
       %{"type" => "refusal", "text" => text} when is_binary(text) and text != "" ->
-        [%{type: "text", text: text}]
+        [%{type: "text", text: text, refusal: true}]
 
       _ ->
         []
@@ -563,27 +651,6 @@ defmodule Alloy.Provider.OpenAI do
     if Enum.any?(content_blocks, &(&1.type == "tool_use")), do: :tool_use, else: :end_turn
   end
 
-  defp decode_function_call_arguments(%{"name" => name} = call) do
-    args = Map.get(call, "arguments", "")
-
-    case args do
-      "" ->
-        {:ok, %{}}
-
-      encoded when is_binary(encoded) ->
-        case Jason.decode(encoded) do
-          {:ok, input} -> {:ok, input}
-          {:error, _} -> {:error, "Invalid JSON in tool call arguments for #{name}"}
-        end
-
-      decoded when is_map(decoded) ->
-        {:ok, decoded}
-
-      _other ->
-        {:error, "Invalid tool call arguments payload for #{name}"}
-    end
-  end
-
   # Alloy.Usage follows Anthropic: input_tokens excludes cache reads and
   # writes, which have their own fields. OpenAI counts both inside
   # input_tokens, so they are taken out here.
@@ -592,12 +659,12 @@ defmodule Alloy.Provider.OpenAI do
     cache_read = details["cached_tokens"] || 0
     cache_write = details["cache_write_tokens"] || 0
 
-    %{
-      input_tokens: max((usage["input_tokens"] || 0) - cache_read - cache_write, 0),
-      output_tokens: usage["output_tokens"] || 0,
-      cache_read_input_tokens: cache_read,
-      cache_creation_input_tokens: cache_write
-    }
+    HTTP.cache_adjusted_usage(
+      usage["input_tokens"] || 0,
+      usage["output_tokens"] || 0,
+      cache_read,
+      cache_write
+    )
   end
 
   defp parse_usage(nil), do: parse_usage(%{})
@@ -610,20 +677,16 @@ defmodule Alloy.Provider.OpenAI do
 
   defp response_metadata_from_response(resp) do
     %{}
-    |> maybe_put_response_metadata(:citations, Map.get(resp, "citations"))
-    |> maybe_put_response_metadata(
+    |> HTTP.maybe_put_unless_empty_list(:citations, Map.get(resp, "citations"))
+    |> HTTP.maybe_put_unless_empty_list(
       :server_side_tool_usage,
       Map.get(resp, "server_side_tool_usage")
     )
-    |> maybe_put_response_metadata(:stop_details, stop_details(resp))
+    |> HTTP.maybe_put_unless_empty_list(:stop_details, stop_details(resp))
   end
 
   defp stop_details(%{"status" => "incomplete"} = resp), do: resp["incomplete_details"]
   defp stop_details(_resp), do: nil
-
-  defp maybe_put_response_metadata(metadata, _key, nil), do: metadata
-  defp maybe_put_response_metadata(metadata, _key, value) when value == [], do: metadata
-  defp maybe_put_response_metadata(metadata, key, value), do: Map.put(metadata, key, value)
 
   defp maybe_put_annotations(block, annotations)
        when is_list(annotations) and annotations != [] do

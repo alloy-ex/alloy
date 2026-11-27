@@ -212,6 +212,30 @@ defmodule Alloy.ToolTest do
       path = Path.join(secrets, "key.txt")
       assert {:ok, ^path} = Tool.resolve_path(path, %{allowed_paths: ["/"]})
     end
+
+    @tag :tmp_dir
+    test "expands relative allowed_paths against working_directory and rejects bad inputs", %{
+      tmp_dir: dir
+    } do
+      sub = Path.join(dir, "allowed")
+      File.mkdir_p!(sub)
+      file = Path.join(sub, "ok.txt")
+      File.write!(file, "hi")
+
+      assert {:ok, resolved} =
+               Tool.resolve_path("allowed/ok.txt", %{
+                 working_directory: dir,
+                 allowed_paths: ["allowed"]
+               })
+
+      assert String.ends_with?(resolved, "/allowed/ok.txt")
+      assert {:error, _} = Tool.resolve_path(123, %{})
+      assert {:error, _} = Tool.resolve_path("bad\0path", %{})
+      assert {:error, _} = Tool.resolve_path("ok.txt", %{allowed_paths: "not-a-list"})
+
+      assert {:error, _} =
+               Tool.resolve_path("ok.txt", %{working_directory: dir, allowed_paths: [nil]})
+    end
   end
 
   # macOS puts tmp dirs under /var, a symlink to /private/var.

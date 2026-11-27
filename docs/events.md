@@ -11,14 +11,23 @@ fields) may change between minor versions.
 
 - `Alloy.stream/3` — pass `:on_event` in opts; the callback receives
   every envelope for the run.
-- `Alloy.run/2` — pass `:on_event` in opts; the callback receives every
-  envelope except text deltas, which only a streaming run produces.
+- `Alloy.run/2` — pass `:on_event` in opts; the callback receives lifecycle and
+  tool envelopes (`:turn_start`, `:turn_end`, `:tool_start`, `:tool_update`,
+  `:tool_end`), while streaming delta envelopes (`:text_delta`,
+  `:thinking_delta`, `:tool_call_delta`) are produced only by `Alloy.stream/3`.
 - `alloy_agent` — `AlloyAgent.Server` passes the same envelopes to its
   callers and PubSub subscribers.
 
 A lower-level analogue is fired for every envelope via `:telemetry` as
 `[:alloy, :event]` with measurements `%{seq: seq}` and metadata
-`%{v:, event:, correlation_id:, turn:}`.
+`%{v:, event:, correlation_id:, turn:}`. Note that `:thinking_delta`,
+`:tool_call_delta`, and `:tool_update` envelopes (and their `[:alloy, :event]`
+telemetry) are only produced when `:on_event` is subscribed, so unsubscribed
+`Alloy.stream/3` callers preserve retry/fallback resilience across non-text
+deltas (while `:text_delta`, `:turn_start`, `:turn_end`, `:tool_start`, and
+`:tool_end` always fire telemetry). When `:on_event` is subscribed, emitting
+any streaming delta marks the provider attempt as having emitted output and
+disables retries and provider fallbacks for that turn.
 
 ## Envelope shape
 
@@ -51,10 +60,14 @@ Field guarantees:
 
 | `event` | `payload` | Emitted when |
 |---|---|---|
+| `:turn_start` | `%{turn:}` | a turn begins in `Alloy.Agent.Turn` (both `run/2` and `stream/3`) |
+| `:turn_end` | `%{turn:, status:, stop_reason:, usage:}` | a turn finishes; `status` is `:running` if the loop continues or the final status otherwise (`:completed`, `:max_turns`, `:halted`, `:cancelled`, or `:error` — also `:error` if an unhandled exception aborts the turn before re-raising); `stop_reason` is `nil` if the turn ended before a provider response (including when a `:turn_end` callback on a `:running` turn exhausts `:timeout_ms` or cancels `:cancel_token`, causing the next turn to stop immediately with zero usage while `Result.turns` still counts completed model turns); `usage` is the per-turn `%Alloy.Usage{}` delta (preserving already-accounted response usage and `stop_reason` on post-response exceptions) |
 | `:text_delta` | `String.t()` — text fragment | streaming providers emit assistant text |
-| `:thinking_delta` | `String.t()` — reasoning fragment | providers with reasoning/thinking blocks stream them |
-| `:tool_start` | `%{id:, name:, input:}` | a tool call begins executing |
-| `:tool_end` | `%{id:, name:, input:, duration_ms:, error:, start_event_seq:}` | a tool call finishes; `error` is `nil` on success, a string otherwise; `start_event_seq` links back to the matching `:tool_start` envelope |
+| `:thinking_delta` | `String.t()` — reasoning fragment | streaming providers emit reasoning/thinking deltas (Anthropic, OpenAI/xAI Responses, Gemini, OpenAICompat) |
+| `:tool_call_delta` | `%{id:, index:, name:, arguments_delta:}` | streaming providers emit tool-call headers or partial argument JSON deltas (`id` and `name` are non-empty strings, `index` is provider-scoped — e.g. Anthropic content-block index, OpenAI Responses `output_index`, Gemini tool ordinal, Chat Completions `tool_calls[].index` — correlate calls alongside `id`; for zero-argument tools, concatenated `arguments_delta` may be `""` or `"{}"` depending on the provider) |
+| `:tool_start` | `%{id:, name:, input:}` (plus optional `:parent_call_id` for nested calls) | a tool call begins executing |
+| `:tool_update` | `%{id:, name:, chunk:, start_event_seq:}` (plus optional `:parent_call_id` for nested calls) | a running tool emits incremental output (for example `Alloy.Tool.Core.Bash`); marshalled to the caller process strictly between `:tool_start` and `:tool_end` |
+| `:tool_end` | `%{id:, name:, input:, duration_ms:, error:, start_event_seq:}` (plus optional `:parent_call_id` for nested calls) | a tool call finishes; `error` is `nil` on success, a string otherwise; `start_event_seq` links back to the matching `:tool_start` envelope |
 | `:runtime_event` | `term()` — the raw event | anything emitted that isn't a recognized tuple; a forward-compatibility escape hatch |
 
 Consumers should match on the `event` atoms they know and ignore the

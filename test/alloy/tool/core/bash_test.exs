@@ -298,6 +298,35 @@ defmodule Alloy.Tool.Core.BashTest do
       assert msg =~ "timed out"
     end
 
+    test "supervisor shutdown of host runner task kills background shell children", %{
+      tmp_dir: tmp_dir
+    } do
+      pid_file = Path.join(tmp_dir, "bg.pid")
+
+      caller =
+        Task.async(fn ->
+          Bash.execute(
+            %{"command" => "sleep 30 & echo $! > #{pid_file}; wait", "timeout" => 10_000},
+            %{working_directory: tmp_dir, bash_restricted: false}
+          )
+        end)
+
+      assert eventually(fn -> File.exists?(pid_file) end), "background child never wrote pid"
+      bg_pid = pid_file |> File.read!() |> String.trim()
+      assert os_alive?(bg_pid)
+
+      [runner] =
+        for pid <- Task.Supervisor.children(Alloy.TaskSupervisor),
+            {:dictionary, dict} <- [Process.info(pid, :dictionary)],
+            caller.pid in Keyword.get(dict, :"$callers", []),
+            do: pid
+
+      Process.exit(runner, :shutdown)
+      assert {:error, msg} = Task.await(caller, 2_000)
+      assert msg =~ "Executor crashed: :shutdown"
+      assert eventually(fn -> not os_alive?(bg_pid) end)
+    end
+
     @tag timeout: 60_000
     test "huge output is capped while it streams, not buffered", %{tmp_dir: tmp_dir} do
       bytes = 64 * 1024 * 1024
@@ -337,6 +366,32 @@ defmodule Alloy.Tool.Core.BashTest do
       :stop -> send(parent, {:peak_growth, peak})
     after
       5 -> sample_peak(base, parent, max(peak, :erlang.memory(:binary) - base))
+    end
+  end
+
+  defp os_alive?(os_pid) do
+    no_env = Enum.map(System.get_env(), fn {name, _value} -> {name, nil} end)
+
+    {_output, status} =
+      System.cmd("/bin/sh", ["-c", ~S(kill -0 "$1"), "probe", os_pid],
+        env: no_env,
+        stderr_to_stdout: true
+      )
+
+    status == 0
+  end
+
+  defp eventually(fun, attempts \\ 50) do
+    cond do
+      fun.() ->
+        true
+
+      attempts == 0 ->
+        false
+
+      true ->
+        Process.sleep(50)
+        eventually(fun, attempts - 1)
     end
   end
 
@@ -397,6 +452,178 @@ defmodule Alloy.Tool.Core.BashTest do
 
       assert String.length(result) <= 31_000
       assert result =~ "truncated"
+    end
+
+    test "rejects non-string and NUL-byte commands" do
+      assert {:error, bash_msg} = Bash.execute(%{"command" => 123}, %{})
+      assert bash_msg =~ "string"
+      assert {:error, nul_msg} = Bash.execute(%{"command" => "echo hi\0"}, %{})
+      assert nul_msg =~ "NUL"
+    end
+
+    test "custom executor reports invalid return shapes instead of timeout or crash" do
+      for bad_return <- [{:error, :boom}, {nil, 0}, {"ok", "0"}, "raw-string"] do
+        assert {:error, msg} =
+                 Bash.execute(%{"command" => "echo hi"}, %{
+                   bash_executor: fn _cmd, _dir -> bad_return end
+                 })
+
+        assert msg =~ "Custom bash executor returned invalid result"
+        refute msg =~ "timed out"
+      end
+    end
+
+    test "custom executor reports raises, Erlang errors, throws, and exits cleanly" do
+      cases = [
+        {fn _, _ -> raise "boom" end, "boom"},
+        {fn _, _ -> :erlang.error(:badarg) end, "argument error"},
+        {fn _, _ -> throw(:stop_now) end, "stop_now"},
+        {fn _, _ -> exit(:gone) end, "gone"}
+      ]
+
+      for {executor, expected} <- cases do
+        assert {:error, msg} =
+                 Bash.execute(%{"command" => "echo hi"}, %{bash_executor: executor})
+
+        assert msg =~ "Executor crashed:"
+        assert msg =~ expected
+      end
+    end
+
+    test "custom executor crashes omit secrets captured in structural errors, exits, and throws" do
+      secret = "sk-bash-executor-secret-42"
+      creds = Map.new(api_key: secret, ssh_token: secret)
+
+      cases = [
+        {fn _, _ -> Map.fetch!(creds, :missing_key) end, "KeyError (key :missing_key not found)"},
+        {fn _, _ -> {:ok, _} = Function.identity({:error, creds}) end, "MatchError"},
+        {fn _, _ -> exit({:failed, creds}) end, "exit: {:failed, ...}"},
+        {fn _, _ -> throw(creds) end, "throw: unexpected map"}
+      ]
+
+      for {executor, expected} <- cases do
+        assert {:error, msg} =
+                 Bash.execute(%{"command" => "echo hi"}, %{bash_executor: executor})
+
+        assert msg =~ "Executor crashed:"
+        assert msg =~ expected
+        refute msg =~ secret
+      end
+    end
+
+    test "custom executor dies when caller is killed and inherits Logger metadata and OTel context" do
+      test_pid = self()
+      logger_meta = [request_id: "bash-req-7"]
+      reset_meta = [request_id: nil]
+      Logger.metadata(logger_meta)
+      Process.put(:"$__current_otel_ctx", {:fake_otel_ctx, "bash-span"})
+
+      try do
+        assert {:ok, _} =
+                 Bash.execute(%{"command" => "ctx"}, %{
+                   bash_executor: fn _cmd, _dir ->
+                     send(
+                       test_pid,
+                       {:bash_ctx, Logger.metadata()[:request_id],
+                        Process.get(:"$__current_otel_ctx")}
+                     )
+
+                     {"ok", 0}
+                   end
+                 })
+
+        assert_received {:bash_ctx, "bash-req-7", {:fake_otel_ctx, "bash-span"}}
+      after
+        Logger.metadata(reset_meta)
+        Process.delete(:"$__current_otel_ctx")
+      end
+
+      blocking_executor = fn _cmd, _dir ->
+        send(test_pid, {:exec_started, self()})
+        Process.sleep(10_000)
+        {"never", 0}
+      end
+
+      caller =
+        spawn(fn ->
+          Bash.execute(%{"command" => "sleep"}, %{bash_executor: blocking_executor})
+        end)
+
+      assert_receive {:exec_started, exec_pid}, 1_000
+      ref = Process.monitor(exec_pid)
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^exec_pid, :killed}, 1_000
+    end
+
+    test "custom executor crash terminates linked children and timeout kills exit-trapping workers" do
+      test_pid = self()
+
+      crashing_executor = fn _cmd, _dir ->
+        child = spawn_link(fn -> Process.sleep(:infinity) end)
+        send(test_pid, {:bash_linked_child, child})
+        raise "executor boom"
+      end
+
+      assert {:error, msg} =
+               Bash.execute(%{"command" => "boom"}, %{bash_executor: crashing_executor})
+
+      assert msg =~ "Executor crashed:"
+      assert msg =~ "executor boom"
+
+      assert_receive {:bash_linked_child, child}, 1_000
+      child_ref = Process.monitor(child)
+      assert_receive {:DOWN, ^child_ref, :process, ^child, _reason}, 1_000
+
+      trapping_executor = fn _cmd, _dir ->
+        Process.flag(:trap_exit, true)
+        send(test_pid, {:bash_trapping_worker, self()})
+
+        receive do
+          :never -> {"never", 0}
+        end
+      end
+
+      bash_task =
+        Task.async(fn ->
+          Bash.execute(%{"command" => "hang", "timeout" => 50}, %{
+            bash_executor: trapping_executor
+          })
+        end)
+
+      assert_receive {:bash_trapping_worker, worker}, 1_000
+      worker_ref = Process.monitor(worker)
+      assert {:error, timeout_msg} = Task.await(bash_task, 2_000)
+      assert timeout_msg =~ "timed out"
+      assert timeout_msg =~ "non-blocking approach"
+      refute Process.alive?(worker)
+      assert_receive {:DOWN, ^worker_ref, :process, ^worker, _reason}, 1_000
+    end
+
+    test "custom executor external kill returns sanitized error without crashing caller" do
+      test_pid = self()
+
+      executor = fn _cmd, _dir ->
+        send(test_pid, {:kill_me_worker, self()})
+        Process.sleep(:infinity)
+      end
+
+      task =
+        Task.async(fn ->
+          Bash.execute(%{"command" => "wait"}, %{bash_executor: executor})
+        end)
+
+      assert_receive {:kill_me_worker, worker}, 1_000
+      Process.exit(worker, :kill)
+
+      assert {:error, "Executor crashed: :killed"} = Task.await(task, 2_000)
+
+      # Huge crash payloads are bounded so they cannot flood the model transcript.
+      big = String.duplicate("x", 10_000)
+
+      assert {:error, big_err} =
+               Bash.execute(%{"command" => "boom"}, %{bash_executor: fn _, _ -> exit(big) end})
+
+      assert byte_size(big_err) <= 550
     end
   end
 end

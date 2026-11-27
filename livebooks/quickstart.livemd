@@ -2,7 +2,7 @@
 
 ```elixir
 Mix.install([
-  {:alloy, "~> 0.12"},
+  {:alloy, "~> 0.16"},
   {:kino, "~> 0.14"}
 ])
 ```
@@ -46,15 +46,39 @@ The result also carries usage and per-call metadata:
 ## 2. Give it a tool
 
 Built-in tools cover files and shell. `Alloy.Tool.Core.Read` is safe to try
-from a notebook:
+from a notebook against a temporary file:
 
 ```elixir
-{:ok, result} = Alloy.run(
-  "Read mix.exs in this directory and tell me the Elixir version requirement",
-  provider: provider,
-  tools: [Alloy.Tool.Core.Read],
-  context: %{allowed_paths: [File.cwd!()]}
+sample_dir =
+  Path.join(
+    System.tmp_dir!(),
+    "alloy_quickstart_#{Base.url_encode64(:crypto.strong_rand_bytes(8), padding: false)}"
+  )
+
+File.mkdir_p!(sample_dir)
+File.chmod!(sample_dir, 0o700)
+
+File.write!(
+  Path.join(sample_dir, "notes.txt"),
+  "Alloy runs the agent loop on the BEAM.\n",
+  [:exclusive]
 )
+
+result =
+  try do
+    {:ok, result} =
+      Alloy.run(
+        "Read notes.txt in the working directory and summarize it in five words",
+        provider: provider,
+        tools: [Alloy.Tool.Core.Read],
+        working_directory: sample_dir,
+        context: %{allowed_paths: [sample_dir]}
+      )
+
+    result
+  after
+    File.rm_rf!(sample_dir)
+  end
 
 result.text
 ```

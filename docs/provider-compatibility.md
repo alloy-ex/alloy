@@ -37,17 +37,20 @@ Alloy.run("Summarize this repository",
 )
 ```
 
-For current Claude models, use adaptive thinking through existing passthrough
-(the `extended_thinking` option was removed in 0.13). Thinking text is omitted by default
-on several new models; request summarized display when your UI needs it.
-Do not carry old sampling or forced-tool-choice settings into a new model
-without checking its contract. [Thinking configuration](https://platform.claude.com/docs/en/build-with-claude/thinking).
+For current Claude models, pass portable `reasoning: :medium` (or `:off`,
+`:low`, `:high`, `:xhigh`, or `%{effort: ..., display: :summarized | :omitted}`)
+on `Alloy.run/2` / `Alloy.stream/3` or inside provider config, or use
+`extra_body` for provider-specific controls (the `extended_thinking` option was
+removed in 0.13). Thinking text is omitted by default on several new models;
+request `display: :summarized` when your UI needs it. Do not carry old sampling
+or forced-tool-choice settings into a new model without checking its contract.
+[Thinking configuration](https://platform.claude.com/docs/en/build-with-claude/thinking).
 
 ```elixir
 provider = {Alloy.Provider.Anthropic,
   api_key: System.fetch_env!("ANTHROPIC_API_KEY"),
   model: "claude-sonnet-5-5",
-  extra_body: %{"thinking" => %{"type" => "adaptive", "display" => "summarized"}}
+  reasoning: %{effort: :medium, display: :summarized}
 }
 ```
 
@@ -56,11 +59,13 @@ provider = {Alloy.Provider.Anthropic,
 Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 accept a replayed
 thinking block only while the `system` prompt, `tools` and earlier messages
 are unchanged. Accounts created on or after 31 August 2026 get a 400
-otherwise. Alloy keeps `system` and `tools` fixed for a run and only appends
-to `messages`, except when it compacts. After compaction it removes every
-thinking block it keeps, which is the documented valid change, so no beta
-header is needed. If you edit history yourself, either do the same or opt
-into the API dropping stale blocks:
+otherwise. By default Alloy keeps `system` and `tools` fixed for a run and only
+appends to `messages`, except when it compacts. After compaction it removes
+every thinking block it keeps, which is the documented valid change, so no beta
+header is needed. If your `:before_completion` middleware edits `system`,
+`tools`, or earlier `messages` mid-run via `Alloy.Agent.State.prepare/2` (or
+you edit history yourself), either drop earlier thinking blocks or opt into the
+API dropping stale blocks:
 
 ```elixir
 extra_headers: [{"anthropic-beta", "thinking-binding-controls-2026-08-01"}],
@@ -77,14 +82,16 @@ extra_body: %{
 ### Switching provider mid-conversation
 
 Each assistant message records its provider, model and origin: a hash of
-the provider module, `:api_url` and `:api_key`. Before every request,
-including to a fallback provider, `Alloy.Message.normalize_for/3` rewrites
-messages from a different origin, meaning another provider, endpoint or
-account:
+the provider module, `:api_url` and `:origin_key` (falling back to `:api_key`
+when `:origin_key` is not set). Before every request, including to a fallback
+provider, `Alloy.Message.normalize_for/3` rewrites messages from a different
+origin, meaning another provider, endpoint or account:
 
 - thinking becomes plain text, with signatures removed;
-- redacted thinking, raw OpenAI and xAI reasoning items, and Anthropic
-  server-tool records are dropped;
+- redacted thinking, raw OpenAI and xAI reasoning items, Gemini
+  `"gemini_part"` blocks, and Anthropic server-tool records are dropped;
+- foreign origin-scoped `file_id` documents and Gemini File API URIs are
+  omitted;
 - tool-call ids outside `[a-zA-Z0-9_-]{1,64}` are rewritten.
 
 Gemini receives Google's placeholder thought signature on the first tool
@@ -95,7 +102,9 @@ reasoning the new model can't use themselves, and Gemini says to resend it.
 Encrypted reasoning only ever goes back to the endpoint and credentials
 that issued it, since OpenAI ties it to the issuing organisation. Rotating
 an API key counts as a new origin, so earlier reasoning is then sent as
-text. Messages saved without their `origin` are sent unchanged.
+text — unless you pass a stable `:origin_key` (supported with both static
+string `:api_key` values and 0-arity `:api_key` callbacks) representing the
+same tenant/account. Messages saved without their `origin` are sent unchanged.
 
 Known limits:
 
@@ -106,11 +115,32 @@ Known limits:
 - **Anthropic manual thinking** (`"type" => "enabled"`, Claude 4.6 and
   earlier) requires the turn in progress to start with a thinking block,
   which a turn written by another provider lacks. Adaptive thinking, the
-  only mode on current models, has no such rule.
+  only mode on current models, has no such rule. Anthropic streaming also
+  expects each block's `content_block_start` event before text, thinking, or
+  signature deltas for that index (standard Anthropic endpoints always emit
+  it; non-compliant gateways omitting it return `:protocol_error`).
+- **Portable `:output_schema` with tools & wrapper options:** Alloy sends
+  `:output_schema` on every completion turn (including fallback providers).
+  Gemini models prior to Gemini 3 and some OpenAI-compatible servers reject
+  combining tool declarations with native JSON Schema output — use Gemini 3+
+  (`gemini-3.8-flash`), `:until_tool` / `:stop_after_tool`, or a separate
+  no-tools follow-up turn. `:name` and `:strict` (default `true`) apply to
+  OpenAI, xAI, and OpenAICompat and are ignored on Anthropic, Gemini, and
+  Codex. See `Alloy.OutputSchema` for full Gemini conflict, override, and
+  failure semantics.
 - **`OpenAICompat`** reaches each vendor at its own `:api_url`, so
   switching vendors is a change of origin: earlier `reasoning_content` is
   sent as plain text in the assistant message, and Gemini signatures from
-  Google's compatibility endpoint are dropped.
+  Google's compatibility endpoint are dropped. Thinking extracted from
+  array-of-parts `content` (such as Mistral Magistral) is tagged
+  `source: "content_part"` and withheld from top-level `reasoning_content`
+  on later turns (not re-sent) so strict OpenAI-compatible APIs do not reject
+  unknown assistant keys. Under `finish_reason: "length"` (and `OpenAI`
+  Responses `status: "incomplete"`), cut-off tool calls whose id or name never
+  arrived receive unique placeholder `"truncated_<n>_<uniq>"` / `"truncated"`
+  fields and `input: %{}` so the loop abandons them with matching error
+  `tool_result` blocks in `result.messages` instead of retrying deterministic
+  truncations.
 
 The provider tests check serialization, stream parsing, and opaque state
 round-trips using fixtures. Those checks do not certify every current model

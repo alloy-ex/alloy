@@ -26,15 +26,15 @@ defmodule Alloy.Usage do
   @spec merge(t(), map()) :: t()
   def merge(%__MODULE__{} = acc, response_usage) when is_map(response_usage) do
     %__MODULE__{
-      input_tokens: acc.input_tokens + Map.get(response_usage, :input_tokens, 0),
-      output_tokens: acc.output_tokens + Map.get(response_usage, :output_tokens, 0),
+      input_tokens: acc.input_tokens + (Map.get(response_usage, :input_tokens) || 0),
+      output_tokens: acc.output_tokens + (Map.get(response_usage, :output_tokens) || 0),
       cache_creation_input_tokens:
         acc.cache_creation_input_tokens +
-          Map.get(response_usage, :cache_creation_input_tokens, 0),
+          (Map.get(response_usage, :cache_creation_input_tokens) || 0),
       cache_read_input_tokens:
-        acc.cache_read_input_tokens + Map.get(response_usage, :cache_read_input_tokens, 0),
+        acc.cache_read_input_tokens + (Map.get(response_usage, :cache_read_input_tokens) || 0),
       estimated_cost_cents:
-        acc.estimated_cost_cents + Map.get(response_usage, :estimated_cost_cents, 0)
+        acc.estimated_cost_cents + (Map.get(response_usage, :estimated_cost_cents) || 0)
     }
   end
 
@@ -45,6 +45,23 @@ defmodule Alloy.Usage do
   def total(%__MODULE__{input_tokens: input, output_tokens: output})
       when is_integer(input) and is_integer(output) do
     input + output
+  end
+
+  @doc """
+  Computes the non-negative delta between two cumulative usage snapshots
+  (`current - previous`), useful for reporting per-turn usage.
+  """
+  @spec diff(t(), t()) :: t()
+  def diff(%__MODULE__{} = current, %__MODULE__{} = previous) do
+    %__MODULE__{
+      input_tokens: max(current.input_tokens - previous.input_tokens, 0),
+      output_tokens: max(current.output_tokens - previous.output_tokens, 0),
+      cache_creation_input_tokens:
+        max(current.cache_creation_input_tokens - previous.cache_creation_input_tokens, 0),
+      cache_read_input_tokens:
+        max(current.cache_read_input_tokens - previous.cache_read_input_tokens, 0),
+      estimated_cost_cents: max(current.estimated_cost_cents - previous.estimated_cost_cents, 0)
+    }
   end
 
   @doc """

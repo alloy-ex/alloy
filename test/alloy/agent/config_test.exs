@@ -1,7 +1,7 @@
 defmodule Alloy.Agent.ConfigTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Agent.Config
+  alias Alloy.Agent.{Config, State}
   alias Alloy.Context.Compactor
   alias Alloy.ModelMetadata
 
@@ -176,6 +176,147 @@ defmodule Alloy.Agent.ConfigTest do
     test "accepts code_execution: false explicitly" do
       config = Config.from_opts(provider: {Alloy.Provider.Test, []}, code_execution: false)
       assert config.code_execution == false
+    end
+
+    test "redacts provider config secrets in invalid provider and fallback_providers ArgumentError" do
+      secret = "sk-invalid-provider-secret"
+
+      err1 =
+        assert_raise ArgumentError, ~r/provider must be a module/, fn ->
+          Config.from_opts(provider: {nil, [api_key: secret]})
+        end
+
+      refute Exception.message(err1) =~ secret
+      assert Exception.message(err1) =~ "{nil, ...}"
+
+      err2 =
+        assert_raise ArgumentError, ~r/fallback provider must be a module/, fn ->
+          Config.from_opts(
+            provider: Alloy.Provider.Test,
+            fallback_providers: [{false, %{api_key: secret}}]
+          )
+        end
+
+      refute Exception.message(err2) =~ secret
+      assert Exception.message(err2) =~ "{false, ...}"
+
+      state =
+        Config.from_opts(provider: Alloy.Provider.Test)
+        |> State.init([])
+
+      err3 =
+        assert_raise ArgumentError, ~r/provider must be a module/, fn ->
+          State.prepare(state, provider: {"bad", api_key: secret})
+        end
+
+      refute Exception.message(err3) =~ secret
+
+      for bad_shape <- [
+            secret,
+            {secret, []},
+            [api_key: secret],
+            %{module: Alloy.Provider.Test, api_key: secret},
+            {Alloy.Provider.Test, [api_key: secret], :extra},
+            URI.parse("https://user:#{secret}@example.com")
+          ] do
+        err =
+          assert_raise ArgumentError, ~r/provider must be a module/, fn ->
+            Config.from_opts(provider: bad_shape)
+          end
+
+        refute Exception.message(err) =~ secret
+      end
+
+      for bad_fallbacks <- [
+            {Alloy.Provider.Test, api_key: secret},
+            %{module: Alloy.Provider.Test, api_key: secret}
+          ] do
+        err =
+          assert_raise ArgumentError, ~r/fallback_providers must be a list/, fn ->
+            Config.from_opts(provider: Alloy.Provider.Test, fallback_providers: bad_fallbacks)
+          end
+
+        refute Exception.message(err) =~ secret
+      end
+
+      ctx_err =
+        assert_raise ArgumentError, ~r/context must be a map/, fn ->
+          Config.from_opts(provider: Alloy.Provider.Test, context: [api_key: secret])
+        end
+
+      refute Exception.message(ctx_err) =~ secret
+      assert Exception.message(ctx_err) =~ "got: list"
+
+      prompt_err =
+        assert_raise ArgumentError, ~r/system_prompt must be a string or nil/, fn ->
+          Config.from_opts(provider: Alloy.Provider.Test, system_prompt: %{api_key: secret})
+        end
+
+      refute Exception.message(prompt_err) =~ secret
+      assert Exception.message(prompt_err) =~ "got: map"
+
+      mw_err =
+        assert_raise ArgumentError, ~r/middleware must be a list of module atoms/, fn ->
+          Config.from_opts(
+            provider: Alloy.Provider.Test,
+            middleware: [{Alloy.Provider.Test, api_key: secret}]
+          )
+        end
+
+      refute Exception.message(mw_err) =~ secret
+      assert Exception.message(mw_err) =~ "got: list"
+    end
+
+    test "requires :origin_key when provider or fallback uses a function :api_key" do
+      auth_fun = fn -> {:ok, "tok"} end
+
+      assert_raise ArgumentError, ~r/:origin_key/, fn ->
+        Config.from_opts(provider: {Alloy.Provider.Anthropic, api_key: auth_fun, model: "m"})
+      end
+
+      assert_raise ArgumentError, ~r/:origin_key/, fn ->
+        Config.from_opts(
+          provider: Alloy.Provider.Test,
+          fallback_providers: [{Alloy.Provider.OpenAI, api_key: auth_fun, model: "m"}]
+        )
+      end
+
+      assert_raise ArgumentError, ~r/0-arity/, fn ->
+        Config.from_opts(
+          provider: {Alloy.Provider.Anthropic, api_key: fn _x -> "tok" end, model: "m"}
+        )
+      end
+
+      assert_raise ArgumentError, ~r/:origin_key/, fn ->
+        Config.from_opts(
+          provider:
+            {Alloy.Provider.Anthropic, api_key: "oauth-tok", auth_scheme: :bearer, model: "m"}
+        )
+      end
+
+      assert_raise ArgumentError, ~r/:origin_key/, fn ->
+        Config.from_opts(
+          provider:
+            {Alloy.Provider.OpenAI, api_key: "sk-1", origin_key: :not_a_string, model: "m"}
+        )
+      end
+
+      cfg =
+        Config.from_opts(
+          provider:
+            {Alloy.Provider.Anthropic, api_key: auth_fun, origin_key: "acct-1", model: "m"}
+        )
+
+      assert cfg.provider_config.origin_key == "acct-1"
+
+      bearer_cfg =
+        Config.from_opts(
+          provider:
+            {Alloy.Provider.Gemini,
+             api_key: "oauth-tok", auth_scheme: :bearer, origin_key: "gcp-proj-1", model: "m"}
+        )
+
+      assert bearer_cfg.provider_config.origin_key == "gcp-proj-1"
     end
   end
 
@@ -376,6 +517,53 @@ defmodule Alloy.Agent.ConfigTest do
           compaction: [summary_prompt: :bad]
         )
       end
+    end
+
+    test "accepts timeout_ms: :infinity to disable the run-level deadline" do
+      config = Config.from_opts(provider: Alloy.Provider.Test, timeout_ms: :infinity)
+      assert config.timeout_ms == :infinity
+    end
+
+    test "rejects nil and invalid core option values" do
+      for bad_opts <- [
+            [provider: nil],
+            [provider: false],
+            [provider: Alloy.Provider.Test, max_turns: nil],
+            [provider: Alloy.Provider.Test, max_turns: 0],
+            [provider: Alloy.Provider.Test, max_tokens: nil],
+            [provider: Alloy.Provider.Test, max_retries: -1],
+            [provider: Alloy.Provider.Test, retry_backoff_ms: -1],
+            [provider: Alloy.Provider.Test, timeout_ms: 0],
+            [provider: Alloy.Provider.Test, timeout_ms: :bad],
+            [provider: Alloy.Provider.Test, tool_timeout: 0],
+            [provider: Alloy.Provider.Test, tool_timeout: :infinity],
+            [provider: Alloy.Provider.Test, fallback_providers: [nil]]
+          ] do
+        assert_raise ArgumentError, fn -> Config.from_opts(bad_opts) end
+      end
+    end
+  end
+
+  describe "Inspect implementation" do
+    test "redacts provider_config, fallback_providers, and context" do
+      config =
+        Config.from_opts(
+          provider: {Alloy.Provider.Test, api_key: "sk-primary-secret"},
+          fallback_providers: [{Alloy.Provider.Test, api_key: "sk-fallback-secret"}],
+          context: %{db_password: "ctx-secret-password"},
+          max_turns: 9
+        )
+
+      inspected = inspect(config)
+
+      assert inspected =~ "#Alloy.Agent.Config<"
+      assert inspected =~ "max_turns: 9"
+      refute inspected =~ "sk-primary-secret"
+      refute inspected =~ "sk-fallback-secret"
+      refute inspected =~ "ctx-secret-password"
+      refute inspected =~ "provider_config:"
+      refute inspected =~ "fallback_providers:"
+      refute inspected =~ "context:"
     end
   end
 end

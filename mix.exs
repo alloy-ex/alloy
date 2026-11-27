@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.13.0"
+  @version "0.16.0"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -56,7 +56,7 @@ defmodule Alloy.MixProject do
   def application do
     [
       mod: {Alloy.Application, []},
-      extra_applications: [:logger]
+      extra_applications: [:logger, :crypto]
     ]
   end
 
@@ -75,6 +75,8 @@ defmodule Alloy.MixProject do
       {:mint, "~> 1.11"},
       {:jason, "~> 1.2"},
       {:telemetry, "~> 1.0"},
+      # Validation uses 0.11.x Ref/Root/get_fragment internals for local-only $ref
+      # preflight (lib/alloy/tool/validation.ex); re-verify before bumping to 0.12+.
       {:ex_json_schema, "~> 0.11.5", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
@@ -96,7 +98,11 @@ defmodule Alloy.MixProject do
       main: "Alloy",
       source_url: @source_url,
       source_ref: "v#{@version}",
+      skip_undefined_reference_warnings_on: ["CHANGELOG.md"],
       extras: [
+        "CHANGELOG.md",
+        "docs/upgrading-to-0.16.md",
+        "docs/upgrading-to-0.14.md",
         "docs/upgrading-to-0.13.md",
         "docs/events.md",
         "docs/provider-compatibility.md",
@@ -104,24 +110,28 @@ defmodule Alloy.MixProject do
         "docs/recipes/sub-agents.md",
         "docs/recipes/mcp-tools.md",
         "docs/recipes/code-mode.md",
+        "docs/recipes/llm-db-catalog.md",
         "docs/recipes/output-capture.md",
+        "docs/recipes/opentelemetry.md",
         "livebooks/quickstart.livemd"
       ],
       groups_for_extras: [
         Guides:
-          ~r{docs/(upgrading-to-0\.13|events|provider-compatibility|loop-controls)\.md|livebooks/.*},
+          ~r{docs/(upgrading-to-[^/]+|events|provider-compatibility|loop-controls)\.md|livebooks/.*},
         Recipes: ~r{docs/recipes/.*}
       ],
       groups_for_modules: [
         Core: [
           Alloy,
           Alloy.Agent.Config,
+          Alloy.Cancel,
           Alloy.Events,
           Alloy.ModelCatalog,
           Alloy.ModelMetadata,
           Alloy.Agent.State,
           Alloy.Agent.Turn,
           Alloy.Message,
+          Alloy.OutputSchema,
           Alloy.Result,
           Alloy.Transcript,
           Alloy.Usage
@@ -134,7 +144,9 @@ defmodule Alloy.MixProject do
           Alloy.Provider.Gemini,
           Alloy.Provider.OpenAI,
           Alloy.Provider.OpenAICompat,
+          Alloy.Provider.OpenAIStream,
           Alloy.Provider.Retry,
+          Alloy.Provider.SSE,
           Alloy.Provider.Test,
           Alloy.Provider.XAI
         ],

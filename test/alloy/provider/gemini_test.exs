@@ -279,6 +279,59 @@ defmodule Alloy.Provider.GeminiTest do
       end
     end
 
+    test "resolves tool_result names with latest-message and earliest-block precedence" do
+      messages = [
+        Message.assistant_blocks([
+          %{type: "tool_use", id: "dup", name: "old_tool", input: %{}},
+          %{type: "tool_use", id: "falsey_latest", name: "older_valid", input: %{}}
+        ]),
+        Message.assistant_blocks([
+          %{type: "tool_use", id: "dup", name: false, input: %{}},
+          %{type: "tool_use", id: "dup", name: "first_in_latest", input: %{}},
+          %{type: "tool_use", id: "dup", name: "second_in_latest", input: %{}},
+          %{type: "tool_use", id: "falsey_latest", name: false, input: %{}}
+        ]),
+        Message.tool_results([
+          Message.tool_result_block("dup", "ok"),
+          Message.tool_result_block("falsey_latest", "ok"),
+          Message.tool_result_block("missing", "ok")
+        ])
+      ]
+
+      Gemini.complete(messages, [], config_that_captures_request())
+      assert_received {:request_body, body}
+      response = body |> Jason.decode!() |> Map.fetch!("contents") |> List.last()
+
+      assert [
+               %{"functionResponse" => %{"id" => "dup", "name" => "first_in_latest"}},
+               %{"functionResponse" => %{"id" => "falsey_latest", "name" => "older_valid"}},
+               %{"functionResponse" => %{"id" => "missing", "name" => "unknown_tool"}}
+             ] = response["parts"]
+    end
+
+    test "preserves inlineData serialization for non-binary image/audio/video mime types while keeping binary guards on documents" do
+      messages = [
+        %Message{
+          role: :user,
+          content: [
+            Message.image(:"image/png", "YWJj"),
+            %{type: "audio", mime_type: :"audio/wav", data: "ZGVm"},
+            %{type: "document", mime_type: :"application/pdf", data: "Z2hp"}
+          ]
+        }
+      ]
+
+      Gemini.complete(messages, [], config_that_captures_request())
+      assert_received {:request_body, body}
+      [%{"parts" => parts}] = body |> Jason.decode!() |> Map.fetch!("contents")
+
+      assert [
+               %{"inlineData" => %{"mimeType" => "image/png", "data" => "YWJj"}},
+               %{"inlineData" => %{"mimeType" => "audio/wav", "data" => "ZGVm"}},
+               %{"text" => "[Unsupported content block for Gemini provider: \"document\"]"}
+             ] = parts
+    end
+
     test "formats thinking blocks back into Gemini thought parts" do
       config = config_that_captures_request()
 
@@ -327,6 +380,626 @@ defmodule Alloy.Provider.GeminiTest do
       refute Map.has_key?(second_call, "thoughtSignature")
       refute Enum.any?(results["parts"], &Map.has_key?(&1, "thoughtSignature"))
       assert [%{"thoughtSignature" => "sig_real"}] = second_step["parts"]
+    end
+
+    test "omits empty-map thoughtSignature on parse and falls back to placeholder on replay" do
+      parse_config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(
+              gemini_response([
+                %{
+                  "functionCall" => %{
+                    "id" => "call_empty_sig",
+                    "name" => "read",
+                    "args" => %{"path" => "a.ex"}
+                  },
+                  "thoughtSignature" => %{}
+                }
+              ])
+            )
+        })
+
+      assert {:ok, %{messages: [assistant_msg]}} =
+               Gemini.complete([Message.user("Read")], [], parse_config)
+
+      assert [%{type: "tool_use", id: "call_empty_sig", name: "read"} = parsed_block] =
+               assistant_msg.content
+
+      refute Map.has_key?(parsed_block, :signature)
+
+      replay_config = config_that_captures_request()
+
+      hand_built =
+        Message.assistant_blocks([
+          %{type: "tool_use", id: "call_hand", name: "read", input: %{}, signature: %{}}
+        ])
+
+      messages = [
+        Message.user("Read"),
+        assistant_msg,
+        Message.tool_results([Message.tool_result_block("call_empty_sig", "ok")]),
+        hand_built,
+        Message.tool_results([Message.tool_result_block("call_hand", "ok")])
+      ]
+
+      Gemini.complete(messages, [], replay_config)
+
+      assert_received {:request_body, body}
+      [_user, first_step, _r1, second_step, _r2] = Jason.decode!(body)["contents"]
+
+      assert [%{"thoughtSignature" => "skip_thought_signature_validator"}] = first_step["parts"]
+      assert [%{"thoughtSignature" => "skip_thought_signature_validator"}] = second_step["parts"]
+
+      # Empty list signatures are preserved (only nil and %{} are omitted, matching baseline).
+      list_sig_config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(
+              gemini_response([
+                %{"text" => "With list sig", "thoughtSignature" => []}
+              ])
+            )
+        })
+
+      assert {:ok, %{messages: [%Message{content: [%{type: "text", signature: []}]}]}} =
+               Gemini.complete([Message.user("Hi")], [], list_sig_config)
+    end
+
+    test "formats inline/file_id documents, image URLs, cached_content conflicts, native tools, and server-tool replay" do
+      # 1. :cached_content works with system_prompt and local Alloy tools (omitting
+      #    systemInstruction/tools from the wire body while still executing returned calls).
+      test_pid = self()
+      turn_counter = :atomics.new(1, signed: false)
+
+      cached_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:cached_req_body, body})
+        send(test_pid, {:cached_req_headers, conn.req_headers})
+
+        resp =
+          if :atomics.add_get(turn_counter, 1, 1) == 1 do
+            gemini_response([
+              %{
+                "functionCall" => %{"id" => "c1", "name" => "echo", "args" => %{}},
+                "thoughtSignature" => "sig_cached_1"
+              }
+            ])
+          else
+            gemini_response([%{"text" => "cached done"}])
+          end
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(resp))
+      end
+
+      echo_tool =
+        Alloy.Tool.inline(
+          name: "echo",
+          description: "Echo",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> {:ok, "ran locally"} end
+        )
+
+      assert {:ok, %{text: "cached done"}} =
+               Alloy.run("Hi",
+                 system_prompt: "Baked into cache",
+                 tools: [echo_tool],
+                 provider:
+                   {Gemini,
+                    api_key: fn -> {:ok, "adc-bearer-tok"} end,
+                    origin_key: "gem-acct-1",
+                    auth_scheme: :bearer,
+                    model: "gemini-3.8-flash",
+                    cached_content: "cachedContents/abc123",
+                    req_options: [plug: cached_plug]}
+               )
+
+      assert_received {:cached_req_body, cache_body}
+      assert_received {:cached_req_headers, headers}
+      assert {"authorization", "Bearer adc-bearer-tok"} in headers
+      refute Enum.any?(headers, fn {k, _} -> k == "x-goog-api-key" end)
+      decoded_cached = Jason.decode!(cache_body)
+      assert decoded_cached["cachedContent"] == "cachedContents/abc123"
+      refute Map.has_key?(decoded_cached, "systemInstruction")
+      refute Map.has_key?(decoded_cached, "tools")
+
+      # 2. :cached_content combined with explicit provider-level tool_config, native tools,
+      #    or extra_body tools fails fast; invalid :auth_scheme also fails fast.
+      cache_only =
+        config_that_captures_request()
+        |> Map.put(:cached_content, "cachedContents/abc123")
+
+      tool_defs = [
+        %{
+          name: "read",
+          description: "Read a file",
+          input_schema: %{type: "object", properties: %{}}
+        }
+      ]
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(cache_only, :tool_config, %{functionCallingConfig: %{mode: "AUTO"}})
+               )
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(cache_only, :google_search, true)
+               )
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(cache_only, :extra_body, %{"tools" => [%{"googleSearch" => %{}}]})
+               )
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(cache_only, :auth_scheme, :basic)
+               )
+
+      # 3. Combining native tools + custom functionDeclarations sets includeServerSideToolInvocations
+      #    and formats multimodal document/image blocks.
+      combined_config =
+        config_that_captures_request()
+        |> Map.merge(%{
+          google_search: true,
+          url_context: true,
+          code_execution: true
+        })
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            Message.image_url("https://example.com/pic.png", mime_type: "image/png"),
+            Message.document_data("application/pdf", "JVBERi0="),
+            Message.document_file(
+              "application/pdf",
+              "https://generativelanguage.googleapis.com/v1beta/files/gem-file-1"
+            )
+          ]
+        }
+      ]
+
+      assert {:ok, _} = Gemini.complete(messages, tool_defs, combined_config)
+      assert_received {:request_body, body}
+      decoded = Jason.decode!(body)
+
+      assert [
+               %{"functionDeclarations" => [%{"name" => "read"}]},
+               %{"googleSearch" => %{}},
+               %{"urlContext" => %{}},
+               %{"codeExecution" => %{}}
+             ] = decoded["tools"]
+
+      assert decoded["toolConfig"] == %{"includeServerSideToolInvocations" => true}
+
+      [%{"parts" => [img, doc_data, doc_file]}] = decoded["contents"]
+
+      assert img == %{
+               "fileData" => %{
+                 "fileUri" => "https://example.com/pic.png",
+                 "mimeType" => "image/png"
+               }
+             }
+
+      assert doc_data == %{
+               "inlineData" => %{"mimeType" => "application/pdf", "data" => "JVBERi0="}
+             }
+
+      assert doc_file == %{
+               "fileData" => %{
+                 "mimeType" => "application/pdf",
+                 "fileUri" => "https://generativelanguage.googleapis.com/v1beta/files/gem-file-1"
+               }
+             }
+
+      # 4. Multi-turn round-trip of executableCode, codeExecutionResult, toolCall, and toolResponse
+      #    with thoughtSignature preserved verbatim across both complete/3 and stream/4.
+      exec_part = %{
+        "executableCode" => %{"language" => "PYTHON", "code" => "print(2 + 2)"},
+        "thoughtSignature" => "sig_exec_1"
+      }
+
+      exec_result = %{
+        "codeExecutionResult" => %{"outcome" => "OUTCOME_OK", "output" => "4\n"}
+      }
+
+      server_call = %{
+        "toolCall" => %{"toolType" => "GOOGLE_SEARCH", "args" => %{"q" => "elixir"}},
+        "thoughtSignature" => "sig_srv_1"
+      }
+
+      server_resp = %{
+        "toolResponse" => %{"toolType" => "GOOGLE_SEARCH", "response" => %{"hits" => 1}}
+      }
+
+      resp_cfg =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(
+              gemini_response([
+                exec_part,
+                exec_result,
+                server_call,
+                server_resp,
+                %{"text" => "4"}
+              ])
+            )
+        })
+
+      assert {:ok, %{messages: [asst_msg]}} =
+               Gemini.complete([Message.user("2+2?")], [], resp_cfg)
+
+      assert [
+               %{type: "gemini_part", raw: ^exec_part},
+               %{type: "gemini_part", raw: ^exec_result},
+               %{type: "gemini_part", raw: ^server_call},
+               %{type: "gemini_part", raw: ^server_resp},
+               %{type: "text", text: "4"}
+             ] = asst_msg.content
+
+      # Replay on the next turn preserves all 4 raw parts and their signatures verbatim.
+      assert {:ok, _} =
+               Gemini.complete(
+                 [Message.user("2+2?"), asst_msg, Message.user("Again")],
+                 [],
+                 config_that_captures_request()
+               )
+
+      assert_received {:request_body, replay_body}
+      [_u1, model_turn, _u2] = Jason.decode!(replay_body)["contents"]
+
+      assert [^exec_part, ^exec_result, ^server_call, ^server_resp, %{"text" => "4"}] =
+               model_turn["parts"]
+
+      # Streaming path also preserves gemini_part blocks verbatim.
+      stream_cfg =
+        config_with_sse_stream([
+          sse_chunk(gemini_response([exec_part, exec_result], nil)),
+          sse_chunk(gemini_response([%{"text" => "4"}]))
+        ])
+
+      assert {:ok, %{messages: [streamed_asst]}} =
+               Gemini.stream([Message.user("2+2?")], [], stream_cfg, fn _ -> :ok end)
+
+      assert [
+               %{type: "gemini_part", raw: ^exec_part},
+               %{type: "gemini_part", raw: ^exec_result},
+               %{type: "text", text: "4"}
+             ] = streamed_asst.content
+    end
+
+    test "rejects AUTO functionCallingConfig with combined native tools and scopes top-level code_execution to Anthropic" do
+      key_called = :atomics.new(1, signed: false)
+
+      tool_defs = [
+        %{name: "read", description: "Read", input_schema: %{type: "object", properties: %{}}}
+      ]
+
+      conflict_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          api_key: fn ->
+            :atomics.add_get(key_called, 1, 1)
+            {:ok, "should-not-run"}
+          end,
+          google_search: true,
+          tool_config: %{functionCallingConfig: %{mode: "AUTO"}}
+        })
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request, message: msg}} =
+               Gemini.complete([Message.user("Hi")], tool_defs, conflict_cfg)
+
+      assert msg =~ "AUTO"
+      assert :atomics.get(key_called, 1) == 0
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Gemini.stream([Message.user("Hi")], tool_defs, conflict_cfg, fn _ -> :ok end)
+
+      # Snake_case function_calling_config AUTO mode is also rejected.
+      snake_conflict_cfg =
+        Map.put(conflict_cfg, :tool_config, %{function_calling_config: %{mode: "AUTO"}})
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request, message: snake_msg}} =
+               Gemini.complete([Message.user("Hi")], tool_defs, snake_conflict_cfg)
+
+      assert snake_msg =~ "AUTO"
+
+      # Gemini.stream/4 resolves dynamic :api_key on the success path.
+      test_pid = self()
+
+      dyn_stream_plug = fn conn ->
+        send(test_pid, {:gem_stream_headers, conn.req_headers})
+
+        sse =
+          "data: " <>
+            Jason.encode!(%{
+              "candidates" => [
+                %{
+                  "content" => %{"role" => "model", "parts" => [%{"text" => "streamed"}]},
+                  "finishReason" => "STOP"
+                }
+              ],
+              "usageMetadata" => %{"promptTokenCount" => 1, "candidatesTokenCount" => 1}
+            }) <> "\n\n"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{messages: [stream_msg]}} =
+               Gemini.stream(
+                 [Message.user("Hi")],
+                 [],
+                 %{
+                   api_key: fn -> {:ok, "dyn-gem-stream-key"} end,
+                   model: "gemini-2.5-flash",
+                   req_options: [plug: dyn_stream_plug]
+                 },
+                 fn _ -> :ok end
+               )
+
+      assert Message.text(stream_msg) == "streamed"
+      assert_received {:gem_stream_headers, gsh}
+      assert {"x-goog-api-key", "dyn-gem-stream-key"} in gsh
+
+      # VALIDATED mode succeeds alongside native + custom tools.
+      valid_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          google_search: true,
+          tool_config: %{functionCallingConfig: %{mode: "VALIDATED"}}
+        })
+
+      assert {:ok, _} = Gemini.complete([Message.user("Hi")], tool_defs, valid_cfg)
+      assert_received {:request_body, valid_body}
+
+      assert Jason.decode!(valid_body)["toolConfig"] == %{
+               "functionCallingConfig" => %{"mode" => "VALIDATED"},
+               "includeServerSideToolInvocations" => true
+             }
+
+      # Snake_case include_server_side_tool_invocations is respected without adding a duplicate camelCase key,
+      # and unsupported image URL schemes degrade gracefully to text notices while gs:// is kept.
+      snake_opt_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          google_search: true,
+          tool_config: %{include_server_side_tool_invocations: false}
+        })
+
+      img_msgs = [
+        %Message{
+          role: :user,
+          content: [
+            Message.image_url("gs://my-bucket/photo.png", mime_type: "image/png"),
+            Message.image_url("file:///etc/passwd")
+          ]
+        }
+      ]
+
+      assert {:ok, _} = Gemini.complete(img_msgs, tool_defs, snake_opt_cfg)
+      assert_received {:request_body, snake_opt_body}
+      assert_received {:request_headers, _}
+      decoded_snake = Jason.decode!(snake_opt_body)
+
+      assert decoded_snake["toolConfig"] == %{"include_server_side_tool_invocations" => false}
+
+      [%{"parts" => [gs_part, bad_scheme_part]}] = decoded_snake["contents"]
+
+      assert gs_part == %{
+               "fileData" => %{
+                 "fileUri" => "gs://my-bucket/photo.png",
+                 "mimeType" => "image/png"
+               }
+             }
+
+      assert bad_scheme_part == %{"text" => "[Unsupported image URL scheme for Gemini provider]"}
+
+      # Top-level Alloy.run code_execution: true does not activate Gemini codeExecution.
+      gem_cfg = config_that_captures_request()
+
+      assert {:ok, _} =
+               Alloy.run("Hi",
+                 provider: {Gemini, gem_cfg},
+                 code_execution: true
+               )
+
+      assert_received {:request_body, top_body}
+      refute Map.has_key?(Jason.decode!(top_body), "tools")
+    end
+
+    test "binds unattributed Gemini File API URI to the Gemini fallback account that handled it" do
+      test_pid = self()
+      gem_uri = "https://generativelanguage.googleapis.com/v1beta/files/acct-a-doc"
+
+      gem_a_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:gem_a_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(gemini_response([%{"text" => "from gem A"}])))
+      end
+
+      gem_b_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:gem_b_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(gemini_response([%{"text" => "from gem B"}])))
+      end
+
+      user_msg = %Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Summarize"},
+          Message.document("application/pdf", gem_uri)
+        ]
+      }
+
+      gem_a_cfg = %{
+        api_key: "gem-acct-a",
+        model: "gemini-2.5-flash",
+        req_options: [plug: gem_a_plug]
+      }
+
+      # 1. Anthropic primary fails -> Gemini Account A fallback handles the URI and binds its origin.
+      assert {:ok, res_a} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: fn -> {:error, :auth_failed} end,
+                    origin_key: "ant-primary",
+                    model: "claude-sonnet-5-5"},
+                 fallback_providers: [{Gemini, gem_a_cfg}],
+                 max_retries: 0
+               )
+
+      assert res_a.text == "from gem A"
+      assert_received {:gem_a_body, body_a}
+      assert body_a =~ gem_uri
+
+      gem_a_origin = Message.origin(Gemini, gem_a_cfg)
+      [persisted_user | _] = res_a.messages
+      assert [_, %{uri: ^gem_uri, origin: ^gem_a_origin}] = persisted_user.content
+
+      # 2. Resuming on Gemini Account B omits Account A's URI instead of sending it.
+      assert {:ok, res_b} =
+               Alloy.run("Follow up",
+                 messages: res_a.messages,
+                 provider:
+                   {Gemini,
+                    api_key: "gem-acct-b",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_b_plug]},
+                 max_retries: 0
+               )
+
+      assert res_b.text == "from gem B"
+      assert_received {:gem_b_body, body_b}
+      refute body_b =~ gem_uri
+      assert body_b =~ "Omitted provider-specific file attachment"
+
+      # 3. Resuming on the same Gemini Account A preserves the URI intact.
+      assert {:ok, _} =
+               Alloy.run("Follow up on A",
+                 messages: res_a.messages,
+                 provider: {Gemini, gem_a_cfg},
+                 max_retries: 0
+               )
+
+      assert_received {:gem_a_body, body_a_resumed}
+      assert body_a_resumed =~ gem_uri
+
+      # 4. Within a single fallback chain (Anthropic fails -> Gemini A fails -> Gemini B succeeds),
+      #    Gemini B does not receive Account A's URI, res_chain.messages retains A's origin (NOT B's),
+      #    and resuming res_chain.messages on Gemini B still omits Account A's URI.
+      gem_a_fail_plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          500,
+          Jason.encode!(%{"error" => %{"status" => "INTERNAL", "message" => "boom"}})
+        )
+      end
+
+      assert {:ok, res_chain} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: fn -> {:error, :auth_failed} end,
+                    origin_key: "ant-primary",
+                    model: "claude-sonnet-5-5"},
+                 fallback_providers: [
+                   {Gemini,
+                    api_key: "gem-acct-a",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_a_fail_plug]},
+                   {Gemini,
+                    api_key: "gem-acct-b",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_b_plug]}
+                 ],
+                 max_retries: 0
+               )
+
+      assert res_chain.text == "from gem B"
+      assert_received {:gem_b_body, body_b_chain}
+      refute body_b_chain =~ gem_uri
+
+      [chain_user | _] = res_chain.messages
+      assert [_, %{uri: ^gem_uri, origin: ^gem_a_origin}] = chain_user.content
+
+      assert {:ok, _} =
+               Alloy.run("Resume after chain",
+                 messages: res_chain.messages,
+                 provider:
+                   {Gemini,
+                    api_key: "gem-acct-b",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_b_plug]},
+                 max_retries: 0
+               )
+
+      assert_received {:gem_b_body, body_b_chain_resumed}
+      refute body_b_chain_resumed =~ gem_uri
+      assert body_b_chain_resumed =~ "Omitted provider-specific file attachment"
+
+      # 5. Exhausted fallback chain (Anthropic fails -> Gemini A fails) still persists
+      #    Account A's origin on failed.messages so resuming on Gemini B omits A's URI.
+      assert {:error, failed_chain} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: fn -> {:error, :auth_failed} end,
+                    origin_key: "ant-primary",
+                    model: "claude-sonnet-5-5"},
+                 fallback_providers: [
+                   {Gemini,
+                    api_key: "gem-acct-a",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_a_fail_plug]}
+                 ],
+                 max_retries: 0
+               )
+
+      [failed_user | _] = failed_chain.messages
+      assert [_, %{uri: ^gem_uri, origin: ^gem_a_origin}] = failed_user.content
+
+      assert {:ok, _} =
+               Alloy.run("Resume after failure",
+                 messages: failed_chain.messages,
+                 provider:
+                   {Gemini,
+                    api_key: "gem-acct-b",
+                    model: "gemini-2.5-flash",
+                    req_options: [plug: gem_b_plug]},
+                 max_retries: 0
+               )
+
+      assert_received {:gem_b_body, body_b_after_fail}
+      refute body_b_after_fail =~ gem_uri
+      assert body_b_after_fail =~ "Omitted provider-specific file attachment"
     end
   end
 
@@ -666,7 +1339,165 @@ defmodule Alloy.Provider.GeminiTest do
     test "a body that is not JSON is a provider error" do
       config = config_with_response(%{status: 200, body: "<html>proxy error</html>"})
 
-      assert {:error, %Error{kind: :unknown}} = Gemini.complete([Message.user("Hi")], [], config)
+      assert {:error, %Error{kind: :malformed_reply}} =
+               Gemini.complete([Message.user("Hi")], [], config)
+    end
+
+    test "returns :unknown error for pre-decoded non-map HTTP 200 JSON bodies" do
+      for raw_json <- ["[]", "123", "true", "null"] do
+        plug = fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(200, raw_json)
+        end
+
+        config = %{
+          api_key: "gem-test-key",
+          model: "gemini-2.5-flash",
+          req_options: [plug: plug, retry: false, decode_body: true]
+        }
+
+        assert {:error, %Error{kind: :unknown, message: message}} =
+                 Gemini.complete([Message.user("Hi")], [], config)
+
+        assert message =~ "Unexpected Gemini response payload"
+      end
+    end
+
+    test "omits empty-map finishReason and finishMessage metadata" do
+      payload = %{
+        "candidates" => [
+          %{
+            "content" => %{"parts" => [%{"text" => "ok"}]},
+            "finishReason" => %{},
+            "finishMessage" => %{}
+          }
+        ]
+      }
+
+      assert {:ok, %{response_metadata: metadata}} = complete_with(payload)
+      refute Map.has_key?(metadata, :finish_reason)
+      refute Map.has_key?(metadata, :finish_message)
+    end
+
+    test "rejects cut-off stream with null finishReason and supports extra_body" do
+      chunk = %{
+        "candidates" => [
+          %{"content" => %{"parts" => [%{"text" => "half"}]}, "finishReason" => nil}
+        ]
+      }
+
+      Req.Test.stub(:gemini_null_finish, fn conn ->
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        body = Jason.decode!(raw)
+        assert body["cachedContent"] == "cachedContents/123"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, "data: #{Jason.encode!(chunk)}\n\n")
+      end)
+
+      config = %{
+        api_key: "k",
+        model: "models/gemini-3.8-flash",
+        extra_body: %{cachedContent: "cachedContents/123"},
+        req_options: [plug: {Req.Test, :gemini_null_finish}]
+      }
+
+      assert {:error, %Error{kind: :network}} =
+               Gemini.stream([Message.user("hi")], [], config, fn _ -> :ok end)
+    end
+
+    test "classifies undecodable SSE chunk as :malformed_reply while prioritizing in-band API errors" do
+      bad_then_good =
+        "data: {not-valid-json\n\n" <>
+          "data: #{Jason.encode!(%{"candidates" => [%{"content" => %{"parts" => [%{"text" => "ok"}]}, "finishReason" => "STOP"}]})}\n\n"
+
+      Req.Test.stub(:gemini_malformed_chunk, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, bad_then_good)
+      end)
+
+      config = %{
+        api_key: "k",
+        model: "models/gemini-3.8-flash",
+        req_options: [plug: {Req.Test, :gemini_malformed_chunk}]
+      }
+
+      assert {:error, %Error{kind: :malformed_reply}} =
+               Gemini.stream([Message.user("hi")], [], config, fn _ -> :ok end)
+
+      bad_and_api_error =
+        "data: {not-valid-json\n\n" <>
+          "data: #{Jason.encode!(%{"error" => %{"code" => 429, "status" => "RESOURCE_EXHAUSTED", "message" => "quota"}})}\n\n"
+
+      Req.Test.stub(:gemini_inband_over_malformed, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, bad_and_api_error)
+      end)
+
+      assert {:error, %Error{kind: :rate_limited, status: 429}} =
+               Gemini.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{config | req_options: [plug: {Req.Test, :gemini_inband_over_malformed}]},
+                 fn _ -> :ok end
+               )
+
+      # Non-map JSON (data: null) also yields to a later in-band API error.
+      null_then_api_error =
+        "data: null\n\n" <>
+          "data: #{Jason.encode!(%{"error" => %{"code" => 429, "status" => "RESOURCE_EXHAUSTED", "message" => "quota"}})}\n\n"
+
+      Req.Test.stub(:gemini_null_then_api_error, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, null_then_api_error)
+      end)
+
+      assert {:error, %Error{kind: :rate_limited, status: 429}} =
+               Gemini.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{config | req_options: [plug: {Req.Test, :gemini_null_then_api_error}]},
+                 fn _ -> :ok end
+               )
+
+      # Malformed first chunk suppresses stale text deltas so Retry can recover on attempt 2.
+      test_pid = self()
+      attempts = :atomics.new(1, signed: false)
+
+      good_stream =
+        "data: #{Jason.encode!(%{"candidates" => [%{"content" => %{"parts" => [%{"text" => "recovered"}]}, "finishReason" => "STOP"}]})}\n\n"
+
+      Req.Test.stub(:gemini_retry_after_malformed, fn conn ->
+        attempt = :atomics.add_get(attempts, 1, 1)
+        body = if attempt == 1, do: bad_then_good, else: good_stream
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, body)
+      end)
+
+      assert {:ok, result} =
+               Alloy.stream(
+                 "hi",
+                 fn chunk -> send(test_pid, {:chunk, chunk}) end,
+                 provider:
+                   {Gemini,
+                    api_key: "k",
+                    model: "models/gemini-3.8-flash",
+                    req_options: [plug: {Req.Test, :gemini_retry_after_malformed}]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0
+               )
+
+      assert :atomics.get(attempts, 1) == 2
+      assert result.text == "recovered"
+      assert_received {:chunk, "recovered"}
+      refute_received {:chunk, "ok"}
     end
   end
 
@@ -712,6 +1543,172 @@ defmodule Alloy.Provider.GeminiTest do
       assert_received {:request_body, body}
       [_user, model, _again] = Jason.decode!(body)["contents"]
       assert model["parts"] == [%{"text" => "Hello"}]
+    end
+  end
+
+  describe "malformed candidate, error, and usage hardening" do
+    test "stream records sticky :protocol_error on malformed content/parts/candidates and suppresses later text" do
+      for {label, bad_chunk} <- [
+            {"false content", %{"candidates" => [%{"content" => false}]}},
+            {"non-list parts", %{"candidates" => [%{"content" => %{"parts" => "bad"}}]}},
+            {"non-map part", %{"candidates" => [%{"content" => %{"parts" => ["bad"]}}]}},
+            {"non-map candidate", %{"candidates" => ["bad"]}},
+            {"non-list candidates", %{"candidates" => "bad"}},
+            {"bad functionCall args",
+             %{
+               "candidates" => [
+                 %{
+                   "content" => %{
+                     "parts" => [%{"functionCall" => %{"name" => "f", "args" => "x"}}]
+                   }
+                 }
+               ]
+             }}
+          ] do
+        test_pid = self()
+
+        chunks = [
+          sse_chunk(%{"candidates" => [%{"content" => %{"parts" => [%{"text" => "prefix"}]}}]}),
+          sse_chunk(bad_chunk),
+          sse_chunk(%{
+            "candidates" => [
+              %{"content" => %{"parts" => [%{"text" => "suppressed"}]}, "finishReason" => "STOP"}
+            ]
+          })
+        ]
+
+        config = config_with_sse_stream(chunks)
+
+        assert {:error, %Error{kind: :protocol_error}} =
+                 Gemini.stream([Message.user("Hi")], [], config, fn text ->
+                   send(test_pid, {:chunk, label, text})
+                   :ok
+                 end)
+
+        assert_received {:chunk, ^label, "prefix"}
+        refute_received {:chunk, ^label, "suppressed"}
+      end
+    end
+
+    test "complete/3 returns :protocol_error on malformed candidate, content, parts, or functionCall" do
+      for payload <- [
+            %{"candidates" => ["bad"]},
+            %{"candidates" => "bad"},
+            %{"candidates" => [%{"content" => false, "finishReason" => "STOP"}]},
+            %{"candidates" => [%{"content" => %{"parts" => "bad"}, "finishReason" => "STOP"}]},
+            %{"candidates" => [%{"content" => %{"parts" => ["bad"]}, "finishReason" => "STOP"}]},
+            %{
+              "candidates" => [
+                %{
+                  "content" => %{
+                    "parts" => [%{"functionCall" => %{"name" => "f", "args" => 123}}]
+                  },
+                  "finishReason" => "STOP"
+                }
+              ]
+            }
+          ] do
+        assert {:error, %Error{kind: :protocol_error}} = complete_with(payload)
+      end
+    end
+
+    test "ignores error: null and preserves list-wrapped in-band API error classification" do
+      assert {:ok, %{stop_reason: :end_turn}} =
+               stream_with([
+                 %{
+                   "error" => nil,
+                   "candidates" => [
+                     %{"content" => %{"parts" => [%{"text" => "ok"}]}, "finishReason" => "STOP"}
+                   ],
+                   "usageMetadata" => %{"promptTokenCount" => "bad", "candidatesTokenCount" => 3}
+                 }
+               ])
+
+      list_error =
+        "data: " <>
+          Jason.encode!([
+            %{
+              "error" => %{
+                "code" => 429,
+                "status" => "RESOURCE_EXHAUSTED",
+                "message" => "Quota exceeded"
+              }
+            }
+          ]) <> "\n\n"
+
+      config =
+        config_with_sse_stream([
+          sse_chunk(%{"candidates" => [%{"content" => false}]}),
+          list_error
+        ])
+
+      assert {:error, %Error{kind: :rate_limited, message: "Quota exceeded"}} =
+               Gemini.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+    end
+
+    test "malformed SSE JSON error does not leak raw chunk payload into error message" do
+      config = config_with_sse_stream(["data: {not json SECRET_GEMINI_CHUNK_PAYLOAD\n\n"])
+
+      assert {:error, %Error{kind: :malformed_reply, message: msg}} =
+               Gemini.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+
+      assert msg =~ "Malformed JSON in Gemini SSE chunk"
+      refute msg =~ "SECRET_GEMINI_CHUNK_PAYLOAD"
+    end
+
+    test "tolerates non-map usageMetadata and non-integer counts in complete/3 and stream/4" do
+      assert {:ok, %{usage: %{input_tokens: 0, output_tokens: 0}}} =
+               complete_with(%{
+                 "candidates" => [
+                   %{"content" => %{"parts" => [%{"text" => "ok"}]}, "finishReason" => "STOP"}
+                 ],
+                 "usageMetadata" => "not-a-map"
+               })
+
+      assert {:ok, %{usage: %{input_tokens: 10, output_tokens: 0}}} =
+               stream_with([
+                 %{
+                   "candidates" => [%{"content" => %{"parts" => [%{"text" => "ok"}]}}],
+                   "usageMetadata" => "not-a-map"
+                 },
+                 %{
+                   "candidates" => [%{"finishReason" => "STOP"}],
+                   "usageMetadata" => %{
+                     "promptTokenCount" => 10,
+                     "candidatesTokenCount" => "bad"
+                   }
+                 },
+                 %{
+                   "usageMetadata" => %{"promptTokenCount" => nil}
+                 }
+               ])
+    end
+
+    test "complete/3 prioritizes explicit API errors over malformed or present candidates" do
+      assert {:error, %Error{kind: :auth, status: 403, type: "PERMISSION_DENIED"}} =
+               complete_with(%{
+                 "candidates" => false,
+                 "error" => %{
+                   "code" => 403,
+                   "status" => "PERMISSION_DENIED",
+                   "message" => "denied"
+                 }
+               })
+
+      assert {:error, %Error{kind: :rate_limited, status: 429}} =
+               complete_with(%{
+                 "candidates" => [
+                   %{
+                     "content" => %{"parts" => [%{"text" => "partial"}]},
+                     "finishReason" => "STOP"
+                   }
+                 ],
+                 "error" => %{
+                   "code" => 429,
+                   "status" => "RESOURCE_EXHAUSTED",
+                   "message" => "Quota exceeded"
+                 }
+               })
     end
   end
 

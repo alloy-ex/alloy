@@ -3,9 +3,23 @@ defmodule Alloy.Provider.OpenAITest do
 
   import Alloy.StreamTestHelpers
 
+  alias Alloy.Agent.State
   alias Alloy.Message
   alias Alloy.Provider.Error
   alias Alloy.Provider.OpenAI
+  alias Alloy.Provider.OpenAI.JSONPrefix
+  alias Alloy.Provider.OpenAI.Stream, as: ResponsesStream
+
+  defmodule SwitchToOpenAIMiddleware do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:before_completion, %{turn: 1} = state) do
+      State.prepare(state, provider: state.config.context.next_provider)
+    end
+
+    def call(_hook, state), do: state
+  end
 
   describe "complete/3 with text response" do
     test "returns normalized end_turn response" do
@@ -706,8 +720,10 @@ defmodule Alloy.Provider.OpenAITest do
             )
         })
 
-      assert {:error, reason} = OpenAI.complete([Message.user("Hi")], [], config)
-      assert reason =~ "Invalid JSON"
+      assert {:error, %Alloy.Provider.Error{kind: :malformed_reply} = reason} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert Exception.message(reason) =~ "Invalid JSON"
     end
   end
 
@@ -748,6 +764,146 @@ defmodule Alloy.Provider.OpenAITest do
       assert result.stop_reason == :end_turn
       assert result.usage.input_tokens == 0
       assert result.usage.output_tokens == 0
+    end
+  end
+
+  describe "complete/3 edge-case preservation" do
+    test "returns :unknown error for pre-decoded non-map HTTP 200 JSON bodies" do
+      for raw_json <- ["[]", "123", "true", "null"] do
+        plug = fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(200, raw_json)
+        end
+
+        config = %{
+          api_key: "sk-test-key",
+          model: "gpt-5.2",
+          req_options: [plug: plug, retry: false, decode_body: true]
+        }
+
+        assert {:error, %Alloy.Provider.Error{kind: :unknown, message: message}} =
+                 OpenAI.complete([Message.user("Hi")], [], config)
+
+        assert message =~ "Unexpected OpenAI response payload"
+      end
+    end
+
+    test "omits empty-list request options and stop_details" do
+      config =
+        config_that_captures_request()
+        |> Map.merge(%{
+          max_tokens: [],
+          previous_response_id: [],
+          store: [],
+          parallel_tool_calls: []
+        })
+
+      assert {:ok, _} = OpenAI.complete([Message.user("Hi")], [], config)
+      assert_received {:request_body, raw_body}
+      decoded = Jason.decode!(raw_body)
+
+      refute Map.has_key?(decoded, "max_output_tokens")
+      refute Map.has_key?(decoded, "previous_response_id")
+      refute Map.has_key?(decoded, "store")
+      refute Map.has_key?(decoded, "parallel_tool_calls")
+
+      resp_config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "resp_inc",
+              "status" => "incomplete",
+              "incomplete_details" => [],
+              "output" => [assistant_text_item("partial")],
+              "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+            })
+        })
+
+      assert {:ok, %{response_metadata: metadata}} =
+               OpenAI.complete([Message.user("Hi")], [], resp_config)
+
+      refute Map.has_key?(metadata, :stop_details)
+    end
+
+    test "retains map-valued arguments on truncated Responses function calls" do
+      config =
+        config_with_response(%{
+          status: 200,
+          body:
+            Jason.encode!(%{
+              "id" => "resp_trunc",
+              "status" => "incomplete",
+              "incomplete_details" => %{"reason" => "max_output_tokens"},
+              "output" => [
+                %{
+                  "type" => "function_call",
+                  "call_id" => "call_1",
+                  "name" => "search",
+                  "arguments" => %{"q" => "kept"}
+                }
+              ],
+              "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+            })
+        })
+
+      assert {:ok,
+              %{
+                stop_reason: :max_tokens,
+                messages: [
+                  %Message{
+                    content: [%{type: "tool_use", id: "call_1", name: "search", input: input}]
+                  }
+                ]
+              }} = OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert input == %{"q" => "kept"}
+    end
+
+    test "accepts pre-decoded struct-valued arguments in normal and truncated Responses calls" do
+      defmodule StructArgsAdapter do
+        def run(req) do
+          [status] = Req.Request.get_header(req, "x-test-status")
+
+          body = %{
+            "id" => "resp_struct",
+            "status" => status,
+            "output" => [
+              %{
+                "type" => "function_call",
+                "call_id" => "call_uri",
+                "name" => "fetch",
+                "arguments" => URI.parse("https://example.com")
+              }
+            ],
+            "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+          }
+
+          {req, Req.Response.new(status: 200, body: body)}
+        end
+      end
+
+      uri = URI.parse("https://example.com")
+
+      for {status, expected_stop} <- [{"completed", :tool_use}, {"incomplete", :max_tokens}] do
+        config = %{
+          api_key: "sk-test-key",
+          model: "gpt-5.2",
+          extra_headers: [{"x-test-status", status}],
+          req_options: [adapter: StructArgsAdapter, retry: false]
+        }
+
+        assert {:ok,
+                %{
+                  stop_reason: ^expected_stop,
+                  messages: [
+                    %Message{
+                      content: [%{type: "tool_use", id: "call_uri", name: "fetch", input: ^uri}]
+                    }
+                  ]
+                }} = OpenAI.complete([Message.user("Hi")], [], config)
+      end
     end
   end
 
@@ -1121,6 +1277,645 @@ defmodule Alloy.Provider.OpenAITest do
       decoded = Jason.decode!(body)
       assert decoded["stream"] == true
       assert is_list(decoded["input"])
+    end
+
+    test "rejects non-object tool arguments and non-map SSE payloads with :malformed_reply" do
+      for bad_args <- ["null", "false", "[]"] do
+        body = [function_call_item("call_1", "read", bad_args)] |> response_payload()
+        config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 OpenAI.complete([Message.user("Hi")], [], config)
+      end
+
+      for {bad_sse, expected_kind} <- [
+            {"data: null\n\n", :protocol_error},
+            {"data: 123\n\n", :protocol_error},
+            {"data: {broken\n\n", :malformed_reply}
+          ] do
+        config =
+          config_with_sse_stream([
+            bad_sse,
+            sse_response_completed([assistant_text_item("ok")]),
+            "data: [DONE]\n\n"
+          ])
+
+        assert {:error, %Error{kind: ^expected_kind}} =
+                 OpenAI.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
+      end
+
+      # In-band API error after a malformed chunk takes precedence, and text deltas are suppressed.
+      test_pid = self()
+
+      config =
+        config_with_sse_stream([
+          "data: {broken\n\n",
+          sse_response_output_text_delta("stale text"),
+          sse_response_event("error", %{
+            "type" => "error",
+            "code" => "rate_limit_exceeded",
+            "message" => "Slow down"
+          })
+        ])
+
+      assert {:error, %Error{kind: :rate_limited, code: "rate_limit_exceeded"}} =
+               OpenAI.stream([Message.user("Hi")], [], config, fn chunk ->
+                 send(test_pid, {:chunk, chunk})
+               end)
+
+      refute_received {:chunk, _}
+    end
+
+    test "rejects function_call items missing non-empty id or name with :protocol_error" do
+      for bad_item <- [
+            %{"type" => "function_call", "name" => "read", "arguments" => "{}"},
+            %{"type" => "function_call", "call_id" => "", "name" => "read", "arguments" => "{}"},
+            %{"type" => "function_call", "call_id" => "call_1", "arguments" => "{}"},
+            %{"type" => "function_call", "call_id" => "call_1", "name" => "", "arguments" => "{}"}
+          ] do
+        body = response_payload([bad_item])
+        config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+        assert {:error, %Error{kind: :protocol_error}} =
+                 OpenAI.complete([Message.user("Hi")], [], config)
+      end
+    end
+
+    test "incomplete max_output_tokens truncations abandon cleanly without retrying, and content_filter drops partial calls" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "read",
+          description: "read",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :openai_truncated_tool_ran)
+            {:ok, "nope"}
+          end
+        )
+
+      incomplete_body = %{
+        "id" => "resp_trunc",
+        "object" => "response",
+        "status" => "incomplete",
+        "incomplete_details" => %{"reason" => "max_output_tokens"},
+        "output" => [
+          %{"type" => "function_call", "arguments" => "{\"file_path\":\"cut_off"}
+        ],
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 5}
+      }
+
+      Req.Test.stub(:openai_incomplete_truncated_tool, fn conn ->
+        send(test_pid, :openai_incomplete_hit)
+        Req.Test.json(conn, incomplete_body)
+      end)
+
+      assert {:error, result} =
+               Alloy.run("read it",
+                 provider:
+                   {OpenAI,
+                    api_key: "sk-test",
+                    model: "gpt-5.4",
+                    req_options: [plug: {Req.Test, :openai_incomplete_truncated_tool}]},
+                 tools: [tool],
+                 max_retries: 2,
+                 retry_backoff_ms: 0
+               )
+
+      assert result.status == :error
+      assert result.error =~ "max_tokens"
+      assert_received :openai_incomplete_hit
+      refute_received :openai_incomplete_hit
+      refute_received :openai_truncated_tool_ran
+      assert :ok == Alloy.Transcript.validate(result.messages)
+
+      refusal_body = %{
+        "id" => "resp_refusal",
+        "object" => "response",
+        "status" => "incomplete",
+        "incomplete_details" => %{"reason" => "content_filter"},
+        "output" => [
+          %{"type" => "function_call", "arguments" => "{broken"}
+        ],
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 0}
+      }
+
+      config = config_with_response(%{status: 200, body: Jason.encode!(refusal_body)})
+
+      assert {:ok, %{stop_reason: :refusal, messages: [%Message{content: []}]}} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+    end
+
+    test "preserves explicitly empty map metadata and omits empty list metadata and request fields" do
+      body = %{
+        "id" => "resp_empty_meta",
+        "object" => "response",
+        "status" => "incomplete",
+        "incomplete_details" => %{},
+        "citations" => [],
+        "server_side_tool_usage" => %{},
+        "output" => [assistant_text_item("partial")],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 2}
+      }
+
+      config = config_with_response(%{status: 200, body: Jason.encode!(body)})
+
+      assert {:ok, %{response_metadata: metadata}} =
+               OpenAI.complete([Message.user("Hi")], [], config)
+
+      assert metadata == %{server_side_tool_usage: %{}, stop_details: %{}}
+
+      # Confirm the symmetric case: empty map citations survives while empty list usage is omitted.
+      symmetric_body =
+        body
+        |> Map.put("citations", %{})
+        |> Map.put("server_side_tool_usage", [])
+
+      symmetric_config = config_with_response(%{status: 200, body: Jason.encode!(symmetric_body)})
+
+      assert {:ok, %{response_metadata: symmetric_metadata}} =
+               OpenAI.complete([Message.user("Hi")], [], symmetric_config)
+
+      assert symmetric_metadata == %{citations: %{}, stop_details: %{}}
+
+      # Optional request fields and replayed assistant phase follow the same nil/[]-only rule.
+      capture_config =
+        config_that_captures_request()
+        |> Map.put(:store, true)
+        |> Map.put(:tool_choice, [])
+        |> Map.put(:include, [])
+
+      messages = [
+        Message.user("Hi"),
+        Message.assistant_blocks([%{type: "text", text: "previous answer", phase: []}]),
+        Message.user("Follow-up")
+      ]
+
+      OpenAI.complete(messages, [], capture_config)
+      assert_received {:request_body, req_body}
+      decoded = Jason.decode!(req_body)
+      assert decoded["store"] == true
+      refute Map.has_key?(decoded, "tool_choice")
+      refute Map.has_key?(decoded, "include")
+
+      assert [
+               %{"role" => "user", "content" => "Hi"},
+               %{"role" => "assistant", "content" => "previous answer"} = assistant_input,
+               %{"role" => "user", "content" => "Follow-up"}
+             ] = decoded["input"]
+
+      refute Map.has_key?(assistant_input, "phase")
+    end
+
+    test "formats image URLs, inline/URL/file_id documents, prompt_cache options, and dynamic api_key" do
+      test_pid = self()
+
+      plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request_body, body})
+        send(test_pid, {:request_headers, conn.req_headers})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(200, Jason.encode!(response_payload([assistant_text_item("ok")])))
+      end
+
+      config = %{
+        api_key: fn -> {:ok, "dyn-oai-key"} end,
+        model: "gpt-5.4",
+        prompt_cache_key: "tenant-1",
+        prompt_cache_retention: "24h",
+        req_options: [plug: plug]
+      }
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            Message.image_url("https://example.com/a.png"),
+            Message.document_data("application/pdf", "JVBERi0=", filename: "plan.pdf"),
+            Message.document("application/pdf", "https://example.com/remote.pdf"),
+            Message.document_file("application/pdf", "file_oai_1")
+          ]
+        }
+      ]
+
+      assert {:ok, _} = OpenAI.complete(messages, [], config)
+      assert_received {:request_body, body}
+      assert_received {:request_headers, headers}
+
+      assert {"authorization", "Bearer dyn-oai-key"} in headers
+      decoded = Jason.decode!(body)
+      assert decoded["prompt_cache_key"] == "tenant-1"
+      assert decoded["prompt_cache_retention"] == "24h"
+
+      [%{"role" => "user", "content" => [img, doc_data, doc_url, doc_file]}] = decoded["input"]
+      assert img == %{"type" => "input_image", "image_url" => "https://example.com/a.png"}
+
+      assert doc_data == %{
+               "type" => "input_file",
+               "filename" => "plan.pdf",
+               "file_data" => "data:application/pdf;base64,JVBERi0="
+             }
+
+      assert doc_url == %{"type" => "input_file", "file_url" => "https://example.com/remote.pdf"}
+      assert doc_file == %{"type" => "input_file", "file_id" => "file_oai_1"}
+
+      # Non-HTTP image URL and Gemini File API URIs (document or image) fall back to
+      # unsupported notices rather than sending unfetchable URLs to OpenAI.
+      non_http_msg = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            Message.image_url("gs://b/a.png"),
+            Message.document(
+              "application/pdf",
+              "https://generativelanguage.googleapis.com/v1beta/files/gem123"
+            ),
+            Message.image_url(
+              "https://generativelanguage.googleapis.com/v1beta/files/gemimg1",
+              mime_type: "image/png"
+            )
+          ]
+        }
+      ]
+
+      assert {:ok, _} =
+               OpenAI.complete(non_http_msg, [], %{config | prompt_cache_retention: "in_memory"})
+
+      assert_received {:request_body, nh_body}
+
+      decoded_nh = Jason.decode!(nh_body)
+      assert decoded_nh["prompt_cache_retention"] == "in_memory"
+
+      [
+        %{
+          "content" => [
+            %{"type" => "input_text", "text" => nh_text},
+            gem_uri_block,
+            gem_img_block
+          ]
+        }
+      ] = decoded_nh["input"]
+
+      assert nh_text =~ "Unsupported"
+      assert gem_uri_block["type"] == "input_text"
+      assert gem_uri_block["text"] =~ "Unsupported"
+      assert gem_img_block["type"] == "input_text"
+      assert gem_img_block["text"] =~ "Unsupported"
+      refute nh_body =~ "generativelanguage.googleapis.com"
+    end
+
+    test "dynamic api_key re-invokes on retry, skips retry on :auth error, and strips foreign user file_id on fallback" do
+      test_pid = self()
+      attempts = :atomics.new(1, signed: false)
+
+      retry_plug = fn conn ->
+        send(test_pid, {:attempt_headers, conn.req_headers})
+        n = :atomics.add_get(attempts, 1, 1)
+
+        if n == 1 do
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(500, Jason.encode!(%{"error" => %{"message" => "transient"}}))
+        else
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(
+            200,
+            Jason.encode!(response_payload([assistant_text_item("ok")]))
+          )
+        end
+      end
+
+      key_calls = :atomics.new(1, signed: false)
+
+      assert {:ok, %{text: "ok"}} =
+               Alloy.run("Hi",
+                 provider:
+                   {OpenAI,
+                    api_key: fn ->
+                      n = :atomics.add_get(key_calls, 1, 1)
+                      {:ok, "rot-key-#{n}"}
+                    end,
+                    origin_key: "oai-acct-1",
+                    model: "gpt-5.4",
+                    req_options: [plug: retry_plug]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0
+               )
+
+      assert_received {:attempt_headers, h1}
+      assert_received {:attempt_headers, h2}
+      assert {"authorization", "Bearer rot-key-1"} in h1
+      assert {"authorization", "Bearer rot-key-2"} in h2
+
+      # Primary auth callback failure skips retries and falls back to OpenAI with
+      # user-attached Anthropic file_id automatically stripped.
+      primary_calls = :atomics.new(1, signed: false)
+
+      fb_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:fallback_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(response_payload([assistant_text_item("from fallback")]))
+        )
+      end
+
+      user_msg = %Alloy.Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Summarize"},
+          Message.document_file("application/pdf", "file_ant_only")
+        ]
+      }
+
+      assert {:ok, %{text: "from fallback"}} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: fn ->
+                      :atomics.add_get(primary_calls, 1, 1)
+                      {:error, :token_expired}
+                    end,
+                    origin_key: "ant-acct-1",
+                    model: "claude-sonnet-5-5"},
+                 fallback_providers: [
+                   {OpenAI, api_key: "oai-fb-key", model: "gpt-5.4", req_options: [plug: fb_plug]}
+                 ],
+                 max_retries: 2,
+                 retry_backoff_ms: 0
+               )
+
+      assert :atomics.get(primary_calls, 1) == 1
+      assert_received {:fallback_body, fb_body}
+      refute fb_body =~ "file_ant_only"
+      assert fb_body =~ "Summarize"
+    end
+
+    test "stamps user file_id origin after turn 1 so State.prepare/2 provider switch strips it, and streams with dynamic api_key" do
+      test_pid = self()
+
+      # 1. OpenAI.stream/4 resolves dynamic :api_key.
+      stream_plug = fn conn ->
+        send(test_pid, {:oai_stream_headers, conn.req_headers})
+
+        sse =
+          "event: response.completed\ndata: " <>
+            Jason.encode!(%{
+              "type" => "response.completed",
+              "response" => response_payload([assistant_text_item("streamed")])
+            }) <> "\n\n"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, %{messages: [msg]}} =
+               OpenAI.stream(
+                 [Message.user("Hi")],
+                 [],
+                 %{
+                   api_key: fn -> {:ok, "dyn-oai-stream"} end,
+                   model: "gpt-5.4",
+                   req_options: [plug: stream_plug]
+                 },
+                 fn _ -> :ok end
+               )
+
+      assert Message.text(msg) == "streamed"
+      assert_received {:oai_stream_headers, sh}
+      assert {"authorization", "Bearer dyn-oai-stream"} in sh
+
+      # 2. Turn 1 succeeds on Anthropic (tool call), middleware switches to OpenAI on turn 2:
+      #    the user's unattributed file_id is stamped on turn 1 and stripped before turn 2 hits OpenAI.
+      ant_plug = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(%{
+            "id" => "msg_1",
+            "type" => "message",
+            "role" => "assistant",
+            "content" => [
+              %{"type" => "tool_use", "id" => "toolu_1", "name" => "echo", "input" => %{}}
+            ],
+            "stop_reason" => "tool_use",
+            "usage" => %{"input_tokens" => 5, "output_tokens" => 5}
+          })
+        )
+      end
+
+      oai_turn2_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:oai_turn2_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(response_payload([assistant_text_item("switched cleanly")]))
+        )
+      end
+
+      echo_tool =
+        Alloy.Tool.inline(
+          name: "echo",
+          description: "Echo",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> {:ok, "done"} end
+        )
+
+      user_msg = %Alloy.Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Read file"},
+          Message.document_file("application/pdf", "file_ant_turn1")
+        ]
+      }
+
+      assert {:ok, %{text: "switched cleanly"}} =
+               Alloy.run(nil,
+                 messages: [user_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: "ant-k", model: "claude-sonnet-5-5", req_options: [plug: ant_plug]},
+                 tools: [echo_tool],
+                 middleware: [SwitchToOpenAIMiddleware],
+                 context: %{
+                   next_provider:
+                     {OpenAI,
+                      api_key: "oai-k", model: "gpt-5.4", req_options: [plug: oai_turn2_plug]}
+                 }
+               )
+
+      assert_received {:oai_turn2_body, t2_body}
+      refute t2_body =~ "file_ant_turn1"
+      assert t2_body =~ "Read file"
+
+      # 3. Failed run (including exhausted fallback chain) still persists file_id origin so
+      #    resuming failed.messages on another provider strips the foreign file_id.
+      failing_ant = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(500, Jason.encode!(%{"error" => %{"message" => "boom"}}))
+      end
+
+      failing_fb = fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(503, Jason.encode!(%{"error" => %{"message" => "fb down"}}))
+      end
+
+      fail_msg = %Alloy.Message{
+        role: :user,
+        content: [Message.document_file("application/pdf", "file_failed_ant")]
+      }
+
+      assert {:error, failed_result} =
+               Alloy.run(nil,
+                 messages: [fail_msg],
+                 provider:
+                   {Alloy.Provider.Anthropic,
+                    api_key: "ant-k", model: "claude-sonnet-5-5", req_options: [plug: failing_ant]},
+                 fallback_providers: [
+                   {OpenAI, api_key: "oai-k", model: "gpt-5.4", req_options: [plug: failing_fb]}
+                 ],
+                 max_retries: 0
+               )
+
+      resume_plug = fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:resumed_oai_body, body})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(
+          200,
+          Jason.encode!(response_payload([assistant_text_item("resumed")]))
+        )
+      end
+
+      assert {:ok, %{text: "resumed"}} =
+               Alloy.run(nil,
+                 messages: failed_result.messages,
+                 provider:
+                   {OpenAI,
+                    api_key: "oai-k",
+                    model: "gpt-5.4",
+                    prompt_cache_key: "",
+                    prompt_cache_retention: "",
+                    req_options: [plug: resume_plug]}
+               )
+
+      assert_received {:resumed_oai_body, resumed_body}
+      refute resumed_body =~ "file_failed_ant"
+      decoded_resumed = Jason.decode!(resumed_body)
+      refute Map.has_key?(decoded_resumed, "prompt_cache_key")
+      refute Map.has_key?(decoded_resumed, "prompt_cache_retention")
+    end
+  end
+
+  describe "OpenAI.JSONPrefix" do
+    test "reconciles objects, lists, literals, strings, escapes, and numbers" do
+      cases = [
+        {~s({"a": 1, "b":), %{"a" => 1, "b" => [true, false, nil]}},
+        {~s({"key": "hel), %{"key" => "hello\n\t\"\\/"}},
+        {~s({"ch": "\\), %{"ch" => "\b\f\r"}},
+        {~s({"emoji": "\\uD83D\\uDE), %{"emoji" => "😀"}},
+        {~s({"u": "\\u00), %{"u" => "A"}},
+        {~s({"items": [1, ), %{"items" => [1, 2, 3]}},
+        {~s({"items": [), %{"items" => []}},
+        {~s({"flag": tr), %{"flag" => true}},
+        {~s({"none": nu), %{"none" => nil}},
+        {~s({"neg": -), %{"neg" => -42}},
+        {~s({"zero": -), %{"zero" => 0}},
+        {~s({"exp": 1e), %{"exp" => 100}},
+        {~s({"small": 1e-0), %{"small" => 0.001}},
+        {~s({"tiny": 1e-), %{"tiny" => 0.0}},
+        {~s({"round": 0.29), %{"round" => 0.3}},
+        {~s({"partial_k), %{"partial_key" => "v", "other" => 1}}
+      ]
+
+      for {prefix, expected} <- cases do
+        assert {:ok, suffix, combined} = JSONPrefix.reconcile(prefix, expected)
+        assert combined == prefix <> suffix
+        assert Jason.decode!(combined) == expected
+      end
+    end
+
+    test "returns :conflict and :error for mismatched or invalid JSON prefixes" do
+      assert :conflict = JSONPrefix.reconcile(~s({"a": 2}), %{"a" => 1})
+      assert :conflict = JSONPrefix.reconcile(~s({"a": 1, }), %{"a" => 1})
+      assert :conflict = JSONPrefix.reconcile(~s([1, 2, ), [1, 2])
+      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\x"}), %{"s" => "x"})
+      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\uDC00"}), %{"s" => "x"})
+      assert :conflict = JSONPrefix.reconcile(~s({"n": -), %{"n" => 5})
+      assert :conflict = JSONPrefix.reconcile(~s({"b": tr), %{"b" => false})
+      assert :error = JSONPrefix.complete(%{"a" => 1}, ~s({"a": 1} trailing))
+    end
+  end
+
+  describe "OpenAI.Stream direct unit coverage" do
+    test "emits reasoning deltas and reconciles streamed function call deltas" do
+      test_pid = self()
+
+      chunks = [
+        sse_response_event("response.reasoning_summary_text.delta", %{"delta" => "Thinking..."}),
+        sse_response_event("response.output_item.added", %{
+          "output_index" => 0,
+          "item" => %{
+            "type" => "function_call",
+            "id" => "fc_1",
+            "call_id" => "call_1",
+            "name" => "read"
+          }
+        }),
+        sse_response_event("response.function_call_arguments.delta", %{
+          "item_id" => "fc_1",
+          "output_index" => 0,
+          "delta" => ~s({"path": )
+        }),
+        sse_response_completed([
+          function_call_item("call_1", "read", ~s({"path":"mix.exs"}))
+        ]),
+        "data: [DONE]\n\n"
+      ]
+
+      Req.Test.stub(__MODULE__, sse_chunks_plug(chunks))
+
+      config = %{
+        api_key: "sk-test",
+        model: "gpt-5.4",
+        on_event: fn ev -> send(test_pid, {:ev, ev}) end,
+        req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+      }
+
+      assert {:ok, response} =
+               ResponsesStream.stream(
+                 "https://api.openai.com/v1/responses",
+                 [{"authorization", "Bearer sk-test"}],
+                 %{"model" => "gpt-5.4", "input" => []},
+                 fn _ -> :ok end,
+                 config
+               )
+
+      assert response.stop_reason == :tool_use
+      assert_received {:ev, {:thinking_delta, "Thinking..."}}
+
+      assert_received {:ev,
+                       {:tool_call_delta, %{id: "call_1", name: "read", arguments_delta: ""}}}
+
+      assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s({"path": )}}}
+      assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s("mix.exs"})}}}
     end
   end
 

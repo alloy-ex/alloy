@@ -6,16 +6,27 @@ defmodule Alloy.Agent.State do
   current status. Passed through each iteration of the agent loop.
 
   `deadline` is the monotonic time in milliseconds (see
-  `System.monotonic_time/1`) by which the run's provider requests must
-  finish; `Alloy.Agent.Turn.run_loop/2` sets it. Middleware that makes its
-  own provider request, as compaction does, should finish by it.
+  `System.monotonic_time/1`) with 5 seconds of headroom before `timeout_ms`
+  (`run_deadline - 5_000`), or `nil` when `timeout_ms: :infinity`.
+  `Alloy.Agent.Turn.run_loop/2` sets it to govern provider retries and give
+  non-streaming calls cleanup headroom; `run_deadline` is the absolute
+  wall-clock cap (`started + timeout_ms`), or `nil` when `timeout_ms: :infinity`,
+  enforced across requests, streaming, tool execution, and turns. Middleware
+  inspecting `deadline` or `run_deadline` should guard with `is_integer/1`. Hosts
+  wrapping `Alloy.run/2` or `Alloy.stream/3` in `Task.await/2` should give
+  their outer await more time than `:timeout_ms` so Alloy can return its own
+  `:timeout` result cleanly. Middleware that makes its own provider request,
+  as compaction does, uses `deadline` for retry headroom and `run_deadline` as
+  the hard wall-clock ceiling (so when `timeout_ms <= 5_000`, summary requests
+  run once without retries or fallbacks).
   """
 
   alias Alloy.Agent.Config
-  alias Alloy.{Message, Usage}
+  alias Alloy.{Message, OutputSchema, Usage}
+  alias Alloy.Provider.Error
   alias Alloy.Tool.Registry
 
-  @type status :: :idle | :running | :completed | :error | :max_turns | :halted
+  @type status :: :idle | :running | :completed | :error | :max_turns | :halted | :cancelled
 
   @type t :: %__MODULE__{
           config: Config.t(),
@@ -34,9 +45,11 @@ defmodule Alloy.Agent.State do
           run_metadata: map(),
           started_at: integer() | nil,
           deadline: integer() | nil,
+          run_deadline: integer() | nil,
           agent_id: String.t()
         }
 
+  @derive {Inspect, except: [:tool_schema_cache]}
   @enforce_keys [:config]
   defstruct [
     :config,
@@ -56,6 +69,8 @@ defmodule Alloy.Agent.State do
     run_metadata: %{},
     started_at: nil,
     deadline: nil,
+    # Internal absolute monotonic deadline for the whole run (without retry headroom).
+    run_deadline: nil,
     agent_id: ""
   ]
 
@@ -64,7 +79,7 @@ defmodule Alloy.Agent.State do
   """
   @spec init(Config.t(), [Message.t()]) :: t()
   def init(%Config{} = config, messages \\ []) do
-    {tool_defs, tool_fns} = Alloy.Tool.Registry.build(config.tools)
+    {tool_defs, tool_fns} = Registry.build(config.tools)
 
     agent_id =
       Map.get(config.context, :session_id) || generate_agent_id()
@@ -83,8 +98,11 @@ defmodule Alloy.Agent.State do
   @doc """
   Prepares request inputs from `:before_completion` middleware.
 
-  Accepts `:messages`, `:tools`, `:system_prompt`, and `:provider` (the same
-  provider tuple accepted by `Alloy.run/2`). Changes persist for later turns.
+  Accepts `:messages`, `:tools`, `:system_prompt`, `:provider` (the same
+  provider tuple accepted by `Alloy.run/2`), `:output_schema`, and
+  `:reasoning`. Changes persist for later turns (updating `:reasoning` overrides
+  any earlier primary provider-level `:reasoning`, while fallback providers that
+  configured their own explicit `:reasoning` keep theirs).
   Tools and their wire definitions are rebuilt together. Provider changes
   re-derive model limits and discard previous opaque provider state; pass an
   explicit `provider_state` in the new provider config to restore it.
@@ -92,7 +110,16 @@ defmodule Alloy.Agent.State do
   """
   @spec prepare(t(), keyword()) :: t()
   def prepare(%__MODULE__{} = state, opts) when is_list(opts) do
-    opts = Keyword.validate!(opts, [:messages, :tools, :system_prompt, :provider])
+    opts =
+      Keyword.validate!(opts, [
+        :messages,
+        :tools,
+        :system_prompt,
+        :provider,
+        :output_schema,
+        :reasoning
+      ])
+
     config = prepare_config(state.config, opts)
     {tool_defs, tool_fns} = Registry.build(config.tools)
     messages = Keyword.get(opts, :messages, state.messages)
@@ -129,7 +156,39 @@ defmodule Alloy.Agent.State do
     unless is_nil(prompt) or is_binary(prompt),
       do: raise(ArgumentError, "system_prompt must be a string or nil")
 
-    %{config | system_prompt: prompt}
+    output_schema =
+      case Keyword.fetch(opts, :output_schema) do
+        {:ok, spec} -> OutputSchema.normalize!(spec)
+        :error -> config.output_schema
+      end
+
+    {reasoning, provider_config} =
+      case Keyword.fetch(opts, :reasoning) do
+        {:ok, spec} ->
+          normalized = Alloy.Provider.normalize_reasoning!(spec)
+
+          # When middleware explicitly updates :reasoning without setting a
+          # provider-specific :reasoning in the same call, clear any earlier
+          # provider-level :reasoning so the new setting takes effect.
+          updated_provider_config =
+            if Keyword.has_key?(opts, :provider) and
+                 Map.has_key?(config.provider_config, :reasoning),
+               do: config.provider_config,
+               else: Map.delete(config.provider_config, :reasoning)
+
+          {normalized, updated_provider_config}
+
+        :error ->
+          {config.reasoning, config.provider_config}
+      end
+
+    %{
+      config
+      | system_prompt: prompt,
+        output_schema: output_schema,
+        reasoning: reasoning,
+        provider_config: provider_config
+    }
   end
 
   defp prepared_provider_state(state, config) do
@@ -138,8 +197,10 @@ defmodule Alloy.Agent.State do
       else: state.provider_state
   end
 
-  defp provider_changed?(old, new),
-    do: old.provider != new.provider or old.provider_config != new.provider_config
+  defp provider_changed?(old, new) do
+    old.provider != new.provider or
+      Map.delete(old.provider_config, :reasoning) != Map.delete(new.provider_config, :reasoning)
+  end
 
   @doc """
   Append messages to the conversation history.
@@ -192,6 +253,20 @@ defmodule Alloy.Agent.State do
   def merge_run_metadata(%__MODULE__{} = state, metadata) when is_map(metadata) do
     %{state | run_metadata: Map.merge(state.run_metadata, metadata)}
   end
+
+  @doc false
+  @spec cancel(t()) :: t()
+  def cancel(%__MODULE__{} = state) do
+    %{state | status: :cancelled, error: :cancelled}
+  end
+
+  @doc false
+  @spec put_provider_error(t(), term()) :: t()
+  def put_provider_error(%__MODULE__{} = state, %Error{} = error) do
+    merge_run_metadata(state, %{provider_error: error})
+  end
+
+  def put_provider_error(%__MODULE__{} = state, _reason), do: state
 
   @doc """
   Return the conversation history in chronological order, the same as

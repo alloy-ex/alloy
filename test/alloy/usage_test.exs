@@ -111,6 +111,20 @@ defmodule Alloy.UsageTest do
 
       assert result.estimated_cost_cents == 0
     end
+
+    test "handles explicit nil values without crashing" do
+      merged =
+        Usage.merge(%Usage{input_tokens: 10, output_tokens: 5}, %{
+          input_tokens: nil,
+          output_tokens: 3,
+          cache_read_input_tokens: nil,
+          cache_creation_input_tokens: nil,
+          estimated_cost_cents: nil
+        })
+
+      assert merged.input_tokens == 10
+      assert merged.output_tokens == 8
+    end
   end
 
   describe "estimate_cost/3 replacement semantic" do

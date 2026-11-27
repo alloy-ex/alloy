@@ -859,6 +859,28 @@ defmodule Alloy.Provider.AnthropicTest do
 
       assert Exception.message(reason) =~ "overloaded"
     end
+
+    test "returns :unknown error for pre-decoded non-map HTTP 200 JSON bodies" do
+      for raw_json <- ["[]", "123", "true", "null"] do
+        plug = fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(200, raw_json)
+        end
+
+        config = %{
+          api_key: "sk-ant-test-key",
+          model: "claude-sonnet-4-6",
+          max_tokens: 4096,
+          req_options: [plug: plug, retry: false, decode_body: true]
+        }
+
+        assert {:error, %Error{kind: :unknown, message: message}} =
+                 Anthropic.complete([Message.user("Hi")], [], config)
+
+        assert message =~ "Unexpected Anthropic response payload"
+      end
+    end
   end
 
   describe "complete/3 with cache: true" do
@@ -1174,6 +1196,281 @@ defmodule Alloy.Provider.AnthropicTest do
       assert is_list(user_msg["content"])
       [block] = user_msg["content"]
       assert is_map(block)
+    end
+
+    test "formats image URLs, base64/URL/Files API documents, dynamic api_key, 1h cache TTL, and web_search" do
+      counter = :atomics.new(1, signed: false)
+
+      config =
+        config_that_captures_request()
+        |> Map.merge(%{
+          api_key: fn ->
+            n = :atomics.add_get(counter, 1, 1)
+            {:ok, "dyn-ant-key-#{n}"}
+          end,
+          system_prompt: "You are concise.",
+          cache: "1h",
+          web_search: %{max_uses: 3}
+        })
+
+      messages = [
+        %Alloy.Message{
+          role: :user,
+          content: [
+            Message.image_url("https://example.com/pic.png"),
+            Message.document_data("application/pdf", "JVBERi0=", title: "Report"),
+            Message.document_data("text/plain", Base.encode64("hello plain"), title: "Notes"),
+            Message.document_data("application/octet-stream", "AAAA"),
+            Message.document("application/pdf", "https://example.com/doc.pdf",
+              filename: "doc.pdf"
+            ),
+            Message.document_file("application/pdf", "file_abc", title: "Uploaded"),
+            Message.document("application/pdf", "gs://bucket/skip.pdf")
+          ]
+        }
+      ]
+
+      config =
+        Map.put(config, :extra_headers, [{"anthropic-beta", "files-api-2025-04-14, custom-beta"}])
+
+      assert {:ok, _} = Anthropic.complete(messages, [], config)
+      assert_received {:request_body, body}
+      assert_received {:request_headers, headers}
+
+      assert {"x-api-key", "dyn-ant-key-1"} in headers
+      beta_val = Enum.find_value(headers, fn {k, v} -> if k == "anthropic-beta", do: v end)
+      assert beta_val == "files-api-2025-04-14,custom-beta"
+
+      decoded = Jason.decode!(body)
+
+      assert [%{"cache_control" => %{"type" => "ephemeral", "ttl" => "1h"}}] = decoded["system"]
+
+      assert [
+               %{"type" => "web_search_20260209", "name" => "web_search", "max_uses" => 3}
+             ] = decoded["tools"]
+
+      [img, doc_b64, doc_txt, doc_bin, doc_url, doc_file, doc_gcs] =
+        hd(decoded["messages"])["content"]
+
+      assert img == %{
+               "type" => "image",
+               "source" => %{"type" => "url", "url" => "https://example.com/pic.png"}
+             }
+
+      assert doc_b64 == %{
+               "type" => "document",
+               "title" => "Report",
+               "source" => %{
+                 "type" => "base64",
+                 "media_type" => "application/pdf",
+                 "data" => "JVBERi0="
+               }
+             }
+
+      assert doc_txt == %{
+               "type" => "document",
+               "title" => "Notes",
+               "source" => %{
+                 "type" => "text",
+                 "media_type" => "text/plain",
+                 "data" => "hello plain"
+               }
+             }
+
+      assert doc_bin["type"] == "text"
+      assert doc_bin["text"] =~ "Unsupported inline document (application/octet-stream)"
+
+      assert doc_url == %{
+               "type" => "document",
+               "title" => "doc.pdf",
+               "source" => %{"type" => "url", "url" => "https://example.com/doc.pdf"}
+             }
+
+      assert doc_file == %{
+               "type" => "document",
+               "title" => "Uploaded",
+               "source" => %{"type" => "file", "file_id" => "file_abc"}
+             }
+
+      assert doc_gcs["type"] == "text"
+      assert doc_gcs["text"] =~ "Unsupported document URI"
+      assert doc_gcs["cache_control"] == %{"type" => "ephemeral", "ttl" => "1h"}
+
+      # Verify web_search: true and map-based cache TTL configs.
+      map_cache_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{cache: %{ttl: "1h"}, web_search: true, system_prompt: "Sys"})
+
+      assert {:ok, _} = Anthropic.complete([Message.user("Hi")], [], map_cache_cfg)
+      assert_received {:request_body, map_cache_body}
+      decoded2 = Jason.decode!(map_cache_body)
+      assert [%{"type" => "web_search_20260209", "name" => "web_search"}] = decoded2["tools"]
+      assert [%{"cache_control" => %{"type" => "ephemeral", "ttl" => "1h"}}] = decoded2["system"]
+
+      # Invalid :cache returns non-retryable :invalid_request on both complete/3 and stream/4.
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Anthropic.complete([Message.user("Hi")], [], Map.put(config, :cache, "2h"))
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Anthropic.stream(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(config, :cache, "2h"),
+                 fn _ -> :ok end
+               )
+
+      # Stream path resolves dynamic :api_key and surfaces callback :auth errors.
+      stream_cfg =
+        config_with_sse_stream([
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 0}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "ok"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{"output_tokens" => 1}
+          }),
+          ant_event("message_stop", %{})
+        ])
+        |> Map.put(:api_key, fn -> {:ok, "dyn-stream-key"} end)
+
+      assert {:ok, _} = Anthropic.stream([Message.user("Hi")], [], stream_cfg, fn _ -> :ok end)
+
+      assert {:error, %Alloy.Provider.Error{kind: :auth}} =
+               Anthropic.stream(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(stream_cfg, :api_key, fn -> {:error, :expired} end),
+                 fn _ -> :ok end
+               )
+    end
+
+    test "rejects non-PDF URL documents gracefully, deduplicates web_search, and validates body before auth callback" do
+      key_calls = :atomics.new(1, signed: false)
+
+      bad_cache_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          cache: "invalid",
+          api_key: fn ->
+            :atomics.add_get(key_calls, 1, 1)
+            {:ok, "never-fetched"}
+          end
+        })
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Anthropic.complete([Message.user("Hi")], [], bad_cache_cfg)
+
+      assert :atomics.get(key_calls, 1) == 0
+
+      # Non-PDF URL document falls back to notice; explicit server_tools web_search is not duplicated.
+      dedupe_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{
+          web_search: true,
+          server_tools: [%{"type" => "web_search_20250305", "name" => "web_search"}]
+        })
+
+      msg = %Alloy.Message{
+        role: :user,
+        content: [
+          Message.document("text/plain", "https://example.com/notes.txt"),
+          Message.document(
+            "application/pdf",
+            "https://generativelanguage.googleapis.com/v1beta/files/gem123"
+          ),
+          Message.image_url(
+            "https://generativelanguage.googleapis.com/v1beta/files/gemimg1",
+            mime_type: "image/png"
+          )
+        ]
+      }
+
+      assert {:ok, _} = Anthropic.complete([msg], [], dedupe_cfg)
+      assert_received {:request_body, body}
+      assert_received {:request_headers, _headers}
+      decoded = Jason.decode!(body)
+
+      assert [%{"type" => "web_search_20250305", "name" => "web_search"}] = decoded["tools"]
+
+      [
+        %{"type" => "text", "text" => notice},
+        %{"type" => "text", "text" => gem_notice},
+        %{"type" => "text", "text" => gem_img_notice}
+      ] = hd(decoded["messages"])["content"]
+
+      assert notice =~ "URL documents require application/pdf"
+      assert gem_notice =~ "Unsupported document URI (application/pdf)"
+      assert gem_img_notice =~ "Unsupported image URL"
+      refute body =~ "generativelanguage.googleapis.com"
+    end
+
+    test "supports auth_scheme: :bearer on complete/3 and stream/4 and rejects invalid auth_scheme" do
+      bearer_cfg =
+        config_that_captures_request()
+        |> Map.merge(%{api_key: fn -> {:ok, "oauth-tok"} end, auth_scheme: :bearer})
+
+      assert {:ok, _} = Anthropic.complete([Message.user("Hi")], [], bearer_cfg)
+      assert_received {:request_headers, b_headers}
+      assert {"authorization", "Bearer oauth-tok"} in b_headers
+      refute Enum.any?(b_headers, fn {k, _} -> k == "x-api-key" end)
+
+      # Stream path also sends Authorization: Bearer without x-api-key.
+      test_pid = self()
+
+      stream_plug = fn conn ->
+        send(test_pid, {:ant_bearer_stream_headers, conn.req_headers})
+
+        sse =
+          ant_event("message_start", %{
+            "message" => %{"usage" => %{"input_tokens" => 1, "output_tokens" => 0}}
+          }) <>
+            ant_event("content_block_start", %{
+              "index" => 0,
+              "content_block" => %{"type" => "text", "text" => ""}
+            }) <>
+            ant_event("content_block_delta", %{
+              "index" => 0,
+              "delta" => %{"type" => "text_delta", "text" => "ok"}
+            }) <>
+            ant_event("content_block_stop", %{"index" => 0}) <>
+            ant_event("message_delta", %{
+              "delta" => %{"stop_reason" => "end_turn"},
+              "usage" => %{"output_tokens" => 1}
+            }) <>
+            ant_event("message_stop", %{})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, sse)
+      end
+
+      assert {:ok, _} =
+               Anthropic.stream(
+                 [Message.user("Hi")],
+                 [],
+                 %{bearer_cfg | req_options: [plug: stream_plug]},
+                 fn _ -> :ok end
+               )
+
+      assert_received {:ant_bearer_stream_headers, s_headers}
+      assert {"authorization", "Bearer oauth-tok"} in s_headers
+      refute Enum.any?(s_headers, fn {k, _} -> k == "x-api-key" end)
+
+      assert {:error, %Alloy.Provider.Error{kind: :invalid_request}} =
+               Anthropic.complete(
+                 [Message.user("Hi")],
+                 [],
+                 Map.put(bearer_cfg, :auth_scheme, :bad)
+               )
     end
   end
 
@@ -1837,6 +2134,613 @@ defmodule Alloy.Provider.AnthropicTest do
       assert {:ok, result} = Anthropic.stream([Message.user("Hi")], [], config, on_chunk)
       assert Message.text(hd(result.messages)) == "Done."
       assert_received {:chunk, "Done."}
+    end
+
+    test "concatenates split signature_delta chunks and trims trailing api_url slash" do
+      events =
+        [
+          ant_event("message_start", %{
+            "message" => %{"id" => "m1", "type" => "message", "usage" => %{"input_tokens" => 5}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "thinking", "thinking" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "thinking_delta", "thinking" => "plan"}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "signature_delta", "signature" => "sig_part_1_"}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "signature_delta", "signature" => "sig_part_2"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("content_block_start", %{
+            "index" => 1,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 1,
+            "delta" => %{"type" => "text_delta", "text" => "ok"}
+          }),
+          ant_event("content_block_stop", %{"index" => 1}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{"output_tokens" => 3}
+          })
+        ]
+        |> Enum.join()
+
+      Req.Test.stub(:anthropic_split_sig, fn conn ->
+        assert conn.request_path == "/v1/messages"
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, events)
+      end)
+
+      config = %{
+        api_key: "k",
+        api_url: "http://localhost/",
+        model: "claude-sonnet-5-5",
+        req_options: [plug: {Req.Test, :anthropic_split_sig}]
+      }
+
+      assert {:ok,
+              %{
+                messages: [
+                  %Message{content: [%{type: "thinking", signature: "sig_part_1_sig_part_2"} | _]}
+                ]
+              }} =
+               Anthropic.stream([Message.user("hi")], [], config, fn _ -> :ok end)
+    end
+
+    test "rejects invalid streaming tool JSON with :malformed_reply and unexpected payloads with :unknown" do
+      bad_tool_events =
+        [
+          ant_event("message_start", %{
+            "message" => %{"id" => "m2", "type" => "message", "usage" => %{}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{
+              "type" => "tool_use",
+              "id" => "t1",
+              "name" => "read",
+              "input" => %{}
+            }
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"path\":"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{"delta" => %{"stop_reason" => "tool_use"}, "usage" => %{}})
+        ]
+        |> Enum.join()
+
+      Req.Test.stub(:anthropic_bad_tool_json, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, bad_tool_events)
+      end)
+
+      config = %{
+        api_key: "k",
+        model: "claude-sonnet-5-5",
+        req_options: [plug: {Req.Test, :anthropic_bad_tool_json}]
+      }
+
+      assert {:error, %Error{kind: :malformed_reply}} =
+               Anthropic.stream([Message.user("hi")], [], config, fn _ -> :ok end)
+
+      Req.Test.stub(:anthropic_unexpected_payload, fn conn ->
+        Req.Test.json(conn, %{"unexpected" => true})
+      end)
+
+      assert {:error, %Error{kind: :unknown}} =
+               Anthropic.complete([Message.user("hi")], [], %{
+                 config
+                 | req_options: [plug: {Req.Test, :anthropic_unexpected_payload}]
+               })
+    end
+
+    test "rejects unclosed or malformed streaming tool blocks and never executes the tool" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "delete_item",
+          description: "Deletes an optional target",
+          input_schema: %{type: "object", properties: %{target: %{type: "string"}}},
+          execute: fn input, _ctx ->
+            send(test_pid, {:tool_executed, input})
+            {:ok, "deleted"}
+          end
+        )
+
+      for {stub_name, middle_events, expected_error} <- [
+            {:anthropic_unclosed_tool_json,
+             [
+               ant_event("content_block_delta", %{
+                 "index" => 0,
+                 "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"target\":"}
+               })
+             ], "Incomplete tool call arguments"},
+            {:anthropic_unclosed_tool_zero_deltas, [], "Incomplete tool call arguments"},
+            {:anthropic_malformed_sse_json,
+             [
+               "event: content_block_delta\ndata: {broken\n\n",
+               ant_event("content_block_stop", %{"index" => 0})
+             ], "Malformed JSON in Anthropic SSE"},
+            {:anthropic_non_string_partial_json,
+             [
+               ant_event("content_block_delta", %{
+                 "index" => 0,
+                 "delta" => %{"type" => "input_json_delta", "partial_json" => 123}
+               }),
+               ant_event("content_block_stop", %{"index" => 0})
+             ], "Invalid input_json_delta payload"},
+            {:anthropic_null_delta,
+             [
+               ant_event("content_block_delta", %{"index" => 0, "delta" => nil}),
+               ant_event("content_block_stop", %{"index" => 0})
+             ], "Invalid content_block_delta payload"},
+            {:anthropic_missing_delta,
+             [
+               ant_event("content_block_delta", %{"index" => 0}),
+               ant_event("content_block_stop", %{"index" => 0})
+             ], "Invalid content_block_delta payload"},
+            {:anthropic_non_map_delta,
+             [
+               ant_event("content_block_delta", %{"index" => 0, "delta" => "bad"}),
+               ant_event("content_block_stop", %{"index" => 0})
+             ], "Invalid content_block_delta payload"},
+            {:anthropic_delta_missing_type,
+             [
+               ant_event("content_block_delta", %{"index" => 0, "delta" => %{}}),
+               ant_event("content_block_stop", %{"index" => 0})
+             ], "Invalid content_block_delta payload"},
+            {:anthropic_mismatched_text_delta_on_tool,
+             [
+               ant_event("content_block_delta", %{
+                 "index" => 0,
+                 "delta" => %{"type" => "text_delta", "text" => "oops"}
+               }),
+               ant_event("content_block_stop", %{"index" => 0})
+             ], "Mismatched text_delta for content block 0"},
+            {:anthropic_null_tool_args,
+             [
+               ant_event("content_block_delta", %{
+                 "index" => 0,
+                 "delta" => %{"type" => "input_json_delta", "partial_json" => "null"}
+               }),
+               ant_event("content_block_stop", %{"index" => 0})
+             ], "must be a JSON object"},
+            {:anthropic_false_tool_args,
+             [
+               ant_event("content_block_delta", %{
+                 "index" => 0,
+                 "delta" => %{"type" => "input_json_delta", "partial_json" => "false"}
+               }),
+               ant_event("content_block_stop", %{"index" => 0})
+             ], "must be a JSON object"}
+          ] do
+        events =
+          ([
+             ant_event("message_start", %{
+               "message" => %{"id" => "m3", "type" => "message", "usage" => %{}}
+             }),
+             ant_event("content_block_start", %{
+               "index" => 0,
+               "content_block" => %{
+                 "type" => "tool_use",
+                 "id" => "t1",
+                 "name" => "delete_item",
+                 "input" => %{}
+               }
+             })
+           ] ++
+             middle_events ++
+             [
+               ant_event("message_delta", %{
+                 "delta" => %{"stop_reason" => "tool_use"},
+                 "usage" => %{}
+               })
+             ])
+          |> Enum.join()
+
+        Req.Test.stub(stub_name, fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("text/event-stream")
+          |> Plug.Conn.send_resp(200, events)
+        end)
+
+        assert {:error, %{error: error_msg}} =
+                 Alloy.stream(
+                   "delete it",
+                   fn chunk -> send(test_pid, {:unexpected_chunk, chunk}) end,
+                   provider:
+                     {Anthropic,
+                      api_key: "k",
+                      model: "claude-sonnet-5-5",
+                      req_options: [plug: {Req.Test, stub_name}]},
+                   tools: [tool],
+                   max_retries: 0
+                 )
+
+        assert error_msg =~ expected_error
+        refute_received {:tool_executed, _}
+        refute_received {:unexpected_chunk, _}
+      end
+    end
+
+    test "rejects mismatched block deltas, invalid text/message_delta shapes, and protocol errors on max_tokens" do
+      for {stub_name, events, expected_kind, expected_error} <- [
+            {:anthropic_thinking_delta_on_text,
+             [
+               ant_event("message_start", %{"message" => %{"id" => "m7", "usage" => %{}}}),
+               ant_event("content_block_start", %{
+                 "index" => 0,
+                 "content_block" => %{"type" => "text", "text" => ""}
+               }),
+               ant_event("content_block_delta", %{
+                 "index" => 0,
+                 "delta" => %{"type" => "thinking_delta", "thinking" => "hmm"}
+               }),
+               ant_event("content_block_stop", %{"index" => 0}),
+               ant_event("message_delta", %{
+                 "delta" => %{"stop_reason" => "end_turn"},
+                 "usage" => %{}
+               })
+             ], :protocol_error, "Mismatched thinking_delta for content block 0"},
+            {:anthropic_nil_text_start,
+             [
+               ant_event("message_start", %{"message" => %{"id" => "m8", "usage" => %{}}}),
+               ant_event("content_block_start", %{
+                 "index" => 0,
+                 "content_block" => %{"type" => "text", "text" => nil}
+               }),
+               ant_event("content_block_delta", %{
+                 "index" => 0,
+                 "delta" => %{"type" => "text_delta", "text" => "hi"}
+               }),
+               ant_event("content_block_stop", %{"index" => 0}),
+               ant_event("message_delta", %{
+                 "delta" => %{"stop_reason" => "end_turn"},
+                 "usage" => %{}
+               })
+             ], :protocol_error, "Invalid content_block_start block at index 0"},
+            {:anthropic_nil_tool_input_start,
+             [
+               ant_event("message_start", %{"message" => %{"id" => "m8b", "usage" => %{}}}),
+               ant_event("content_block_start", %{
+                 "index" => 0,
+                 "content_block" => %{
+                   "type" => "tool_use",
+                   "id" => "t1",
+                   "name" => "delete_item",
+                   "input" => nil
+                 }
+               }),
+               ant_event("content_block_stop", %{"index" => 0}),
+               ant_event("message_delta", %{
+                 "delta" => %{"stop_reason" => "tool_use"},
+                 "usage" => %{}
+               })
+             ], :protocol_error, "Invalid content_block_start block at index 0"},
+            {:anthropic_input_json_delta_on_text,
+             [
+               ant_event("message_start", %{"message" => %{"id" => "m9", "usage" => %{}}}),
+               ant_event("content_block_start", %{
+                 "index" => 0,
+                 "content_block" => %{"type" => "text", "text" => ""}
+               }),
+               ant_event("content_block_delta", %{
+                 "index" => 0,
+                 "delta" => %{"type" => "input_json_delta", "partial_json" => "{}"}
+               }),
+               ant_event("content_block_stop", %{"index" => 0}),
+               ant_event("message_delta", %{
+                 "delta" => %{"stop_reason" => "end_turn"},
+                 "usage" => %{}
+               })
+             ], :protocol_error, "Mismatched input_json_delta for content block 0"},
+            {:anthropic_invalid_message_delta,
+             [
+               ant_event("message_start", %{"message" => %{"id" => "m10", "usage" => %{}}}),
+               ant_event("message_delta", %{"delta" => nil})
+             ], :protocol_error, "Invalid message_delta payload"},
+            {:anthropic_protocol_error_on_max_tokens,
+             [
+               ant_event("message_start", %{"message" => %{"id" => "m11", "usage" => %{}}}),
+               "event: content_block_delta\ndata: {broken\n\n",
+               ant_event("message_delta", %{
+                 "delta" => %{"stop_reason" => "max_tokens"},
+                 "usage" => %{}
+               })
+             ], :malformed_reply, "Malformed JSON in Anthropic SSE"}
+          ] do
+        body = Enum.join(events)
+
+        Req.Test.stub(stub_name, fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("text/event-stream")
+          |> Plug.Conn.send_resp(200, body)
+        end)
+
+        assert {:error, %Error{kind: ^expected_kind, message: msg}} =
+                 Anthropic.stream(
+                   [Message.user("hi")],
+                   [],
+                   %{
+                     api_key: "k",
+                     model: "claude-sonnet-5-5",
+                     req_options: [plug: {Req.Test, stub_name}]
+                   },
+                   fn _ -> :ok end
+                 )
+
+        assert msg =~ expected_error
+      end
+    end
+
+    test "streaming refusal mid-tool-block returns refusal without retrying" do
+      requests = :atomics.new(1, signed: false)
+
+      refusal_events =
+        [
+          ant_event("message_start", %{
+            "message" => %{"id" => "m4", "type" => "message", "usage" => %{}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{
+              "type" => "tool_use",
+              "id" => "t1",
+              "name" => "delete_item",
+              "input" => %{}
+            }
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"target\":"}
+          }),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "refusal"},
+            "usage" => %{}
+          })
+        ]
+        |> Enum.join()
+
+      Req.Test.stub(:anthropic_streaming_refusal_mid_tool, fn conn ->
+        :atomics.add(requests, 1, 1)
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, refusal_events)
+      end)
+
+      assert {:error, %{status: :error, error: error_msg}} =
+               Alloy.stream("do it", fn _ -> :ok end,
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    req_options: [plug: {Req.Test, :anthropic_streaming_refusal_mid_tool}]},
+                 max_retries: 2,
+                 retry_backoff_ms: 0
+               )
+
+      assert error_msg =~ "refused"
+      assert :atomics.get(requests, 1) == 1
+    end
+
+    test "streaming max_tokens and model_context_window_exceeded mid-tool-JSON halt without retrying or executing tools" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "delete_item",
+          description: "Deletes an optional target",
+          input_schema: %{type: "object", properties: %{target: %{type: "string"}}},
+          execute: fn input, _ctx ->
+            send(test_pid, {:tool_executed, input})
+            {:ok, "deleted"}
+          end
+        )
+
+      for {stub_name, stop_reason, include_stop?} <- [
+            {:anthropic_streaming_max_tokens_mid_tool, "max_tokens", true},
+            {:anthropic_streaming_max_tokens_unclosed_tool, "max_tokens", false},
+            {:anthropic_streaming_ctx_window_mid_tool, "model_context_window_exceeded", true},
+            {:anthropic_streaming_ctx_window_unclosed_tool, "model_context_window_exceeded",
+             false}
+          ] do
+        requests = :atomics.new(1, signed: false)
+
+        stop_events =
+          if include_stop?, do: [ant_event("content_block_stop", %{"index" => 0})], else: []
+
+        truncated_events =
+          ([
+             ant_event("message_start", %{
+               "message" => %{"id" => "m5", "type" => "message", "usage" => %{}}
+             }),
+             ant_event("content_block_start", %{
+               "index" => 0,
+               "content_block" => %{
+                 "type" => "tool_use",
+                 "id" => "t1",
+                 "name" => "delete_item",
+                 "input" => %{}
+               }
+             }),
+             ant_event("content_block_delta", %{
+               "index" => 0,
+               "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"target\":"}
+             })
+           ] ++
+             stop_events ++
+             [
+               ant_event("message_delta", %{
+                 "delta" => %{"stop_reason" => stop_reason},
+                 "usage" => %{}
+               })
+             ])
+          |> Enum.join()
+
+        Req.Test.stub(stub_name, fn conn ->
+          :atomics.add(requests, 1, 1)
+
+          conn
+          |> Plug.Conn.put_resp_content_type("text/event-stream")
+          |> Plug.Conn.send_resp(200, truncated_events)
+        end)
+
+        assert {:error, %{status: :error, error: error_msg}} =
+                 Alloy.stream("delete it", fn _ -> :ok end,
+                   provider:
+                     {Anthropic,
+                      api_key: "k",
+                      model: "claude-sonnet-5-5",
+                      req_options: [plug: {Req.Test, stub_name}]},
+                   tools: [tool],
+                   max_retries: 2,
+                   retry_backoff_ms: 0
+                 )
+
+        assert error_msg =~ "max_tokens"
+        assert :atomics.get(requests, 1) == 1
+        refute_received {:tool_executed, _}
+      end
+    end
+
+    test "ignores unknown forward-compatible extension delta types during streaming" do
+      events =
+        [
+          ant_event("message_start", %{
+            "message" => %{"id" => "m6", "type" => "message", "usage" => %{}}
+          }),
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "hello"}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "citations_delta", "citation" => %{"source" => "doc"}}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{
+            "delta" => %{"stop_reason" => "end_turn"},
+            "usage" => %{}
+          })
+        ]
+        |> Enum.join()
+
+      Req.Test.stub(:anthropic_extension_delta, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, events)
+      end)
+
+      assert {:ok, %{messages: [msg], stop_reason: :end_turn}} =
+               Anthropic.stream(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "claude-sonnet-5-5",
+                   req_options: [plug: {Req.Test, :anthropic_extension_delta}]
+                 },
+                 fn _ -> :ok end
+               )
+
+      assert Message.text(msg) == "hello"
+    end
+
+    test "protocol error before text suppresses chunks and allows Retry to recover on next attempt" do
+      test_pid = self()
+      attempts = :atomics.new(1, signed: false)
+
+      malformed_then_text =
+        [
+          ant_event("message_start", %{"message" => %{"id" => "m12", "usage" => %{}}}),
+          "event: content_block_delta\ndata: {broken\n\n",
+          ant_event("content_block_start", %{
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }),
+          ant_event("content_block_delta", %{
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "stale chunk"}
+          }),
+          ant_event("content_block_stop", %{"index" => 0}),
+          ant_event("message_delta", %{"delta" => %{"stop_reason" => "end_turn"}, "usage" => %{}})
+        ]
+        |> Enum.join()
+
+      valid_stream =
+        text_stream("recovered ok", %{"stop_reason" => "end_turn"}) |> Enum.join()
+
+      Req.Test.stub(:anthropic_retry_after_protocol_error, fn conn ->
+        attempt = :atomics.add_get(attempts, 1, 1)
+        body = if attempt == 1, do: malformed_then_text, else: valid_stream
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_resp(200, body)
+      end)
+
+      assert {:ok, result} =
+               Alloy.stream(
+                 "hi",
+                 fn chunk -> send(test_pid, {:chunk, chunk}) end,
+                 provider:
+                   {Anthropic,
+                    api_key: "k",
+                    model: "claude-sonnet-5-5",
+                    req_options: [plug: {Req.Test, :anthropic_retry_after_protocol_error}]},
+                 max_retries: 1,
+                 retry_backoff_ms: 0
+               )
+
+      assert :atomics.get(attempts, 1) == 2
+      assert result.text == "recovered ok"
+      assert_received {:chunk, "recovered ok"}
+      refute_received {:chunk, "stale chunk"}
+    end
+
+    test "complete/3 rejects malformed tool_use blocks with :protocol_error" do
+      Req.Test.stub(:anthropic_complete_bad_tool_block, fn conn ->
+        Req.Test.json(conn, %{
+          "id" => "msg_bad",
+          "type" => "message",
+          "role" => "assistant",
+          "content" => [%{"type" => "tool_use", "name" => "read", "input" => nil}],
+          "stop_reason" => "tool_use",
+          "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+        })
+      end)
+
+      assert {:error, %Error{kind: :protocol_error}} =
+               Anthropic.complete(
+                 [Message.user("hi")],
+                 [],
+                 %{
+                   api_key: "k",
+                   model: "claude-sonnet-5-5",
+                   req_options: [plug: {Req.Test, :anthropic_complete_bad_tool_block}]
+                 }
+               )
     end
   end
 

@@ -3,6 +3,7 @@ defmodule Alloy.Tool.ExecutorTest do
 
   alias Alloy.Agent.{Config, State}
   alias Alloy.Message
+  alias Alloy.Provider.Test, as: TestProvider
   alias Alloy.Tool.Executor
 
   # --- Test Tool Modules ---
@@ -167,20 +168,131 @@ defmodule Alloy.Tool.ExecutorTest do
       assert log =~ "lib/alloy/tool/executor.ex"
     end
 
+    test "does not leak input or context secrets on FunctionClauseError in logs, tool_calls, or telemetry" do
+      clause_tool =
+        Alloy.Tool.inline(
+          name: "strict_clause",
+          description: "Matches only expected input",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn %{"expected" => val}, _ctx -> {:ok, val} end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          Alloy.Testing.tool_response("strict_clause", %{"token" => "input-secret-888"}),
+          Alloy.Testing.text_response("done")
+        ])
+
+      stop_handler_id = "tool-sanitize-telemetry-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        stop_handler_id,
+        [:alloy, :tool, :stop],
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop_sanitized, tool_name: "strict_clause"}
+      )
+
+      try do
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:ok, result} =
+                     Alloy.run("call it",
+                       provider: {TestProvider, agent_pid: pid},
+                       tools: [clause_tool],
+                       context: %{api_secret: "ctx-secret-999"}
+                     )
+
+            assert [meta] = result.tool_calls
+            assert is_binary(meta.error)
+            refute meta.error =~ "ctx-secret-999"
+            refute meta.error =~ "input-secret-888"
+          end)
+
+        assert log =~ "Tool strict_clause crashed"
+        refute log =~ "ctx-secret-999"
+        refute log =~ "input-secret-888"
+
+        assert_received {:tool_stop_sanitized, [:alloy, :tool, :stop], _measurements, stop_meta}
+        assert is_binary(stop_meta.error)
+        refute stop_meta.error =~ "ctx-secret-999"
+        refute stop_meta.error =~ "input-secret-888"
+      after
+        :telemetry.detach(stop_handler_id)
+      end
+    end
+
+    test "does not leak context secrets on KeyError in tool_result, logs, tool_calls, or telemetry" do
+      key_tool =
+        Alloy.Tool.inline(
+          name: "fetch_missing_key",
+          description: "Raises KeyError on context",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, ctx -> {:ok, Map.fetch!(ctx, :missing_db_url)} end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          Alloy.Testing.tool_response("fetch_missing_key", %{}),
+          Alloy.Testing.text_response("done")
+        ])
+
+      stop_handler_id = "tool-keyerror-telemetry-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        stop_handler_id,
+        [:alloy, :tool, :stop],
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop_key_error, tool_name: "fetch_missing_key"}
+      )
+
+      try do
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:ok, result} =
+                     Alloy.run("call it",
+                       provider: {TestProvider, agent_pid: pid},
+                       tools: [key_tool],
+                       context: %{api_secret: "ctx-keyerror-secret-777"}
+                     )
+
+            tool_result_text =
+              result.messages
+              |> Enum.flat_map(fn
+                %Message{content: blocks} when is_list(blocks) -> blocks
+                _ -> []
+              end)
+              |> Enum.filter(&(&1.type == "tool_result"))
+              |> Enum.map_join("\n", & &1.content)
+
+            assert tool_result_text =~ "KeyError"
+            refute tool_result_text =~ "ctx-keyerror-secret-777"
+
+            assert [meta] = result.tool_calls
+            assert meta.error =~ "KeyError"
+            refute meta.error =~ "ctx-keyerror-secret-777"
+          end)
+
+        assert log =~ "Tool fetch_missing_key crashed"
+        refute log =~ "ctx-keyerror-secret-777"
+
+        assert_received {:tool_stop_key_error, [:alloy, :tool, :stop], _measurements, stop_meta}
+        assert stop_meta.error =~ "KeyError"
+        refute stop_meta.error =~ "ctx-keyerror-secret-777"
+      after
+        :telemetry.detach(stop_handler_id)
+      end
+    end
+
     test "exception telemetry keeps full stacktrace while model-visible result is short" do
       state = build_state([CrashingTool])
       tool_call = %{id: "call_crash", name: "crasher", type: "tool_use", input: %{}}
-      test_pid = self()
-
       stop_handler_id = "tool-error-telemetry-#{inspect(make_ref())}"
 
       :telemetry.attach(
         stop_handler_id,
         [:alloy, :tool, :stop],
-        fn _event, _measurements, metadata, _config ->
-          send(test_pid, {:tool_stop, metadata})
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop, []}
       )
 
       try do
@@ -193,7 +305,9 @@ defmodule Alloy.Tool.ExecutorTest do
           refute block.content =~ "\n"
         end)
 
-        assert_receive {:tool_stop, %{tool_name: "crasher", error: error}}
+        assert_receive {:tool_stop, [:alloy, :tool, :stop], _measurements,
+                        %{tool_name: "crasher", error: error}}
+
         assert error =~ "boom!"
         assert error =~ "lib/alloy/tool/executor.ex"
       after
@@ -227,6 +341,147 @@ defmodule Alloy.Tool.ExecutorTest do
         assert block.is_error == true
         assert block.content =~ "Tool crash crashed"
         assert block.content =~ ":boom"
+      end
+    end
+
+    @tag capture_log: true
+    test "process exits from linked Task.await KeyError and GenServer.call timeout never leak context secrets" do
+      secret = "sk-exit-path-secret-999"
+      handler_id = "executor-exit-leak-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:alloy, :tool, :stop],
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop, []}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      silent_server =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      on_exit(fn -> send(silent_server, :stop) end)
+
+      task_crash_tool =
+        Alloy.Tool.inline(
+          name: "task_crash",
+          description: "crashes inside Task.async",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, ctx ->
+            Task.async(fn -> Map.fetch!(ctx, :missing_db_url) end) |> Task.await()
+          end
+        )
+
+      call_timeout_tool =
+        Alloy.Tool.inline(
+          name: "call_timeout",
+          description: "times out in GenServer.call with secret in payload",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _input, ctx ->
+            GenServer.call(silent_server, {:query, ctx.api_key}, 10)
+          end
+        )
+
+      state = build_state([task_crash_tool, call_timeout_tool], context: %{api_key: secret})
+
+      calls = [
+        %{id: "c_task", name: "task_crash", type: "tool_use", input: %{}},
+        %{id: "c_call", name: "call_timeout", type: "tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{content: [task_block, call_block]}, [task_meta, call_meta]} =
+               Executor.execute_all(calls, state.tool_fns, state, [])
+
+      assert task_block.is_error == true
+      assert task_block.content =~ "KeyError (key :missing_db_url not found)"
+      refute task_block.content =~ secret
+      refute task_meta.error =~ secret
+
+      assert call_block.is_error == true
+      assert call_block.content =~ ":timeout"
+      refute call_block.content =~ secret
+      refute call_meta.error =~ secret
+
+      for _ <- 1..2 do
+        assert_receive {:tool_stop, [:alloy, :tool, :stop], _measurements, meta}
+        refute to_string(meta.error) =~ secret
+      end
+    end
+
+    @tag capture_log: true
+    test "non-RuntimeError exceptions (ArgumentError and custom defexception) report module-only without stuttering" do
+      defmodule CustomQuotaError do
+        defexception [:message]
+      end
+
+      secret = "sk-custom-exception-secret"
+
+      arg_tool =
+        Alloy.Tool.inline(
+          name: "arg_crash",
+          description: "raises ArgumentError",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> raise ArgumentError, "bad value #{secret}" end
+        )
+
+      custom_tool =
+        Alloy.Tool.inline(
+          name: "custom_crash",
+          description: "raises custom defexception",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn _, _ -> raise CustomQuotaError, message: "quota #{secret}" end
+        )
+
+      state = build_state([arg_tool, custom_tool])
+
+      calls = [
+        %{id: "c_arg", name: "arg_crash", type: "tool_use", input: %{}},
+        %{id: "c_custom", name: "custom_crash", type: "tool_use", input: %{}}
+      ]
+
+      assert {:ok, %Message{content: [arg_block, custom_block]}, [arg_meta, custom_meta]} =
+               Executor.execute_all(calls, state.tool_fns, state, [])
+
+      assert arg_block.content =~ "ArgumentError"
+      refute arg_block.content =~ secret
+      assert String.starts_with?(arg_meta.error, "** (ArgumentError)\n")
+      refute arg_meta.error =~ "(ArgumentError) ArgumentError"
+      refute arg_meta.error =~ secret
+
+      assert custom_block.content =~ "CustomQuotaError"
+      refute custom_block.content =~ secret
+      assert String.starts_with?(custom_meta.error, "** (#{inspect(CustomQuotaError)})\n")
+      refute custom_meta.error =~ secret
+
+      # RuntimeError whose message starts with "RuntimeError..." must not be corrupted
+      # by prefix or grapheme-set stripping.
+      prefix_tool =
+        Alloy.Tool.inline(
+          name: "prefix_crash",
+          description: "raises RuntimeError with RuntimeError prefix",
+          input_schema: %{type: "object", properties: %{}},
+          execute: fn input, _ -> raise input["msg"] end
+        )
+
+      prefix_state = build_state([prefix_tool])
+
+      for msg <- ["RuntimeErrorout of memory", "RuntimeError foo"] do
+        prefix_call = %{
+          id: "c_prefix",
+          name: "prefix_crash",
+          type: "tool_use",
+          input: %{"msg" => msg}
+        }
+
+        assert {:ok, _msg, [prefix_meta]} =
+                 Executor.execute_all([prefix_call], prefix_state.tool_fns, prefix_state, [])
+
+        assert String.starts_with?(prefix_meta.error, "** (RuntimeError) #{msg}\n")
       end
     end
 
@@ -695,10 +950,8 @@ defmodule Alloy.Tool.ExecutorTest do
       :telemetry.attach(
         handler_id,
         [:alloy, :tool, :stop],
-        fn _event, measurements, metadata, _config ->
-          send(test_pid, {:tool_stop, measurements, metadata})
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :tool_stop, []}
       )
 
       try do
@@ -716,7 +969,7 @@ defmodule Alloy.Tool.ExecutorTest do
         assert meta.start_event_seq == start_seq
         assert meta.duration_ms >= 50
 
-        assert_received {:tool_stop, %{duration_ms: duration_ms},
+        assert_received {:tool_stop, [:alloy, :tool, :stop], %{duration_ms: duration_ms},
                          %{tool_id: "c_slow", start_event_seq: ^start_seq}}
 
         assert duration_ms >= 50
@@ -730,27 +983,21 @@ defmodule Alloy.Tool.ExecutorTest do
       call = %{id: "call_telemetry", name: "success", type: "tool_use", input: %{}}
       seq_ref = :atomics.new(1, signed: false)
       correlation = "corr-telemetry"
-      test_pid = self()
-
       start_handler_id = "test-tool-start-#{inspect(make_ref())}"
       stop_handler_id = "test-tool-stop-#{inspect(make_ref())}"
 
       :telemetry.attach(
         start_handler_id,
         [:alloy, :tool, :start],
-        fn event, measurements, metadata, _config ->
-          send(test_pid, {:telemetry_event, event, measurements, metadata})
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :telemetry_event, correlation_id: correlation}
       )
 
       :telemetry.attach(
         stop_handler_id,
         [:alloy, :tool, :stop],
-        fn event, measurements, metadata, _config ->
-          send(test_pid, {:telemetry_event, event, measurements, metadata})
-        end,
-        nil
+        &__MODULE__.forward_tool_telemetry/4,
+        {self(), :telemetry_event, correlation_id: correlation}
       )
 
       try do
@@ -787,6 +1034,16 @@ defmodule Alloy.Tool.ExecutorTest do
   end
 
   # --- Helpers ---
+
+  @doc false
+  def forward_tool_telemetry(event, measurements, metadata, {test_pid, tag, filters})
+      when test_pid == self() do
+    if Enum.all?(filters, fn {k, v} -> Map.get(metadata, k) == v end) do
+      send(test_pid, {tag, event, measurements, metadata})
+    end
+  end
+
+  def forward_tool_telemetry(_event, _measurements, _metadata, _config), do: :ok
 
   defp build_state(tools, opts \\ []) do
     config = %Config{
@@ -1053,6 +1310,259 @@ defmodule Alloy.Tool.ExecutorTest do
 
       ids = Enum.map(blocks, & &1.tool_use_id)
       assert ids == ["c1", "c2", "c3"]
+    end
+  end
+
+  describe "execute_all — absolute run deadline" do
+    test "sequential batches skip unstarted calls after run deadline without emitting tool_start" do
+      test_pid = self()
+
+      first_seq =
+        Alloy.Tool.inline(
+          name: "first_seq",
+          description: "blocks until killed by run deadline",
+          concurrent?: false,
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :first_started)
+
+            receive do
+              :never -> {:ok, "done"}
+            end
+          end
+        )
+
+      second_seq =
+        Alloy.Tool.inline(
+          name: "second_seq",
+          description: "must not execute after deadline",
+          concurrent?: false,
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :second_executed)
+            {:ok, "ran"}
+          end
+        )
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "c1", name: "first_seq", input: %{}},
+            %{id: "c2", name: "second_seq", input: %{}}
+          ]),
+          TestProvider.text_response("should not reach turn 2")
+        ])
+
+      assert {:error, result} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: pid},
+                 tools: [first_seq, second_seq],
+                 timeout_ms: 150,
+                 tool_timeout: 10_000,
+                 on_event: fn ev -> send(test_pid, {:run_event, ev}) end
+               )
+
+      assert_received :first_started
+      refute_received :second_executed
+      assert result.status == :error
+      assert [first_call] = result.tool_calls
+      assert first_call.name == "first_seq"
+      assert first_call.error =~ "run deadline"
+
+      tool_starts =
+        Stream.repeatedly(fn ->
+          receive do
+            {:run_event, %{event: :tool_start, payload: %{name: name}}} -> name
+          after
+            0 -> :done
+          end
+        end)
+        |> Enum.take_while(&(&1 != :done))
+
+      assert tool_starts == ["first_seq"]
+      assert :ok == Alloy.Transcript.validate(result.messages)
+
+      tool_result_msg = List.last(result.messages)
+
+      assert Enum.any?(
+               tool_result_msg.content,
+               &(&1.tool_use_id == "c2" and &1.content =~ "Not executed:")
+             )
+    end
+
+    test "tool_concurrency: 1 skips expired calls without emitting tool_start" do
+      test_pid = self()
+
+      first_q_block =
+        Alloy.Tool.inline(
+          name: "first_q_block",
+          description: "blocks until run deadline",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            receive do
+              :never -> {:ok, "done"}
+            end
+          end
+        )
+
+      second_q_skip =
+        Alloy.Tool.inline(
+          name: "second_q_skip",
+          description: "must not run or emit tool_start after expiry",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :c1_second_ran)
+            {:ok, "ran"}
+          end
+        )
+
+      {:ok, c1_pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "s1", name: "first_q_block", input: %{}},
+            %{id: "s2", name: "second_q_skip", input: %{}}
+          ])
+        ])
+
+      assert {:error, c1_result} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: c1_pid},
+                 tools: [first_q_block, second_q_skip],
+                 tool_concurrency: 1,
+                 timeout_ms: 250,
+                 tool_timeout: 10_000,
+                 on_event: fn ev -> send(test_pid, {:c1_event, ev}) end
+               )
+
+      refute_received :c1_second_ran
+      assert [%{name: "first_q_block"}] = c1_result.tool_calls
+
+      c1_starts =
+        Stream.repeatedly(fn ->
+          receive do
+            {:c1_event, %{event: :tool_start, payload: %{name: name}}} -> name
+          after
+            0 -> :done
+          end
+        end)
+        |> Enum.take_while(&(&1 != :done))
+
+      assert c1_starts == ["first_q_block"]
+    end
+
+    test "queued concurrent tools inside a parallel batch are killed at the absolute run deadline" do
+      test_pid = self()
+
+      t1_delayed =
+        Alloy.Tool.inline(
+          name: "t1_delayed",
+          description: "finishes 500ms into an 800ms budget to dequeue t3 late",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            Process.sleep(500)
+            send(test_pid, :t1_done)
+            {:ok, "t1 done"}
+          end
+        )
+
+      t2_hold =
+        Alloy.Tool.inline(
+          name: "t2_hold",
+          description: "holds slot 2 until deadline",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            receive do
+              :never -> {:ok, "done"}
+            end
+          end
+        )
+
+      t3_queued =
+        Alloy.Tool.inline(
+          name: "t3_queued",
+          description: "dequeued at ~500ms and killed at 800ms before 1_000ms side effect",
+          input_schema: %{type: "object"},
+          execute: fn _, _ ->
+            send(test_pid, :t3_started)
+            Process.sleep(500)
+            send(test_pid, :t3_side_effect)
+            {:ok, "ran"}
+          end
+        )
+
+      {:ok, q_pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{id: "q1", name: "t1_delayed", input: %{}},
+            %{id: "q2", name: "t2_hold", input: %{}},
+            %{id: "q3", name: "t3_queued", input: %{}}
+          ])
+        ])
+
+      q_started = System.monotonic_time(:millisecond)
+
+      assert {:error, q_result} =
+               Alloy.run("go",
+                 provider: {TestProvider, agent_pid: q_pid},
+                 tools: [t1_delayed, t2_hold, t3_queued],
+                 tool_concurrency: 2,
+                 timeout_ms: 800,
+                 tool_timeout: 10_000
+               )
+
+      assert System.monotonic_time(:millisecond) - q_started < 3_000
+      assert_received :t1_done
+      assert_received :t3_started
+      refute_receive :t3_side_effect, 400
+      assert q_result.status == :error
+
+      assert Enum.any?(
+               q_result.tool_calls,
+               &(&1.name == "t3_queued" and &1.error =~ "run deadline")
+             )
+    end
+
+    test "blocked tool calls in an already-expired batch preserve middleware block reason" do
+      state = build_state([SuccessTool], middleware: [BlockingMiddleware])
+      call = %{type: "tool_use", id: "b1", name: "success", input: %{}}
+      past = System.monotonic_time(:millisecond) - 10
+
+      assert {:ok, %Message{content: [%{tool_use_id: "b1", content: content, is_error: true}]},
+              []} =
+               Executor.execute_all([call], state.tool_fns, state, run_deadline: past)
+
+      assert content == "Blocked: not allowed"
+    end
+
+    test "explicit nil or false tool inputs are rejected rather than coerced to an empty map" do
+      test_pid = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "optional_tool",
+          description: "Optional args",
+          input_schema: %{type: "object", properties: %{a: %{type: "string"}}},
+          execute: fn input, _ctx ->
+            send(test_pid, {:ran, input})
+            {:ok, "ran"}
+          end
+        )
+
+      state = build_state([tool])
+      on_event = fn event -> send(test_pid, {:event, event}) end
+
+      for bad_input <- [nil, false, [1, 2], "str"] do
+        call = %{type: "tool_use", id: "bad", name: "optional_tool", input: bad_input}
+
+        assert {:ok, %Message{content: [%{is_error: true, content: content}]}, [meta]} =
+                 Executor.execute_all([call], state.tool_fns, state, on_event: on_event)
+
+        assert content =~ "must be a JSON object"
+        assert meta.input == bad_input
+        assert_received {:event, {:tool_start, %{id: "bad", input: ^bad_input}}}
+        assert_received {:event, {:tool_end, %{id: "bad", input: ^bad_input}}}
+        refute_received {:ran, _}
+      end
     end
   end
 end

@@ -42,6 +42,247 @@ defmodule Alloy.MessageTest do
                uri: "gs://bucket/report.pdf"
              }
     end
+
+    test "image_url/2, document_data/3, and document_file/3 build multimodal blocks" do
+      assert Message.image_url("https://example.com/a.png") == %{
+               type: "image",
+               url: "https://example.com/a.png"
+             }
+
+      assert Message.image_url("https://example.com/a.png", mime_type: "image/png") == %{
+               type: "image",
+               url: "https://example.com/a.png",
+               mime_type: "image/png"
+             }
+
+      assert Message.document_data("application/pdf", "JVBERi0=",
+               filename: "spec.pdf",
+               title: "Spec"
+             ) == %{
+               type: "document",
+               mime_type: "application/pdf",
+               data: "JVBERi0=",
+               filename: "spec.pdf",
+               title: "Spec"
+             }
+
+      assert Message.document_file("application/pdf", "file_123", title: "Invoice") == %{
+               type: "document",
+               mime_type: "application/pdf",
+               file_id: "file_123",
+               title: "Invoice"
+             }
+    end
+
+    test "origin/2 never invokes function api_key, distinguishes captured accounts, and respects :origin_key" do
+      make_auth = fn acct ->
+        fn -> raise "should never be invoked: #{acct}" end
+      end
+
+      f_a = make_auth.("account-a")
+      f_b = make_auth.("account-b")
+
+      o_a = Message.origin(Alloy.Provider.Anthropic, %{api_key: f_a})
+      o_b = Message.origin(Alloy.Provider.Anthropic, %{api_key: f_b})
+      assert o_a == Message.origin(Alloy.Provider.Anthropic, %{api_key: f_a})
+      refute o_a == o_b
+
+      ok1 =
+        Message.origin(Alloy.Provider.Anthropic, %{
+          api_key: fn -> "tok1" end,
+          origin_key: "acct-a"
+        })
+
+      ok2 =
+        Message.origin(Alloy.Provider.Anthropic, %{
+          api_key: fn -> "tok2" end,
+          origin_key: "acct-a"
+        })
+
+      assert ok1 == ok2
+    end
+
+    test "normalize_for/3 drops cross-origin file_id documents on both user and assistant messages" do
+      ant_origin = Message.origin(Alloy.Provider.Anthropic, %{api_key: "k1"})
+
+      user_mixed = %Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Check this PDF"},
+          Message.document_file("application/pdf", "file_ant_1", origin: ant_origin),
+          Message.document_data("application/pdf", "JVBERi0=")
+        ]
+      }
+
+      user_only_file = %Message{
+        role: :user,
+        origin: ant_origin,
+        content: [Message.document_file("application/pdf", "file_ant_2")]
+      }
+
+      assistant_msg = %Message{
+        role: :assistant,
+        origin: ant_origin,
+        content: [
+          %{type: "text", text: "See attached"},
+          Message.document_file("application/pdf", "file_secret"),
+          Message.document_data("application/pdf", "JVBERi0=")
+        ]
+      }
+
+      # Same origin keeps user file_id attachments intact.
+      [same_mixed, same_only, _] =
+        Message.normalize_for(
+          [user_mixed, user_only_file, assistant_msg],
+          Alloy.Provider.Anthropic,
+          %{api_key: "k1"}
+        )
+
+      assert Enum.any?(same_mixed.content, &match?(%{file_id: "file_ant_1"}, &1))
+      assert Enum.any?(same_only.content, &match?(%{file_id: "file_ant_2"}, &1))
+
+      # Different origin drops foreign file_id blocks on both user and assistant messages.
+      [norm_mixed, norm_only, norm_asst] =
+        Message.normalize_for(
+          [user_mixed, user_only_file, assistant_msg],
+          Alloy.Provider.OpenAI,
+          %{api_key: "k2"}
+        )
+
+      assert norm_mixed.content == [
+               %{type: "text", text: "Check this PDF"},
+               %{type: "text", text: "[Omitted provider-specific file attachment]"},
+               %{type: "document", mime_type: "application/pdf", data: "JVBERi0="}
+             ]
+
+      assert norm_only.content == [
+               %{type: "text", text: "[Omitted provider-specific file attachment]"}
+             ]
+
+      assert norm_asst.content == [
+               %{type: "text", text: "See attached"},
+               %{type: "document", mime_type: "application/pdf", data: "JVBERi0="}
+             ]
+
+      # Gemini File API URIs passed via document/2 or image_url/2 are also
+      # origin-scoped: attributed to Gemini, preserved on the same Gemini origin,
+      # and replaced/dropped on another provider or another Gemini account.
+      gem_origin = Message.origin(Alloy.Provider.Gemini, %{api_key: "gem-k1"})
+      gem_uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+      gem_img_uri = "https://generativelanguage.googleapis.com/v1beta/files/img456"
+
+      gem_user = %Message{
+        role: :user,
+        content: [
+          %{type: "text", text: "Read this"},
+          Message.document("application/pdf", gem_uri),
+          Message.image_url(gem_img_uri, mime_type: "image/png")
+        ]
+      }
+
+      gem_asst = %Message{
+        role: :assistant,
+        origin: gem_origin,
+        content: [
+          %{type: "text", text: "Generated"},
+          Message.image_url(gem_img_uri, mime_type: "image/png")
+        ]
+      }
+
+      [attributed_gem_user] =
+        Message.attribute_file_blocks([gem_user], gem_origin, Alloy.Provider.Gemini)
+
+      assert [_, %{uri: ^gem_uri, origin: ^gem_origin}, %{url: ^gem_img_uri, origin: ^gem_origin}] =
+               attributed_gem_user.content
+
+      # Non-Gemini primary does NOT stamp a Gemini File API URI with its own origin,
+      # so a Gemini fallback still receives the URI intact.
+      [unattributed_on_ant] =
+        Message.attribute_file_blocks([gem_user], ant_origin, Alloy.Provider.Anthropic)
+
+      assert [_, %{uri: ^gem_uri} = u_doc, %{url: ^gem_img_uri} = u_img] =
+               unattributed_on_ant.content
+
+      refute Map.has_key?(u_doc, :origin)
+      refute Map.has_key?(u_img, :origin)
+
+      # Rotating credentials with a stable :origin_key preserves persisted user
+      # document_file attachments across resumed turns on the same account.
+      rotated_origin =
+        Message.origin(Alloy.Provider.Anthropic, %{api_key: "key-v1", origin_key: "org-1"})
+
+      persisted_user = %Message{
+        role: :user,
+        content: [
+          Message.document_file("application/pdf", "file_ws_1", origin: rotated_origin)
+        ]
+      }
+
+      [resumed_user] =
+        Message.normalize_for([persisted_user], Alloy.Provider.Anthropic, %{
+          api_key: "key-v2-rotated",
+          origin_key: "org-1"
+        })
+
+      assert [%{file_id: "file_ws_1"}] = resumed_user.content
+
+      [same_gem, same_gem_asst] =
+        Message.normalize_for([attributed_gem_user, gem_asst], Alloy.Provider.Gemini, %{
+          api_key: "gem-k1"
+        })
+
+      assert [_, %{uri: ^gem_uri}, %{url: ^gem_img_uri}] = same_gem.content
+      assert [_, %{url: ^gem_img_uri}] = same_gem_asst.content
+
+      for {target_mod, target_cfg} <- [
+            {Alloy.Provider.Anthropic, %{api_key: "k1"}},
+            {Alloy.Provider.OpenAI, %{api_key: "k2"}},
+            {Alloy.Provider.OpenAICompat, %{api_key: "k3", api_url: "http://localhost"}},
+            {Alloy.Provider.Gemini, %{api_key: "gem-k2"}}
+          ] do
+        [cross, cross_asst] =
+          Message.normalize_for([attributed_gem_user, gem_asst], target_mod, target_cfg)
+
+        assert cross.content == [
+                 %{type: "text", text: "Read this"},
+                 %{type: "text", text: "[Omitted provider-specific file attachment]"},
+                 %{type: "text", text: "[Omitted provider-specific file attachment]"}
+               ]
+
+        assert cross_asst.content == [%{type: "text", text: "Generated"}]
+      end
+
+      # Block-level foreign file_id on unattributed (origin: nil) and same-origin
+      # assistant messages is also stripped, covering {mod, keyword} and {mod, map} origins.
+      oai_origin = Message.origin(Alloy.Provider.OpenAI, %{api_key: "k2"})
+
+      unattributed_asst =
+        Message.assistant_blocks([
+          Message.document_file("application/pdf", "file_a1",
+            origin: {Alloy.Provider.Anthropic, [api_key: "k1"]}
+          )
+        ])
+
+      conflicting_asst = %Message{
+        role: :assistant,
+        origin: oai_origin,
+        content: [
+          %{type: "text", text: "Kept"},
+          Message.document_file("application/pdf", "file_a2",
+            origin: {Alloy.Provider.Anthropic, %{api_key: "k1"}}
+          )
+        ]
+      }
+
+      assert [norm_conflicting] =
+               Message.normalize_for(
+                 [unattributed_asst, conflicting_asst],
+                 Alloy.Provider.OpenAI,
+                 %{api_key: "k2"}
+               )
+
+      assert norm_conflicting.content == [%{type: "text", text: "Kept"}]
+    end
   end
 
   describe "composing media blocks into messages" do
@@ -244,6 +485,162 @@ defmodule Alloy.MessageTest do
       assert Enum.all?(ids, &Regex.match?(~r/^[a-zA-Z0-9_-]{1,64}$/, &1))
       assert ids == Enum.uniq(ids)
       assert [%Message{content: ^rewritten}] = Message.normalize_for([message], @anthropic, %{})
+    end
+
+    test "later same-origin reused call ID keeps its raw ID paired with its tool result" do
+      provider = Alloy.Provider.OpenAICompat
+      config = %{api_key: "target"}
+      call = %{type: "tool_use", id: "functions.read:0", name: "read", input: %{}}
+
+      foreign = %{
+        Message.assistant_blocks([call])
+        | origin: Message.origin(provider, %{api_key: "other"})
+      }
+
+      local = %{Message.assistant_blocks([call]) | origin: Message.origin(provider, config)}
+      result = Message.tool_results([Message.tool_result_block(call.id, "ok")])
+
+      [norm_foreign, norm_foreign_res, norm_local, norm_local_res] =
+        Message.normalize_for([foreign, result, local, result], provider, config)
+
+      assert hd(norm_foreign.content).id == hd(norm_foreign_res.content).tool_use_id
+      assert hd(norm_foreign.content).id != call.id
+      assert hd(norm_local.content).id == call.id
+      assert hd(norm_local_res.content).tool_use_id == call.id
+    end
+  end
+
+  describe "Alloy.Message.Validator" do
+    alias Alloy.Message.Validator
+
+    test "accepts valid string and block messages across all supported block types" do
+      messages = [
+        Message.user("hello"),
+        %Message{
+          role: :assistant,
+          provider: Alloy.Provider.Anthropic,
+          model: "claude-sonnet-5-5",
+          origin: "orig-1",
+          content: [
+            %{type: "text", text: "hi", refusal: false, phase: "final", signature: "sig"},
+            %{
+              type: "thinking",
+              thinking: "hmm",
+              signature: "s",
+              thought_signature: "ts",
+              source: "x"
+            },
+            %{type: "redacted_thinking", data: "opaque"},
+            %{
+              type: "tool_use",
+              id: "call_1",
+              name: "read",
+              input: %{"path" => "mix.exs", "nested" => [1, true, nil, 2.5]},
+              caller: %{"type" => "direct"}
+            }
+          ]
+        },
+        Message.tool_results([
+          %{type: "tool_result", tool_use_id: "call_1", content: "ok", is_error: false}
+        ]),
+        %Message{
+          role: :user,
+          content: [
+            %{type: "image", mime_type: "image/png", data: "abc"},
+            %{type: "image", url: "https://example.com/a.png", mime_type: "image/png"},
+            %{type: "audio", mime_type: "audio/mp3", data: "abc"},
+            %{type: "video", mime_type: "video/mp4", data: "abc"},
+            %{type: "document", mime_type: "application/pdf", data: "abc", filename: "a.pdf"},
+            %{
+              type: "document",
+              mime_type: "application/pdf",
+              uri: "https://example.com/a.pdf",
+              title: "A"
+            },
+            %{type: "document", mime_type: "application/pdf", file_id: "file_1", origin: "orig-1"}
+          ]
+        }
+      ]
+
+      assert {:ok, ^messages} = Validator.poll_callback(:follow_up, fn _ -> messages end, :state)
+    end
+
+    test "rejects malformed messages, invalid blocks, non-JSON values, and broken tool pairing" do
+      assert {:error, msg} = Validator.validate_callback_messages(:steering, :not_a_list)
+      assert msg =~ "steering callback returned invalid messages"
+      assert msg =~ ":not_a_list"
+
+      assert {:error, msg} = Validator.validate_callback_messages(:follow_up, [%{role: :user}])
+      assert msg =~ "follow_up callback returned invalid messages"
+
+      orphan = [Message.tool_results([Message.tool_result_block("missing_id", "ok")])]
+
+      assert {:error, "steering callback returned messages with invalid tool pairing"} =
+               Validator.validate_callback_messages(:steering, orphan)
+
+      refute Validator.valid_message?(%Message{role: :system, content: "hi"})
+      refute Validator.valid_message?(%Message{role: :user, content: []})
+      refute Validator.valid_message?(%Message{role: :user, content: <<0xFF>>})
+      refute Validator.valid_message?(%Message{role: :user, content: "hi", model: 123})
+
+      refute Validator.valid_block?(:not_a_map)
+      refute Validator.valid_block?(%Message{role: :user, content: "x"})
+      refute Validator.valid_block?(%{type: "unknown"})
+      refute Validator.valid_block?(%{type: "text", text: "ok", refusal: "yes"})
+      refute Validator.valid_block?(%{type: "text", text: "ok", extra: self()})
+      refute Validator.valid_block?(%{type: "tool_use", id: "", name: "x", input: %{}})
+      refute Validator.valid_block?(%{type: "tool_use", id: "1", name: "x", input: %URI{}})
+
+      refute Validator.valid_block?(%{
+               type: "tool_use",
+               id: "1",
+               name: "x",
+               input: %{},
+               caller: []
+             })
+
+      refute Validator.valid_block?(%{
+               type: "tool_use",
+               id: "1",
+               name: "x",
+               input: %{"a" => [1 | 2]}
+             })
+
+      refute Validator.valid_block?(%{type: "tool_result", tool_use_id: "", content: "ok"})
+      refute Validator.valid_block?(%{type: "image", mime_type: "image/png", data: "a", url: "b"})
+      refute Validator.valid_block?(%{type: "image"})
+      refute Validator.valid_block?(%{type: "audio", mime_type: "audio/mp3", data: "a", url: "b"})
+
+      refute Validator.valid_block?(%{
+               type: "document",
+               mime_type: "application/pdf",
+               data: "a",
+               uri: "b"
+             })
+
+      refute Validator.valid_block?(%{type: "document", mime_type: "application/pdf"})
+    end
+
+    test "rescues exceptions and catches throws/exits with redaction" do
+      assert {:error, err} =
+               Validator.poll_callback(
+                 :steering,
+                 fn _ -> raise KeyError, key: :token, term: %{secret: "sk-leak"} end,
+                 :state
+               )
+
+      assert err == "steering callback failed (KeyError)"
+      refute err =~ "sk-leak"
+
+      assert {:error, err} =
+               Validator.poll_callback(
+                 :follow_up,
+                 fn _ -> throw(%{secret: "sk-throw-leak"}) end,
+                 :state
+               )
+
+      assert err == "follow_up callback throw: unexpected map"
+      refute err =~ "sk-throw-leak"
     end
   end
 end

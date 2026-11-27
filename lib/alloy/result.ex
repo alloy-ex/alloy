@@ -12,13 +12,24 @@ defmodule Alloy.Result do
       output was cut off), `nil` only when the conversation has no assistant message.
       With `:stop_after_tool`, this is the selected tool's final content instead;
       its metadata is in `metadata.final_tool`
+    * `:output` — decoded JSON value when `:output_schema` is configured and
+      the run completes normally (`status: :completed`), or `nil` otherwise
+      (including when `:after_completion` middleware returns `{:halt, reason}`
+      or `{:halt, reason, state}`, where the validated value was available on
+      `state.run_metadata.output` inside `:after_completion` and the raw reply
+      remains in `:text` / `:messages`)
     * `:thinking` — the final assistant thinking/reasoning text (or `nil` if none),
       so callers need not dig it out of the last message's content blocks
     * `:messages` — full conversation history
     * `:usage` — accumulated `%Alloy.Usage{}` token counts
     * `:tool_calls` — list of tool execution metadata maps
-    * `:metadata` — auxiliary result metadata such as provider-owned state
-    * `:status` — final run status (`:completed`, `:max_turns`, `:error`, `:halted`)
+    * `:metadata` — auxiliary result metadata such as provider-owned state,
+      `metadata.run.provider_error` (`%Alloy.Provider.Error{}` on provider
+      failures), and `metadata.run.output_error` (`%{kind: :invalid_json |
+      :schema_mismatch | :invalid_schema | :truncated | :refusal | :missing_text,
+      message: String.t(), decoded: term() | nil}` when `:output_schema` decoding
+      or validation fails)
+    * `:status` — final run status (`:completed`, `:max_turns`, `:error`, `:halted`, `:cancelled`)
     * `:stop_reason` — why the model stopped on the last provider response
       (`:end_turn`, `:tool_use`, `:max_tokens`, `:refusal`, `:pause_turn`), or
       `nil` if no response arrived. Check for `:max_tokens` to detect a
@@ -35,6 +46,7 @@ defmodule Alloy.Result do
 
   @type t :: %__MODULE__{
           text: String.t() | nil,
+          output: term() | nil,
           thinking: String.t() | nil,
           messages: [Message.t()],
           usage: Usage.t(),
@@ -49,6 +61,7 @@ defmodule Alloy.Result do
 
   defstruct [
     :text,
+    :output,
     :thinking,
     :error,
     :request_id,
@@ -72,6 +85,7 @@ defmodule Alloy.Result do
   def from_state(%State{} = state) do
     %__MODULE__{
       text: final_text(state),
+      output: final_output(state),
       thinking: State.last_assistant_thinking(state),
       messages: State.messages(state),
       usage: state.usage,
@@ -88,7 +102,7 @@ defmodule Alloy.Result do
   Tags a result the way `Alloy.run/2` returns it.
 
   `{:ok, result}` when the run completed or stopped at `:max_turns`;
-  `{:error, result}` for every other status (`:error`, `:halted`).
+  `{:error, result}` for every other status (`:error`, `:halted`, `:cancelled`).
   """
   @spec wrap(t()) :: {:ok, t()} | {:error, t()}
   def wrap(%__MODULE__{status: status} = result) when status in [:completed, :max_turns],
@@ -114,7 +128,7 @@ defmodule Alloy.Result do
     %{}
     |> maybe_put_metadata(:provider_state, state.provider_state)
     |> maybe_put_metadata(:provider_response, state.provider_response_metadata)
-    |> maybe_put_metadata(:run, Map.delete(state.run_metadata, :final_tool))
+    |> maybe_put_metadata(:run, Map.drop(state.run_metadata, [:final_tool, :output]))
     |> maybe_put_metadata(:final_tool, Map.get(state.run_metadata, :final_tool, %{}))
   end
 
@@ -122,6 +136,9 @@ defmodule Alloy.Result do
     do: content
 
   defp final_text(state), do: State.last_assistant_text(state)
+
+  defp final_output(%State{status: :completed, run_metadata: %{output: output}}), do: output
+  defp final_output(_state), do: nil
 
   defp maybe_put_metadata(metadata, _key, value) when is_map(value) and map_size(value) == 0,
     do: metadata

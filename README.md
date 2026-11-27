@@ -9,7 +9,7 @@
 
 Alloy is the completion-tool-call loop and nothing else. Send messages to any LLM, execute tool calls, loop until done. Swap providers with one line. No opinions on sessions, persistence, memory, scheduling, or UI — those belong in your application, where OTP already gives you the runtime.
 
-Alloy is a harness, not a framework. Four runtime dependencies, ~10,000 lines — small enough to read in a day, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
+Alloy is a harness, not a framework. Four runtime dependencies, ~21,000 lines — small enough to inspect end-to-end, and everything beyond the loop is a [recipe](https://hexdocs.pm/alloy/sub-agents.html) built on the primitives, not a subsystem.
 
 ```elixir
 {:ok, result} = Alloy.run("Read mix.exs and tell me the version",
@@ -17,7 +17,7 @@ Alloy is a harness, not a framework. Four runtime dependencies, ~10,000 lines �
   tools: [Alloy.Tool.Core.Read]
 )
 
-result.text #=> "The version is 0.13.0"
+result.text #=> "The version is 0.16.0"
 ```
 
 ## Why Alloy?
@@ -60,20 +60,22 @@ application layer. The library stays small so those choices remain yours.
 ## What's in the box
 
 - **6 providers** — Anthropic, Gemini, OpenAI, Codex, xAI, and OpenAICompat (works with any OpenAI-compatible API: Ollama, OpenRouter, DeepSeek, Mistral, Groq, Together, etc.)
-- **4 built-in tools** — read, write, edit, bash — plus inline tools defined as data with `Alloy.Tool.inline/1`
-- **Streaming** — incremental HTTP provider output; Codex replays final text through the same interface
-- **Middleware** — custom hooks, tool blocking, argument editing
+- **4 built-in tools** — read, write, edit, bash (with streaming `:tool_update` output) — plus inline tools (`Alloy.Tool.inline/1`) and reusable single-tool execution (`Alloy.Tool.Executor.run_tool/3`) with native `:parent_call_id`
+- **Multimodal & major-lab wire parity** — portable image URLs and PDF/document blocks (`data:`, `uri:`, or origin-scoped `file_id:`), dynamic 0-arity `:api_key` callbacks with `:origin_key` isolation, Anthropic `:cache` TTL / `:web_search`, OpenAI/xAI prompt cache keys, and Gemini provider-config `:cached_content`, `:google_search`, `:url_context`, and `:code_execution` (note: top-level `code_execution: true` on `Alloy.run/2` applies to Anthropic only)
+- **Portable `:reasoning` & uniform v1 streaming** — single `:reasoning` knob across all 6 providers plus versioned `:turn_start`, `:turn_end`, `:text_delta`, `:thinking_delta`, `:tool_call_delta`, `:tool_start`, `:tool_update`, and `:tool_end` envelopes (`docs/events.md`)
+- **Interactive loop controls** — lock-free cooperative cancellation (`Alloy.Cancel`), mid-run `:steering` between tool batches, and completion `:follow_up` queues alongside `:output_schema`, `until_tool`, and `stop_after_tool`
+- **Middleware** — custom hooks, tool blocking, argument editing, result rewriting
 - **Context compaction** — middleware, on by default: tool-result clearing plus summary-based compaction when approaching token limits, with configurable reserve and fallback to truncation
 - **Memory tool** — `Alloy.Memory.tool/1` for any provider (Anthropic gets its native `memory_20250818` type). Alloy owns the commands and path validation; you own the store (in-memory, disk, Postgres — whatever fits)
-- **Prompt caching** — Anthropic `cache: true` adds cache breakpoints for 60-90% input token savings
+- **Prompt caching** — Anthropic `cache: true` / `cache: %{ttl: "1h"}`, OpenAI/xAI `:prompt_cache_key`, and Gemini `:cached_content`
 - **Reasoning blocks** — OpenAI encrypted reasoning, Anthropic and Gemini signed thinking, and DeepSeek/Kimi/GLM `reasoning_content` are kept as blocks and sent back the way each API requires
 - **Tool guardrails** — `concurrent?/0` controls parallel execution, `max_result_chars/0` caps output, prompt-too-long auto-recovery. Note: the bash tool's restricted mode is a guardrail, not a sandbox — see [Built-in tools](#built-in-tools)
-- **Structured output** — `until_tool` forces the loop to continue until a specific tool is called
+- **Structured output** — portable `:output_schema` (translated to each provider's native JSON Schema field and decoded into `result.output`) plus `until_tool` / `stop_after_tool` for tool-enforced output
 - **Provider passthrough** — `extra_body` injects arbitrary provider-specific params (response_format, temperature, reasoning_effort)
-- **Telemetry** — run, turn, provider, and compaction lifecycle events for OTEL/logging/metrics
+- **Telemetry** — run, turn, provider, tool, event, and compaction lifecycle events for OTEL/logging/metrics (see [OpenTelemetry recipe](docs/recipes/opentelemetry.md))
 - **Budget limits** — a small `:before_completion` middleware [recipe](#budget-limits) prices usage and halts the run
-- **Pluggable model catalog** — `Alloy.ModelCatalog` behaviour; bring your own context-window source (e.g., an `llm_db` adapter)
-- **~10,000 lines** — small enough to read, understand, and extend
+- **Pluggable model catalog** — `Alloy.ModelCatalog` behaviour with required `context_window/1`, optional `max_output_tokens/1`, `capabilities/1`, and `pricing/1`, plus `Alloy.ModelCatalog.info/2` (see [`llm_db` recipe](docs/recipes/llm-db-catalog.md))
+- **Small, inspectable core** — 4 mandatory runtime dependencies (`req`, `mint`, `jason`, `telemetry`) plus optional `ex_json_schema`
 
 ## Installation
 
@@ -82,15 +84,16 @@ Add `alloy` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:alloy, "~> 0.13"}
+    {:alloy, "~> 0.16"}
   ]
 end
 ```
 
+Upgrading from 0.14? See [Upgrading to 0.16](docs/upgrading-to-0.16.md).
 For a supervised agent process — sessions, async dispatch over
-Phoenix.PubSub, backpressure, and ready-made memory stores — add
-[`alloy_agent`](https://github.com/alloy-ex/alloy_agent) as well. It moved
-out of Alloy in 0.13; see [Upgrading to 0.13](docs/upgrading-to-0.13.md).
+Phoenix.PubSub, backpressure, and ready-made memory stores — see
+[`alloy_agent`](https://github.com/alloy-ex/alloy_agent) (and
+[Upgrading to 0.13](docs/upgrading-to-0.13.md) for the runtime split).
 
 ## Quick Start
 
@@ -254,32 +257,48 @@ Set `max_tokens` explicitly when you want a fixed compaction budget. Otherwise
 Alloy derives it from the current model, including after
 `Alloy.Agent.Config.with_provider/2` switches to a different provider model.
 
+### Cooperative cancellation, steering, and follow-up
+
+Control long-running interactive loops without killing the host process:
+
+```elixir
+token = Alloy.Cancel.new()
+
+task =
+  Task.async(fn ->
+    Alloy.run("Refactor the parser and run tests",
+      provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-5-5"},
+      tools: [Alloy.Tool.Core.Read, Alloy.Tool.Core.Edit, Alloy.Tool.Core.Bash],
+      reasoning: :medium,
+      cancel_token: token,
+      steering: fn _state -> MyApp.Queue.pop_steering(run_id) end,
+      follow_up: fn _state -> MyApp.Queue.pop_follow_up(run_id) end
+    )
+  end)
+
+# From another process (e.g. a LiveView cancel button):
+Alloy.Cancel.cancel(token)
+{:error, %Alloy.Result{status: :cancelled, error: :cancelled}} = Task.await(task)
+```
+
 ### Pluggable model catalog
 
 The built-in catalog is deliberately small — Alloy is a harness, not a model
 database, and a hand-curated list will always lag the release treadmill. For a
-richer source of truth, implement the `Alloy.ModelCatalog` behaviour and pass
-it via `model_catalog:`. For example, backed by
-[`llm_db`](https://hex.pm/packages/llm_db) (45+ providers, maintained against
-models.dev):
+richer source of truth, implement the `Alloy.ModelCatalog` behaviour (required
+`context_window/1`, optional `max_output_tokens/1`, `capabilities/1`, and
+`pricing/1`) and pass it via `model_catalog:`. See the
+[`llm_db` catalog recipe](docs/recipes/llm-db-catalog.md) for a full
+provider-scoped [`LLMDB`](https://hex.pm/packages/llm_db) adapter and
+`Alloy.ModelCatalog.info/2` usage:
 
 ```elixir
-defmodule MyApp.LlmDbCatalog do
-  @behaviour Alloy.ModelCatalog
-
-  @impl true
-  def context_window(model) do
-    case LLMDb.model(model) do
-      %{context_window: limit} when is_integer(limit) -> limit
-      _ -> nil
-    end
-  end
-end
-
 {:ok, result} = Alloy.run("Summarise this repository",
-  provider: {Alloy.Provider.OpenAI, api_key: "...", model: "gpt-5.4"},
-  model_catalog: MyApp.LlmDbCatalog
+  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-4-6"},
+  model_catalog: MyApp.LlmDbCatalog.Anthropic
 )
+
+Alloy.ModelCatalog.info(MyApp.LlmDbCatalog.Anthropic, "claude-sonnet-4-6")
 ```
 
 Resolution order: explicit `max_tokens` → `model_metadata_overrides` →
@@ -321,7 +340,8 @@ your application needs to own the handoff format. Both values must be strings;
 omitting them uses Alloy's default summary prompts.
 
 Compaction is ordinary middleware, `Alloy.Context.Compactor`, which
-`Alloy.run/2` puts first in `:middleware`. Pass `compaction: false` to turn it
+`Alloy.run/2` puts last in `:middleware` so it budgets inputs prepared by
+earlier middleware. Pass `compaction: false` to turn it
 off (for example when your application manages context itself), or list the
 compactor in `:middleware` to choose where it runs. When the provider rejects
 a request as too long, the loop runs the `:on_context_overflow` hook — the
@@ -504,26 +524,63 @@ logging, or custom metrics:
 
 | Event | Measurements | Metadata |
 |-------|-------------|----------|
-| `[:alloy, :run, :start]` | `system_time` | `model` |
-| `[:alloy, :run, :stop]` | `duration_ms` | `status`, `turns`, `model` |
-| `[:alloy, :run, :exception]` | `duration_ms` | `kind`, `reason`, `stacktrace`, `model` |
+| `[:alloy, :run, :start]` | `system_time` | `model`, `telemetry_span_context` |
+| `[:alloy, :run, :stop]` | `duration_ms` | `status`, `turns`, `model`, `telemetry_span_context` |
+| `[:alloy, :run, :exception]` | `duration_ms` | `kind`, `reason`, `stacktrace`, `model`, `telemetry_span_context` |
 | `[:alloy, :turn, :start]` | `system_time`, `monotonic_time` | `turn`, `telemetry_span_context` |
 | `[:alloy, :turn, :stop]` | `duration`, `monotonic_time` | `turn`, `status`, `telemetry_span_context` |
-| `[:alloy, :turn, :exception]` | `duration`, `monotonic_time` | `turn`, `kind`, `reason`, `stacktrace` |
+| `[:alloy, :turn, :exception]` | `duration`, `monotonic_time` | `turn`, `kind`, `reason`, `stacktrace`, `telemetry_span_context` |
 | `[:alloy, :provider, :request]` | `duration_ms` | `provider`, `model`, `streaming`, `attempt`, `result` |
 | `[:alloy, :compaction, :cleared]` | `results_cleared`, `bytes_cleared` | `turn` |
 | `[:alloy, :compaction, :done]` | `messages_before`, `messages_after` | `turn` |
-| `[:alloy, :tool, :start]` | — | tool identity, correlation |
-| `[:alloy, :tool, :stop]` | `duration_ms` | tool identity, result |
+| `[:alloy, :tool, :start]` | `event_seq` | `correlation_id`, `turn`, `tool_id`, `tool_name`, optional `parent_call_id` |
+| `[:alloy, :tool, :stop]` | `event_seq`, `duration_ms` | `correlation_id`, `turn`, `tool_id`, `tool_name`, `error`, `start_event_seq`, optional `parent_call_id` |
+| `[:alloy, :turn, :prompt_too_long_recovery]` | — | `turn`, `retry` |
+| `[:alloy, :event]` | `seq` | `v`, `event`, `correlation_id`, `turn` |
 
 Each turn's stop fires when that turn ends. A turn the loop continues past
 reports `status: :running`; the run's outcome is on `[:alloy, :run, :stop]`.
+`[:alloy, :run, :exception]` and `[:alloy, :turn, :exception]` strip function
+arguments from `:stacktrace` while carrying the raw `:reason` (matching
+`:telemetry.span/3`), so telemetry handlers exporting to external backends
+should record only the exception module or crash kind. See
+[OpenTelemetry tracing recipe](docs/recipes/opentelemetry.md) for a
+copy-pasteable GenAI OTel bridge.
 
-### Structured output with `until_tool`
+### Structured output with `:output_schema` or `until_tool`
 
-Force the model to call a specific tool before the loop completes. This is more
-reliable than response format instructions because the tool schema is validated
-at the API level:
+Pass `:output_schema` to request native JSON Schema output across Anthropic,
+OpenAI, xAI, OpenAICompat, and Gemini (and schema-guided JSON instructions on
+Codex) and decode/validate the result into `result.output`:
+
+```elixir
+schema = %{
+  type: "object",
+  properties: %{answer: %{type: "string"}, confidence: %{type: "number"}},
+  required: ["answer", "confidence"],
+  additionalProperties: false
+}
+
+{:ok, result} = Alloy.run("What is the capital of France?",
+  provider: {Alloy.Provider.Anthropic, api_key: "...", model: "claude-sonnet-5-5"},
+  output_schema: schema
+)
+
+result.output
+#=> %{"answer" => "Paris", "confidence" => 0.99}
+```
+
+Invalid, truncated, refused, missing, or non-conforming output fails terminally
+with `{:error, result}` (`output: nil`, `result.metadata.run.output_error`);
+full Draft 4/6/7 validation runs when optional `:ex_json_schema` is loaded
+(otherwise top-level `type`/`required` only). `:name` and `:strict` (default
+`true`) apply to OpenAI, xAI, and OpenAICompat and are ignored on Anthropic,
+Gemini, and Codex. See `Alloy.OutputSchema` and
+[Provider compatibility](docs/provider-compatibility.md) for full failure,
+strict-mode, and tool-combination details.
+
+Or force the model to call a specific tool before the loop completes using
+`until_tool` (optionally paired with `stop_after_tool`):
 
 ```elixir
 defmodule SubmitAnswer do
@@ -626,15 +683,17 @@ requires one (16,000 tokens by default). Reasoning counts against the cap on
 current models, so set `:max_tokens` only when you want a hard limit; a
 truncated answer completes with `result.stop_reason == :max_tokens`.
 
-**Anthropic thinking.** Configure thinking through `extra_body` (the
-`extended_thinking` option was removed in 0.13; Claude 4.7 and later reject
-manual budgets anyway):
+**Portable reasoning & Anthropic thinking.** Use top-level (or provider-level)
+`:reasoning` (`:off | :low | :medium | :high | :xhigh | %{effort: ..., display: ...}`)
+across all 6 built-in providers. Explicit `extra_body` overrides `:reasoning`
+when you need vendor-specific controls (the legacy `extended_thinking` option
+was removed in 0.13):
 
 ```elixir
 {Alloy.Provider.Anthropic,
  api_key: "...",
  model: "claude-sonnet-5-5",
- extra_body: %{"thinking" => %{"type" => "adaptive", "display" => "summarized"}}}
+ reasoning: %{effort: :high, display: :summarized}}
 ```
 
 **Codex.** `Alloy.Provider.Codex` drives the `codex` CLI (0.122.0 or later)

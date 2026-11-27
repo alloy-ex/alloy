@@ -30,6 +30,16 @@ defmodule Alloy.Tool do
   human-readable result and `data` is a map of structured data for
   programmatic consumption (e.g., by a code execution sandbox).
 
+  ## Error Handling
+
+  Return `{:error, message}` (or raise a `RuntimeError` via `raise "message"`)
+  for failure reasons the model or telemetry should see. Other raised exceptions
+  (such as `KeyError`, `MatchError`, `ArgumentError` with custom messages, or
+  custom `defexception`s) are summarized as module-only (plus atom key name on
+  `KeyError`, or `"argument error"` on `:badarg`) so captured `context` or
+  credential maps cannot leak into model-visible tool results, logs, or
+  telemetry.
+
   ## Path Security
 
   Set `:allowed_paths` in the agent context to restrict file access:
@@ -77,6 +87,8 @@ defmodule Alloy.Tool do
       end
   """
 
+  alias Alloy.Internal.Sanitize
+
   @doc "Unique tool name (used in API calls)."
   @callback name() :: String.t()
 
@@ -91,8 +103,11 @@ defmodule Alloy.Tool do
 
   Context is a map that may contain:
   - `:working_directory` - base path for file operations
-  - `:config` - agent config struct
   - `:allowed_paths` - list of allowed directory prefixes for file access
+  - `:on_tool_update` - injected 1-arity callback `(String.t() -> :ok)` when
+    running inside `Alloy.Tool.Executor`; call via `Map.get(context, :on_tool_update)`
+    so tools remain callable directly outside the executor to emit incremental
+    `:tool_update` events marshalled onto the caller process
   - any custom keys added by middleware
 
   Returns `{:ok, string}` or `{:error, string}` for text-only results.
@@ -243,23 +258,40 @@ defmodule Alloy.Tool do
   under an allowed directory between the check and the open (for
   example the agent's own bash tool) can still race it.
   """
-  @spec resolve_path(String.t(), map()) :: {:ok, String.t()} | {:error, String.t()}
-  def resolve_path(file_path, context) do
-    expanded =
-      case Map.get(context, :working_directory) do
-        nil -> Path.expand(file_path)
-        wd -> Path.expand(file_path, wd)
-      end
+  @spec resolve_path(term(), map()) :: {:ok, String.t()} | {:error, String.t()}
+  def resolve_path(file_path, _context) when not is_binary(file_path) do
+    {:error, "file_path must be a string, got: #{Sanitize.inspect_bounded(file_path)}"}
+  end
 
-    case Map.get(context, :allowed_paths) do
-      nil -> {:ok, expanded}
-      roots when is_list(roots) -> check_allowed(expanded, roots)
+  def resolve_path(file_path, context) do
+    if String.contains?(file_path, <<0>>) do
+      {:error, "Path must not contain NUL bytes"}
+    else
+      wd = Map.get(context, :working_directory)
+      expanded = expand_against(file_path, wd)
+
+      case Map.get(context, :allowed_paths) do
+        nil ->
+          {:ok, expanded}
+
+        roots when is_list(roots) ->
+          check_allowed(expanded, roots, wd)
+
+        other ->
+          {:error,
+           "allowed_paths must be a list of paths, got: #{Sanitize.inspect_bounded(other)}"}
+      end
     end
   end
 
-  defp check_allowed(expanded, roots) do
-    with {:ok, real} <- real_path(expanded) do
-      if Enum.any?(roots, &inside?(real, &1)) do
+  defp expand_against(path, nil), do: Path.expand(path)
+  defp expand_against(path, wd) when is_binary(wd), do: Path.expand(path, wd)
+  defp expand_against(path, _wd), do: Path.expand(path)
+
+  defp check_allowed(expanded, roots, wd) do
+    with :ok <- validate_allowed_roots(roots),
+         {:ok, real} <- real_path(expanded) do
+      if Enum.any?(roots, &inside?(real, &1, wd)) do
         {:ok, real}
       else
         {:error, "Path #{expanded} is outside allowed directories"}
@@ -267,8 +299,26 @@ defmodule Alloy.Tool do
     end
   end
 
-  defp inside?(real, root) do
-    case real_path(Path.expand(root)) do
+  defp validate_allowed_roots(roots) do
+    Enum.reduce_while(roots, :ok, fn
+      root, :ok when is_binary(root) ->
+        if String.contains?(root, <<0>>) do
+          {:halt,
+           {:error,
+            "allowed_paths entries must be strings without NUL bytes, got: #{Sanitize.inspect_bounded(root)}"}}
+        else
+          {:cont, :ok}
+        end
+
+      bad, :ok ->
+        {:halt,
+         {:error,
+          "allowed_paths entries must be strings without NUL bytes, got: #{Sanitize.inspect_bounded(bad)}"}}
+    end)
+  end
+
+  defp inside?(real, root, wd) do
+    case real_path(expand_against(root, wd)) do
       {:ok, root} ->
         real == root or String.starts_with?(real, String.trim_trailing(root, "/") <> "/")
 

@@ -162,6 +162,91 @@ defmodule Alloy.MiddlewareTest do
 
       assert result == {:halted, "limit"}
     end
+
+    test "raises ArgumentError without leaking secrets when middleware returns {:halt, state}, {:block, state}, or {:edit, non_map}" do
+      defmodule HaltStateMiddleware do
+        @behaviour Alloy.Middleware
+        def call(_hook, state), do: {:halt, state}
+      end
+
+      defmodule BlockStateMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, state), do: {:block, state}
+        def call(_hook, state), do: state
+      end
+
+      defmodule BadEditNonMapMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, _state), do: {:edit, nil}
+        def call(_hook, state), do: state
+      end
+
+      api_secret = "sk-middleware-api-secret"
+      ctx_secret = "ctx-middleware-token"
+
+      state =
+        build_state(
+          provider: {Alloy.Provider.Test, api_key: api_secret},
+          context: %{db_token: ctx_secret},
+          middleware: [HaltStateMiddleware]
+        )
+
+      err1 =
+        assert_raise ArgumentError, ~r/unsupported value/, fn ->
+          Middleware.run(:after_completion, state)
+        end
+
+      refute Exception.message(err1) =~ api_secret
+      refute Exception.message(err1) =~ ctx_secret
+
+      tool_call = %{id: "tc_1", name: "read", input: %{"path" => "mix.exs"}}
+
+      err2 =
+        assert_raise ArgumentError, ~r/unsupported value/, fn ->
+          Middleware.run_before_tool_call(state, tool_call)
+        end
+
+      refute Exception.message(err2) =~ api_secret
+      refute Exception.message(err2) =~ ctx_secret
+
+      block_state = %{state | config: %{state.config | middleware: [BlockStateMiddleware]}}
+
+      err3 =
+        assert_raise ArgumentError, ~r/unsupported value/, fn ->
+          Middleware.run_before_tool_call(block_state, tool_call)
+        end
+
+      refute Exception.message(err3) =~ api_secret
+      refute Exception.message(err3) =~ ctx_secret
+
+      bad_edit_state = %{state | config: %{state.config | middleware: [BadEditNonMapMiddleware]}}
+
+      assert_raise ArgumentError, ~r/unsupported value/, fn ->
+        Middleware.run_before_tool_call(bad_edit_state, tool_call)
+      end
+
+      defmodule SecretMapMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, state), do: {:block, state.config.context}
+        def call(_hook, state), do: {:halt, state.config.provider_config}
+      end
+
+      secret_mw_state = %{state | config: %{state.config | middleware: [SecretMapMiddleware]}}
+
+      err4 =
+        assert_raise ArgumentError, ~r/\{:halt, map\}/, fn ->
+          Middleware.run(:before_completion, secret_mw_state)
+        end
+
+      refute Exception.message(err4) =~ api_secret
+
+      err5 =
+        assert_raise ArgumentError, ~r/\{:block, map\}/, fn ->
+          Middleware.run_before_tool_call(secret_mw_state, tool_call)
+        end
+
+      refute Exception.message(err5) =~ ctx_secret
+    end
   end
 
   describe "run/2 with {:block, reason} at non-tool-call hook" do
@@ -267,6 +352,41 @@ defmodule Alloy.MiddlewareTest do
       tool_call = %{id: "tc_1", name: "bash", input: %{"command" => "rm -rf /"}}
 
       assert {:halted, "blocked"} = Middleware.run_before_tool_call(state, tool_call)
+    end
+
+    test "supports {:halt, reason, state} and preserves {:block, reason} over concurrent cancel" do
+      defmodule HaltWithStateOnToolCallMiddleware do
+        @behaviour Alloy.Middleware
+        def call(:before_tool_call, state), do: {:halt, "halt with state", state}
+        def call(_hook, %State{} = state), do: state
+      end
+
+      defmodule BlockAndCancelMiddleware do
+        @behaviour Alloy.Middleware
+
+        def call(:before_tool_call, state) do
+          assert Map.fetch!(state.config.context, :current_tool_result) == nil
+          Alloy.Cancel.cancel(state.config.cancel_token)
+          {:block, "policy block wins"}
+        end
+
+        def call(_hook, %State{} = state), do: state
+      end
+
+      tool_call = %{id: "tc_1", name: "bash", input: %{"command" => "echo hi"}}
+
+      halt_state = build_state(middleware: [HaltWithStateOnToolCallMiddleware])
+
+      assert {:halted, "halt with state"} =
+               Middleware.run_before_tool_call(halt_state, tool_call)
+
+      token = Alloy.Cancel.new()
+      block_state = build_state(middleware: [BlockAndCancelMiddleware], cancel_token: token)
+
+      assert {:block, "policy block wins"} =
+               Middleware.run_before_tool_call(block_state, tool_call)
+
+      assert Alloy.Cancel.cancelled?(token)
     end
   end
 

@@ -44,6 +44,8 @@ defmodule Alloy.Provider.Test do
   Returns `{:error, :no_more_responses}` when all responses have been consumed.
   """
   @impl Alloy.Provider
+  @spec complete([Alloy.Message.t()], [Alloy.Provider.tool_def()], map()) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(_messages, _tool_defs, %{agent_pid: pid}) do
     pop_response(pid)
   end
@@ -54,6 +56,12 @@ defmodule Alloy.Provider.Test do
   streaming. Consumes from the same script queue as `complete/3`.
   """
   @impl Alloy.Provider
+  @spec stream(
+          [Alloy.Message.t()],
+          [Alloy.Provider.tool_def()],
+          map(),
+          (String.t() -> :ok)
+        ) :: {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(_messages, _tool_defs, %{agent_pid: pid} = config, on_chunk)
       when is_function(on_chunk, 1) do
     on_event = Map.get(config, :on_event, fn _ -> :ok end)
@@ -61,7 +69,7 @@ defmodule Alloy.Provider.Test do
     case pop_response(pid) do
       {:ok, %{stop_reason: :end_turn, messages: messages} = response} ->
         # Stream each character of text content.
-        # :text_delta on_event is emitted by Turn.wrapped_chunk universally.
+        # :text_delta on_event is emitted by Retry.call_provider/5 universally.
         for msg <- messages,
             text = Alloy.Message.text(msg),
             text != "",
@@ -126,13 +134,8 @@ defmodule Alloy.Provider.Test do
   """
   @spec text_response(String.t(), map()) :: {:ok, Alloy.Provider.completion_response()}
   def text_response(text, provider_state) when is_binary(text) and is_map(provider_state) do
-    {:ok,
-     %{
-       stop_reason: :end_turn,
-       messages: [Alloy.Message.assistant(text)],
-       usage: %{input_tokens: 10, output_tokens: 5},
-       provider_state: provider_state
-     }}
+    {:ok, response} = text_response(text)
+    {:ok, Map.put(response, :provider_state, provider_state)}
   end
 
   @doc """

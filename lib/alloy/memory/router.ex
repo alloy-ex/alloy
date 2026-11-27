@@ -31,7 +31,7 @@ defmodule Alloy.Memory.Router do
          "file_text" => file_text
        })
        when is_binary(file_text) do
-    with {:ok, path} <- Memory.validate_path(path) do
+    with {:ok, path} <- validate_file_path(path, "create") do
       module.create(store, path, file_text)
     end
   end
@@ -52,7 +52,7 @@ defmodule Alloy.Memory.Router do
          "new_str" => new_str
        })
        when is_binary(old_str) and is_binary(new_str) do
-    with {:ok, path} <- Memory.validate_path(path) do
+    with {:ok, path} <- validate_file_path(path, "str_replace") do
       module.str_replace(store, path, old_str, new_str)
     end
   end
@@ -64,16 +64,14 @@ defmodule Alloy.Memory.Router do
          "insert_text" => insert_text
        })
        when is_integer(insert_line) and insert_line >= 0 and is_binary(insert_text) do
-    with {:ok, path} <- Memory.validate_path(path) do
+    with {:ok, path} <- validate_file_path(path, "insert") do
       module.insert(store, path, insert_line, insert_text)
     end
   end
 
   defp execute(module, store, %{"command" => "delete", "path" => path}) do
-    case Memory.validate_path(path) do
-      {:ok, @root} -> {:error, "Cannot delete the #{@root} directory itself."}
-      {:ok, path} -> module.delete(store, path)
-      {:error, _reason} = error -> error
+    with {:ok, path} <- validate_file_path(path, "delete") do
+      module.delete(store, path)
     end
   end
 
@@ -90,6 +88,14 @@ defmodule Alloy.Memory.Router do
 
   defp execute(_module, _store, input) do
     {:error, "invalid memory tool input: #{inspect(input)}"}
+  end
+
+  defp validate_file_path(path, command) do
+    case Memory.validate_path(path) do
+      {:ok, @root} -> {:error, "Cannot #{command} the #{@root} directory itself."}
+      {:ok, validated} -> {:ok, validated}
+      {:error, _reason} = error -> error
+    end
   end
 
   defp rename(_module, _store, old_path, new_path) when @root in [old_path, new_path],

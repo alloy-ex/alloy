@@ -6,13 +6,21 @@ defmodule Alloy.Agent.Config do
   updated through `Alloy.Agent.State.prepare/2` in middleware.
   """
 
+  alias Alloy.Cancel
   alias Alloy.Context.Compactor
+  alias Alloy.Internal.Sanitize
   alias Alloy.ModelMetadata
+  alias Alloy.OutputSchema
 
   @options [
     :tool_concurrency,
     :tool_validation,
     :stop_after_tool,
+    :output_schema,
+    :reasoning,
+    :cancel_token,
+    :steering,
+    :follow_up,
     :provider,
     :tools,
     :system_prompt,
@@ -85,12 +93,17 @@ defmodule Alloy.Agent.Config do
           max_tokens: pos_integer(),
           max_tokens_explicit?: boolean(),
           max_retries: non_neg_integer(),
-          retry_backoff_ms: pos_integer(),
-          timeout_ms: pos_integer(),
+          retry_backoff_ms: non_neg_integer(),
+          timeout_ms: pos_integer() | :infinity,
           tool_timeout: pos_integer(),
           tool_concurrency: pos_integer() | nil,
           tool_validation: :required | :schema,
           stop_after_tool: String.t() | nil,
+          output_schema: OutputSchema.t() | nil,
+          reasoning: Alloy.Provider.normalized_reasoning() | nil,
+          cancel_token: Cancel.t() | nil,
+          steering: (Alloy.Agent.State.t() -> [Alloy.Message.t()]) | nil,
+          follow_up: (Alloy.Agent.State.t() -> [Alloy.Message.t()]) | nil,
           middleware: [module()],
           compaction: compaction(),
           compaction_explicit: %{
@@ -107,6 +120,7 @@ defmodule Alloy.Agent.Config do
           until_tool: String.t() | nil
         }
 
+  @derive {Inspect, except: [:provider_config, :fallback_providers, :context]}
   @enforce_keys [:provider, :provider_config]
   defstruct [
     :provider,
@@ -123,6 +137,11 @@ defmodule Alloy.Agent.Config do
     tool_concurrency: nil,
     tool_validation: :required,
     stop_after_tool: nil,
+    output_schema: nil,
+    reasoning: nil,
+    cancel_token: nil,
+    steering: nil,
+    follow_up: nil,
     middleware: [],
     compaction: %{
       reserve_tokens: 16_384,
@@ -151,9 +170,7 @@ defmodule Alloy.Agent.Config do
   def from_opts(opts) when is_list(opts) do
     validate_option_names!(opts)
     {provider_mod, provider_config} = parse_provider(opts[:provider])
-
-    provider_config =
-      provider_config |> normalize_provider_config() |> reject_removed!(provider_mod)
+    provider_config = prepare_provider_config!(provider_config, provider_mod)
 
     model_metadata_overrides = normalize_model_metadata_overrides(opts[:model_metadata_overrides])
 
@@ -174,57 +191,171 @@ defmodule Alloy.Agent.Config do
     {compaction, compaction_explicit} = resolve_compaction(opts[:compaction], max_tokens)
     tools = Keyword.get(opts, :tools, []) ++ memory_tools(Keyword.get(opts, :memory))
 
+    system_prompt = opts[:system_prompt]
+    tool_validation = Keyword.get(opts, :tool_validation, :required)
+    context = Keyword.get(opts, :context, %{})
+    on_compaction = opts[:on_compaction]
+    cancel_token = opts[:cancel_token]
+    steering = opts[:steering]
+    follow_up = opts[:follow_up]
+    code_execution = Keyword.get(opts, :code_execution, false)
+
     %__MODULE__{
       provider: provider_mod,
       provider_config: provider_config,
       tools: tools,
-      system_prompt: Keyword.get(opts, :system_prompt),
-      max_turns: Keyword.get(opts, :max_turns, 25),
+      system_prompt:
+        require_opt_shape!(
+          is_nil(system_prompt) or is_binary(system_prompt),
+          system_prompt,
+          "system_prompt must be a string or nil"
+        ),
+      max_turns: validate_pos_integer!(Keyword.get(opts, :max_turns, 25), :max_turns),
       max_tokens: max_tokens,
       max_tokens_explicit?: max_tokens_explicit?,
-      max_retries: Keyword.get(opts, :max_retries, 3),
-      retry_backoff_ms: Keyword.get(opts, :retry_backoff_ms, 1_000),
-      timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
-      tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
+      max_retries: validate_non_neg_integer!(Keyword.get(opts, :max_retries, 3), :max_retries),
+      retry_backoff_ms:
+        validate_non_neg_integer!(Keyword.get(opts, :retry_backoff_ms, 1_000), :retry_backoff_ms),
+      timeout_ms: validate_timeout_ms!(Keyword.get(opts, :timeout_ms, 120_000)),
+      tool_timeout:
+        validate_pos_integer!(Keyword.get(opts, :tool_timeout, 120_000), :tool_timeout),
       tool_concurrency: validate_tool_concurrency!(Keyword.get(opts, :tool_concurrency)),
-      tool_validation: validate_tool_validation!(Keyword.get(opts, :tool_validation, :required)),
-      stop_after_tool: validate_stop_after_tool!(Keyword.get(opts, :stop_after_tool)),
-      middleware: resolve_middleware(Keyword.get(opts, :middleware, []), opts[:compaction]),
+      tool_validation:
+        require_opt!(
+          tool_validation in [:required, :schema],
+          tool_validation,
+          "tool_validation must be :required or :schema"
+        ),
+      stop_after_tool:
+        validate_optional_non_empty_string!(
+          Keyword.get(opts, :stop_after_tool),
+          "stop_after_tool must be a nonempty tool name"
+        ),
+      output_schema: OutputSchema.normalize!(Keyword.get(opts, :output_schema)),
+      reasoning: Alloy.Provider.normalize_reasoning!(Keyword.get(opts, :reasoning)),
+      cancel_token:
+        require_opt_shape!(
+          is_nil(cancel_token) or Cancel.valid?(cancel_token),
+          cancel_token,
+          "cancel_token must be an Alloy.Cancel struct or nil"
+        ),
+      steering:
+        require_opt_shape!(
+          is_nil(steering) or is_function(steering, 1),
+          steering,
+          "steering must be a 1-arity function or nil"
+        ),
+      follow_up:
+        require_opt_shape!(
+          is_nil(follow_up) or is_function(follow_up, 1),
+          follow_up,
+          "follow_up must be a 1-arity function or nil"
+        ),
+      middleware:
+        resolve_middleware(
+          validate_middleware!(Keyword.get(opts, :middleware, [])),
+          opts[:compaction]
+        ),
       compaction: compaction,
       compaction_explicit: compaction_explicit,
-      working_directory: Keyword.get(opts, :working_directory, "."),
-      context: Keyword.get(opts, :context, %{}),
-      on_compaction: Keyword.get(opts, :on_compaction, nil),
+      working_directory:
+        validate_non_empty_string!(Keyword.get(opts, :working_directory, "."), :working_directory),
+      context: require_opt_shape!(is_map(context), context, "context must be a map"),
+      on_compaction:
+        require_opt!(
+          is_nil(on_compaction) or is_function(on_compaction, 2),
+          on_compaction,
+          "on_compaction must be a 2-arity function or nil"
+        ),
       fallback_providers:
         opts
         |> Keyword.get(:fallback_providers, [])
-        |> Enum.map(&parse_fallback_provider/1),
-      code_execution: Keyword.get(opts, :code_execution, false),
+        |> validate_fallback_providers!(),
+      code_execution:
+        require_opt!(
+          is_boolean(code_execution),
+          code_execution,
+          "code_execution must be a boolean"
+        ),
       model_metadata_overrides: model_metadata_overrides,
       model_catalog: model_catalog,
-      until_tool: Keyword.get(opts, :until_tool)
+      until_tool:
+        validate_optional_non_empty_string!(
+          Keyword.get(opts, :until_tool),
+          "until_tool must be a nonempty string or nil"
+        )
     }
   end
 
+  defp require_opt!(true, value, _msg), do: value
+
+  defp require_opt!(false, value, msg),
+    do: raise(ArgumentError, "#{msg}, got: #{Sanitize.inspect_bounded(value)}")
+
+  defp require_opt_shape!(true, value, _msg), do: value
+
+  defp require_opt_shape!(false, value, msg),
+    do: raise(ArgumentError, "#{msg}, got: #{Sanitize.shape_summary(value)}")
+
+  defp validate_timeout_ms!(:infinity), do: :infinity
+
+  defp validate_timeout_ms!(value),
+    do:
+      require_opt!(
+        is_integer(value) and value > 0,
+        value,
+        "timeout_ms must be a positive integer or :infinity"
+      )
+
+  defp validate_pos_integer!(value, field),
+    do:
+      require_opt!(is_integer(value) and value > 0, value, "#{field} must be a positive integer")
+
+  defp validate_non_neg_integer!(value, field),
+    do:
+      require_opt!(
+        is_integer(value) and value >= 0,
+        value,
+        "#{field} must be a non-negative integer"
+      )
+
+  defp validate_non_empty_string!(value, field),
+    do:
+      require_opt!(
+        is_binary(value) and byte_size(value) > 0,
+        value,
+        "#{field} must be a nonempty string"
+      )
+
+  defp validate_optional_non_empty_string!(nil, _msg), do: nil
+
+  defp validate_optional_non_empty_string!(value, msg),
+    do: require_opt!(is_binary(value) and byte_size(value) > 0, value, msg)
+
   defp validate_tool_concurrency!(nil), do: nil
-  defp validate_tool_concurrency!(n) when is_integer(n) and n > 0, do: n
 
   defp validate_tool_concurrency!(value),
     do:
-      raise(ArgumentError, "tool_concurrency must be a positive integer, got: #{inspect(value)}")
+      require_opt!(
+        is_integer(value) and value > 0,
+        value,
+        "tool_concurrency must be a positive integer"
+      )
 
-  defp validate_tool_validation!(mode) when mode in [:required, :schema], do: mode
+  defp validate_middleware!(value) do
+    require_opt_shape!(
+      is_list(value) and Enum.all?(value, &valid_module_atom?/1),
+      value,
+      "middleware must be a list of module atoms"
+    )
+  end
 
-  defp validate_tool_validation!(value),
-    do:
-      raise(ArgumentError, "tool_validation must be :required or :schema, got: #{inspect(value)}")
+  defp validate_fallback_providers!(value) do
+    require_opt_shape!(is_list(value), value, "fallback_providers must be a list")
+    |> Enum.map(&parse_fallback_provider/1)
+  end
 
-  defp validate_stop_after_tool!(nil), do: nil
-  defp validate_stop_after_tool!(name) when is_binary(name) and byte_size(name) > 0, do: name
-
-  defp validate_stop_after_tool!(value),
-    do:
-      raise(ArgumentError, "stop_after_tool must be a nonempty tool name, got: #{inspect(value)}")
+  defp valid_module_atom?(mod), do: is_atom(mod) and not is_nil(mod) and not is_boolean(mod)
 
   # A misspelt or removed option used to be ignored silently, which hides
   # mistakes such as a budget or tool list that never applies.
@@ -271,10 +402,79 @@ defmodule Alloy.Agent.Config do
   end
 
   defp reject_removed!(provider_config, provider) do
+    if Map.has_key?(provider_config, :output_schema) or
+         Map.has_key?(provider_config, "output_schema") do
+      raise ArgumentError,
+            "pass :output_schema as a top-level Alloy.run/2 option, not inside provider config"
+    end
+
     case Map.get(@removed_provider_options, provider) do
       {key, message} when is_map_key(provider_config, key) -> raise ArgumentError, message
       _none -> provider_config
     end
+  end
+
+  defp validate_provider_auth!(provider_config, provider) do
+    case Map.get(provider_config, :api_key) do
+      fun when is_function(fun, 0) ->
+        require_origin_key!(
+          provider_config,
+          provider,
+          "uses a function :api_key and must also set a non-empty string :origin_key for account isolation"
+        )
+
+      fun when is_function(fun) ->
+        raise ArgumentError,
+              "provider #{inspect(provider)} :api_key callback must be a 0-arity function"
+
+      _other ->
+        if Map.get(provider_config, :auth_scheme) == :bearer do
+          require_origin_key!(
+            provider_config,
+            provider,
+            "uses auth_scheme: :bearer and must also set a non-empty string :origin_key so rotating bearer tokens preserve account provenance"
+          )
+        else
+          validate_optional_origin_key!(provider_config, provider)
+        end
+    end
+  end
+
+  defp validate_optional_origin_key!(provider_config, provider) do
+    case Map.fetch(provider_config, :origin_key) do
+      :error ->
+        provider_config
+
+      {:ok, nil} ->
+        provider_config
+
+      {:ok, key} when is_binary(key) and byte_size(key) > 0 ->
+        provider_config
+
+      {:ok, _invalid} ->
+        raise ArgumentError,
+              "provider #{inspect(provider)} :origin_key must be a non-empty string when set"
+    end
+  end
+
+  defp validate_provider_reasoning!(provider_config) do
+    case Map.fetch(provider_config, :reasoning) do
+      :error ->
+        provider_config
+
+      {:ok, value} ->
+        Map.put(provider_config, :reasoning, Alloy.Provider.normalize_reasoning!(value))
+    end
+  end
+
+  defp require_origin_key!(provider_config, provider, detail) do
+    origin_key = Map.get(provider_config, :origin_key)
+
+    unless is_binary(origin_key) and byte_size(origin_key) > 0 do
+      raise ArgumentError, "provider #{inspect(provider)} #{detail}"
+    end
+
+    provider_config
   end
 
   # `memory: binding` is shorthand for `tools: [Alloy.Memory.tool(binding)]`.
@@ -290,9 +490,7 @@ defmodule Alloy.Agent.Config do
   @spec with_provider(t(), module() | {module(), keyword() | map()}) :: t()
   def with_provider(%__MODULE__{} = config, provider) do
     {provider_mod, provider_config} = parse_provider(provider)
-
-    provider_config =
-      provider_config |> normalize_provider_config() |> reject_removed!(provider_mod)
+    provider_config = prepare_provider_config!(provider_config, provider_mod)
 
     max_tokens =
       if config.max_tokens_explicit? do
@@ -306,7 +504,7 @@ defmodule Alloy.Agent.Config do
       end
 
     compaction =
-      %{
+      Map.merge(config.compaction, %{
         reserve_tokens:
           resolve_compaction_field(
             config.compaction.reserve_tokens,
@@ -319,9 +517,6 @@ defmodule Alloy.Agent.Config do
             config.compaction_explicit.keep_recent_tokens,
             default_keep_recent_tokens(max_tokens)
           ),
-        fallback: config.compaction.fallback,
-        clear_tool_results: config.compaction.clear_tool_results,
-        keep_recent_tool_results: config.compaction.keep_recent_tool_results,
         summary_system_prompt:
           Map.get(
             config.compaction,
@@ -330,7 +525,7 @@ defmodule Alloy.Agent.Config do
           ),
         summary_prompt:
           Map.get(config.compaction, :summary_prompt, Compactor.default_summary_prompt())
-      }
+      })
 
     %{
       config
@@ -341,33 +536,46 @@ defmodule Alloy.Agent.Config do
     }
   end
 
-  defp parse_provider({module, config})
-       when is_atom(module) and (is_list(config) or is_map(config)) do
-    {module, config}
+  defp parse_provider(entry), do: parse_provider_entry(entry, "provider", [])
+
+  defp parse_fallback_provider(entry) do
+    {mod, cfg} = parse_provider_entry(entry, "fallback provider", %{})
+    {mod, prepare_provider_config!(cfg, mod)}
   end
 
-  defp parse_provider(module) when is_atom(module) do
-    {module, []}
+  defp prepare_provider_config!(provider_config, provider_mod) do
+    provider_config
+    |> normalize_provider_config()
+    |> reject_removed!(provider_mod)
+    |> validate_provider_auth!(provider_mod)
+    |> validate_provider_reasoning!()
   end
 
-  defp parse_fallback_provider({module, provider_config}) when is_atom(module) do
-    {module, provider_config |> normalize_provider_config() |> reject_removed!(module)}
+  defp parse_provider_entry({mod, cfg}, _label, _default)
+       when is_atom(mod) and not is_nil(mod) and not is_boolean(mod) and
+              (is_list(cfg) or is_map(cfg)),
+       do: {mod, cfg}
+
+  defp parse_provider_entry(mod, _label, default)
+       when is_atom(mod) and not is_nil(mod) and not is_boolean(mod),
+       do: {mod, default}
+
+  defp parse_provider_entry(other, label, _default) do
+    raise ArgumentError,
+          "#{label} must be a module or {module, config} tuple, got: #{format_invalid_provider(other)}"
   end
 
-  defp parse_fallback_provider(module) when is_atom(module) do
-    {module, %{}}
-  end
+  defp format_invalid_provider({mod, _config}), do: "{#{Sanitize.shape_summary(mod)}, ...}"
+  defp format_invalid_provider(other), do: Sanitize.shape_summary(other)
 
   defp normalize_provider_config(config) when is_map(config), do: config
   defp normalize_provider_config(config) when is_list(config), do: Map.new(config)
-  defp normalize_provider_config(nil), do: %{}
 
   defp normalize_model_metadata_overrides(overrides) when is_map(overrides), do: overrides
 
   defp normalize_model_metadata_overrides(overrides) when is_list(overrides),
     do: Map.new(overrides)
 
-  defp normalize_model_metadata_overrides(nil), do: %{}
   defp normalize_model_metadata_overrides(_), do: %{}
 
   defp resolve_max_tokens(
@@ -378,7 +586,7 @@ defmodule Alloy.Agent.Config do
          max_tokens_explicit?
        ) do
     if max_tokens_explicit? do
-      Keyword.fetch!(opts, :max_tokens)
+      opts |> Keyword.fetch!(:max_tokens) |> validate_pos_integer!(:max_tokens)
     else
       provider_config
       |> model_name()
@@ -412,42 +620,45 @@ defmodule Alloy.Agent.Config do
       keep_recent_tokens: Map.has_key?(compaction, :keep_recent_tokens)
     }
 
-    fallback =
-      compaction
-      |> Map.get(:fallback, :truncate)
-      |> validate_compaction_fallback()
+    fallback = Map.get(compaction, :fallback, :truncate)
+    clear_tool_results = Map.get(compaction, :clear_tool_results, true)
+
+    summary_system_prompt =
+      Map.get(compaction, :summary_system_prompt, Compactor.default_summary_system_prompt())
+
+    summary_prompt = Map.get(compaction, :summary_prompt, Compactor.default_summary_prompt())
 
     resolved = %{
       reserve_tokens:
         if(explicit.reserve_tokens,
-          do: validate_compaction_tokens!(compaction.reserve_tokens, :reserve_tokens),
+          do: validate_pos_integer!(compaction.reserve_tokens, :reserve_tokens),
           else: default_reserve_tokens(max_tokens)
         ),
       keep_recent_tokens:
         if(explicit.keep_recent_tokens,
-          do: validate_compaction_tokens!(compaction.keep_recent_tokens, :keep_recent_tokens),
+          do: validate_pos_integer!(compaction.keep_recent_tokens, :keep_recent_tokens),
           else: default_keep_recent_tokens(max_tokens)
         ),
-      fallback: fallback,
+      fallback:
+        require_opt!(fallback == :truncate, fallback, "compaction fallback must be :truncate"),
       clear_tool_results:
-        compaction
-        |> Map.get(:clear_tool_results, true)
-        |> validate_clear_tool_results!(),
+        require_opt!(
+          is_boolean(clear_tool_results),
+          clear_tool_results,
+          "clear_tool_results must be a boolean"
+        ),
       keep_recent_tool_results:
         compaction
         |> Map.get(:keep_recent_tool_results, 3)
-        |> validate_keep_recent_tool_results!(),
+        |> validate_non_neg_integer!(:keep_recent_tool_results),
       summary_system_prompt:
-        compaction
-        |> Map.get(
-          :summary_system_prompt,
-          Compactor.default_summary_system_prompt()
-        )
-        |> validate_compaction_prompt!(:summary_system_prompt),
+        require_opt!(
+          is_binary(summary_system_prompt),
+          summary_system_prompt,
+          "summary_system_prompt must be a string"
+        ),
       summary_prompt:
-        compaction
-        |> Map.get(:summary_prompt, Compactor.default_summary_prompt())
-        |> validate_compaction_prompt!(:summary_prompt)
+        require_opt!(is_binary(summary_prompt), summary_prompt, "summary_prompt must be a string")
     }
 
     {resolved, explicit}
@@ -464,7 +675,7 @@ defmodule Alloy.Agent.Config do
 
   defp normalize_compaction(other) do
     raise ArgumentError,
-          "compaction must be a keyword list or map, got: #{inspect(other)}"
+          "compaction must be a keyword list or map, got: #{Sanitize.inspect_bounded(other)}"
   end
 
   defp normalize_compaction_map(map) do
@@ -477,48 +688,16 @@ defmodule Alloy.Agent.Config do
 
   defp compaction_key!(key) do
     case Map.fetch(@compaction_keys_by_name, key) do
-      {:ok, known} -> known
-      :error -> raise ArgumentError, "unsupported compaction option: #{inspect(key)}"
+      {:ok, known} ->
+        known
+
+      :error ->
+        raise ArgumentError, "unsupported compaction option: #{Sanitize.inspect_bounded(key)}"
     end
   end
 
   defp resolve_compaction_field(current_value, true, _default_value), do: current_value
   defp resolve_compaction_field(_current_value, false, default_value), do: default_value
-
-  defp validate_compaction_tokens!(value, _field) when is_integer(value) and value > 0, do: value
-
-  defp validate_compaction_tokens!(value, field) do
-    raise ArgumentError,
-          "#{field} must be a positive integer, got: #{inspect(value)}"
-  end
-
-  defp validate_keep_recent_tool_results!(value) when is_integer(value) and value >= 0, do: value
-
-  defp validate_keep_recent_tool_results!(value) do
-    raise ArgumentError,
-          "keep_recent_tool_results must be a non-negative integer, got: #{inspect(value)}"
-  end
-
-  defp validate_clear_tool_results!(value) when is_boolean(value), do: value
-
-  defp validate_clear_tool_results!(value) do
-    raise ArgumentError,
-          "clear_tool_results must be a boolean, got: #{inspect(value)}"
-  end
-
-  defp validate_compaction_prompt!(value, _field) when is_binary(value), do: value
-
-  defp validate_compaction_prompt!(value, field) do
-    raise ArgumentError,
-          "#{field} must be a string, got: #{inspect(value)}"
-  end
-
-  defp validate_compaction_fallback(:truncate), do: :truncate
-
-  defp validate_compaction_fallback(other) do
-    raise ArgumentError,
-          "compaction fallback must be :truncate, got: #{inspect(other)}"
-  end
 
   defp default_reserve_tokens(max_tokens) do
     min(16_384, max(1, div(max_tokens, 10)))

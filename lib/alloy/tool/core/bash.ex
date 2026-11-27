@@ -26,9 +26,23 @@ defmodule Alloy.Tool.Core.Bash do
   - `:bash_max_timeout` - ceiling in milliseconds for the `timeout` the
     model asks for (default 10 minutes). The agent's `:tool_timeout`
     still applies on top of it.
+  - `:bash_on_output` - optional 1-arity callback `(binary() -> any())` invoked
+    in a dedicated supervised worker for each raw output chunk as it arrives
+    from the shell port (before head/tail truncation), allowing hosts to inspect
+    or stream raw bytes without blocking shell timeout or cancellation cleanup.
+    The worker queue is bounded (at most 128 chunks and 256 KiB queued in
+    memory; excess chunks are dropped under backpressure with a once-per-command
+    warning log), and command exit waits at most a short flush grace period
+    (`250ms`, clamped to the remaining command timeout, also logging once if
+    queued chunks remain) so a slow callback never turns a finished command into
+    a timeout. Raising callbacks are rescued and logged once per command; throws
+    or exits terminate only the callback worker while command execution
+    continues.
   - `:bash_executor` - an `t:executor/0` that runs the command instead of
     the local shell, for a container, VM or remote runner. The options
-    above, except the timeout, do not apply to it.
+    above, except the timeout, do not apply to it. Custom executors run inside
+    a supervised worker that is brutally killed on timeout or cancellation
+    (avoid setting `:trap_exit` unless your executor handles termination).
   - `:working_directory` - where the command runs (set by the agent).
 
   ## Security
@@ -67,7 +81,9 @@ defmodule Alloy.Tool.Core.Bash do
 
   @behaviour Alloy.Tool
 
-  alias Alloy.OSProcess
+  alias Alloy.Internal.{Deadline, Sanitize}
+  alias Alloy.{OSProcess, OwnedWorker}
+  alias Alloy.Tool.Core.Bash.OutputWorker
 
   @typedoc """
   A custom command executor. Receives the shell command string and the working
@@ -115,15 +131,29 @@ defmodule Alloy.Tool.Core.Bash do
   @impl true
   def execute(input, context) do
     command = input["command"]
-    max_timeout = Map.get(context, :bash_max_timeout, @max_timeout)
-    timeout = normalize_timeout(input["timeout"], max_timeout)
-    working_dir = Map.get(context, :working_directory)
 
-    case Map.get(context, :bash_executor) do
-      nil -> run_host(command, working_dir, timeout, context)
-      executor -> run_custom_executor(executor, command, working_dir, timeout)
+    with :ok <- validate_command(command) do
+      max_timeout = Map.get(context, :bash_max_timeout, @max_timeout)
+      timeout = normalize_timeout(input["timeout"], max_timeout)
+      working_dir = Map.get(context, :working_directory)
+
+      case Map.get(context, :bash_executor) do
+        nil -> run_host(command, working_dir, timeout, context)
+        executor -> run_custom_executor(executor, command, working_dir, timeout)
+      end
     end
   end
+
+  defp validate_command(command) when is_binary(command) do
+    if String.contains?(command, <<0>>) do
+      {:error, "command must not contain NUL bytes."}
+    else
+      :ok
+    end
+  end
+
+  defp validate_command(command),
+    do: {:error, "command must be a string, got: #{Sanitize.inspect_bounded(command)}"}
 
   defp run_host(command, working_dir, timeout, context) do
     with {:ok, bash} <- find_bash(),
@@ -136,13 +166,14 @@ defmodule Alloy.Tool.Core.Bash do
         |> maybe_add_cd(working_dir)
 
       caller = self()
+      callbacks = extract_output_callbacks(context)
 
       # The port lives in its own process so the shell is killed even when
       # the caller is: the executor brutally kills a tool's task on
       # :tool_timeout, and closing a port does not stop the shell.
       task =
         Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-          run_port(bash, opts, timeout, caller)
+          run_port(bash, opts, timeout, caller, callbacks)
         end)
 
       result = Task.yield(task, timeout + @kill_grace_ms) || Task.shutdown(task, :brutal_kill)
@@ -156,7 +187,8 @@ defmodule Alloy.Tool.Core.Bash do
           {:error, with_output(output, timeout_message(timeout))}
 
         {:exit, reason} ->
-          {:error, "Executor crashed: #{inspect(reason)}"}
+          OSProcess.signal_group(os_pid, "KILL")
+          {:error, "Executor crashed: #{OwnedWorker.format_exit_reason(reason)}"}
 
         # The runner missed its own deadline and was killed before it could
         # stop the shell, so stop it here.
@@ -215,21 +247,71 @@ defmodule Alloy.Tool.Core.Bash do
     Enum.any?(@secret_name_parts, &String.contains?(name, &1))
   end
 
-  defp run_port(bash, opts, timeout, caller) do
-    caller_ref = Process.monitor(caller)
-    port = Port.open({:spawn_executable, bash}, opts)
+  defp extract_output_callbacks(context) do
+    on_tool_update =
+      case Map.get(context, :on_tool_update) do
+        fun when is_function(fun, 1) -> fun
+        _ -> nil
+      end
 
-    run = %{
-      port: port,
-      os_pid: OSProcess.os_pid(port),
-      caller_ref: caller_ref,
-      deadline: System.monotonic_time(:millisecond) + timeout
+    bash_on_output =
+      case Map.get(context, :bash_on_output) do
+        fun when is_function(fun, 1) -> fun
+        _ -> nil
+      end
+
+    %{
+      on_tool_update: on_tool_update,
+      bash_on_output: bash_on_output
     }
+  end
 
-    send(caller, {:bash_os_pid, self(), run.os_pid})
-    result = collect(run, new_output())
-    Process.demonitor(caller_ref, [:flush])
-    result
+  defp run_port(bash, opts, timeout, caller, callbacks) do
+    # Trapping exits lets a supervisor shutdown stop the shell process group too.
+    Process.flag(:trap_exit, true)
+    caller_ref = Process.monitor(caller)
+
+    receive do
+      {:DOWN, ^caller_ref, :process, _pid, _reason} ->
+        :caller_down
+
+      {:EXIT, from, reason} when is_pid(from) ->
+        Process.demonitor(caller_ref, [:flush])
+        exit(reason)
+    after
+      0 ->
+        output_worker = OutputWorker.start(callbacks.bash_on_output)
+
+        try do
+          port = Port.open({:spawn_executable, bash}, opts)
+          os_pid = OSProcess.os_pid(port)
+          send(caller, {:bash_os_pid, self(), os_pid})
+
+          run = %{
+            port: port,
+            os_pid: os_pid,
+            caller_ref: caller_ref,
+            deadline: System.monotonic_time(:millisecond) + timeout,
+            on_tool_update: callbacks.on_tool_update,
+            utf8_carry: <<>>,
+            output_worker: output_worker
+          }
+
+          try do
+            collect(run, new_output())
+          catch
+            kind, reason ->
+              OSProcess.signal_group(os_pid, "KILL")
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+        catch
+          kind, reason ->
+            OutputWorker.kill(output_worker)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        after
+          Process.demonitor(caller_ref, [:flush])
+        end
+    end
   end
 
   # Flushes the runner's start message in every outcome; the pid is only
@@ -245,23 +327,52 @@ defmodule Alloy.Tool.Core.Bash do
   # The deadline is absolute and checked before each receive, so a steady
   # stream of output can't postpone the timeout.
   defp collect(run, output) do
-    case run.deadline - System.monotonic_time(:millisecond) do
+    case Deadline.remaining_ms(run.deadline) do
       remaining when remaining > 0 -> receive_output(run, output, remaining)
-      _expired -> time_out(run, output)
+      0 -> time_out(run, output)
     end
   end
 
   defp receive_output(%{port: port, caller_ref: caller_ref} = run, output, remaining) do
+    worker_mon_ref = OutputWorker.monitor_ref(run.output_worker)
+
     receive do
       {^port, {:data, data}} ->
-        collect(run, append(output, data))
+        utf8_carry = emit_utf8_update(run.on_tool_update, run.utf8_carry, data)
+        OutputWorker.dispatch(run.output_worker, data)
+        collect(%{run | utf8_carry: utf8_carry}, append(output, data))
+
+      {:DOWN, ^worker_mon_ref, :process, _pid, reason} when is_reference(worker_mon_ref) ->
+        OutputWorker.log_exit(reason)
+        collect(%{run | output_worker: nil}, output)
 
       {^port, {:exit_status, status}} ->
-        {:exited, status, render(output)}
+        flush_utf8_carry(run.on_tool_update, run.utf8_carry)
+
+        case OutputWorker.flush(run.output_worker, run.caller_ref, run.deadline) do
+          :ok ->
+            {:exited, status, render(output)}
+
+          :caller_down ->
+            OSProcess.signal_group(run.os_pid, "KILL")
+            :caller_down
+
+          {:exit, reason} ->
+            OSProcess.signal_group(run.os_pid, "KILL")
+            Process.demonitor(caller_ref, [:flush])
+            exit(reason)
+        end
 
       {:DOWN, ^caller_ref, :process, _pid, _reason} ->
         OSProcess.signal_group(run.os_pid, "KILL")
+        OutputWorker.kill(run.output_worker)
         :caller_down
+
+      {:EXIT, from, reason} when is_pid(from) ->
+        OSProcess.signal_group(run.os_pid, "KILL")
+        OutputWorker.kill(run.output_worker)
+        Process.demonitor(caller_ref, [:flush])
+        exit(reason)
     after
       remaining -> time_out(run, output)
     end
@@ -269,24 +380,70 @@ defmodule Alloy.Tool.Core.Bash do
 
   defp time_out(run, output) do
     OSProcess.signal_group(run.os_pid, "KILL")
+    OutputWorker.kill(run.output_worker)
+    flush_utf8_carry(run.on_tool_update, run.utf8_carry)
     {:timeout, render(output)}
   end
 
-  defp run_custom_executor(executor, command, working_dir, timeout) do
-    task =
-      Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-        executor.(command, working_dir)
-      end)
+  # Carries incomplete trailing multibyte UTF-8 sequences across port chunks so
+  # split codepoints (e.g. "€" split across reads) render cleanly in :tool_update.
+  defp emit_utf8_update(nil, _carry, _data), do: <<>>
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {output, exit_code}} ->
+  defp emit_utf8_update(fun, carry, data) do
+    {ready, next_carry} = split_complete_utf8(carry <> data, [])
+    if byte_size(ready) > 0, do: fun.(ready)
+    next_carry
+  end
+
+  defp flush_utf8_carry(nil, _carry), do: :ok
+  defp flush_utf8_carry(_fun, <<>>), do: :ok
+  defp flush_utf8_carry(fun, carry), do: fun.(String.replace_invalid(carry))
+
+  defp split_complete_utf8(<<>>, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), <<>>}
+
+  defp split_complete_utf8(bin, acc) do
+    case :unicode.characters_to_binary(bin) do
+      valid when is_binary(valid) ->
+        {IO.iodata_to_binary(Enum.reverse([valid | acc])), <<>>}
+
+      {:incomplete, valid, rest} ->
+        {IO.iodata_to_binary(Enum.reverse([valid | acc])), rest}
+
+      {:error, valid, <<_bad, rest::binary>>} ->
+        split_complete_utf8(rest, ["\uFFFD", valid | acc])
+    end
+  end
+
+  # Runs the custom executor inside a linked worker owned by a supervised task
+  # that monitors the caller before starting the worker and propagates Logger
+  # metadata and OpenTelemetry context.
+  defp run_custom_executor(executor, command, working_dir, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    owner = OwnedWorker.start(deadline, fn -> executor.(command, working_dir) end)
+
+    case Task.yield(owner, timeout + 1_000) do
+      {:ok, {:ok, {output, exit_code}}} when is_binary(output) and is_integer(exit_code) ->
         {:ok, "#{new_output() |> append(output) |> render()}\nexit code: #{exit_code}"}
 
+      {:ok, {:ok, other}} ->
+        {:error,
+         "Custom bash executor returned invalid result: #{Sanitize.inspect_bounded(other)}"}
+
+      {:ok, {:worker_exit, {:worker_crash, kind, reason, stacktrace}}} ->
+        {:error, "Executor crashed: #{Sanitize.crash_summary(kind, reason, stacktrace)}"}
+
+      {:ok, {:worker_exit, reason}} ->
+        {:error, "Executor crashed: #{OwnedWorker.format_exit_reason(reason)}"}
+
       {:exit, reason} ->
-        {:error, "Executor crashed: #{inspect(reason)}"}
+        {:error, "Executor crashed: #{OwnedWorker.format_exit_reason(reason)}"}
+
+      {:ok, :timeout} ->
+        {:error, timeout_message(timeout)}
 
       nil ->
-        {:error, "Command timed out after #{timeout}ms."}
+        OwnedWorker.cancel(owner)
+        {:error, timeout_message(timeout)}
     end
   end
 

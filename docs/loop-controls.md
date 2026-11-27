@@ -11,7 +11,10 @@ arguments before the tool executes.
 same context. The result has `content` (text), `data` (map or nil), and `is_error`.
 Return `{:result, replacement}` to replace content/data, or the state unchanged.
 Replacements pass through later hooks. `is_error` cannot change. This hook runs
-for successful, blocked, invalid, unknown, crashed, and timed-out calls.
+for successful, blocked, invalid, unknown, crashed, timed-out, and
+interrupted-in-flight cancelled calls. Unstarted calls skipped before dispatch
+because of cancellation, steering, or deadline expiry return synthetic error
+results directly without invoking `:after_tool_call`.
 
 ```elixir
 def call(:after_tool_call, state) do
@@ -91,11 +94,14 @@ end
 def call(_hook, state), do: state
 ```
 
-`State.prepare/2` accepts `:tools`, `:messages`, `:system_prompt`, and `:provider`.
+`State.prepare/2` accepts `:tools`, `:messages`, `:system_prompt`, `:provider`,
+`:output_schema`, and `:reasoning`.
 Changes persist for later turns. Tool definitions and dispatch mappings change
 together. A provider tuple can update the model or its request settings; derived
 model limits are refreshed, while explicit context limits remain unchanged.
-Changing provider configuration clears opaque provider state conservatively.
+Changing provider configuration clears opaque provider state conservatively,
+whereas updating only `:reasoning` (either top-level or inside the provider
+tuple) preserves live `provider_state`.
 Pass `provider_state:` in the new provider configuration to supply replacement
 state explicitly. Preparing unchanged provider configuration retains live state.
 
@@ -133,3 +139,23 @@ Pass `tool_concurrency: 4` to limit parallel tool execution. The default remains
 `System.schedulers_online()`. Tools with `concurrent?/0 == false` still execute
 alone in source order, with barriers around adjacent parallel batches. This is
 a per-run execution limit; account-wide rate limits remain application policy.
+
+## Cancellation, steering, and follow-up
+
+- **Cooperative cancellation (`:cancel_token`):** Create a token with
+  `Alloy.Cancel.new/0`, pass `cancel_token: token` to `Alloy.run/2` or
+  `Alloy.stream/3`, and call `Alloy.Cancel.cancel/1` from any process.
+  Cancellation aborts in-flight provider requests and tool workers, emits
+  synthetic error `tool_result` blocks for interrupted or skipped tools so the
+  transcript stays valid, and returns
+  `{:error, %Alloy.Result{status: :cancelled, error: :cancelled}}`.
+- **Mid-round steering (`:steering`):** Pass `steering: fn state -> [...] end`.
+  Polled between completed tool batches (and after the last batch before
+  `:stop_after_tool`); returning one or more `%Alloy.Message{}` structs skips
+  any remaining unstarted tool batches with synthetic error `tool_result`
+  blocks, appends the steering messages, and starts the next turn.
+- **Post-turn follow-up (`:follow_up`):** Pass `follow_up: fn state -> [...] end`.
+  Polled right before normal non-refusal `:end_turn` completion once
+  `:until_tool` is satisfied; returning one or more `%Alloy.Message{}` structs
+  appends them and continues the loop within `:max_turns`, `:timeout_ms`, and
+  `:cancel_token`.

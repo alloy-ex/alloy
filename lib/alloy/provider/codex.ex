@@ -22,6 +22,11 @@ defmodule Alloy.Provider.Codex do
     the user config, including its MCP servers and plugins.
   - `:config_overrides` - `key=value` strings passed to `codex exec` as
     `-c` flags, for example `[~s(model_reasoning_effort="high")]`
+  - `:reasoning` - Portable reasoning config (`nil | :off | :low | :medium |
+    :high | :xhigh | %{effort: ..., display: :summarized | :omitted}`). Maps
+    `:effort` to a `-c model_reasoning_effort="..."` override (`:off` maps to
+    `"none"`). An explicit `model_reasoning_effort` entry in `:config_overrides`
+    takes precedence.
   - `:tmp_dir` - Parent for the provider's temp working directory
     (default: `System.tmp_dir!/0`)
   - `:timeout_ms` - Timeout for a single `codex exec` invocation
@@ -69,12 +74,13 @@ defmodule Alloy.Provider.Codex do
   `:malformed_reply` and is retried within the configured retry budget;
   accompanying text is not treated as evidence of task completion.
 
-  A failed resumed call instead returns non-retryable `:session_uncertain`:
-  the saved Codex transcript may already include the attempted turn. After
-  any failed, cancelled or crashed turn in a persistent session (including
-  cancellation during Alloy tool execution), change `:session_generation`
-  before continuing. This also recovers from a deleted or corrupt saved thread.
-  Do not share continuation state between concurrent callers.
+  A failed resumed call returns non-retryable `:session_uncertain` — or
+  `:shutdown` if interrupted by supervisor shutdown; in both cases the saved
+  Codex transcript may already include the attempted turn. After any failed,
+  cancelled, or crashed turn in a persistent session (including cancellation
+  during Alloy tool execution), change `:session_generation` before continuing.
+  This also recovers from a deleted or corrupt saved thread. Do not share
+  continuation state between concurrent callers.
 
   Hosts retaining `Alloy.Agent.State` can use `Alloy.Agent.State.prepare/2`
   with the same provider configuration and a new `:session_generation`. This
@@ -101,34 +107,24 @@ defmodule Alloy.Provider.Codex do
     before the process exits, not token-by-token JSON fragments. Commands and commentary
     remain in response metadata, never in answer chunks. If no such event is
     available, the validated final response is replayed once.
+  - `:command_runner` is a test/injection hook that runs directly in the calling
+    process without port timeout or cancellation wrapping.
   """
 
   @behaviour Alloy.Provider
 
-  alias Alloy.{Message, OSProcess}
-  alias Alloy.Provider.{CodexSession, Error}
+  alias Alloy.Internal.Sanitize
+  alias Alloy.{Message, OutputSchema}
+  alias Alloy.Provider
+  alias Alloy.Provider.{CodexRunner, CodexSession, Error, HTTP}
 
-  @default_timeout_ms 120_000
-  @default_codex_bin "codex"
   @output_truncation 4_000
   @error_truncation 2_000
   @zero_usage %{input_tokens: 0, output_tokens: 0}
-  # How long codex gets to exit after SIGTERM before the group is killed.
-  @term_grace_ms 100
-  # The owning task replies by its deadline plus the kill grace; this only
-  # bounds the wait if it stops responding.
-  @reply_grace_ms 5_000
 
   # Matches any `\X` where X is NOT a valid JSON single-character escape
   # (valid set: " \ / b f n r t u). Used by the decode repair pass.
   @invalid_json_escape_re ~r{\\(?!["\\/bfnrtu])}
-
-  # sh only wires up redirects: the prompt file on stdin (codex reads it to
-  # EOF, which a port cannot send) and stderr to a file, so stdout carries
-  # nothing but --json events. Paths and arguments are positional
-  # parameters, never spliced into the script. `exec` keeps the port's OS
-  # pid on codex itself.
-  @launch_script ~S(prompt="$1"; stderr="$2"; shift 2; exec "$@" < "$prompt" 2> "$stderr")
 
   @response_schema %{
     type: "object",
@@ -167,6 +163,7 @@ defmodule Alloy.Provider.Codex do
           optional(:profile) => String.t(),
           optional(:codex_home) => String.t(),
           optional(:config_overrides) => [String.t()],
+          optional(:reasoning) => Alloy.Provider.reasoning(),
           optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
           optional(:receive_timeout) => pos_integer(),
@@ -187,22 +184,61 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp run_completion(messages, tool_defs, config) do
-    with {:ok, codex_home} <- codex_home(config),
-         :ok <- validate_session_workdir(config, codex_home) do
+    with {:ok, reasoning} <- Provider.normalize_reasoning(Map.get(config, :reasoning)),
+         config = Map.put(config, :reasoning, reasoning),
+         {:ok, codex_home} <- codex_home(config),
+         :ok <- validate_session_workdir(config) do
       scope = session_scope(config, codex_home, tool_defs)
-      plan = session_plan(config, codex_home, messages, scope)
+      plan = session_plan(config, messages, scope)
       config = Map.put(config, :alloy_codex_plan, plan)
       prompt = session_prompt(plan, messages, tool_defs, config)
 
-      with {:ok, command_result} <- execute(prompt, codex_home, config),
+      with {:ok, command_result} <-
+             CodexRunner.execute(
+               prompt,
+               codex_home,
+               &codex_args(&1, config),
+               @response_schema_json,
+               config,
+               &structured_reply(&1, config)
+             ),
            {:ok, payload} <- decode_payload(command_result, config),
            {:ok, result} <- parse_payload(payload, config, command_result),
            :ok <- finish_stream(result, command_result, config) do
         {:ok, remember_session(result, messages, scope, plan, command_result)}
       end
+      |> maybe_cancel_codex_error(config)
       |> session_result(plan)
     end
     |> to_provider_error()
+  end
+
+  defp maybe_cancel_codex_error({:error, %Error{kind: :cancelled}} = err, _config), do: err
+
+  defp maybe_cancel_codex_error({:error, _reason} = err, config) do
+    if Alloy.Cancel.cancelled?(Map.get(config, :alloy_cancel_token)),
+      do: {:error, %Error{kind: :cancelled, message: "codex exec cancelled"}},
+      else: err
+  end
+
+  defp maybe_cancel_codex_error(ok, _config), do: ok
+
+  defp session_result({:error, %Error{kind: :shutdown} = error}, {:resume, _id, _count}) do
+    {:error,
+     %{
+       error
+       | message:
+           "Codex resume interrupted by shutdown; change :session_generation before continuing: #{error.message}"
+     }}
+  end
+
+  defp session_result({:error, %Error{kind: :cancelled} = error}, {:resume, _id, _count}) do
+    {:error,
+     %{
+       error
+       | message:
+           "Codex resume cancelled; change :session_generation before continuing: #{error.message}"
+     }}
   end
 
   defp session_result({:error, reason}, {:resume, _id, _count}) do
@@ -216,20 +252,28 @@ defmodule Alloy.Provider.Codex do
   defp session_result(result, _plan), do: result
 
   defp session_scope(config, home, tools) do
-    %{
+    base = %{
       home: home || System.get_env("CODEX_HOME") || Path.expand("~/.codex"),
       workdir: Map.get(config, :workdir),
       model: Map.get(config, :model),
       system_prompt: Map.get(config, :system_prompt),
-      overrides: Map.get(config, :config_overrides, []),
-      executable: codex_bin(config),
+      overrides: effective_config_overrides(config),
+      executable: CodexRunner.codex_bin(config),
       generation: Map.get(config, :session_generation),
       tools: tools
     }
+
+    case Map.get(config, :output_schema) do
+      nil ->
+        base
+
+      %OutputSchema{schema: schema} ->
+        Map.put(base, :output_schema, schema)
+    end
   end
 
-  defp validate_session_workdir(%{persist_session: true} = config, home) do
-    if ephemeral_home?(config, home) or
+  defp validate_session_workdir(%{persist_session: true} = config) do
+    if ephemeral_home?(config) or
          (is_binary(config[:workdir]) and File.dir?(config.workdir)) do
       :ok
     else
@@ -241,12 +285,12 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp validate_session_workdir(_config, _home), do: :ok
+  defp validate_session_workdir(_config), do: :ok
 
-  defp ephemeral_home?(config, _home), do: Map.get(config, :profile) not in [nil, ""]
+  defp ephemeral_home?(config), do: Map.get(config, :profile) not in [nil, ""]
 
-  defp session_plan(%{persist_session: true} = config, home, messages, scope) do
-    if ephemeral_home?(config, home) do
+  defp session_plan(%{persist_session: true} = config, messages, scope) do
+    if ephemeral_home?(config) do
       {:fresh, :ephemeral}
     else
       CodexSession.plan(
@@ -257,7 +301,7 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp session_plan(_config, _home, _messages, _scope), do: {:fresh, :ephemeral}
+  defp session_plan(_config, _messages, _scope), do: {:fresh, :ephemeral}
 
   defp session_prompt({:resume, _id, count}, messages, tools, config) do
     "Continue the recorded conversation. Only new transcript messages follow.\n" <>
@@ -347,265 +391,6 @@ defmodule Alloy.Provider.Codex do
   defp codex_home(%{codex_home: codex_home}) when is_binary(codex_home), do: {:ok, codex_home}
   defp codex_home(_config), do: {:ok, nil}
 
-  # Test hook: a synchronous function matching `System.cmd/3`, run in the
-  # caller with no timeout of its own.
-  defp execute(prompt, codex_home, %{command_runner: runner} = config) do
-    in_temp_dir(config, fn paths ->
-      with :ok <- write_inputs(paths, prompt) do
-        run_injected(runner, codex_args(paths, config) ++ [prompt], codex_home, paths, config)
-      end
-    end)
-  end
-
-  # The OS process belongs to a supervised task rather than the caller, so it
-  # is stopped and its files removed even when the caller is killed (the
-  # loop kills a cancelled turn, and `after` blocks do not run on a kill).
-  defp execute(prompt, codex_home, config) do
-    with :ok <- check_workdir(config) do
-      caller = self()
-      timeout = effective_timeout(config)
-      tag = make_ref()
-      on_chunk = Map.get(config, :alloy_on_chunk)
-      emit = if on_chunk, do: fn text -> send(caller, {tag, text}) end
-      config = Map.put(config, :alloy_emit, emit)
-
-      task =
-        Task.Supervisor.async_nolink(Alloy.TaskSupervisor, fn ->
-          own_run(caller, prompt, codex_home, config, timeout)
-        end)
-
-      deadline = System.monotonic_time(:millisecond) + timeout + @reply_grace_ms
-
-      case await_task(task, tag, on_chunk, deadline) do
-        {:ok, result} -> result
-        {:exit, reason} -> {:error, %Error{message: "codex exec failed: #{inspect(reason)}"}}
-        nil -> {:error, timed_out(timeout)}
-      end
-    end
-  end
-
-  defp await_task(%Task{ref: ref} = task, tag, on_chunk, deadline) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
-
-    receive do
-      {^tag, text} ->
-        deliver_chunk(task, tag, on_chunk, text)
-        await_task(task, tag, on_chunk, deadline)
-
-      {^ref, result} ->
-        _ = Task.ignore(task)
-        {:ok, result}
-
-      {:DOWN, ^ref, :process, _pid, reason} ->
-        {:exit, reason}
-    after
-      remaining ->
-        _ = Task.shutdown(task)
-        flush_chunks(tag)
-        nil
-    end
-  end
-
-  defp deliver_chunk(task, tag, on_chunk, text) do
-    on_chunk.(text)
-  catch
-    kind, reason ->
-      _ = Task.shutdown(task)
-      flush_chunks(tag)
-      :erlang.raise(kind, reason, __STACKTRACE__)
-  end
-
-  defp flush_chunks(tag) do
-    receive do
-      {^tag, _text} -> flush_chunks(tag)
-    after
-      0 -> :ok
-    end
-  end
-
-  # The port reports a missing directory only as "exit status 2" with the
-  # reason on stderr, so check it up front for a clear error.
-  defp check_workdir(%{workdir: workdir}) when is_binary(workdir) do
-    if File.dir?(workdir),
-      do: :ok,
-      else: {:error, %Error{message: "Codex :workdir #{workdir} is not a directory"}}
-  end
-
-  defp check_workdir(_config), do: :ok
-
-  defp own_run(caller, prompt, codex_home, config, timeout) do
-    # Trapping exits lets a supervisor shutdown stop codex too.
-    Process.flag(:trap_exit, true)
-    caller_ref = Process.monitor(caller)
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    result =
-      in_temp_dir(config, fn paths ->
-        with :ok <- write_inputs(paths, prompt) do
-          port = open_port(codex_args(paths, config) ++ ["-"], codex_home, paths, config)
-
-          run = %{
-            port: port,
-            os_pid: OSProcess.os_pid(port),
-            caller_ref: caller_ref,
-            deadline: deadline,
-            timeout: timeout,
-            emit: Map.get(config, :alloy_emit),
-            stream_buffer: [],
-            stream_candidate: nil,
-            streamed_text: nil,
-            config: config
-          }
-
-          with {:ok, output, status, streamed_text} <- collect(run, []) do
-            {:ok,
-             Map.put(
-               command_result(output, read_stderr(paths), status, paths),
-               :streamed_text,
-               streamed_text
-             )}
-          end
-        end
-      end)
-
-    Process.demonitor(caller_ref, [:flush])
-    result
-  end
-
-  defp in_temp_dir(config, fun) do
-    parent = Map.get(config, :tmp_dir) || System.tmp_dir!()
-    base_dir = Path.join(parent, "alloy-codex-#{System.unique_integer([:positive])}")
-
-    # 0700: the prompt file holds the whole conversation, and the default
-    # mode leaves it readable by other users on a shared /tmp.
-    with :ok <- File.mkdir_p(base_dir),
-         :ok <- File.chmod(base_dir, 0o700) do
-      try do
-        fun.(paths(base_dir, config))
-      after
-        _ = File.rm_rf(base_dir)
-      end
-    else
-      {:error, reason} ->
-        _ = File.rm_rf(base_dir)
-        {:error, "failed to prepare Codex temp directory: #{inspect(reason)}"}
-    end
-  end
-
-  defp paths(base_dir, config) do
-    %{
-      base_dir: base_dir,
-      prompt_path: Path.join(base_dir, "prompt.txt"),
-      schema_path: Path.join(base_dir, "response_schema.json"),
-      last_message_path: Path.join(base_dir, "last_message.json"),
-      stderr_path: Path.join(base_dir, "stderr.log"),
-      workdir: Map.get(config, :workdir, base_dir)
-    }
-  end
-
-  defp write_inputs(paths, prompt) do
-    with :ok <- File.write(paths.schema_path, @response_schema_json) do
-      File.write(paths.prompt_path, prompt)
-    end
-  end
-
-  defp effective_timeout(config) do
-    [
-      Map.get(config, :timeout_ms) || @default_timeout_ms,
-      Map.get(config, :receive_timeout),
-      config |> Map.get(:req_options, []) |> Keyword.get(:receive_timeout)
-    ]
-    |> Enum.filter(&(is_integer(&1) and &1 > 0))
-    |> Enum.min()
-  end
-
-  defp run_injected(runner, args, codex_home, paths, config) do
-    opts = [cd: paths.workdir, env: codex_env(codex_home)]
-
-    case runner.(codex_bin(config), args, opts) do
-      {output, status} when is_binary(output) and is_integer(status) ->
-        {:ok, command_result(output, "", status, paths)}
-
-      other ->
-        {:error, "codex exec returned unexpected result: #{inspect(other)}"}
-    end
-  rescue
-    error in ErlangError -> {:error, not_runnable(config, Exception.message(error))}
-  end
-
-  defp open_port(args, codex_home, paths, config) do
-    env = Enum.map(codex_env(codex_home), fn {key, value} -> "#{key}=#{value}" end)
-
-    launch_args =
-      ["-lc", @launch_script, "alloy-codex", paths.prompt_path, paths.stderr_path, "env"] ++
-        env ++ [codex_bin(config) | args]
-
-    Port.open(
-      {:spawn_executable, "/bin/sh"},
-      [{:args, launch_args}, {:cd, paths.workdir}, :binary, :exit_status, :use_stdio]
-    )
-  end
-
-  # The deadline is absolute: checking it before each receive keeps a
-  # steady stream of output from postponing the timeout.
-  defp collect(run, acc) do
-    case run.deadline - System.monotonic_time(:millisecond) do
-      remaining when remaining > 0 -> receive_output(run, acc, remaining)
-      _expired -> time_out(run)
-    end
-  end
-
-  defp receive_output(%{port: port, caller_ref: caller_ref} = run, acc, remaining) do
-    receive do
-      {^port, {:data, data}} ->
-        collect(stream_output(run, data), [acc, data])
-
-      {^port, {:exit_status, status}} ->
-        {:ok, IO.iodata_to_binary(acc), status, run.streamed_text}
-
-      {:DOWN, ^caller_ref, :process, _pid, reason} ->
-        :ok = stop(run)
-        {:error, %Error{message: "codex exec cancelled: caller exited (#{inspect(reason)})"}}
-
-      {:EXIT, from, reason} when is_pid(from) ->
-        :ok = stop(run)
-        exit(reason)
-    after
-      remaining -> time_out(run)
-    end
-  end
-
-  defp stream_output(%{emit: nil} = run, _data), do: run
-  defp stream_output(%{streamed_text: text} = run, _data) when is_binary(text), do: run
-
-  defp stream_output(run, data) do
-    consume_lines(:binary.split(data, "\n", [:global]), run)
-  end
-
-  defp consume_lines([partial], run),
-    do: %{run | stream_buffer: [partial | run.stream_buffer]}
-
-  defp consume_lines([line | rest], run) do
-    complete = [line | run.stream_buffer] |> Enum.reverse() |> IO.iodata_to_binary()
-    consume_lines(rest, stream_event(complete, %{run | stream_buffer: []}))
-  end
-
-  defp stream_event(_line, %{streamed_text: text} = run) when is_binary(text), do: run
-
-  defp stream_event(line, run) do
-    case Jason.decode(line) do
-      {:ok, %{"type" => "item.completed", "item" => %{"type" => "agent_message", "text" => text}}} ->
-        %{run | stream_candidate: structured_reply(text, run.config)}
-
-      {:ok, %{"type" => "turn.completed"}} when is_binary(run.stream_candidate) ->
-        run.emit.(run.stream_candidate)
-        %{run | streamed_text: run.stream_candidate}
-
-      _other ->
-        run
-    end
-  end
-
   defp structured_reply(text, config) when is_binary(text) do
     with {:ok, payload} <- Jason.decode(text),
          {:ok, result} <- parse_payload(payload, config, %{output: "", status: 0, events: []}),
@@ -618,82 +403,14 @@ defmodule Alloy.Provider.Codex do
 
   defp structured_reply(_text, _config), do: nil
 
-  defp time_out(run) do
-    :ok = stop(run)
-    {:error, timed_out(run.timeout)}
-  end
-
-  # SIGTERM, a short grace for codex to exit, then SIGKILL for anything left
-  # in the group. The port's process leads its own process group
-  # (erl_child_setup calls setsid), so this reaches codex's children too.
-  defp stop(%{os_pid: nil}), do: :ok
-
-  defp stop(%{port: port, os_pid: os_pid}) do
-    :ok = OSProcess.signal_group(os_pid, "TERM")
-
-    receive do
-      {^port, {:exit_status, _status}} -> :ok
-    after
-      @term_grace_ms -> :ok
-    end
-
-    OSProcess.signal_group(os_pid, "KILL")
-  end
-
-  defp timed_out(timeout),
-    do: %Error{kind: :timeout, message: "codex exec timed out after #{timeout}ms"}
-
-  defp read_stderr(paths) do
-    case File.read(paths.stderr_path) do
-      {:ok, stderr} -> stderr
-      {:error, _reason} -> ""
-    end
-  end
-
-  defp command_result(output, stderr, status, paths) do
-    %{
-      output: output,
-      stderr: stderr,
-      status: status,
-      events: decode_events(output),
-      last_message: File.read(paths.last_message_path)
-    }
-  end
-
-  # `codex exec --json` writes one event object per line.
-  defp decode_events(output) do
-    output
-    |> String.split("\n", trim: true)
-    |> Enum.flat_map(fn line ->
-      case Jason.decode(line) do
-        {:ok, %{"type" => type} = event} when is_binary(type) -> [event]
-        _other -> []
-      end
-    end)
-  end
-
-  defp codex_env(nil), do: [{"OTEL_SDK_DISABLED", "true"}]
-  defp codex_env(codex_home), do: [{"OTEL_SDK_DISABLED", "true"}, {"CODEX_HOME", codex_home}]
-
-  defp codex_bin(config), do: Map.get(config, :codex_bin, @default_codex_bin)
-
-  # sh and env exit 127 when the executable is missing and 126 when it
-  # cannot be run.
+  # sh exits 127 when the executable is missing and 126 when it cannot be run.
   defp codex_error(%{status: status} = command_result, config) when status in [126, 127],
-    do: not_runnable(config, "status #{status}: #{detail(command_result)}")
+    do: CodexRunner.not_runnable(config, "status #{status}: #{detail(command_result)}")
 
   defp codex_error(%{status: status} = command_result, _config) do
     message = "codex exec failed with status #{status}: #{detail(command_result)}"
     kind = if Error.overflow_text?(message), do: :context_overflow, else: :unknown
     %Error{kind: kind, message: message}
-  end
-
-  defp not_runnable(config, detail) do
-    %Error{
-      message:
-        "could not run codex executable #{inspect(codex_bin(config))}; install the Codex CLI " <>
-          "or set :codex_bin (#{detail})"
-    }
   end
 
   defp detail(command_result) do
@@ -722,8 +439,15 @@ defmodule Alloy.Provider.Codex do
 
   defp event_error(_event), do: nil
 
-  # A payload counts even when codex exits non-zero; without one, a non-zero
-  # exit is the error worth reporting.
+  # Under persist_session: true, a non-zero exit means the recorded CLI session
+  # may be partial or corrupt, so never treat last_message as a clean reply.
+  defp decode_payload(%{status: status} = command_result, %{persist_session: true} = config)
+       when status != 0 do
+    {:error, codex_error(command_result, config)}
+  end
+
+  # For ephemeral runs, a valid payload still counts when codex exits non-zero;
+  # without one, a non-zero exit is the error worth reporting.
   defp decode_payload(%{last_message: last_message, status: status} = command_result, config) do
     case decode_last_message(last_message) do
       {:ok, payload} -> {:ok, payload}
@@ -743,7 +467,7 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp decode_last_message({:error, reason}),
-    do: {:error, "failed to read Codex response file: #{inspect(reason)}"}
+    do: {:error, "failed to read Codex response file: #{Sanitize.inspect_bounded(reason)}"}
 
   defp parse_payload(
          %{"stop_reason" => "end_turn", "text" => text, "tool_calls" => tool_calls},
@@ -782,32 +506,32 @@ defmodule Alloy.Provider.Codex do
   end
 
   defp parse_payload(payload, _config, _command_result) do
-    {:error, "unexpected Codex response payload: #{inspect(payload)}"}
+    {:error, "unexpected Codex response payload: #{Sanitize.inspect_bounded(payload)}"}
   end
 
   defp parse_tool_blocks(text, tool_calls) do
-    tool_calls
-    |> Enum.with_index(1)
-    |> Enum.reduce_while([], fn {tool_call, index}, acc ->
-      case build_tool_block(tool_call, index) do
-        {:ok, block} -> {:cont, [block | acc]}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> finalize_reduced_tool_blocks(text)
+    case tool_calls
+         |> Enum.with_index(1)
+         |> HTTP.map_ok(fn {tool_call, index} -> build_tool_block(tool_call, index) end) do
+      {:ok, blocks} -> finalize_tool_blocks(text, blocks)
+      {:error, _} = err -> err
+    end
   end
 
-  defp finalize_reduced_tool_blocks({:error, _} = err, _text), do: err
-
-  defp finalize_reduced_tool_blocks(blocks, text),
-    do: finalize_tool_blocks(text, Enum.reverse(blocks))
-
-  defp build_tool_block(tool_call, index) do
+  defp build_tool_block(tool_call, index) when is_map(tool_call) do
     with {:ok, call_id} <- tool_call_id(tool_call, index),
          {:ok, name} <- fetch_string(tool_call, "name"),
          {:ok, arguments} <- fetch_arguments(tool_call) do
       {:ok, %{type: "tool_use", id: call_id, name: name, input: arguments}}
     end
+  end
+
+  defp build_tool_block(other, _index) do
+    {:error,
+     %Error{
+       kind: :protocol_error,
+       message: "invalid Codex tool call entry: #{Sanitize.inspect_bounded(other)}"
+     }}
   end
 
   defp finalize_tool_blocks(_text, []) do
@@ -829,14 +553,14 @@ defmodule Alloy.Provider.Codex do
     case Map.get(tool_call, "call_id") do
       value when is_binary(value) and value != "" -> {:ok, value}
       nil -> {:ok, "call_#{index}"}
-      other -> {:error, "invalid Codex tool call id: #{inspect(other)}"}
+      other -> {:error, "invalid Codex tool call id: #{Sanitize.inspect_bounded(other)}"}
     end
   end
 
   defp fetch_string(map, key) do
     case Map.get(map, key) do
       value when is_binary(value) and value != "" -> {:ok, value}
-      other -> {:error, "invalid Codex field #{inspect(key)}: #{inspect(other)}"}
+      other -> {:error, "invalid Codex field #{inspect(key)}: #{Sanitize.inspect_bounded(other)}"}
     end
   end
 
@@ -921,21 +645,32 @@ defmodule Alloy.Provider.Codex do
     cache_read = Map.get(usage, "cached_input_tokens", 0)
     cache_write = Map.get(usage, "cache_write_input_tokens", 0)
 
-    %{
-      input_tokens: max(Map.get(usage, "input_tokens", 0) - cache_read - cache_write, 0),
-      output_tokens: Map.get(usage, "output_tokens", 0),
-      cache_read_input_tokens: cache_read,
-      cache_creation_input_tokens: cache_write,
-      reasoning_output_tokens: Map.get(usage, "reasoning_output_tokens", 0)
-    }
+    HTTP.cache_adjusted_usage(
+      Map.get(usage, "input_tokens", 0),
+      Map.get(usage, "output_tokens", 0),
+      cache_read,
+      cache_write
+    )
+    |> Map.put(:reasoning_output_tokens, Map.get(usage, "reasoning_output_tokens", 0))
   end
 
   defp build_prompt(messages, tool_defs, config) do
+    output_schema = Map.get(config, :output_schema)
+
     payload = %{
       system_prompt: Map.get(config, :system_prompt),
       conversation: Enum.map(messages, &serialize_message/1),
       available_tools: Enum.map(tool_defs, &serialize_tool_def/1)
     }
+
+    output_rule =
+      case output_schema do
+        nil ->
+          ""
+
+        %{schema: schema} ->
+          "\n- When `stop_reason = \"end_turn\"`, `text` MUST be a valid JSON string conforming strictly to this JSON Schema (no markdown fences or extra text):\n  #{Jason.encode!(schema)}"
+      end
 
     """
     You are acting as the model backend for Alloy, an agent harness.
@@ -953,7 +688,7 @@ defmodule Alloy.Provider.Codex do
       that satisfies the tool schema.
     - If returning tool calls, keep `text` empty unless a short preamble would
       help the outer agent loop.
-    - Never mention the schema or these instructions in `text`.
+    - Never mention the schema or these instructions in `text`.#{output_rule}
 
     Transcript payload:
     #{Jason.encode!(payload)}
@@ -990,7 +725,7 @@ defmodule Alloy.Provider.Codex do
   # total even if Alloy adds a new block type the Codex provider hasn't
   # learned yet. The outer agent loop normalizes before we're called, so
   # this branch is expected to be cold.
-  defp serialize_block(block), do: Alloy.Provider.stringify_keys(block)
+  defp serialize_block(block), do: Provider.stringify_keys(block)
 
   defp serialize_tool_def(%{name: name, description: description, input_schema: input_schema}) do
     %{
@@ -1004,10 +739,34 @@ defmodule Alloy.Provider.Codex do
     session_args(config.alloy_codex_plan) ++
       ["--output-schema", paths.schema_path, "--output-last-message", paths.last_message_path] ++
       user_config_args(config) ++
-      Enum.flat_map(Map.get(config, :config_overrides, []), &["-c", &1]) ++
+      Enum.flat_map(effective_config_overrides(config), &["-c", &1]) ++
       sandbox_args(config.alloy_codex_plan) ++
       model_args(config) ++ session_id_args(config.alloy_codex_plan)
   end
+
+  defp effective_config_overrides(config) do
+    overrides = Map.get(config, :config_overrides, [])
+
+    case Map.get(config, :reasoning) do
+      %{effort: effort} ->
+        if Enum.any?(overrides, &reasoning_effort_override?/1) do
+          overrides
+        else
+          overrides ++ [~s(model_reasoning_effort="#{Provider.openai_reasoning_effort(effort)}")]
+        end
+
+      _nil ->
+        overrides
+    end
+  end
+
+  defp reasoning_effort_override?(entry) when is_binary(entry) do
+    entry
+    |> String.trim_leading()
+    |> String.starts_with?("model_reasoning_effort")
+  end
+
+  defp reasoning_effort_override?(_other), do: false
 
   defp session_args({:fresh, :ephemeral}),
     do: ~w(exec --json --skip-git-repo-check --ephemeral --ignore-rules --sandbox read-only)

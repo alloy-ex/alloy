@@ -189,5 +189,30 @@ defmodule Alloy.Tool.Core.EditTest do
 
       assert File.read!(file) == "new value\n"
     end
+
+    test "rejects non-boolean replace_all and binary files", %{tmp_dir: dir} do
+      bin = Path.join(dir, "data.bin")
+      File.write!(bin, <<0, 1, 2, 3>>)
+      txt = Path.join(dir, "a.txt")
+      File.write!(txt, "foo foo")
+
+      assert {:error, msg} =
+               Edit.execute(
+                 %{
+                   "file_path" => txt,
+                   "old_string" => "foo",
+                   "new_string" => "bar",
+                   "replace_all" => "false"
+                 },
+                 %{}
+               )
+
+      assert msg =~ "boolean"
+
+      assert {:error, bin_msg} =
+               Edit.execute(%{"file_path" => bin, "old_string" => "a", "new_string" => "b"}, %{})
+
+      assert bin_msg =~ "binary"
+    end
   end
 end

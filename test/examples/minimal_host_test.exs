@@ -5,6 +5,7 @@ defmodule MinimalHostTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Agent.{Config, State}
+  alias Alloy.Cancel
   alias MinimalHost.{CodeMode, OutputCapture}
 
   defmodule Policy do
@@ -19,6 +20,14 @@ defmodule MinimalHostTest do
 
     def call(:after_tool_execution, state) do
       send(state.config.context.test_pid, :after_children)
+      state
+    end
+
+    def call(:after_tool_call, state) do
+      if pid = state.config.context[:after_tool_call_pid] do
+        send(pid, {:after_tool_call, state.config.context.current_tool_call.id})
+      end
+
       state
     end
 
@@ -88,6 +97,40 @@ defmodule MinimalHostTest do
     assert_receive :after_children
     assert_receive {:event, {:tool_start, %{parent_call_id: "script-1", id: "script-1-1"}}}
     assert_receive {:event, {:tool_end, %{parent_call_id: "script-1", id: "script-1-3"}}}
+  end
+
+  test "single-call dispatch routes through Executor.run_tool/3 with native parent_call_id" do
+    parent = self()
+
+    execute = fn input, ctx ->
+      if ctx[:on_tool_update], do: ctx.on_tool_update.("step:" <> input["value"])
+      {:ok, "single:" <> input["value"], %{single: true}}
+    end
+
+    initial = state([tool("read", execute)])
+
+    program = fn dispatch ->
+      dispatch.(%{name: "read", input: %{"value" => "one"}})
+    end
+
+    assert {:ok, %{result: result, metadata: meta}} =
+             CodeMode.run(
+               program,
+               initial,
+               Keyword.put(opts(), :on_event, &send(parent, {:event, &1}))
+             )
+
+    refute Map.get(result, :is_error, false)
+    assert result.content == "single:one"
+    assert meta.parent_call_id == "script-1"
+    assert meta.structured_data == %{single: true}
+    assert_receive {:event, {:tool_start, %{parent_call_id: "script-1", id: "script-1-1"}}}
+
+    assert_receive {:event,
+                    {:tool_update,
+                     %{parent_call_id: "script-1", id: "script-1-1", chunk: "step:one"}}}
+
+    assert_receive {:event, {:tool_end, %{parent_call_id: "script-1", id: "script-1-1"}}}
   end
 
   test "sequential child calls remain ordered" do
@@ -242,6 +285,169 @@ defmodule MinimalHostTest do
     assert_receive {:timed_child, child}
     monitor = Process.monitor(child)
     assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
+  end
+
+  test "interpreter timeout is terminal even if the program ignores the child timeout result" do
+    parent = self()
+
+    slow =
+      tool("slow", fn _input, _context ->
+        send(parent, {:slow_started, self()})
+        Process.sleep(:infinity)
+      end)
+
+    program = fn dispatch ->
+      _ignored = dispatch.(%{name: "slow", input: %{"value" => "wait"}})
+      :continued_after_timeout
+    end
+
+    assert {:error, :timeout} =
+             CodeMode.run(
+               program,
+               state([slow]),
+               Keyword.put(opts(), :timeout, 60)
+             )
+
+    assert_receive {:slow_started, child}
+    monitor = Process.monitor(child)
+    assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
+  end
+
+  test "rejects empty or invalid UTF-8 parent_call_id upfront" do
+    for bad_parent <- ["", <<0xFF>>] do
+      assert_raise ArgumentError, ~r/non-empty UTF-8 parent_call_id/, fn ->
+        CodeMode.run(
+          fn _dispatch -> :ok end,
+          state([]),
+          Keyword.put(opts(), :parent_call_id, bad_parent)
+        )
+      end
+    end
+  end
+
+  test "clamps interpreter timeout to tighter outer state.run_deadline" do
+    parent = self()
+
+    slow =
+      tool("slow", fn _input, _context ->
+        send(parent, {:bounded_child, self()})
+        Process.sleep(:infinity)
+      end)
+
+    program = fn dispatch ->
+      _ignored = dispatch.(%{name: "slow", input: %{"value" => "wait"}})
+      :should_not_succeed
+    end
+
+    now = System.monotonic_time(:millisecond)
+    bounded_state = %{state([slow]) | run_deadline: now + 60}
+
+    {elapsed_us, result} =
+      :timer.tc(fn ->
+        CodeMode.run(program, bounded_state, Keyword.put(opts(), :timeout, 5_000))
+      end)
+
+    assert result == {:error, :timeout}
+    assert elapsed_us < 1_500_000
+    assert_receive {:bounded_child, child}
+    monitor = Process.monitor(child)
+    assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
+
+    # Pre-expired outer run_deadline returns {:error, :timeout} immediately without running program
+    expired_state = %{state([slow]) | run_deadline: now - 1}
+
+    assert {:error, :timeout} =
+             CodeMode.run(fn _ -> flunk("should not run") end, expired_state, opts())
+  end
+
+  test "honors cooperative :cancel_token during child calls and between dispatches" do
+    parent = self()
+
+    # 1. Cancel during child tool execution (via state.config.cancel_token) finalizes
+    #    :after_tool_call, matching :tool_end, and stop telemetry before returning :cancelled
+    outer_token = Cancel.new()
+    handler_id = "code-mode-cancel-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:alloy, :tool, :stop],
+      fn _event, _meas, meta, _cfg ->
+        if meta[:parent_call_id] == "script-cancel-1" do
+          send(parent, {:tool_stop_telemetry, meta.tool_id, meta.error})
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    slow =
+      tool("slow", fn _input, _context ->
+        send(parent, {:cancel_child, self()})
+        Process.sleep(:infinity)
+      end)
+
+    state_with_cancel =
+      Config.from_opts(
+        provider: {Alloy.Provider.Test, %{}},
+        tools: [slow],
+        middleware: [Policy],
+        context: %{test_pid: parent, after_tool_call_pid: parent},
+        cancel_token: outer_token
+      )
+      |> State.init()
+
+    task =
+      Task.async(fn ->
+        CodeMode.run(
+          fn dispatch ->
+            _ignored = dispatch.(%{name: "slow", input: %{"value" => "wait"}})
+            :should_not_succeed
+          end,
+          state_with_cancel,
+          Keyword.merge(opts(),
+            parent_call_id: "script-cancel-1",
+            on_event: &send(parent, {:cancel_ev, &1})
+          )
+        )
+      end)
+
+    assert_receive {:cancel_child, child}, 2_000
+    monitor = Process.monitor(child)
+    Cancel.cancel(outer_token)
+
+    assert {:error, :cancelled} = Task.await(task, 2_000)
+    assert_receive {:DOWN, ^monitor, :process, ^child, _reason}, 2_000
+    assert_receive {:cancel_ev, {:tool_start, %{id: "script-cancel-1-1"}}}, 1_000
+    assert_receive {:cancel_ev, {:tool_end, %{id: "script-cancel-1-1", error: err}}}, 1_000
+    assert err =~ "was cancelled"
+    assert_receive {:after_tool_call, "script-cancel-1-1"}, 1_000
+    assert_receive {:tool_stop_telemetry, "script-cancel-1-1", stop_err}, 1_000
+    assert stop_err =~ "was cancelled"
+
+    # 2. Cancel via opts[:cancel_token] while program sleeps between dispatches
+    inner_token = Cancel.new()
+
+    task2 =
+      Task.async(fn ->
+        CodeMode.run(
+          fn _dispatch ->
+            send(parent, :between_dispatches)
+            Process.sleep(5_000)
+            :too_late
+          end,
+          state([]),
+          Keyword.put(opts(), :cancel_token, inner_token)
+        )
+      end)
+
+    assert_receive :between_dispatches, 2_000
+    Cancel.cancel(inner_token)
+    assert {:error, :cancelled} = Task.await(task2, 2_000)
+
+    # 3. Empty dispatch list returns empty results without mutating transcript
+    assert {:ok, %{results: [], metadata: []}} =
+             CodeMode.run(fn dispatch -> dispatch.([]) end, state([]), opts())
   end
 
   @tag :tmp_dir

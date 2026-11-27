@@ -69,5 +69,29 @@ defmodule Alloy.MemoryTest do
 
       assert {:error, _} = Memory.validate_path(42)
     end
+
+    test "blocks create/str_replace/insert on /memories root and caps result chars" do
+      tool = Memory.tool({Alloy.Test.MemoryStore, self()})
+      assert tool.max_result_chars == 50_000
+
+      for input <- [
+            %{"command" => "create", "path" => "/memories", "file_text" => "x"},
+            %{
+              "command" => "str_replace",
+              "path" => "/memories",
+              "old_str" => "a",
+              "new_str" => "b"
+            },
+            %{
+              "command" => "insert",
+              "path" => "/memories",
+              "insert_line" => 0,
+              "insert_text" => "a"
+            }
+          ] do
+        assert {:error, msg} = tool.execute.(input, %{})
+        assert msg =~ "/memories"
+      end
+    end
   end
 end

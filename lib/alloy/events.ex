@@ -13,6 +13,9 @@ defmodule Alloy.Events do
   """
 
   alias Alloy.Agent.State
+  alias Alloy.Internal.Sanitize
+
+  require Logger
 
   @doc """
   Normalize runtime opts for event emission.
@@ -22,12 +25,16 @@ defmodule Alloy.Events do
   """
   @spec normalize_opts(State.t(), keyword()) :: keyword()
   def normalize_opts(%State{} = state, opts) do
-    on_event = Keyword.get(opts, :on_event) || fn _event -> :ok end
+    raw_on_event = Keyword.get(opts, :on_event)
+    has_subscriber? = Keyword.get(opts, :event_subscriber?, is_function(raw_on_event, 1))
+    on_event = raw_on_event || fn _event -> :ok end
 
     opts
     |> Keyword.put(:on_event, on_event)
-    |> put_new_lazy(:event_seq_ref, fn -> :atomics.new(1, signed: false) end)
-    |> put_new_lazy(:event_correlation_id, fn -> build_correlation_id(state) end)
+    |> Keyword.put(:event_subscriber?, has_subscriber?)
+    |> Keyword.put_new_lazy(:event_seq_ref, fn -> :atomics.new(1, signed: false) end)
+    |> Keyword.put_new_lazy(:event_error_logged_ref, fn -> :atomics.new(1, signed: false) end)
+    |> Keyword.put_new_lazy(:event_correlation_id, fn -> build_correlation_id(state) end)
   end
 
   @doc """
@@ -39,18 +46,23 @@ defmodule Alloy.Events do
   @spec build_correlation_id(State.t()) :: binary()
   def build_correlation_id(%State{} = state) do
     context = state.config.context
+    request_id = Map.get(context, :request_id)
+    correlation_id = Map.get(context, :correlation_id)
 
     cond do
-      is_binary(Map.get(context, :request_id)) ->
-        Map.get(context, :request_id)
+      valid_id?(request_id) ->
+        request_id
 
-      is_binary(Map.get(context, :correlation_id)) ->
-        Map.get(context, :correlation_id)
+      valid_id?(correlation_id) ->
+        correlation_id
 
       true ->
-        state.agent_id <> ":" <> Base.url_encode64(:crypto.strong_rand_bytes(8), padding: false)
+        prefix = if valid_id?(state.agent_id), do: state.agent_id, else: "alloy"
+        prefix <> ":" <> Base.url_encode64(:crypto.strong_rand_bytes(8), padding: false)
     end
   end
+
+  defp valid_id?(value), do: is_binary(value) and byte_size(value) > 0 and String.valid?(value)
 
   @doc """
   Emit an event envelope.
@@ -65,7 +77,7 @@ defmodule Alloy.Events do
     correlation_id = Keyword.get(opts, :event_correlation_id)
 
     envelope = build_event_envelope(raw_event, event_seq_ref, correlation_id, turn)
-    on_event.(envelope)
+    notify_on_event(on_event, envelope, Keyword.get(opts, :event_error_logged_ref))
 
     :telemetry.execute(
       [:alloy, :event],
@@ -78,6 +90,29 @@ defmodule Alloy.Events do
       }
     )
   end
+
+  # A raising UI/telemetry callback must not crash the loop after side-effecting
+  # tools have already run. Log at most once per run so a broken streaming UI
+  # callback cannot flood logs on every chunk. Throws and exits still propagate.
+  defp notify_on_event(on_event, envelope, logged_ref) do
+    on_event.(envelope)
+    :ok
+  rescue
+    exception ->
+      if should_log_error?(logged_ref) do
+        sanitized_trace = Sanitize.stacktrace(__STACKTRACE__)
+
+        Logger.warning(
+          "[Alloy] on_event callback failed (#{Sanitize.exception_summary(exception, 500)}); the run continues (further failures in this run suppressed).\n" <>
+            Exception.format_stacktrace(sanitized_trace)
+        )
+      end
+
+      :ok
+  end
+
+  defp should_log_error?(nil), do: true
+  defp should_log_error?(ref), do: :atomics.compare_exchange(ref, 1, 0, 1) == :ok
 
   defp build_event_envelope(%{v: 1} = envelope, _seq_ref, _correlation_id, _turn), do: envelope
 
@@ -110,7 +145,7 @@ defmodule Alloy.Events do
   end
 
   defp normalize_event_fields(event, payload, seq_ref, correlation_id)
-       when event in [:tool_start, :tool_end] and is_map(payload) do
+       when event in [:tool_start, :tool_update, :tool_end] and is_map(payload) do
     seq = Map.get(payload, :event_seq) || next_event_seq(seq_ref)
     effective_correlation_id = Map.get(payload, :correlation_id) || correlation_id
     normalized_payload = Map.drop(payload, [:event_seq, :correlation_id])
@@ -124,13 +159,5 @@ defmodule Alloy.Events do
 
   defp next_event_seq(ref) do
     :atomics.add_get(ref, 1, 1)
-  end
-
-  defp put_new_lazy(opts, key, producer) when is_list(opts) and is_function(producer, 0) do
-    if Keyword.has_key?(opts, key) do
-      opts
-    else
-      Keyword.put(opts, key, producer.())
-    end
   end
 end

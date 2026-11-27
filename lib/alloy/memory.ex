@@ -68,10 +68,12 @@ defmodule Alloy.Memory do
   - [Python SDK `BetaAbstractMemoryTool`](https://github.com/anthropics/anthropic-sdk-python/blob/main/examples/memory/basic.py)
   """
 
+  alias Alloy.Internal.Sanitize
   alias Alloy.Memory.Router
 
   @tool_name "memory"
   @tool_type "memory_20250818"
+  @max_result_chars 50_000
 
   @tool_description """
   Persistent memory that outlives this conversation, stored as files \
@@ -181,6 +183,7 @@ defmodule Alloy.Memory do
       input_schema: @tool_schema,
       execute: fn input, _context -> Router.dispatch(binding, input) end,
       concurrent?: false,
+      max_result_chars: @max_result_chars,
       native_types: %{anthropic: @tool_type}
     )
   end
@@ -210,18 +213,20 @@ defmodule Alloy.Memory do
 
     cond do
       path != "/memories" and not String.starts_with?(path, "/memories/") ->
-        {:error, "path must start with /memories/ (or be /memories): #{inspect(path)}"}
+        {:error,
+         "path must start with /memories/ (or be /memories): #{Sanitize.inspect_bounded(path)}"}
 
       String.contains?(path, ["%", "\\", <<0>>]) ->
-        {:error, "path must not contain %, \\ or NUL bytes: #{inspect(path)}"}
+        {:error, "path must not contain %, \\ or NUL bytes: #{Sanitize.inspect_bounded(path)}"}
 
       ".." in segments ->
-        {:error, "path must not contain upward traversal: #{inspect(path)}"}
+        {:error, "path must not contain upward traversal: #{Sanitize.inspect_bounded(path)}"}
 
       true ->
         {:ok, "/" <> Enum.join(Enum.reject(segments, &(&1 in ["", "."])), "/")}
     end
   end
 
-  def validate_path(other), do: {:error, "path must be a string, got: #{inspect(other)}"}
+  def validate_path(other),
+    do: {:error, "path must be a string, got: #{Sanitize.inspect_bounded(other)}"}
 end
