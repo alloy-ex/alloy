@@ -79,6 +79,12 @@ defmodule Alloy.ModelMetadata do
     # .../gpt-5.md, checked 2026-10-09. Pages that omit it share the window and
     # output limit of a sibling that states it; gpt-5-pro and o3 have no such
     # sibling, so they get the default.
+    {~r/^gpt-5\.4-pro(-\d{4}-\d{2}-\d{2})?$/,
+     %{
+       context_window: 922_000,
+       max_output_tokens: 128_000,
+       capabilities: Map.put(@full_capabilities, :structured_output?, false)
+     }},
     {~r/^gpt-(6-(astra|sol|luna)|6\.1-sol|5\.6-(sol|terra|luna)|5\.[45](-pro)?)(-\d{4}-\d{2}-\d{2})?$/,
      %{
        context_window: 922_000,

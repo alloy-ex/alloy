@@ -261,6 +261,10 @@ defmodule Alloy.ModelMetadataTest do
       assert ModelMetadata.capabilities("gpt-5.2").structured_output? == true
       assert ModelMetadata.capabilities("gpt-5.2-pro").structured_output? == false
       assert ModelMetadata.capabilities("gpt-5.2-pro-2025-12-11").structured_output? == false
+      assert ModelMetadata.capabilities("gpt-5.4").structured_output? == true
+      assert ModelMetadata.capabilities("gpt-5.4-pro").structured_output? == false
+      assert ModelMetadata.capabilities("gpt-5.4-pro-2026-03-05").structured_output? == false
+      assert ModelMetadata.capabilities("gpt-5.5-pro").structured_output? == true
 
       assert ModelMetadata.capabilities("unknown-model") == nil
       assert ModelMetadata.capabilities("gpt-5-codex") == nil
