@@ -12,7 +12,8 @@ defmodule Alloy.Provider.OpenAI do
   Required:
   - `:api_key` - OpenAI API key string, or a 0-arity callback returning
     `String.t() | {:ok, String.t()} | {:error, term()}` invoked per HTTP
-    attempt (inside a deadline-bounded worker when `:timeout_ms` is finite).
+    attempt (inside a bounded worker when `:timeout_ms` is finite or
+    `:cancel_token` is set).
     When passing a callback via `Alloy.run/2`, also set `:origin_key` to a
     stable non-empty string for account isolation.
   - `:model` - Model name (e.g., "gpt-6-astra", "gpt-6.1-sol", "gpt-5.4")

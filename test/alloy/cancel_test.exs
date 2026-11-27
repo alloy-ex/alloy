@@ -39,6 +39,16 @@ defmodule Alloy.CancelTest do
       assert Cancel.cancelled?(shared)
     end
 
+    test "rejects invalid non-token operands even when the other operand is nil" do
+      token = Cancel.new()
+      bad = Function.identity(:bad)
+
+      assert_raise FunctionClauseError, fn -> Cancel.combine(nil, bad) end
+      assert_raise FunctionClauseError, fn -> Cancel.combine(bad, nil) end
+      assert_raise FunctionClauseError, fn -> Cancel.combine(token, bad) end
+      assert_raise FunctionClauseError, fn -> Cancel.combine(bad, token) end
+    end
+
     test "propagates outer cancellation without mutating outer when inner is cancelled" do
       outer = Cancel.new()
       inner = Cancel.new()
@@ -84,12 +94,17 @@ defmodule Alloy.CancelTest do
       assert Cancel.valid_atomics_ref?(outer.ref)
     end
 
-    test "rejects forged structs, non-tokens, and invalid atomics refs" do
+    test "rejects forged structs, non-tokens, improper parent lists, and invalid atomics refs" do
+      valid_token = Cancel.new()
+      nested_improper = %{valid_token | parents: [%{valid_token | parents: [valid_token | :bad]}]}
+
       refute Cancel.valid?(nil)
       refute Cancel.valid?(:token)
       refute Cancel.valid?(%Cancel{ref: make_ref()})
-      refute Cancel.valid?(%Cancel{ref: Cancel.new().ref, parents: :not_a_list})
-      refute Cancel.valid?(%Cancel{ref: Cancel.new().ref, parents: [%Cancel{ref: make_ref()}]})
+      refute Cancel.valid?(%Cancel{ref: valid_token.ref, parents: :not_a_list})
+      refute Cancel.valid?(%{valid_token | parents: [valid_token | :bad]})
+      refute Cancel.valid?(nested_improper)
+      refute Cancel.valid?(%Cancel{ref: valid_token.ref, parents: [%Cancel{ref: make_ref()}]})
 
       refute Cancel.valid_atomics_ref?(make_ref())
       refute Cancel.valid_atomics_ref?(:not_a_ref)

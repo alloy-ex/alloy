@@ -542,7 +542,7 @@ defmodule Alloy.Provider.Gemini do
         blocks
         |> Enum.reverse()
         |> Enum.reduce(acc, fn
-          %{type: "tool_use", id: id, name: name}, inner when not is_nil(name) ->
+          %{type: "tool_use", id: id, name: name}, inner when name not in [nil, false] ->
             Map.put(inner, id, name)
 
           _block, inner ->
@@ -631,8 +631,7 @@ defmodule Alloy.Provider.Gemini do
   end
 
   defp format_content_block(%{type: type, mime_type: mime_type, data: data})
-       when type in ["image", "audio", "video", "document"] and is_binary(mime_type) and
-              is_binary(data) do
+       when type in ["image", "audio", "video"] do
     %{"inlineData" => %{"mimeType" => mime_type, "data" => data}}
   end
 
@@ -642,6 +641,11 @@ defmodule Alloy.Provider.Gemini do
     else
       %{"text" => "[Unsupported image URL scheme for Gemini provider]"}
     end
+  end
+
+  defp format_content_block(%{type: "document", mime_type: mime_type, data: data})
+       when is_binary(mime_type) and is_binary(data) do
+    %{"inlineData" => %{"mimeType" => mime_type, "data" => data}}
   end
 
   defp format_content_block(%{type: "document", mime_type: mime_type, uri: uri}) do

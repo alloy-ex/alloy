@@ -1284,8 +1284,7 @@ defmodule Alloy.Provider.HTTPTest do
                 message: "Invalid tool call arguments payload for lookup"
               }} = HTTP.decode_tool_arguments(123, "lookup")
 
-      assert {:error, %Error{kind: :malformed_reply}} =
-               HTTP.decode_tool_arguments(%URI{}, "lookup")
+      assert {:ok, %URI{}} = HTTP.decode_tool_arguments(%URI{}, "lookup")
 
       assert {:ok, %{"k" => "v"}} = HTTP.decode_response_body(~s({"k":"v"}))
       assert {:error, %Error{kind: :protocol_error}} = HTTP.decode_response_body("[]")

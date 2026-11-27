@@ -64,8 +64,9 @@ defmodule Alloy.Cancel do
   share an underlying reference).
   """
   @spec combine(t() | nil, t() | nil) :: t() | nil
-  def combine(nil, inner), do: inner
-  def combine(outer, nil), do: outer
+  def combine(nil, nil), do: nil
+  def combine(nil, %__MODULE__{} = inner), do: inner
+  def combine(%__MODULE__{} = outer, nil), do: outer
 
   def combine(%__MODULE__{} = outer, %__MODULE__{ref: inner_ref} = inner) do
     parents =
@@ -82,7 +83,7 @@ defmodule Alloy.Cancel do
   """
   @spec valid?(term()) :: boolean()
   def valid?(%__MODULE__{ref: ref, parents: parents}) when is_list(parents) do
-    valid_atomics_ref?(ref) and Enum.all?(parents, &valid?/1)
+    valid_atomics_ref?(ref) and not List.improper?(parents) and Enum.all?(parents, &valid?/1)
   end
 
   def valid?(_other), do: false

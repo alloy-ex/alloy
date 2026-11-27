@@ -282,14 +282,18 @@ defmodule Alloy.Provider.GeminiTest do
     test "resolves tool_result names with latest-message and earliest-block precedence" do
       messages = [
         Message.assistant_blocks([
-          %{type: "tool_use", id: "dup", name: "old_tool", input: %{}}
+          %{type: "tool_use", id: "dup", name: "old_tool", input: %{}},
+          %{type: "tool_use", id: "falsey_latest", name: "older_valid", input: %{}}
         ]),
         Message.assistant_blocks([
+          %{type: "tool_use", id: "dup", name: false, input: %{}},
           %{type: "tool_use", id: "dup", name: "first_in_latest", input: %{}},
-          %{type: "tool_use", id: "dup", name: "second_in_latest", input: %{}}
+          %{type: "tool_use", id: "dup", name: "second_in_latest", input: %{}},
+          %{type: "tool_use", id: "falsey_latest", name: false, input: %{}}
         ]),
         Message.tool_results([
           Message.tool_result_block("dup", "ok"),
+          Message.tool_result_block("falsey_latest", "ok"),
           Message.tool_result_block("missing", "ok")
         ])
       ]
@@ -300,8 +304,32 @@ defmodule Alloy.Provider.GeminiTest do
 
       assert [
                %{"functionResponse" => %{"id" => "dup", "name" => "first_in_latest"}},
+               %{"functionResponse" => %{"id" => "falsey_latest", "name" => "older_valid"}},
                %{"functionResponse" => %{"id" => "missing", "name" => "unknown_tool"}}
              ] = response["parts"]
+    end
+
+    test "preserves inlineData serialization for non-binary image/audio/video mime types while keeping binary guards on documents" do
+      messages = [
+        %Message{
+          role: :user,
+          content: [
+            Message.image(:"image/png", "YWJj"),
+            %{type: "audio", mime_type: :"audio/wav", data: "ZGVm"},
+            %{type: "document", mime_type: :"application/pdf", data: "Z2hp"}
+          ]
+        }
+      ]
+
+      Gemini.complete(messages, [], config_that_captures_request())
+      assert_received {:request_body, body}
+      [%{"parts" => parts}] = body |> Jason.decode!() |> Map.fetch!("contents")
+
+      assert [
+               %{"inlineData" => %{"mimeType" => "image/png", "data" => "YWJj"}},
+               %{"inlineData" => %{"mimeType" => "audio/wav", "data" => "ZGVm"}},
+               %{"text" => "[Unsupported content block for Gemini provider: \"document\"]"}
+             ] = parts
     end
 
     test "formats thinking blocks back into Gemini thought parts" do

@@ -1246,5 +1246,49 @@ defmodule Alloy.Provider.OpenAICompatTest do
                  req_options: [plug: plug, retry: false]
                })
     end
+
+    test "accepts pre-decoded struct-valued arguments on normal tool calls" do
+      defmodule CompatStructArgsAdapter do
+        def run(req) do
+          body = %{
+            "choices" => [
+              %{
+                "finish_reason" => "tool_calls",
+                "message" => %{
+                  "role" => "assistant",
+                  "tool_calls" => [
+                    %{
+                      "id" => "c1",
+                      "type" => "function",
+                      "function" => %{
+                        "name" => "fetch",
+                        "arguments" => URI.parse("https://example.com")
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+
+          {req, Req.Response.new(status: 200, body: body)}
+        end
+      end
+
+      uri = URI.parse("https://example.com")
+
+      assert {:ok,
+              %{
+                stop_reason: :tool_use,
+                messages: [
+                  %Message{content: [%{type: "tool_use", id: "c1", name: "fetch", input: ^uri}]}
+                ]
+              }} =
+               OpenAICompat.complete([Message.user("Hi")], [], %{
+                 api_url: "http://localhost",
+                 model: "m",
+                 req_options: [adapter: CompatStructArgsAdapter, retry: false]
+               })
+    end
   end
 end

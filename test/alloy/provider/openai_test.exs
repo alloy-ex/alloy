@@ -860,6 +860,51 @@ defmodule Alloy.Provider.OpenAITest do
 
       assert input == %{"q" => "kept"}
     end
+
+    test "accepts pre-decoded struct-valued arguments in normal and truncated Responses calls" do
+      defmodule StructArgsAdapter do
+        def run(req) do
+          [status] = Req.Request.get_header(req, "x-test-status")
+
+          body = %{
+            "id" => "resp_struct",
+            "status" => status,
+            "output" => [
+              %{
+                "type" => "function_call",
+                "call_id" => "call_uri",
+                "name" => "fetch",
+                "arguments" => URI.parse("https://example.com")
+              }
+            ],
+            "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+          }
+
+          {req, Req.Response.new(status: 200, body: body)}
+        end
+      end
+
+      uri = URI.parse("https://example.com")
+
+      for {status, expected_stop} <- [{"completed", :tool_use}, {"incomplete", :max_tokens}] do
+        config = %{
+          api_key: "sk-test-key",
+          model: "gpt-5.2",
+          extra_headers: [{"x-test-status", status}],
+          req_options: [adapter: StructArgsAdapter, retry: false]
+        }
+
+        assert {:ok,
+                %{
+                  stop_reason: ^expected_stop,
+                  messages: [
+                    %Message{
+                      content: [%{type: "tool_use", id: "call_uri", name: "fetch", input: ^uri}]
+                    }
+                  ]
+                }} = OpenAI.complete([Message.user("Hi")], [], config)
+      end
+    end
   end
 
   describe "complete/3 response metadata" do

@@ -236,8 +236,7 @@ defmodule Alloy.Provider.HTTP do
     end
   end
 
-  def decode_tool_arguments(args, _name, _opts) when is_map(args) and not is_struct(args),
-    do: {:ok, args}
+  def decode_tool_arguments(args, _name, _opts) when is_map(args), do: {:ok, args}
 
   def decode_tool_arguments(_args, name, _opts) do
     {:error,
