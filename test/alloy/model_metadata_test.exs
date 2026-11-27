@@ -227,8 +227,10 @@ defmodule Alloy.ModelMetadataTest do
       assert ModelMetadata.max_output_tokens("gpt-5-mini") == 128_000
       assert ModelMetadata.max_output_tokens("gemini-2.5-pro") == 65_536
       assert ModelMetadata.max_output_tokens("models/gemini-3.8-flash") == 65_536
-      assert ModelMetadata.max_output_tokens("grok-4.7") == 131_072
-      assert ModelMetadata.max_output_tokens("grok-build-0.1") == 131_072
+      # xAI Grok models have no separate text output limit beyond context_window
+      assert ModelMetadata.max_output_tokens("grok-4.7") == nil
+      assert ModelMetadata.max_output_tokens("grok-4.6") == nil
+      assert ModelMetadata.max_output_tokens("grok-build-0.1") == nil
 
       assert ModelMetadata.max_output_tokens("unknown-model") == nil
       assert ModelMetadata.max_output_tokens("claude-3-7-sonnet-20250219") == nil
@@ -265,6 +267,16 @@ defmodule Alloy.ModelMetadataTest do
       assert ModelMetadata.capabilities("gpt-5.4-pro").structured_output? == false
       assert ModelMetadata.capabilities("gpt-5.4-pro-2026-03-05").structured_output? == false
       assert ModelMetadata.capabilities("gpt-5.5-pro").structured_output? == true
+
+      assert ModelMetadata.capabilities("grok-build-0.1") == nil
+
+      assert Alloy.ModelCatalog.info("grok-build-0.1") == %{
+               model: "grok-build-0.1",
+               context_window: 256_000,
+               max_output_tokens: nil,
+               capabilities: nil,
+               pricing: nil
+             }
 
       assert ModelMetadata.capabilities("unknown-model") == nil
       assert ModelMetadata.capabilities("gpt-5-codex") == nil

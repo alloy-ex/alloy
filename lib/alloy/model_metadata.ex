@@ -114,30 +114,34 @@ defmodule Alloy.ModelMetadata do
     # https://docs.x.ai/developers/pricing and the per-model pages, checked
     # 2026-10-09. The slugs retired in
     # https://docs.x.ai/developers/migration/may-15-retirement now redirect
-    # to other models, so they are left out.
+    # to other models, so they are left out. xAI models do not enforce a
+    # separate text output ceiling beyond the context window, so
+    # max_output_tokens is nil.
     {~r/^grok-4\.20-[a-z0-9-]*non-reasoning(-[a-z0-9-]+)?$/,
      %{
        context_window: 1_000_000,
-       max_output_tokens: 131_072,
+       max_output_tokens: nil,
        capabilities: @grok_non_reasoning_capabilities
      }},
     {~r/^grok-4\.(3(-latest)?|20(-[a-z0-9-]+)?)$/,
      %{
        context_window: 1_000_000,
-       max_output_tokens: 131_072,
+       max_output_tokens: nil,
        capabilities: @full_capabilities
      }},
     {~r/^grok-(4\.[567](-latest)?|build-latest)$/,
      %{
        context_window: 500_000,
-       max_output_tokens: 131_072,
+       max_output_tokens: nil,
        capabilities: @full_capabilities
      }},
+    # grok-build-0.1 reached end-of-life on 2026-11-19; keep context_window
+    # for backwards compatibility while returning nil for optional metadata.
     {~r/^grok-build-0\.1$/,
      %{
        context_window: 256_000,
-       max_output_tokens: 131_072,
-       capabilities: @full_capabilities
+       max_output_tokens: nil,
+       capabilities: nil
      }}
   ]
 
