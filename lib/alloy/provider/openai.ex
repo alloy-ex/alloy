@@ -19,8 +19,8 @@ defmodule Alloy.Provider.OpenAI do
 
   Optional:
   - `:origin_key` - Account identifier used for cross-origin provenance hashing
-    (required for function `:api_key` and `auth_scheme: :bearer`; recommended
-    for static keys when persisting transcripts with file attachments across key rotation)
+    (required for function `:api_key`; recommended for static keys when
+    persisting transcripts with file attachments across key rotation)
   - `:prompt_cache_key` - Optional cache routing key for Responses prompt caching
   - `:prompt_cache_retention` - Optional cache retention policy (e.g. `"in_memory"`, `"24h"`)
   - `:max_tokens` - Max output tokens, reasoning tokens included. Omitted

@@ -27,10 +27,10 @@ defmodule Alloy.Agent.Turn do
   @deadline_headroom_ms 5_000
 
   @doc """
-  Run the agent loop until completion, error, or max turns.
+  Run the agent loop until completion, halt, cancellation, error, or max turns.
 
-  Takes an initialized `State` with messages and returns the
-  final state with status set to `:completed`, `:error`, or `:max_turns`.
+  Takes an initialized `State` with messages and returns the final state with
+  status set to `:completed`, `:halted`, `:cancelled`, `:error`, or `:max_turns`.
 
   Each turn is reported as `[:alloy, :turn, :start]` and `[:alloy, :turn, :stop]`,
   or `[:alloy, :turn, :exception]` when the turn raises, using the same

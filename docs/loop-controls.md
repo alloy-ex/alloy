@@ -11,7 +11,10 @@ arguments before the tool executes.
 same context. The result has `content` (text), `data` (map or nil), and `is_error`.
 Return `{:result, replacement}` to replace content/data, or the state unchanged.
 Replacements pass through later hooks. `is_error` cannot change. This hook runs
-for successful, blocked, invalid, unknown, crashed, timed-out, and cancelled calls.
+for successful, blocked, invalid, unknown, crashed, timed-out, and
+interrupted-in-flight cancelled calls. Unstarted calls skipped before dispatch
+because of cancellation, steering, or deadline expiry return synthetic error
+results directly without invoking `:after_tool_call`.
 
 ```elixir
 def call(:after_tool_call, state) do

@@ -12,7 +12,9 @@ defmodule Alloy.Provider.Error do
 
   `Alloy.Result.error` stays a string — `Exception.message/1` of this struct,
   in the same `"<type>: <message>"` / `"HTTP <status>: <body>"` shape earlier
-  versions returned — and the struct itself is available as
+  versions returned — **except** for `kind: :cancelled`, where cooperative
+  cancellation sets `result.status` and `result.error` to the atom `:cancelled`.
+  In all cases (including `:cancelled`), the struct itself is available as
   `result.metadata.run.provider_error`. It also implements `String.Chars`, so
   interpolating it keeps working.
 

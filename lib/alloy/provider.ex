@@ -99,7 +99,9 @@ defmodule Alloy.Provider do
     `:receive_timeout`), `:alloy_request_deadline` (monotonic ms deadline
     that built-in providers enforce as a hard wall-clock bound),
     `:alloy_cancel_token` (an `Alloy.Cancel.t()` token, injected only when
-    the caller sets `:cancel_token`), and
+    the caller sets `:cancel_token`),
+    `:reasoning` (a normalized `%{effort: ..., display: ...}` map, injected
+    when top-level `:reasoning` is set), and
     `:output_schema` (an `Alloy.OutputSchema.t()` struct, injected only when
     the caller sets `:output_schema`). Custom providers using strict config
     validation should tolerate or ignore these runtime keys, and custom
