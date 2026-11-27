@@ -1,7 +1,7 @@
 defmodule Alloy.MixProject do
   use Mix.Project
 
-  @version "0.14.0"
+  @version "0.16.0"
   @source_url "https://github.com/alloy-ex/alloy"
 
   def project do
@@ -99,6 +99,7 @@ defmodule Alloy.MixProject do
       source_url: @source_url,
       source_ref: "v#{@version}",
       extras: [
+        "docs/upgrading-to-0.16.md",
         "docs/upgrading-to-0.14.md",
         "docs/upgrading-to-0.13.md",
         "docs/events.md",
@@ -114,7 +115,7 @@ defmodule Alloy.MixProject do
       ],
       groups_for_extras: [
         Guides:
-          ~r{docs/(upgrading-to-0\.(13|14)|events|provider-compatibility|loop-controls)\.md|livebooks/.*},
+          ~r{docs/(upgrading-to-0\.(13|14|16)|events|provider-compatibility|loop-controls)\.md|livebooks/.*},
         Recipes: ~r{docs/recipes/.*}
       ],
       groups_for_modules: [

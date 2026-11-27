@@ -37,17 +37,20 @@ Alloy.run("Summarize this repository",
 )
 ```
 
-For current Claude models, use adaptive thinking through existing passthrough
-(the `extended_thinking` option was removed in 0.13). Thinking text is omitted by default
-on several new models; request summarized display when your UI needs it.
-Do not carry old sampling or forced-tool-choice settings into a new model
-without checking its contract. [Thinking configuration](https://platform.claude.com/docs/en/build-with-claude/thinking).
+For current Claude models, pass portable `reasoning: :medium` (or `:off`,
+`:low`, `:high`, `:xhigh`, or `%{effort: ..., display: :summarized | :omitted}`)
+on `Alloy.run/2` / `Alloy.stream/3` or inside provider config, or use
+`extra_body` for provider-specific controls (the `extended_thinking` option was
+removed in 0.13). Thinking text is omitted by default on several new models;
+request `display: :summarized` when your UI needs it. Do not carry old sampling
+or forced-tool-choice settings into a new model without checking its contract.
+[Thinking configuration](https://platform.claude.com/docs/en/build-with-claude/thinking).
 
 ```elixir
 provider = {Alloy.Provider.Anthropic,
   api_key: System.fetch_env!("ANTHROPIC_API_KEY"),
   model: "claude-sonnet-5-5",
-  extra_body: %{"thinking" => %{"type" => "adaptive", "display" => "summarized"}}
+  reasoning: %{effort: :medium, display: :summarized}
 }
 ```
 
@@ -97,7 +100,10 @@ reasoning the new model can't use themselves, and Gemini says to resend it.
 Encrypted reasoning only ever goes back to the endpoint and credentials
 that issued it, since OpenAI ties it to the issuing organisation. Rotating
 an API key counts as a new origin, so earlier reasoning is then sent as
-text. Messages saved without their `origin` are sent unchanged.
+text — unless you pass a stable `:origin_key` alongside a dynamic `:api_key`
+callback (`(-> String.t())` or `(-> {:ok, String.t()} | {:error, term()})`)
+representing the same tenant/account. Messages saved without their `origin`
+are sent unchanged.
 
 Known limits:
 

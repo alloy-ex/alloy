@@ -142,7 +142,25 @@ defmodule Alloy.Tool.RunToolTest do
       assert {:halted, "halted by policy"} = Executor.run_tool(call, halted_state)
     end
 
-    test "supports :tool_fns override and optional JSON Schema validation" do
+    test "supports :tool_fns override" do
+      override_tool =
+        inline_tool("typed", fn %{"value" => value}, _ctx -> {:ok, value} end)
+
+      state = init_state([])
+
+      assert {:ok, ok_block, _meta} =
+               Executor.run_tool(
+                 %{id: "s0", name: "typed", input: %{"value" => "ok"}},
+                 state,
+                 tool_fns: %{"typed" => override_tool}
+               )
+
+      refute Map.get(ok_block, :is_error, false)
+      assert ok_block.content == "ok"
+    end
+
+    @tag :ex_json_schema
+    test "supports :tool_fns override with optional JSON Schema validation" do
       override_tool =
         inline_tool("typed", fn %{"value" => value}, _ctx -> {:ok, value} end)
 

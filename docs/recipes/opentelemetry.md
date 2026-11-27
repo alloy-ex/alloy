@@ -15,7 +15,7 @@ active Alloy span.
 ```elixir
 defp deps do
   [
-    {:alloy, "~> 0.14"},
+    {:alloy, "~> 0.16"},
     {:opentelemetry, "~> 1.5"},
     {:opentelemetry_api, "~> 1.4"},
     {:opentelemetry_exporter, "~> 1.8"},

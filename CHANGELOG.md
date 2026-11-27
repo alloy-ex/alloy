@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-11-26
+
+Alloy 0.16 brings major-lab wire parity (multimodal PDFs/documents, image URLs,
+dynamic `:api_key` callbacks, provider caching, Gemini native tools, portable
+`:reasoning`), uniform v1 streaming events, cooperative cancellation
+(`Alloy.Cancel`), mid-run `:steering` and completion `:follow_up` controls,
+`Alloy.Tool.Executor.run_tool/3`, and optional `Alloy.ModelCatalog` capability
+and pricing metadata — with zero new mandatory runtime dependencies. See
+[Upgrading to 0.16](docs/upgrading-to-0.16.md).
+
+### Breaking Changes
+
+- **New `:cancelled` status and error kind:** `Alloy.Agent.State.status()`, `Alloy.Result.status`, and `Alloy.Provider.Error.kind()` add `:cancelled`. Cooperatively cancelled runs return `{:error, %Alloy.Result{status: :cancelled, error: :cancelled}}`. Callers with exhaustive `case` matches on run/turn status or provider error kind must handle `:cancelled`.
+- **Fail-closed `Alloy.Middleware.run_before_tool_call/2`:** Direct callers of `Middleware.run_before_tool_call/2` must handle the new `:cancelled` return value when `state.config.cancel_token` is cancelled (explicit `{:block, reason}` verdicts remain preserved).
+- **Required `:origin_key` for dynamic `:api_key` and `auth_scheme: :bearer`:** Built-in HTTP providers configured with a 0-arity `:api_key` function or `auth_scheme: :bearer` now require a non-empty string `:origin_key` so rotating credentials preserve account provenance and origin-scoped file attachment isolation.
+- **Internal `:alloy_cancel_token` provider config key:** When `:cancel_token` is set, Alloy injects `:alloy_cancel_token` into `provider_config` alongside `:alloy_request_deadline`; custom providers using strict option validators should ignore unknown `:alloy_*` keys.
+- **Anthropic `reasoning: :off`:** Explicitly sends `%{"thinking" => %{"type" => "disabled"}}` (`reasoning: nil` continues to omit `"thinking"`).
+- **Stricter OpenAI / `OpenAIStream` streaming tool-call validation:** Negative tool-call indices, conflicting tool-call identities (`id`/`name`), and contradictory terminal tool arguments are rejected with `:protocol_error` (or retryable `:malformed_reply` on incomplete/corrupted argument JSON) instead of silently emitting corrupted calls.
+- **`Alloy.Events.build_correlation_id/1`:** Empty strings (`""`) and invalid UTF-8 values in `context[:request_id]` / `context[:correlation_id]` now fall back to a generated correlation ID so downstream tool events and telemetry always carry valid non-empty UTF-8 correlation IDs.
+
+### Added
+
+- **Multimodal & major-lab wire parity:**
+  - Portable `image` (`url:` or `data:`) and `document` (`data:`, `uri:`, or origin-scoped `file_id:`) content blocks across `Anthropic`, `OpenAI`, `XAI`, and `Gemini` (plus `image` URLs on `OpenAICompat`), with origin-scoped `file_id` and Gemini File API URI omission in `Alloy.Message.normalize_for/3` on cross-origin switches.
+  - Dynamic 0-arity `:api_key` callbacks (resolved per HTTP attempt within the request deadline and cancellation token, rejecting non-ASCII/CR/LF keys, never invoked during origin hashing, and redacting auth error diagnostics) plus `auth_scheme: :bearer` support.
+  - First-class provider caching and native tools: Anthropic `:cache` TTL (`"5m"` / `"1h"`) and `:web_search` shorthand; OpenAI/xAI `:prompt_cache_key` and `:prompt_cache_retention`; Gemini `:cached_content`, `:google_search`, `:url_context`, and `:code_execution` (all stripped automatically on compaction summary requests).
+- **Portable `:reasoning` option:** Unified `:reasoning` config (`nil | :off | :low | :medium | :high | :xhigh | %{effort: ..., display: ...}`) across all 6 built-in providers (updatable via `Alloy.Agent.State.prepare/2`, forwarded to fallback providers, stripped on compaction summaries, and overridable by explicit `extra_body` / `generation_config`).
+- **Uniform v1 streaming events (`docs/events.md`):**
+  - `:thinking_delta` across Anthropic, OpenAI/xAI Responses, Gemini, and OpenAICompat/OpenAIStream.
+  - `:tool_call_delta` (`%{id:, index:, name:, arguments_delta:}`) across streaming providers.
+  - `:turn_start` (`%{turn:}`) and `:turn_end` (`%{turn:, status:, stop_reason:, usage:}`) across both `Alloy.run/2` and `Alloy.stream/3`.
+  - `:tool_update` (`%{id:, name:, chunk:, start_event_seq:}`) marshalled back to the caller process via per-call `Process.alias/0` with bounded in-flight backpressure, wired into `Alloy.Tool.Core.Bash` alongside optional `:bash_on_output`.
+- **Cooperative cancellation (`Alloy.Cancel`):**
+  - Lock-free `:atomics`-backed cancellation tokens (`new/0`, `cancel/1`, `cancelled?/1`, zero processes, zero ETS tables, zero polling overhead when `nil`) propagated through `Turn`, `Retry`, `OwnedWorker`, `HTTP`, `SSE`, `CodexRunner`/`Codex`, `Compactor`, `Middleware`, and `Executor` — including `timeout_ms: :infinity` runs, OS process-group teardown, verbatim compaction history preservation, retry/fallback suppression, and valid repaired transcripts (`Alloy.Transcript.validate/1 == :ok`).
+- **Mid-run `:steering` & completion `:follow_up` callbacks:**
+  - `:steering` polled between completed tool batches to redirect active runs, skip remaining unstarted batches with synthetic error `tool_result` blocks, and bypass `:stop_after_tool`.
+  - `:follow_up` polled before normal non-refusal `:end_turn` completion once `:until_tool` is satisfied, bounded by `:max_turns`, `:timeout_ms`, and `:cancel_token`, firing `:after_completion` once on final completion.
+  - Strict `[%Alloy.Message{}]` and JSON-compatibility validation plus `:redact` exception/throw/exit sanitization for both callbacks.
+- **Reusable single-tool execution (`Alloy.Tool.Executor.run_tool/3`) & native `:parent_call_id`:**
+  - Shared single-tool execution entrypoint with full middleware, validation, supervised timeout/deadline clamping (`state.run_deadline`), composed cancellation (`Alloy.Cancel`), truncation, caller-process `:tool_update` marshalling, and native `:parent_call_id` tagging across `:tool_start`, `:tool_update`, `:tool_end`, tool telemetry, and metadata.
+  - Updated `examples/minimal_host/code_mode.exs` and `docs/recipes/code-mode.md` to route single nested calls through `Executor.run_tool/3`, clamp outer deadlines, and finalize child calls gracefully on cancellation/timeout.
+- **Optional `Alloy.ModelCatalog` metadata & `LLMDB` recipe:**
+  - Added optional `c:Alloy.ModelCatalog.max_output_tokens/1`, `c:Alloy.ModelCatalog.capabilities/1`, and `c:Alloy.ModelCatalog.pricing/1` callbacks plus `Alloy.ModelCatalog.info/1,2` (fully backwards-compatible with minimal v0.14 catalogs exporting only `context_window/1`).
+  - Implemented all three optional callbacks in `Alloy.ModelMetadata` (including `gpt-5.2-pro`/`gpt-5.4-pro` `structured_output?: false`, `grok-4.20-multi-agent` `tools?: false`, non-reasoning Grok distinction, and `nil` optional metadata for retired models).
+  - Added provider-scoped `LLMDB` adapter recipe (`docs/recipes/llm-db-catalog.md`) and `docs/upgrading-to-0.16.md`.
+
 ## [0.14.0] - 2026-11-24
 
 Alloy 0.14 hardens run deadlines, worker supervision, provider wire parsing,

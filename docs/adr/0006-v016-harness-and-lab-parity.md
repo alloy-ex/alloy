@@ -2,7 +2,7 @@
 
 Date: 2026-11-26
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 
@@ -55,8 +55,9 @@ PubSub, OAuth token storage, UI, and scripting VMs outside core.
   resolved per HTTP attempt; arbitrary callback failures map to non-retryable
   `%Alloy.Provider.Error{kind: :auth}` with sanitized messages, while explicit
   `{:error, %Alloy.Provider.Error{}}` returns preserve allowlisted kinds
-  (`:auth`, `:timeout`, `:rate_limited`, `:overloaded`, `:server_error`,
-  `:network`, `:invalid_request`, `:quota`) with redacted diagnostic fields.
+  (`:auth`, `:cancelled`, `:timeout`, `:rate_limited`, `:overloaded`,
+  `:server_error`, `:network`, `:invalid_request`, `:quota`) with redacted
+  diagnostic fields.
   Origin hashing never invokes the callback.
 - Add first-class caching and native tool options: Anthropic `:cache` TTL
   (`"5m" | "1h"`) and `:web_search` shorthand; OpenAI/xAI `:prompt_cache_key`
