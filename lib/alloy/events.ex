@@ -46,18 +46,23 @@ defmodule Alloy.Events do
   @spec build_correlation_id(State.t()) :: binary()
   def build_correlation_id(%State{} = state) do
     context = state.config.context
+    request_id = Map.get(context, :request_id)
+    correlation_id = Map.get(context, :correlation_id)
 
     cond do
-      is_binary(Map.get(context, :request_id)) ->
-        Map.get(context, :request_id)
+      valid_id?(request_id) ->
+        request_id
 
-      is_binary(Map.get(context, :correlation_id)) ->
-        Map.get(context, :correlation_id)
+      valid_id?(correlation_id) ->
+        correlation_id
 
       true ->
-        state.agent_id <> ":" <> Base.url_encode64(:crypto.strong_rand_bytes(8), padding: false)
+        prefix = if valid_id?(state.agent_id), do: state.agent_id, else: "alloy"
+        prefix <> ":" <> Base.url_encode64(:crypto.strong_rand_bytes(8), padding: false)
     end
   end
+
+  defp valid_id?(value), do: is_binary(value) and byte_size(value) > 0 and String.valid?(value)
 
   @doc """
   Emit an event envelope.

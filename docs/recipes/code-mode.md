@@ -65,6 +65,7 @@ event_opts = Alloy.Events.normalize_opts(state, on_event: host_on_event)
     state,
     parent_call_id: "outer-1",
     on_event: &Alloy.Events.emit(event_opts, state.turn, &1),
+    event_subscriber?: event_opts[:event_subscriber?],
     event_seq_ref: event_opts[:event_seq_ref],
     event_correlation_id: event_opts[:event_correlation_id],
     event_turn: state.turn

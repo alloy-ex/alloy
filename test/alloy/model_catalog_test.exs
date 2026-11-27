@@ -63,6 +63,30 @@ defmodule Alloy.ModelCatalogTest do
   defmodule StructBackedLlmDbCatalog do
     @behaviour Alloy.ModelCatalog
 
+    defmacro __using__(opts) do
+      quote bind_quoted: [opts: opts, catalog_mod: __MODULE__] do
+        @behaviour Alloy.ModelCatalog
+        @llm_db_provider Keyword.fetch!(opts, :provider)
+        @llm_db_catalog catalog_mod
+
+        @impl true
+        def context_window(model),
+          do: @llm_db_catalog.context_window_for(model, @llm_db_provider)
+
+        @impl true
+        def max_output_tokens(model),
+          do: @llm_db_catalog.max_output_tokens_for(model, @llm_db_provider)
+
+        @impl true
+        def capabilities(model),
+          do: @llm_db_catalog.capabilities_for(model, @llm_db_provider)
+
+        @impl true
+        def pricing(model),
+          do: @llm_db_catalog.pricing_for(model, @llm_db_provider)
+      end
+    end
+
     @providers [
       %{
         id: :anthropic,
@@ -83,6 +107,12 @@ defmodule Alloy.ModelCatalogTest do
             modalities: %{input: [:text, :image, :pdf], output: [:text]},
             capabilities: %{tools: %{enabled: true}, caching: %{type: "explicit"}},
             cost: %FakeLlmDbCost{input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75}
+          },
+          "colon-wire:v1" => %FakeLlmDbModel{
+            limits: %FakeLlmDbLimits{context: 128_000, input: 128_000, output: 16_000},
+            modalities: %{input: [:text], output: [:text]},
+            capabilities: %{tools: true},
+            cost: %FakeLlmDbCost{input: 0.5, output: 1.5, cache_read: nil, cache_write: nil}
           }
         }
       },
@@ -121,21 +151,30 @@ defmodule Alloy.ModelCatalogTest do
     ]
 
     @impl true
-    def context_window(model) do
-      entry = lookup(model)
+    def context_window(model), do: context_window_for(model, nil)
+
+    @impl true
+    def max_output_tokens(model), do: max_output_tokens_for(model, nil)
+
+    @impl true
+    def capabilities(model), do: capabilities_for(model, nil)
+
+    @impl true
+    def pricing(model), do: pricing_for(model, nil)
+
+    def context_window_for(model, provider) do
+      entry = lookup(model, provider)
 
       positive_int(nested_get(entry, [:limits, :input])) ||
         positive_int(nested_get(entry, [:limits, :context]))
     end
 
-    @impl true
-    def max_output_tokens(model) do
-      positive_int(nested_get(lookup(model), [:limits, :output]))
+    def max_output_tokens_for(model, provider) do
+      positive_int(nested_get(lookup(model, provider), [:limits, :output]))
     end
 
-    @impl true
-    def capabilities(model) do
-      case lookup(model) do
+    def capabilities_for(model, provider) do
+      case lookup(model, provider) do
         entry when is_map(entry) ->
           caps = Map.get(entry, :capabilities)
           input_modalities = List.wrap(nested_get(entry, [:modalities, :input]))
@@ -156,9 +195,8 @@ defmodule Alloy.ModelCatalogTest do
       end
     end
 
-    @impl true
-    def pricing(model) do
-      with entry when is_map(entry) <- lookup(model),
+    def pricing_for(model, provider) do
+      with entry when is_map(entry) <- lookup(model, provider),
            cost when is_map(cost) <- Map.get(entry, :cost),
            input when is_number(input) <- Map.get(cost, :input),
            output when is_number(output) <- Map.get(cost, :output) do
@@ -170,7 +208,7 @@ defmodule Alloy.ModelCatalogTest do
       end
     end
 
-    defp lookup(model) do
+    defp lookup(model, nil) do
       case String.split(model, ":", parts: 2) do
         [provider_str, model_id] ->
           Enum.find_value(@providers, fn %{id: id, models: models} ->
@@ -191,6 +229,12 @@ defmodule Alloy.ModelCatalogTest do
             _none_or_ambiguous -> nil
           end
       end
+    end
+
+    defp lookup(model, provider) do
+      Enum.find_value(@providers, fn %{id: id, models: models} ->
+        if id == provider, do: Map.get(models, model)
+      end)
     end
 
     defp nested_get(nil, _keys), do: nil
@@ -229,6 +273,10 @@ defmodule Alloy.ModelCatalogTest do
 
     defp positive_int(limit) when is_integer(limit) and limit > 0, do: limit
     defp positive_int(_other), do: nil
+  end
+
+  defmodule StructBackedLlmDbCatalog.Anthropic do
+    use StructBackedLlmDbCatalog, provider: :anthropic
   end
 
   defp opts(extra) do
@@ -437,6 +485,21 @@ defmodule Alloy.ModelCatalogTest do
       alt = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog, "alt_provider:shared-id")
       assert alt.context_window == 200_000
       assert alt.pricing.input_per_million == 0.9
+
+      # Provider-scoped __using__/1 module resolves bare IDs and colon-containing
+      # wire IDs directly under its provider and never leaks cross-provider specs.
+      scoped = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog.Anthropic, "shared-id")
+      assert scoped.context_window == 1_000_000
+      assert scoped.pricing.input_per_million == 3.0
+
+      colon = Alloy.ModelCatalog.info(StructBackedLlmDbCatalog.Anthropic, "colon-wire:v1")
+      assert colon.context_window == 128_000
+      assert colon.pricing.input_per_million == 0.5
+
+      cross =
+        Alloy.ModelCatalog.info(StructBackedLlmDbCatalog.Anthropic, "alt_provider:shared-id")
+
+      assert cross.context_window == nil
     end
   end
 end

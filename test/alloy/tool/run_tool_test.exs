@@ -2,7 +2,8 @@ defmodule Alloy.Tool.RunToolTest do
   use ExUnit.Case, async: true
 
   alias Alloy.Agent.{Config, State}
-  alias Alloy.{Cancel, Events, Tool}
+  alias Alloy.{Cancel, Events, Result, Tool}
+  alias Alloy.Provider.Test, as: TestProvider
   alias Alloy.Tool.Executor
 
   defmodule EditBlockHaltMiddleware do
@@ -166,6 +167,41 @@ defmodule Alloy.Tool.RunToolTest do
 
       refute Map.get(ok_block, :is_error, false)
       assert ok_block.content == "ok"
+
+      # Caller-supplied :tool_schemas (nil or %{}) cannot crash or bypass :schema validation
+      for schemas_opt <- [nil, %{}] do
+        assert {:ok, still_checked, _meta} =
+                 Executor.run_tool(
+                   %{id: "s3", name: "typed", input: %{"value" => 123}},
+                   state,
+                   tool_fns: %{"typed" => override_tool},
+                   tool_schemas: schemas_opt
+                 )
+
+        assert still_checked.is_error == true
+        assert still_checked.content =~ "Invalid input for typed"
+      end
+    end
+
+    test "Events.build_correlation_id/1 falls back cleanly on empty or invalid UTF-8 request_id" do
+      echo = inline_tool("echo", fn %{"value" => val}, _ctx -> {:ok, val} end)
+
+      for bad_req_id <- ["", <<0xFF>>] do
+        {:ok, pid} =
+          TestProvider.start_link([
+            TestProvider.tool_use_response([
+              %{id: "tc_1", name: "echo", input: %{"value" => "ok"}}
+            ]),
+            TestProvider.text_response("done")
+          ])
+
+        assert {:ok, %Result{status: :completed, text: "done"}} =
+                 Alloy.run("go",
+                   provider: {TestProvider, agent_pid: pid},
+                   tools: [echo],
+                   context: %{request_id: bad_req_id}
+                 )
+      end
     end
   end
 
@@ -610,6 +646,10 @@ defmodule Alloy.Tool.RunToolTest do
         Executor.run_tool(call, state,
           cancel_token: %Cancel{ref: :atomics.new(1, signed: false), parents: [:bad]}
         )
+      end
+
+      assert_raise ArgumentError, ~r/:cancel_token/, fn ->
+        Executor.run_tool(call, state, cancel_token: %Cancel{ref: make_ref()})
       end
 
       assert_raise ArgumentError, ~r/:parent_call_id/, fn ->

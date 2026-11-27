@@ -59,26 +59,28 @@ defmodule MyApp.LlmDbCatalog do
   @behaviour Alloy.ModelCatalog
 
   defmacro __using__(opts) do
-    provider = Keyword.fetch!(opts, :provider)
-
-    quote bind_quoted: [provider: provider] do
+    quote bind_quoted: [opts: opts] do
       @behaviour Alloy.ModelCatalog
+      @llm_db_provider Keyword.fetch!(opts, :provider)
 
       @impl true
-      def context_window(model), do: MyApp.LlmDbCatalog.context_window_for(model, unquote(provider))
+      def context_window(model),
+        do: MyApp.LlmDbCatalog.context_window_for(model, @llm_db_provider)
 
       @impl true
       def default_context_window, do: MyApp.LlmDbCatalog.default_context_window()
 
       @impl true
       def max_output_tokens(model),
-        do: MyApp.LlmDbCatalog.max_output_tokens_for(model, unquote(provider))
+        do: MyApp.LlmDbCatalog.max_output_tokens_for(model, @llm_db_provider)
 
       @impl true
-      def capabilities(model), do: MyApp.LlmDbCatalog.capabilities_for(model, unquote(provider))
+      def capabilities(model),
+        do: MyApp.LlmDbCatalog.capabilities_for(model, @llm_db_provider)
 
       @impl true
-      def pricing(model), do: MyApp.LlmDbCatalog.pricing_for(model, unquote(provider))
+      def pricing(model),
+        do: MyApp.LlmDbCatalog.pricing_for(model, @llm_db_provider)
     end
   end
 
@@ -153,24 +155,28 @@ defmodule MyApp.LlmDbCatalog do
     end
   end
 
-  defp lookup(model, provider) do
+  # When scoped to a provider, always query `LLMDB.model(provider, model)`
+  # directly so colon-containing wire IDs (for example Ollama `"qwen3:32b"` or
+  # OpenRouter `"deepseek/deepseek-r1:free"`) are never misparsed as cross-provider
+  # specs.
+  defp lookup(model, nil) do
     case LLMDB.model(model) do
       {:ok, entry} ->
         entry
 
       _ ->
-        lookup_bare_model(model, provider)
+        lookup_unambiguous_bare_model(model)
     end
   end
 
-  defp lookup_bare_model(model_id, provider_id) when not is_nil(provider_id) do
-    case LLMDB.model(provider_id, model_id) do
+  defp lookup(model, provider) do
+    case LLMDB.model(provider, model) do
       {:ok, entry} -> entry
       _ -> nil
     end
   end
 
-  defp lookup_bare_model(model_id, nil) do
+  defp lookup_unambiguous_bare_model(model_id) do
     matches =
       LLMDB.providers()
       |> Enum.flat_map(fn provider ->

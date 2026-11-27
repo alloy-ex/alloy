@@ -67,13 +67,12 @@ defmodule Alloy.Tool.Executor do
     wrapped in `Alloy.Events` v1 envelopes and not rescued; to emit v1
     envelopes inside an existing host stream, pass
     `on_event: &Alloy.Events.emit(event_opts, turn, &1)` together with
-    `:event_seq_ref`, `:event_correlation_id`, and `:event_turn` from
-    `Alloy.Events.normalize_opts/2`)
+    `:event_subscriber?`, `:event_seq_ref`, `:event_correlation_id`, and
+    `:event_turn` from `Alloy.Events.normalize_opts/2`)
   - `:event_subscriber?` — boolean or `nil` enabling `:tool_update` streaming
     (defaults to `is_function(opts[:on_event], 1)`)
   - `:event_seq_ref`, `:event_correlation_id`, `:event_turn` — event envelope
     coordination options (`nil` uses defaults)
-  - `:tool_schemas` — precompiled validation schemas
 
   ## Returns
 
@@ -96,7 +95,7 @@ defmodule Alloy.Tool.Executor do
             ":tool_fns must be a map of tool name => tool, got: #{inspect(tool_fns)}"
     end
 
-    {run, _inline_tools} = build_run(tool_fns, state, opts)
+    {run, _inline_tools} = build_run(tool_fns, state, Keyword.delete(opts, :tool_schemas))
 
     with {:ok, [tagged]} <- tag_tool_calls(run.state, [normalized_call]) do
       [{result_block, meta}] = run_batch([tagged], run)

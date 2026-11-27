@@ -122,7 +122,13 @@ defmodule MinimalHost.CodeMode do
     script_name = Keyword.get(opts, :script_tool_name, "run_script")
     deadline = Keyword.fetch!(opts, :run_deadline)
     cancel_token = Keyword.get(opts, :cancel_token)
-    state = %{state | tool_fns: Map.delete(state.tool_fns, script_name)}
+
+    state = %{
+      state
+      | tool_fns: Map.delete(state.tool_fns, script_name),
+        config: %{state.config | cancel_token: cancel_token}
+    }
+
     Process.put(key, {state, 0})
 
     try do
@@ -150,6 +156,15 @@ defmodule MinimalHost.CodeMode do
     %{result: result, metadata: List.first(metadata)}
   end
 
+  defp dispatch([], _key, opts) do
+    check_interpreter_limits!(
+      Keyword.fetch!(opts, :run_deadline),
+      Keyword.get(opts, :cancel_token)
+    )
+
+    %{results: [], metadata: []}
+  end
+
   defp dispatch(calls, key, opts) when is_list(calls) do
     deadline = Keyword.fetch!(opts, :run_deadline)
     cancel_token = Keyword.get(opts, :cancel_token)
@@ -164,9 +179,16 @@ defmodule MinimalHost.CodeMode do
     calls =
       Enum.with_index(calls, used + 1)
       |> Enum.map(fn {call, index} ->
+        name = Map.fetch!(call, :name)
+
+        unless is_binary(name) and byte_size(name) > 0 and String.valid?(name) do
+          raise ArgumentError,
+                "call :name must be a non-empty UTF-8 string, got: #{inspect(name)}"
+        end
+
         %{
           id: "#{parent}-#{index}",
-          name: Map.fetch!(call, :name),
+          name: name,
           input: Map.fetch!(call, :input)
         }
       end)
@@ -189,11 +211,12 @@ defmodule MinimalHost.CodeMode do
     :atomics.put(in_dispatch, 1, 1)
 
     try do
-      with %State{} = ready <- Middleware.run(:after_tool_request, requested),
+      with %State{status: status} = ready when status != :cancelled <-
+             Middleware.run(:after_tool_request, requested),
            :ok <- check_interpreter_limits!(deadline, cancel_token),
            {:ok, results, metadata} <- run_child_calls(calls, ready, executor_opts),
            :ok <- check_interpreter_limits!(deadline, cancel_token),
-           %State{} = finished <-
+           %State{status: finished_status} = finished when finished_status != :cancelled <-
              ready
              |> State.append_messages(results)
              |> State.append_tool_calls(metadata)
@@ -202,6 +225,7 @@ defmodule MinimalHost.CodeMode do
         Process.put(key, {finished, total})
         %{results: results.content, metadata: metadata}
       else
+        %State{status: :cancelled} -> throw(:cancelled)
         {:halted, reason} -> throw({:halted, reason})
       end
     after

@@ -68,10 +68,15 @@ defmodule Alloy.Cancel do
 
   @doc false
   @spec valid?(term()) :: boolean()
-  def valid?(%__MODULE__{ref: ref, parents: parents})
-      when is_reference(ref) and is_list(parents) do
-    Enum.all?(parents, &valid?/1)
+  def valid?(%__MODULE__{ref: ref, parents: parents}) when is_list(parents) do
+    valid_atomics_ref?(ref) and Enum.all?(parents, &valid?/1)
   end
 
   def valid?(_other), do: false
+
+  defp valid_atomics_ref?(ref) do
+    match?(%{size: size} when size >= 1, :atomics.info(ref))
+  rescue
+    ArgumentError -> false
+  end
 end

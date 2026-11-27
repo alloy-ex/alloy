@@ -444,6 +444,10 @@ defmodule MinimalHostTest do
     assert_receive :between_dispatches, 2_000
     Cancel.cancel(inner_token)
     assert {:error, :cancelled} = Task.await(task2, 2_000)
+
+    # 3. Empty dispatch list returns empty results without mutating transcript
+    assert {:ok, %{results: [], metadata: []}} =
+             CodeMode.run(fn dispatch -> dispatch.([]) end, state([]), opts())
   end
 
   @tag :tmp_dir
