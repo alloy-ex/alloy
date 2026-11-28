@@ -68,8 +68,8 @@ defmodule Alloy.Provider.OpenAICompat do
         }
       )
 
-      # Mistral (mistral-large-latest and -2512 are in the built-in
-      # model catalog, so context budgeting works out of the box)
+      # Mistral (pass :model_metadata_overrides or a custom :model_catalog
+      # if you want a context window other than the 200k default)
       Alloy.run("Hello",
         provider: {Alloy.Provider.OpenAICompat,
           api_key: System.get_env("MISTRAL_API_KEY"),

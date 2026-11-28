@@ -1237,7 +1237,7 @@ defmodule Alloy.Provider.OpenAICompatTest do
               %{
                 stop_reason: :max_tokens,
                 messages: [
-                  %Message{content: [%{type: "tool_use", id: "c1", name: "search", input: %{}}]}
+                  %Message{content: [%{type: "tool_use", id: "c1", name: "search", input: input}]}
                 ]
               }} =
                OpenAICompat.complete([Message.user("Hi")], [], %{
@@ -1245,6 +1245,8 @@ defmodule Alloy.Provider.OpenAICompatTest do
                  model: "m",
                  req_options: [plug: plug, retry: false]
                })
+
+      assert input == %{}
     end
 
     test "accepts pre-decoded struct-valued arguments on normal tool calls" do

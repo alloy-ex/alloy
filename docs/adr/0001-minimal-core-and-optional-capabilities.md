@@ -69,4 +69,4 @@ continuation data is not a supported persistence format.
 
 ## References
 
-- [Pi comparison and PR dispositions](../archive/REVIEW-pi-2026-10-13.md)
+- [Pi comparison and PR dispositions](https://github.com/alloy-ex/alloy/blob/v0.16.0/docs/archive/REVIEW-pi-2026-10-13.md)

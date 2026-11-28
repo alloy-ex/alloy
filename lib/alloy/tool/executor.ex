@@ -81,6 +81,15 @@ defmodule Alloy.Tool.Executor do
     started because `:cancel_token` was already cancelled or `:run_deadline` had
     already expired)
   - `{:halted, reason}` — `:before_tool_call` middleware halted execution
+
+  ## Example
+
+      {:ok, result_block, meta} =
+        Alloy.Tool.Executor.run_tool(
+          %{id: "child_1", name: "read", input: %{"file_path" => "mix.exs"}},
+          state,
+          parent_call_id: parent_call_id
+        )
   """
   @spec run_tool(map(), State.t(), keyword()) ::
           {:ok, map(), map() | nil} | {:halted, String.t()}

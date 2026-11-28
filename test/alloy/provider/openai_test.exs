@@ -1828,20 +1828,73 @@ defmodule Alloy.Provider.OpenAITest do
     test "reconciles objects, lists, literals, strings, escapes, and numbers" do
       cases = [
         {~s({"a": 1, "b":), %{"a" => 1, "b" => [true, false, nil]}},
+        {~s({"z":), %{"a" => 1, "z" => 2}},
+        {~s({"z": 2, "m": {"y": ), %{"a" => 1, "m" => %{"x" => 10, "y" => 20}, "z" => 2}},
+        {~s({"ze), %{"alpha" => 1, "zeta" => 2}},
+        {~s({"z":), %{"a" => 1, "z" => nil}},
+        {~s({"a"), %{"a" => 1, "b" => 2}},
+        {~s({"a":1,), %{"a" => 1, "b" => 2}},
+        {~s({"a":1e2,"b":), %{"a" => 100, "b" => 2}},
         {~s({"key": "hel), %{"key" => "hello\n\t\"\\/"}},
         {~s({"ch": "\\), %{"ch" => "\b\f\r"}},
-        {~s({"emoji": "\\uD83D\\uDE), %{"emoji" => "😀"}},
+        {~S({"x":"\u00), %{"x" => "é"}},
+        {~S({"x":"a\/), %{"x" => "a/b"}},
+        {~S({"emoji":"\uD83D\uDE), %{"emoji" => "😀"}},
+        {~S({"a":"\uD83D\uDE00), %{"a" => "😀!"}},
+        {~S({"a":"\uD83D), %{"a" => "😀"}},
+        {"{\"a\":\"\\uD83D\\", %{"a" => "😀"}},
         {~s({"u": "\\u00), %{"u" => "A"}},
+        {~S({"a":"line1\n\t\r\b\f\"\\\/), %{"a" => "line1\n\t\r\b\f\"\\/end"}},
+        {"{\"a\":\"hi\\", %{"a" => "hi\n"}},
+        {"{\"a\":\"hi\\", %{"a" => "hi\"x"}},
+        {"{\"a\":\"hi\\", %{"a" => "hi\\x"}},
+        {"{\"a\":\"hi\\", %{"a" => "hi/x"}},
+        {"{\"a\":\"hi\\", %{"a" => "hi\tx"}},
+        {"{\"a\":\"hi\\", %{"a" => "hi\rx"}},
+        {"{\"a\":\"hi\\", %{"a" => "hi\bx"}},
+        {"{\"a\":\"hi\\", %{"a" => "hi\fx"}},
+        {"{\"a\":\"hi\\", %{"a" => "hié"}},
         {~s({"items": [1, ), %{"items" => [1, 2, 3]}},
+        {~s({"arr":[1,2), %{"arr" => [1, 2]}},
         {~s({"items": [), %{"items" => []}},
+        {~s({"arr":[]), %{"arr" => [], "b" => 1}},
         {~s({"flag": tr), %{"flag" => true}},
+        {~s({"a":true,"b":fa), %{"a" => true, "b" => false, "c" => nil}},
         {~s({"none": nu), %{"none" => nil}},
         {~s({"neg": -), %{"neg" => -42}},
         {~s({"zero": -), %{"zero" => 0}},
         {~s({"exp": 1e), %{"exp" => 100}},
+        {~s({"x":1e+), %{"x" => 100}},
+        {~s({"x":1e+0), %{"x" => 100}},
+        {~s({"x":1e00), %{"x" => 100}},
+        {~s({"x":1e-0), %{"x" => 0.01}},
+        {~s({"x":0.1e), %{"x" => 1.0e308}},
+        {~s({"x":1.2), %{"x" => 1200}},
+        {~s({"x":1.2), %{"x" => 1.2e10}},
+        {~s({"x":1.2), %{"x" => 12_345}},
+        {~s({"x":1.), %{"x" => 1200}},
+        {~s({"x":0), %{"x" => 123}},
+        {~s({"x":0.00), %{"x" => 0.00001}},
+        {~s({"x":0.00000), %{"x" => 1.0e-10}},
+        {~s({"x":0.29), %{"x" => 0.3}},
+        {~s({"x":-0.29), %{"x" => -0.3}},
+        {~s({"x":0.29), %{"x" => 3.0}},
+        {~s({"x":2), %{"x" => 3.0}},
+        {~s({"x":9007199254740993.), %{"x" => 9_007_199_254_740_992.0}},
+        {~s({"x":9007199254740993), %{"x" => 9_007_199_254_740_992.0}},
+        {~s({"x":-9007199254740993.), %{"x" => -9_007_199_254_740_992.0}},
+        {~s({"x":1e-), %{"x" => 0.0}},
+        {~s({"x":1e), %{"x" => 0.0}},
+        {~s({"x":1e-4), %{"x" => 0.0}},
+        {~s({"x":1e-0), %{"x" => 0.0}},
+        {~s({"x":-1.5e-), %{"x" => 0.0}},
+        {~s({"x":1.), %{"x" => 0.0}},
+        {~s({"x":1), %{"x" => 0.0}},
+        {~s({"x":1.5E-), %{"x" => 0.015}},
+        {~s({"x":0e+), %{"x" => 0}},
+        {~s({"x":1.), %{"x" => 1}},
+        {~s({"x":10), %{"x" => 100}},
         {~s({"small": 1e-0), %{"small" => 0.001}},
-        {~s({"tiny": 1e-), %{"tiny" => 0.0}},
-        {~s({"round": 0.29), %{"round" => 0.3}},
         {~s({"partial_k), %{"partial_key" => "v", "other" => 1}}
       ]
 
@@ -1852,14 +1905,66 @@ defmodule Alloy.Provider.OpenAITest do
       end
     end
 
+    test "reconciles every UTF-8 split point across diverse RFC 8259 JSON spellings" do
+      spellings = [
+        ~S({"z": 0.0000000001, "a": 1.2e3}),
+        ~S({"n": 1.2345E+04, "neg": -0.015, "zero": -0.0}),
+        ~S({"r": 0.29999999999999999, "nr": -0.29999999999999999, "t": 2.99999999999999999}),
+        ~S({"big": 9007199254740993.0, "nbig": -9007199254740993.0, "up": 9007199254740993.5}),
+        ~S({"uf": 1e-400, "ufz": 1e-0400, "nuf": -1.5e-400}),
+        ~S({"s": "a\/\u00e9\n\t\uD83D\uDE00", "b": true, "c": null}),
+        ~S({"arr": [0.00001, 1200, {"y": 1.5e-2, "x": false}]})
+      ]
+
+      for raw_json <- spellings do
+        expected = Jason.decode!(raw_json)
+        graphemes = String.graphemes(raw_json)
+
+        for cut <- 1..(length(graphemes) - 1) do
+          prefix = graphemes |> Enum.take(cut) |> Enum.join()
+          assert {:ok, suffix, combined} = JSONPrefix.reconcile(prefix, expected)
+          assert combined == prefix <> suffix
+          assert Jason.decode!(combined) == expected
+        end
+      end
+    end
+
     test "returns :conflict and :error for mismatched or invalid JSON prefixes" do
-      assert :conflict = JSONPrefix.reconcile(~s({"a": 2}), %{"a" => 1})
-      assert :conflict = JSONPrefix.reconcile(~s({"a": 1, }), %{"a" => 1})
-      assert :conflict = JSONPrefix.reconcile(~s([1, 2, ), [1, 2])
-      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\x"}), %{"s" => "x"})
-      assert :conflict = JSONPrefix.reconcile(~s({"s": "\\uDC00"}), %{"s" => "x"})
-      assert :conflict = JSONPrefix.reconcile(~s({"n": -), %{"n" => 5})
-      assert :conflict = JSONPrefix.reconcile(~s({"b": tr), %{"b" => false})
+      conflicts = [
+        {~s({"a": 2}), %{"a" => 1}},
+        {~s({"a": 1, }), %{"a" => 1}},
+        {~s([1, 2, ), [1, 2]},
+        {~s([1]), []},
+        {~s({"arr":[1]), %{"arr" => [1, 2]}},
+        {~s({"arr":[1,]), %{"arr" => [1]}},
+        {~s({"arr":[1,2,3]), %{"arr" => [1, 2]}},
+        {~s({"x":1}), %{"x" => 1, "y" => 2}},
+        {~s({"x":1,), %{"x" => 1}},
+        {~s({"unknown":1), %{"x" => 1}},
+        {~s({"x":1e), %{"x" => 42}},
+        {~s({"x":1e+), %{"x" => 0.0}},
+        {~s({"x":1), %{"x" => 0}},
+        {~s({"x":1.), %{"x" => 0}},
+        {~s({"x":-1e), %{"x" => 100}},
+        {~s({"x":1e2 ), %{"x" => 42}},
+        {~s({"x":0e9), %{"x" => 1}},
+        {~s({"x":true ), %{"x" => false}},
+        {~s({"b": tr), %{"b" => false}},
+        {~s({"n": -), %{"n" => 5}},
+        {~S({"s":"\x"}), %{"s" => "x"}},
+        {~S({"x":"\q), %{"x" => "q"}},
+        {~S({"x":"\uZZZZ), %{"x" => "a"}},
+        {~S({"s":"\uDC00"}), %{"s" => "x"}},
+        {~S({"x":"\uDC00), %{"x" => "a"}},
+        {~S({"x":"\uD83D\u0041), %{"x" => "a"}},
+        {~S({"x":"\u0041), %{"x" => "B"}},
+        {"{\"x\":\"a\\", %{"x" => "a"}}
+      ]
+
+      for {prefix, expected} <- conflicts do
+        assert :conflict = JSONPrefix.reconcile(prefix, expected)
+      end
+
       assert :error = JSONPrefix.complete(%{"a" => 1}, ~s({"a": 1} trailing))
     end
   end
@@ -1916,6 +2021,101 @@ defmodule Alloy.Provider.OpenAITest do
 
       assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s({"path": )}}}
       assert_received {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: ~s("mix.exs"})}}}
+    end
+
+    test "reconciles pretty-printed terminal arguments and rejects incompatible string/token whitespace" do
+      test_pid = self()
+
+      # Compact prefix against pretty-printed terminal arguments succeeds and preserves valid JSON
+      pretty_chunks = [
+        sse_response_event("response.output_item.added", %{
+          "output_index" => 0,
+          "item" => %{
+            "type" => "function_call",
+            "id" => "fc_1",
+            "call_id" => "call_1",
+            "name" => "read"
+          }
+        }),
+        sse_response_event("response.function_call_arguments.delta", %{
+          "item_id" => "fc_1",
+          "output_index" => 0,
+          "delta" => ~s({"path":)
+        }),
+        sse_response_completed([
+          function_call_item("call_1", "read", ~s({\n  "path": "a\\"b"\n}))
+        ]),
+        "data: [DONE]\n\n"
+      ]
+
+      Req.Test.stub(__MODULE__, sse_chunks_plug(pretty_chunks))
+
+      config = %{
+        api_key: "sk-test",
+        model: "gpt-5.4",
+        on_event: fn ev -> send(test_pid, {:ev, ev}) end,
+        req_options: [plug: {Req.Test, __MODULE__}, retry: false]
+      }
+
+      assert {:ok, response} =
+               ResponsesStream.stream(
+                 "https://api.openai.com/v1/responses",
+                 [{"authorization", "Bearer sk-test"}],
+                 %{"model" => "gpt-5.4", "input" => []},
+                 fn _ -> :ok end,
+                 config
+               )
+
+      assert response.stop_reason == :tool_use
+
+      deltas =
+        Stream.repeatedly(fn ->
+          receive do
+            {:ev, {:tool_call_delta, %{id: "call_1", arguments_delta: d}}} -> d
+          after
+            0 -> :done
+          end
+        end)
+        |> Enum.take_while(&(&1 != :done))
+        |> Enum.join()
+
+      assert Jason.decode!(deltas) == %{"path" => ~s(a"b)}
+
+      # Whitespace inside a string literal or splitting a numeric token must fail closed
+      for {bad_prefix, terminal} <- [
+            {~s({"path": "mix.exs ), ~s({"path":"mix.exs"})},
+            {~s({"n": 1 ), ~s({"n":10})}
+          ] do
+        bad_chunks = [
+          sse_response_event("response.output_item.added", %{
+            "output_index" => 0,
+            "item" => %{
+              "type" => "function_call",
+              "id" => "fc_bad",
+              "call_id" => "call_bad",
+              "name" => "read"
+            }
+          }),
+          sse_response_event("response.function_call_arguments.delta", %{
+            "item_id" => "fc_bad",
+            "output_index" => 0,
+            "delta" => bad_prefix
+          }),
+          sse_response_completed([function_call_item("call_bad", "read", terminal)]),
+          "data: [DONE]\n\n"
+        ]
+
+        Req.Test.stub(__MODULE__, sse_chunks_plug(bad_chunks))
+
+        assert {:error, %Alloy.Provider.Error{kind: :malformed_reply}} =
+                 ResponsesStream.stream(
+                   "https://api.openai.com/v1/responses",
+                   [{"authorization", "Bearer sk-test"}],
+                   %{"model" => "gpt-5.4", "input" => []},
+                   fn _ -> :ok end,
+                   config
+                 )
+      end
     end
   end
 

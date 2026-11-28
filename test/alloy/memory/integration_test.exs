@@ -5,6 +5,19 @@ defmodule Alloy.Memory.IntegrationTest do
   alias Alloy.Provider.Test, as: TestProvider
   alias Alloy.Test.{EchoTool, MemoryStore}
 
+  defmodule ReportToolCalls do
+    @behaviour Alloy.Middleware
+
+    @impl true
+    def call(:before_tool_call, state) do
+      %{name: name} = state.config.context.current_tool_call
+      send(state.config.context.report_to, {:before_tool_call, name})
+      state
+    end
+
+    def call(_hook, state), do: state
+  end
+
   describe "Alloy.run/2 with :memory option" do
     test "raises on a malformed :memory value" do
       assert_raise ArgumentError, ~r/expects a \{module, store\} tuple/, fn ->
@@ -209,7 +222,7 @@ defmodule Alloy.Memory.IntegrationTest do
             {Alloy.Provider.Anthropic,
              api_key: "sk-test", model: "claude-sonnet-4-6", req_options: [plug: plug]},
           memory: {MemoryStore, store_pid},
-          middleware: [Alloy.Test.ReportToolCalls],
+          middleware: [ReportToolCalls],
           context: %{report_to: parent},
           on_event: &send(parent, {:event, &1.event})
         )

@@ -859,9 +859,5 @@ MIT — see [LICENSE](LICENSE).
 
 ## Releases
 
-Hex.pm publishing is handled by GitHub Actions on `v*` tags.
-When `ALLOY_WEBSITE_SYNC_TOKEN` is configured, successful publishes also
-dispatch the landing-site version sync workflow. The token needs Contents:
-write on `alloy-ex/alloy-ex.github.io`; without it the dispatch is skipped
-with a warning. GitHub Release entries are separate from Hex publishing.
-Check [Hex](https://hex.pm/packages/alloy) for published package versions.
+Published package versions are available on [Hex](https://hex.pm/packages/alloy)
+and release notes live in [CHANGELOG.md](CHANGELOG.md).

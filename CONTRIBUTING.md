@@ -62,11 +62,10 @@ mix test --warnings-as-errors --cover    # Coverage floor in mix.exs
 mix dialyzer                   # With :unmatched_returns, :missing_return, ...
 ```
 
-Formatter and Credo checks cover library code, tests, examples, checks, and
-Elixir benchmark scripts. Benchmark entry points may write results to stdout;
-other lint checks apply unchanged. Use the standard Elixir formatter, explicit
-public API specs, behaviours for extension points, and supervised tasks for
-concurrent tool execution. Keep application orchestration outside the library.
+Formatter and Credo checks cover library code and tests. Use the standard
+Elixir formatter, explicit public API specs, behaviours for extension points,
+and supervised tasks for concurrent tool execution. Keep application
+orchestration outside the library.
 
 Docs must also build cleanly: `MIX_ENV=dev mix docs --warnings-as-errors`.
 

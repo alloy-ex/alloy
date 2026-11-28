@@ -2001,7 +2001,7 @@ defmodule Alloy.Provider.AnthropicTest do
       refute_received {:chunk, _}
 
       # on_event receives thinking deltas from the provider.
-      # :text_delta is emitted by Turn.wrapped_chunk, not by the provider directly.
+      # :text_delta is emitted by Retry.call_provider/5, not by the provider directly.
       assert_received {:event, {:thinking_delta, "Let me think..."}}
       assert_received {:event, {:thinking_delta, " Step 2."}}
       refute_received {:event, {:text_delta, _}}
@@ -2015,8 +2015,8 @@ defmodule Alloy.Provider.AnthropicTest do
       assert thinking_block.thinking == "Let me think... Step 2."
     end
 
-    test "provider does not emit :text_delta directly (Turn.wrapped_chunk handles it)" do
-      # :text_delta is emitted by Turn.wrapped_chunk for all providers universally.
+    test "provider does not emit :text_delta directly (Retry.call_provider/5 handles it)" do
+      # :text_delta is emitted by Retry.call_provider/5 for all providers universally.
       # The Anthropic provider itself only emits :thinking_delta via on_event.
       config =
         config_with_sse_stream([
@@ -2045,7 +2045,7 @@ defmodule Alloy.Provider.AnthropicTest do
 
       Anthropic.stream([Message.user("Hi")], [], config, fn _ -> :ok end)
 
-      # Provider does NOT emit :text_delta — Turn.wrapped_chunk does
+      # Provider does NOT emit :text_delta — Retry.call_provider/5 does
       refute_received {:event, {:text_delta, _}}
     end
 
